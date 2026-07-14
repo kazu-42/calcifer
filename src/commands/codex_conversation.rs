@@ -6,23 +6,25 @@
 
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
 use crate::cli::InternalProcessMode;
 use crate::conversations::{
     BindingInput, ConversationError, ConversationLifecycle, ConversationRegistry, HeadBinding,
-    InventoryThread, LaunchMode, LaunchResolution, PendingPhase,
+    InventoryThread, LaunchMode, LaunchResolution, PendingLaunch, PendingPhase,
 };
 use crate::error::AppError;
 use crate::profiles::ProfileLease;
 use crate::providers::codex::{
     CodexThreadError, CodexThreadInventory, CodexThreadLifecycle, CodexThreadRead,
-    read_thread_inventory, read_thread_metadata,
+    SUPPORTED_CODEX_STATUS_VERSIONS, probe_codex_version, read_thread_inventory,
+    read_thread_metadata,
 };
 
 const THREAD_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) enum GuardianCapture {
     /// Derive the exact thread from a bounded before/after inventory.
@@ -148,18 +150,17 @@ impl<'a> CaptureContext<'a> {
             validate_head_target(&head, self.profile_id, thread_id, self.working_directory)?;
         }
 
-        let read = match self.read_thread(thread_id) {
-            Ok(read) => read,
-            Err(AppError::Conversation(ConversationError::CodexVersionUnsupported))
-                if mode == InternalProcessMode::ResumeExact =>
-            {
+        if mode == InternalProcessMode::ResumeExact {
+            let codex_version = self.probe_version()?;
+            if !SUPPORTED_CODEX_STATUS_VERSIONS.contains(&codex_version.as_str()) {
                 eprintln!(
                     "Calcifer: the installed Codex version is outside the tracked-session adapter; continuing with explicit exact resume without changing the conversation registry."
                 );
                 return Ok(GuardianCapture::UnsupportedExplicit);
             }
-            Err(error) => return Err(error),
-        };
+        }
+
+        let read = self.read_thread(thread_id)?;
 
         if mode == InternalProcessMode::ResumeHead {
             let head = self.conversations.resolve_head(self.working_directory)?;
@@ -223,7 +224,12 @@ impl<'a> CaptureContext<'a> {
         if pending.launch_id != launch_id {
             return Err(ConversationError::Ambiguous.into());
         }
-        let inventory = self.inventory()?;
+        let inventory = match self.inventory() {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                return finish_reconciliation_failure(self.conversations, launch_id, error);
+            }
+        };
         if !inventory.complete {
             let _ = self
                 .conversations
@@ -231,7 +237,11 @@ impl<'a> CaptureContext<'a> {
             return Err(ConversationError::Ambiguous.into());
         }
         if inventory.codex_version != pending.codex_version {
-            return Err(ConversationError::SessionSchemaUnsupported.into());
+            return finish_reconciliation_failure(
+                self.conversations,
+                launch_id,
+                ConversationError::SessionSchemaUnsupported.into(),
+            );
         }
 
         match inventory_candidate(&pending.pre_inventory, &inventory_projection(&inventory)) {
@@ -242,11 +252,25 @@ impl<'a> CaptureContext<'a> {
                 Ok(())
             }
             InventoryCandidate::One(thread_id) => {
-                let read = self.read_thread(&thread_id)?;
+                let read = match self.read_thread(&thread_id) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        return finish_reconciliation_failure(self.conversations, launch_id, error);
+                    }
+                };
                 if read.codex_version != pending.codex_version {
-                    return Err(ConversationError::SessionSchemaUnsupported.into());
+                    return finish_reconciliation_failure(
+                        self.conversations,
+                        launch_id,
+                        ConversationError::SessionSchemaUnsupported.into(),
+                    );
                 }
-                let mut binding = self.binding_from_read(read)?;
+                let mut binding = match self.binding_from_read(read) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        return finish_reconciliation_failure(self.conversations, launch_id, error);
+                    }
+                };
                 if !provider_succeeded && binding.lifecycle == ConversationLifecycle::Clean {
                     binding.lifecycle = ConversationLifecycle::UnknownCrash;
                 }
@@ -291,8 +315,11 @@ impl<'a> CaptureContext<'a> {
         let inventory = match self.inventory() {
             Ok(inventory) => inventory,
             Err(error) => {
-                let _ = self.conversations.mark_capture_failed(&pending.launch_id);
-                return Err(error);
+                return finish_reconciliation_failure(
+                    self.conversations,
+                    &pending.launch_id,
+                    error,
+                );
             }
         };
         if !inventory.complete {
@@ -302,8 +329,11 @@ impl<'a> CaptureContext<'a> {
             return Err(ConversationError::Ambiguous.into());
         }
         if inventory.codex_version != pending.codex_version {
-            let _ = self.conversations.mark_capture_failed(&pending.launch_id);
-            return Err(ConversationError::SessionSchemaUnsupported.into());
+            return finish_reconciliation_failure(
+                self.conversations,
+                &pending.launch_id,
+                ConversationError::SessionSchemaUnsupported.into(),
+            );
         }
 
         match inventory_candidate(&pending.pre_inventory, &inventory_projection(&inventory)) {
@@ -322,18 +352,34 @@ impl<'a> CaptureContext<'a> {
                 }
             },
             InventoryCandidate::One(thread_id) => {
+                require_started_candidate(self.conversations, &pending)?;
                 let read = match self.read_thread(&thread_id) {
                     Ok(read) => read,
                     Err(error) => {
-                        let _ = self.conversations.mark_capture_failed(&pending.launch_id);
-                        return Err(error);
+                        return finish_reconciliation_failure(
+                            self.conversations,
+                            &pending.launch_id,
+                            error,
+                        );
                     }
                 };
                 if read.codex_version != pending.codex_version {
-                    let _ = self.conversations.mark_capture_failed(&pending.launch_id);
-                    return Err(ConversationError::SessionSchemaUnsupported.into());
+                    return finish_reconciliation_failure(
+                        self.conversations,
+                        &pending.launch_id,
+                        ConversationError::SessionSchemaUnsupported.into(),
+                    );
                 }
-                let mut binding = self.binding_from_read(read)?;
+                let mut binding = match self.binding_from_read(read) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        return finish_reconciliation_failure(
+                            self.conversations,
+                            &pending.launch_id,
+                            error,
+                        );
+                    }
+                };
                 binding.lifecycle = match binding.lifecycle {
                     ConversationLifecycle::Interrupted => ConversationLifecycle::Interrupted,
                     ConversationLifecycle::Clean | ConversationLifecycle::UnknownCrash => {
@@ -343,7 +389,11 @@ impl<'a> CaptureContext<'a> {
                     | ConversationLifecycle::Archived
                     | ConversationLifecycle::Incompatible
                     | ConversationLifecycle::Ambiguous => {
-                        return Err(ConversationError::SessionSchemaUnsupported.into());
+                        return finish_reconciliation_failure(
+                            self.conversations,
+                            &pending.launch_id,
+                            ConversationError::SessionSchemaUnsupported.into(),
+                        );
                     }
                 };
                 let resolved = self
@@ -371,6 +421,18 @@ impl<'a> CaptureContext<'a> {
             self.neutral_working_directory,
             self.working_directory,
             THREAD_METADATA_TIMEOUT,
+        )
+        .map_err(map_thread_error)
+        .map_err(AppError::from)
+    }
+
+    fn probe_version(&self) -> Result<String, AppError> {
+        let _inheritance = self.provider_lease.inherit_provider_lock()?;
+        probe_codex_version(
+            self.executable,
+            self.home,
+            self.neutral_working_directory,
+            VERSION_PROBE_TIMEOUT,
         )
         .map_err(map_thread_error)
         .map_err(AppError::from)
@@ -410,6 +472,41 @@ impl<'a> CaptureContext<'a> {
     }
 }
 
+fn require_started_candidate(
+    conversations: &ConversationRegistry,
+    pending: &PendingLaunch,
+) -> Result<(), AppError> {
+    if pending.phase != PendingPhase::Prepared {
+        return Ok(());
+    }
+    let _ = conversations.finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
+    Err(ConversationError::Ambiguous.into())
+}
+
+fn finish_reconciliation_failure(
+    conversations: &ConversationRegistry,
+    launch_id: &str,
+    error: AppError,
+) -> Result<(), AppError> {
+    let terminal = matches!(
+        &error,
+        AppError::Conversation(
+            ConversationError::RolloutMissing
+                | ConversationError::Archived
+                | ConversationError::SessionSchemaUnsupported
+                | ConversationError::CodexVersionUnsupported
+                | ConversationError::CwdMismatch
+                | ConversationError::ThreadProtocolInvalid
+        )
+    );
+    if terminal {
+        let _ = conversations.finish_launch(launch_id, LaunchResolution::Ambiguous)?;
+    } else {
+        conversations.mark_capture_failed(launch_id)?;
+    }
+    Err(error)
+}
+
 pub(super) fn validate_head_target(
     head: &HeadBinding,
     profile_id: &str,
@@ -437,12 +534,12 @@ fn map_thread_error(error: CodexThreadError) -> ConversationError {
         CodexThreadError::CwdMismatch => ConversationError::CwdMismatch,
         CodexThreadError::Missing => ConversationError::RolloutMissing,
         CodexThreadError::Archived => ConversationError::Archived,
-        CodexThreadError::Protocol
-        | CodexThreadError::Authentication
+        CodexThreadError::Protocol => ConversationError::ThreadProtocolInvalid,
+        CodexThreadError::Authentication
         | CodexThreadError::Timeout
         | CodexThreadError::Transport
         | CodexThreadError::Provider
-        | CodexThreadError::Spawn => ConversationError::ThreadProtocolInvalid,
+        | CodexThreadError::Spawn => ConversationError::ThreadMetadataUnavailable,
     }
 }
 
@@ -479,6 +576,13 @@ fn inventory_projection(inventory: &CodexThreadInventory) -> Vec<InventoryThread
             updated_at: thread.updated_at,
             recency_at: thread.recency_at,
             archived: thread.archived,
+            rollout_device: thread.rollout_fingerprint.device,
+            rollout_inode: thread.rollout_fingerprint.inode,
+            rollout_length: thread.rollout_fingerprint.length,
+            rollout_modified_seconds: thread.rollout_fingerprint.modified_seconds,
+            rollout_modified_nanoseconds: thread.rollout_fingerprint.modified_nanoseconds,
+            rollout_changed_seconds: thread.rollout_fingerprint.changed_seconds,
+            rollout_changed_nanoseconds: thread.rollout_fingerprint.changed_nanoseconds,
         })
         .collect()
 }
@@ -494,18 +598,24 @@ fn inventory_candidate(
     baseline: &[InventoryThread],
     current: &[InventoryThread],
 ) -> InventoryCandidate {
-    let baseline: BTreeMap<&str, (i64, Option<i64>, bool)> = baseline
+    let baseline: BTreeMap<&str, &InventoryThread> = baseline
         .iter()
-        .map(|thread| {
-            (
-                thread.thread_id.as_str(),
-                (thread.updated_at, thread.recency_at, thread.archived),
-            )
-        })
+        .map(|thread| (thread.thread_id.as_str(), thread))
         .collect();
+    let current_ids: BTreeSet<&str> = current
+        .iter()
+        .map(|thread| thread.thread_id.as_str())
+        .collect();
+    if baseline
+        .keys()
+        .any(|thread_id| !current_ids.contains(thread_id))
+    {
+        return InventoryCandidate::Ambiguous;
+    }
     let mut candidates = current.iter().filter(|thread| {
-        baseline.get(thread.thread_id.as_str()).copied()
-            != Some((thread.updated_at, thread.recency_at, thread.archived))
+        baseline
+            .get(thread.thread_id.as_str())
+            .is_none_or(|baseline| *baseline != *thread)
     });
     let first = candidates.next().map(|thread| thread.thread_id.clone());
     match (first, candidates.next()) {
@@ -517,26 +627,95 @@ fn inventory_candidate(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::PathBuf;
+
+    use uuid::Uuid;
+
     use super::*;
+    use crate::profiles::Registry;
+
+    struct PendingFixture {
+        root: PathBuf,
+        workspace: PathBuf,
+        conversations: ConversationRegistry,
+        profile_id: String,
+        launch_id: String,
+    }
+
+    fn registry_fixture(
+        name: &str,
+        provider_started: bool,
+    ) -> Result<PendingFixture, Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "calcifer-reconcile-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let profiles = Registry::at(root.clone());
+        let conversations = ConversationRegistry::from_profiles(&profiles);
+        let profile_id = Uuid::new_v4().to_string();
+        let launch_id = conversations.begin_launch(
+            &profile_id,
+            &workspace,
+            LaunchMode::Run,
+            "0.144.4",
+            Vec::new(),
+        )?;
+        if provider_started {
+            conversations.mark_provider_started(&launch_id)?;
+        }
+        Ok(PendingFixture {
+            root,
+            workspace,
+            conversations,
+            profile_id,
+            launch_id,
+        })
+    }
+
+    fn pending_registry(name: &str) -> Result<PendingFixture, Box<dyn std::error::Error>> {
+        registry_fixture(name, true)
+    }
+
+    fn inventory_thread(thread_id: &str, updated_at: i64) -> InventoryThread {
+        InventoryThread {
+            thread_id: thread_id.to_owned(),
+            updated_at,
+            recency_at: Some(updated_at),
+            archived: false,
+            rollout_device: 1,
+            rollout_inode: 2,
+            rollout_length: 3,
+            rollout_modified_seconds: 4,
+            rollout_modified_nanoseconds: 5,
+            rollout_changed_seconds: 6,
+            rollout_changed_nanoseconds: 7,
+        }
+    }
 
     #[test]
     fn inventory_diff_never_guesses_between_new_changed_or_archived_threads() {
-        let first = InventoryThread {
-            thread_id: "01900000-0000-7000-8000-000000000001".to_owned(),
-            updated_at: 10,
-            recency_at: Some(10),
-            archived: false,
-        };
-        let second = InventoryThread {
-            thread_id: "01900000-0000-7000-8000-000000000002".to_owned(),
-            updated_at: 20,
-            recency_at: Some(20),
-            archived: false,
-        };
+        let first = inventory_thread("01900000-0000-7000-8000-000000000001", 10);
+        let second = inventory_thread("01900000-0000-7000-8000-000000000002", 20);
 
         assert_eq!(
             inventory_candidate(std::slice::from_ref(&first), std::slice::from_ref(&first)),
             InventoryCandidate::None
+        );
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&first), &[]),
+            InventoryCandidate::Ambiguous,
+            "a deleted baseline thread must never preserve a stale head"
+        );
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&first), std::slice::from_ref(&second)),
+            InventoryCandidate::Ambiguous,
+            "a deletion plus a new thread is not a unique launch candidate"
         );
         let mut changed = first.clone();
         changed.updated_at += 1;
@@ -554,5 +733,221 @@ mod tests {
             inventory_candidate(std::slice::from_ref(&first), &[archived]),
             InventoryCandidate::One(first.thread_id)
         );
+    }
+
+    #[test]
+    fn inventory_diff_detects_same_second_rollout_changes() {
+        let original = inventory_thread("01900000-0000-7000-8000-000000000001", 10);
+
+        let mut length_changed = original.clone();
+        length_changed.rollout_length += 1;
+        assert_eq!(
+            inventory_candidate(
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&length_changed)
+            ),
+            InventoryCandidate::One(original.thread_id.clone())
+        );
+
+        let mut nanoseconds_changed = original.clone();
+        nanoseconds_changed.rollout_modified_nanoseconds += 1;
+        assert_eq!(
+            inventory_candidate(
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&nanoseconds_changed)
+            ),
+            InventoryCandidate::One(original.thread_id.clone())
+        );
+
+        let mut renamed = original.clone();
+        renamed.rollout_changed_nanoseconds += 1;
+        assert_eq!(
+            inventory_candidate(
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&renamed)
+            ),
+            InventoryCandidate::One(original.thread_id.clone()),
+            "a path-free ctime fingerprint must detect a same-inode rename"
+        );
+    }
+
+    #[test]
+    fn thread_error_mapping_separates_terminal_schema_from_retryable_availability() {
+        assert!(matches!(
+            map_thread_error(CodexThreadError::Protocol),
+            ConversationError::ThreadProtocolInvalid
+        ));
+        for retryable in [
+            CodexThreadError::Authentication,
+            CodexThreadError::Timeout,
+            CodexThreadError::Transport,
+            CodexThreadError::Provider,
+            CodexThreadError::Spawn,
+        ] {
+            assert!(matches!(
+                map_thread_error(retryable),
+                ConversationError::ThreadMetadataUnavailable
+            ));
+        }
+    }
+
+    #[test]
+    fn archive_transition_is_detected_but_cannot_be_bound_automatically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let active = inventory_thread("01900000-0000-7000-8000-000000000001", 10);
+        let mut archived = active.clone();
+        archived.archived = true;
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&active), &[archived]),
+            InventoryCandidate::One(active.thread_id)
+        );
+
+        let fixture = pending_registry("archive-transition")?;
+        let error = finish_reconciliation_failure(
+            &fixture.conversations,
+            &fixture.launch_id,
+            ConversationError::Archived.into(),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("archived read unexpectedly succeeded"))?;
+        assert_eq!(error.code(), "conversation_archived");
+        assert!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .is_none()
+        );
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_candidate_failures_remove_pending_and_require_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for failure in [
+            ConversationError::RolloutMissing,
+            ConversationError::Archived,
+            ConversationError::SessionSchemaUnsupported,
+            ConversationError::CodexVersionUnsupported,
+            ConversationError::CwdMismatch,
+            ConversationError::ThreadProtocolInvalid,
+        ] {
+            let expected_code = failure.code();
+            let fixture = pending_registry(expected_code)?;
+
+            let error = finish_reconciliation_failure(
+                &fixture.conversations,
+                &fixture.launch_id,
+                failure.into(),
+            )
+            .err()
+            .ok_or_else(|| std::io::Error::other("terminal failure unexpectedly succeeded"))?;
+
+            assert_eq!(error.code(), expected_code);
+            assert!(
+                fixture
+                    .conversations
+                    .pending_for(&fixture.profile_id, &fixture.workspace)?
+                    .is_none(),
+                "terminal failure {expected_code} left a retry loop"
+            );
+            assert_eq!(
+                fixture
+                    .conversations
+                    .resolve_head(&fixture.workspace)
+                    .err()
+                    .map(|error| error.code()),
+                Some("conversation_ambiguous")
+            );
+            fs::remove_dir_all(fixture.root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transient_candidate_failure_remains_retryable() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = pending_registry("transient")?;
+
+        let error = finish_reconciliation_failure(
+            &fixture.conversations,
+            &fixture.launch_id,
+            ConversationError::ThreadMetadataUnavailable.into(),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("transient failure unexpectedly succeeded"))?;
+
+        assert_eq!(error.code(), "codex_thread_metadata_unavailable");
+        assert_eq!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .map(|pending| pending.phase),
+            Some(PendingPhase::CaptureFailed),
+            "a retryable metadata failure must retain its pending launch"
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn transient_candidate_registry_failure_is_not_hidden() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = pending_registry("registry-failure")?;
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o755))?;
+
+        let error = finish_reconciliation_failure(
+            &fixture.conversations,
+            &fixture.launch_id,
+            ConversationError::ThreadMetadataUnavailable.into(),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("unsafe registry unexpectedly succeeded"))?;
+
+        assert_eq!(error.code(), "conversation_registry_invalid");
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700))?;
+        assert_eq!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .map(|pending| pending.phase),
+            Some(PendingPhase::ProviderStarted),
+            "a failed registry mutation must not be reported as capture_failed"
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_launch_never_binds_a_later_candidate() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = registry_fixture("prepared-candidate", false)?;
+        let pending = fixture
+            .conversations
+            .pending_for(&fixture.profile_id, &fixture.workspace)?
+            .ok_or_else(|| std::io::Error::other("prepared launch is missing"))?;
+
+        let error = require_started_candidate(&fixture.conversations, &pending)
+            .err()
+            .ok_or_else(|| std::io::Error::other("prepared candidate was accepted"))?;
+
+        assert_eq!(error.code(), "conversation_ambiguous");
+        assert!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .conversations
+                .resolve_head(&fixture.workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_ambiguous")
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
     }
 }

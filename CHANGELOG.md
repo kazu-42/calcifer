@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Crash-safe same-profile Codex thread capture and bare `calcifer resume`, which
+  validates the tracked workspace head and invokes exact official CLI resume
+  without replaying a prompt.
+- Conservative rollout-store completeness and change fingerprints for the
+  hidden Codex 0.144.4 filesystem scan cap and same-second thread updates.
+
+### Changed
+
+- Exact previous-thread auto-selection is now available for supported Codex
+  versions; active-profile monitoring and provider account-identity
+  verification remain future work.
+- Unix startup now applies umask `0077` before any managed state or provider
+  child is created, while owner-safe legacy `0755`/`0644` nested rollouts remain
+  readable behind the private managed-home boundary.
+
 ## [0.1.0-alpha.3] - 2026-07-15
 
 ### Added
@@ -20,9 +37,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Stable JSON status output with redacted provider errors and display-only remaining percentages.
 - Fail-closed Codex `0.144.4` status compatibility gate with canonical managed-home verification and explicit human/JSON compatibility metadata.
 - Checked cold resume after wrapper restart by exact thread ID or official `--last` behavior.
-- Crash-safe same-profile Codex thread capture and bare `calcifer resume`, which
-  validates the tracked workspace head and invokes exact official CLI resume
-  without replaying a prompt.
 - ADR for profile-independent conversation lineage and required cross-profile continuation after automatic failover.
 - Native five-target release packaging with deterministic archive metadata,
   checksums, provenance attestations, dry-run validation, and a maintainer
@@ -80,7 +94,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Automatic account failover and the accepted cross-profile conversation handoff design are not implemented.
 - Managed profile registration is disabled on Windows until current-user-only ACL creation is verified.
 - `resume` restores persisted Codex conversation state; it does not restart an in-flight tool call or replay a prompt.
-- Active-profile monitoring and provider account-identity verification are not implemented; current status reads idle local profiles, which may alias the same underlying account.
+- Exact previous-thread auto-selection, active-profile monitoring, and provider account-identity verification are not implemented; current status reads idle local profiles, which may alias the same underlying account.
 
 [Unreleased]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.3...HEAD
 [0.1.0-alpha.3]: https://github.com/kazu-42/calcifer/releases/tag/v0.1.0-alpha.3

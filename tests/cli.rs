@@ -323,6 +323,10 @@ fn managed_codex_profile_supports_status_run_and_exact_resume()
         &fake_codex,
         r#"#!/bin/sh
 set -eu
+case "$(umask)" in
+  0077|077) ;;
+  *) exit 98 ;;
+esac
 if env | grep -Eq '^(OPENAI_API_KEY|OPENAI_ORGANIZATION|OPENAI_PROJECT|CODEX_API_KEY|CODEX_ACCESS_TOKEN|CoDeX_AcCeSs_ToKeN|CODEX_REFRESH_TOKEN_URL_OVERRIDE|CODEX_REVOKE_TOKEN_URL_OVERRIDE|CODEX_APP_SERVER_LOGIN_CLIENT_ID|CODEX_AUTHAPI_BASE_URL|CODEX_APP_SERVER_LOGIN_ISSUER|CODEX_APP_SERVER_DEV_OPEN_APP_URL|CODEX_APP_SERVER_MANAGED_CONFIG_PATH|CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG|CODEX_APP_SERVER_TEST_USER_CONFIG_FILE|CODEX_SQLITE_HOME|CODEX_REMOTE_AUTH_TOKEN|CODEX_CONNECTORS_TOKEN|CODEX_CODE_MODE_HOST_PATH|CODEX_CLOUD_TASKS_BASE_URL|CODEX_CLOUD_TASKS_FORCE_INTERNAL|CODEX_STARTING_DIFF|CODEX_EXEC_SERVER_URL|CODEX_EXEC_SERVER_NOISE_REGISTRY_URL|CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID|CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN|CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID|CODEX_OSS_BASE_URL|CODEX_OSS_PORT|CODEX_INTERNAL_ORIGINATOR_OVERRIDE|CODEX_TUI_RECORD_SESSION|CODEX_TUI_SESSION_LOG_PATH|CODEX_ROLLOUT_TRACE_ROOT|CODEX_ANALYTICS_EVENTS_CAPTURE_FILE|CoDeX_TeSt_Future_Auth_Hook|CoDeX_FuTuRe_EnDpOiNt_OvErRiDe)='; then
   exit 97
 fi
@@ -358,8 +362,7 @@ thread_id=01900000-0000-7000-8000-000000000001
 thread_state="$CODEX_HOME/.fake-thread-state"
 thread_counter="$CODEX_HOME/.fake-thread-counter"
 thread_rollout="$CODEX_HOME/sessions/rollout-synthetic-$thread_id.jsonl"
-if [ "${1:-}" != "login" ] && [ "${1:-}" != "app-server" ] && [ "${FAKE_CODEX_NO_THREAD:-}" != "1" ]; then
-  umask 077
+if [ "${1:-}" != "login" ] && [ "${1:-}" != "app-server" ] && [ "${1:-}" != "--version" ] && [ "${FAKE_CODEX_NO_THREAD:-}" != "1" ]; then
   mkdir -p "$CODEX_HOME/sessions"
   counter=0
   if [ -f "$thread_counter" ]; then
@@ -368,8 +371,10 @@ if [ "${1:-}" != "login" ] && [ "${1:-}" != "app-server" ] && [ "${FAKE_CODEX_NO
   counter=$((counter + 1))
   printf '%s\n' "$counter" > "$thread_counter"
   printf '%s\n' "$PWD" > "$thread_state"
-  printf '{"timestamp":"2026-07-15T00:00:00Z","type":"session_meta","payload":{"id":"%s","cwd":"%s","cli_version":"0.144.4","source":"cli","parent_thread_id":null,"base_instructions":"prompt sentinel must not persist"}}\n' "$thread_id" "$PWD" > "$thread_rollout"
-  printf '%s\n' '{"timestamp":"2026-07-15T00:00:01Z","type":"response_item","payload":{"message":"response sentinel must not persist","tool_args":"tool arguments sentinel must not persist"}}' >> "$thread_rollout"
+  if [ ! -f "$thread_rollout" ]; then
+    printf '{"timestamp":"2026-07-15T00:00:00Z","type":"session_meta","payload":{"id":"%s","cwd":"%s","cli_version":"0.144.4","source":"cli","parent_thread_id":null,"base_instructions":"prompt sentinel must not persist"}}\n' "$thread_id" "$PWD" > "$thread_rollout"
+    printf '%s\n' '{"timestamp":"2026-07-15T00:00:01Z","type":"response_item","payload":{"message":"response sentinel must not persist","tool_args":"tool arguments sentinel must not persist"}}' >> "$thread_rollout"
+  fi
   printf '%s\n' '{"timestamp":"2026-07-15T00:00:02Z","type":"event_msg","payload":{"type":"task_started"}}' >> "$thread_rollout"
   case "${1:-}" in
     hold|hold-ignore-int)
@@ -380,11 +385,20 @@ if [ "${1:-}" != "login" ] && [ "${1:-}" != "app-server" ] && [ "${FAKE_CODEX_NO
   esac
 fi
 case "${1:-}" in
+  --version)
+    if [ "${FAKE_CODEX_VERSION_HOLD_STDOUT:-}" = "1" ]; then
+      (sleep 5) &
+    fi
+    printf 'codex-cli %s\n' "${FAKE_CODEX_VERSION:-0.144.4}"
+    ;;
   login)
     umask 077
     printf '%s\n' '{"fake":"synthetic-test-only"}' > "$CODEX_HOME/auth.json"
     ;;
   app-server)
+    if [ "${FAKE_CODEX_APP_SERVER_SHAPE:-}" = "unavailable" ]; then
+      exit 90
+    fi
     if [ -n "${FAKE_CODEX_APP_SERVER_HOLD_PID:-}" ]; then
       printf '%s\n' "$$" > "$FAKE_CODEX_APP_SERVER_HOLD_PID"
       exec sleep 30
@@ -397,7 +411,7 @@ case "${1:-}" in
     printf '%s\n' 'app-server-initialize' >> "$FAKE_CODEX_LOG"
     version=${FAKE_CODEX_VERSION:-0.144.4}
     reported_home=${FAKE_CODEX_REPORTED_HOME:-$CODEX_HOME}
-    if [ "${FAKE_CODEX_NULL_INITIALIZE:-}" = "1" ]; then
+    if [ "${FAKE_CODEX_NULL_INITIALIZE:-}" = "1" ] || [ "${FAKE_CODEX_APP_SERVER_SHAPE:-}" = "schema-drift" ]; then
       printf '%s\n' '{"id":0,"result":null}'
     else
       printf '{"id":0,"result":{"userAgent":"calcifer/%s (test)","platformFamily":"unix","platformOs":"test","codexHome":"%s"}}\n' "$version" "$reported_home"
@@ -423,6 +437,9 @@ case "${1:-}" in
               if [ -f "$thread_state" ] && [ -f "$thread_counter" ] && [ -f "$thread_rollout" ]; then
                 thread_cwd=$(cat "$thread_state")
                 updated_at=$(cat "$thread_counter")
+                if [ "${FAKE_CODEX_FIXED_THREAD_TIMESTAMP:-}" = "1" ]; then
+                  updated_at=1
+                fi
                 printf '{"id":%s,"result":{"data":[{"id":"%s","parentThreadId":null,"ephemeral":false,"updatedAt":%s,"recencyAt":%s,"cwd":"%s","cliVersion":"0.144.4","source":"cli","path":"%s","preview":"preview sentinel must not persist","turns":[{"prompt":"prompt sentinel must not persist"}]}],"nextCursor":null}}\n' "$request_id" "$thread_id" "$updated_at" "$updated_at" "$thread_cwd" "$thread_rollout"
               else
                 printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$request_id"
@@ -442,6 +459,9 @@ case "${1:-}" in
           else
             thread_cwd=$(cat "$thread_state")
             updated_at=$(cat "$thread_counter")
+            if [ "${FAKE_CODEX_FIXED_THREAD_TIMESTAMP:-}" = "1" ]; then
+              updated_at=1
+            fi
             printf '{"id":%s,"result":{"thread":{"id":"%s","parentThreadId":null,"ephemeral":false,"updatedAt":%s,"recencyAt":%s,"cwd":"%s","cliVersion":"0.144.4","source":"cli","path":"%s","preview":"preview sentinel must not persist","turns":[{"response":"response sentinel must not persist"}]}}}\n' "$request_id" "$thread_id" "$updated_at" "$updated_at" "$thread_cwd" "$thread_rollout"
           fi
           ;;
@@ -844,6 +864,19 @@ config_file = "{sensitive_role_path}"
         .args(["run", "codex@work", "--", "--help"])
         .output()?;
     assert!(run.status.success(), "{}", String::from_utf8(run.stderr)?);
+    let managed_sessions = managed_home.join("sessions");
+    let managed_rollout =
+        managed_sessions.join("rollout-synthetic-01900000-0000-7000-8000-000000000001.jsonl");
+    assert_eq!(
+        std::fs::metadata(&managed_sessions)?.permissions().mode() & 0o777,
+        0o700,
+        "the real provider child must inherit Calcifer's 0077 umask"
+    );
+    assert_eq!(
+        std::fs::metadata(&managed_rollout)?.permissions().mode() & 0o777,
+        0o600,
+        "the real provider child must create private rollouts"
+    );
 
     let log_before_explicit_resume = std::fs::read_to_string(&log)?;
     let resume = calcifer_with_ambient_codex_auth_overrides()
@@ -885,17 +918,28 @@ config_file = "{sensitive_role_path}"
         "explicit exact resume validates before launch and refreshes lifecycle after exit"
     );
 
+    let thread_reads_before_same_second_resume = std::fs::read_to_string(&log)?
+        .matches("app-server-thread-read")
+        .count();
     let resume_last = calcifer_with_ambient_codex_auth_overrides()
         .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_FIXED_THREAD_TIMESTAMP", "1")
         .args(["resume", "codex@work"])
         .output()?;
     assert!(
         resume_last.status.success(),
         "{}",
         String::from_utf8(resume_last.stderr)?
+    );
+    assert!(
+        std::fs::read_to_string(&log)?
+            .matches("app-server-thread-read")
+            .count()
+            > thread_reads_before_same_second_resume,
+        "a same-second rollout length/mtime change must still select the resumed thread"
     );
 
     let log_before_cold_resume = std::fs::read_to_string(&log)?;
@@ -961,12 +1005,145 @@ config_file = "{sensitive_role_path}"
         );
     }
 
-    let unsupported_exact = calcifer_with_ambient_codex_auth_overrides()
+    for unsupported_version in ["0.145.0", "0.145.0-alpha.11"] {
+        for app_server_shape in ["unavailable", "schema-drift"] {
+            let log_before = std::fs::read_to_string(&log)?;
+            let unsupported_exact = calcifer_with_ambient_codex_auth_overrides()
+                .current_dir(&workspace)
+                .env("PATH", &path)
+                .env("CALCIFER_HOME", &root)
+                .env("FAKE_CODEX_LOG", &log)
+                .env("FAKE_CODEX_VERSION", unsupported_version)
+                .env("FAKE_CODEX_APP_SERVER_SHAPE", app_server_shape)
+                .args([
+                    "resume",
+                    "codex@work",
+                    "01900000-0000-7000-8000-000000000001",
+                ])
+                .output()?;
+            assert!(
+                unsupported_exact.status.success(),
+                "{}",
+                String::from_utf8(unsupported_exact.stderr.clone())?
+            );
+            assert!(
+                String::from_utf8(unsupported_exact.stderr)?
+                    .contains("continuing with explicit exact resume")
+            );
+            let log_after = std::fs::read_to_string(&log)?;
+            let delta = log_after
+                .strip_prefix(&log_before)
+                .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+            assert!(delta.contains("--version"));
+            assert!(!delta.contains("app-server"));
+            assert!(delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+            assert_eq!(
+                std::fs::read(&conversation_path)?,
+                conversation_bytes,
+                "unsupported explicit fallback must not rewrite tracked metadata"
+            );
+        }
+    }
+
+    let log_before_malformed_version = std::fs::read_to_string(&log)?;
+    let malformed_version = calcifer()
         .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
-        .env("FAKE_CODEX_VERSION", "0.145.0")
+        .env("FAKE_CODEX_VERSION", "0.145.0-alpha.01")
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert_eq!(malformed_version.status.code(), Some(1));
+    assert!(String::from_utf8(malformed_version.stderr)?.contains("invalid thread metadata"));
+    let malformed_version_log = std::fs::read_to_string(&log)?;
+    let malformed_version_delta = malformed_version_log
+        .strip_prefix(&log_before_malformed_version)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+    assert!(malformed_version_delta.contains("--version"));
+    assert!(!malformed_version_delta.contains("app-server"));
+    assert!(!malformed_version_delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+    assert_eq!(std::fs::read(&conversation_path)?, conversation_bytes);
+
+    for app_server_shape in ["unavailable", "schema-drift"] {
+        let log_before = std::fs::read_to_string(&log)?;
+        let rejected_supported_exact = calcifer()
+            .current_dir(&workspace)
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .env("FAKE_CODEX_VERSION", "0.144.4")
+            .env("FAKE_CODEX_APP_SERVER_SHAPE", app_server_shape)
+            .args([
+                "resume",
+                "codex@work",
+                "01900000-0000-7000-8000-000000000001",
+            ])
+            .output()?;
+        let stderr = String::from_utf8(rejected_supported_exact.stderr)?;
+        assert_eq!(rejected_supported_exact.status.code(), Some(1));
+        let expected_message = if app_server_shape == "schema-drift" {
+            "invalid thread metadata response"
+        } else {
+            "temporarily unavailable"
+        };
+        assert!(stderr.contains(expected_message));
+        let log_after = std::fs::read_to_string(&log)?;
+        let delta = log_after
+            .strip_prefix(&log_before)
+            .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+        assert!(delta.contains("--version"));
+        assert!(delta.contains("app-server"));
+        assert!(!delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+        assert_eq!(
+            std::fs::read(&conversation_path)?,
+            conversation_bytes,
+            "supported-version metadata failures must not rewrite tracked metadata"
+        );
+    }
+
+    let log_before_held_version_stdout = std::fs::read_to_string(&log)?;
+    let held_version_started = std::time::Instant::now();
+    let held_version_stdout = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_VERSION_HOLD_STDOUT", "1")
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    let held_version_elapsed = held_version_started.elapsed();
+    let held_version_stderr = String::from_utf8(held_version_stdout.stderr)?;
+    assert_eq!(held_version_stdout.status.code(), Some(1));
+    assert!(held_version_stderr.contains("temporarily unavailable"));
+    assert!(
+        held_version_elapsed < std::time::Duration::from_secs(4),
+        "version probe exceeded its wall-clock bound: {held_version_elapsed:?}"
+    );
+    let log_after_held_version_stdout = std::fs::read_to_string(&log)?;
+    let held_version_delta = log_after_held_version_stdout
+        .strip_prefix(&log_before_held_version_stdout)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+    assert!(held_version_delta.contains("--version"));
+    assert!(!held_version_delta.contains("app-server"));
+    assert!(!held_version_delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+
+    let rollout = managed_rollout;
+    std::fs::set_permissions(&managed_sessions, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o644))?;
+    let legacy_rollout_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
         .args([
             "resume",
             "codex@work",
@@ -974,24 +1151,11 @@ config_file = "{sensitive_role_path}"
         ])
         .output()?;
     assert!(
-        unsupported_exact.status.success(),
+        legacy_rollout_resume.status.success(),
         "{}",
-        String::from_utf8(unsupported_exact.stderr.clone())?
+        String::from_utf8(legacy_rollout_resume.stderr)?
     );
-    assert!(
-        String::from_utf8(unsupported_exact.stderr)?
-            .contains("continuing with explicit exact resume")
-    );
-    assert_eq!(
-        std::fs::read(&conversation_path)?,
-        conversation_bytes,
-        "unsupported explicit fallback must not rewrite tracked metadata"
-    );
-
-    let rollout = managed_home
-        .join("sessions")
-        .join("rollout-synthetic-01900000-0000-7000-8000-000000000001.jsonl");
-    std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o644))?;
+    std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o666))?;
     let provider_log_before_unsafe_rollout = std::fs::read_to_string(&log)?;
     let exact_invocations_before = provider_log_before_unsafe_rollout
         .matches(" resume 01900000-0000-7000-8000-000000000001")
@@ -1019,6 +1183,7 @@ config_file = "{sensitive_role_path}"
         "a supported-version unsafe rollout must fail before the official TUI starts"
     );
     std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(&managed_sessions, std::fs::Permissions::from_mode(0o700))?;
 
     let before_rejected = std::fs::read_to_string(&log)?;
     std::fs::write(&project_config, "debug = {}\n")?;

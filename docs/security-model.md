@@ -41,10 +41,10 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 
 ## Secret-handling requirements
 
-- Managed directories are private to the current user; secret files are private at creation time.
+- Managed profile roots and homes are private to the current user; secret files are private at creation time. Provider-owned nested rollout directories/files from older installations may retain non-writable `0755`/`0644` modes behind that private home boundary.
 - Tokens and reset-credit IDs are never accepted as ordinary command-line flags because process listings and shell history can expose them.
 - Raw arguments, child environments, credential files, account email, and stable provider IDs are not logged.
-- Conversation metadata stores only Calcifer/profile/thread UUIDs, canonical cwd, tested adapter versions, bounded inventory timestamps, and lifecycle state. It excludes aliases, rollout paths, App Server previews, transcript bodies, prompts, responses, approvals, tool arguments, terminal streams, credentials, and provider identity.
+- Conversation metadata stores only Calcifer/profile/thread UUIDs, canonical cwd, tested adapter versions, bounded inventory timestamps, path-free file identity/size/mtime/ctime fingerprints, and lifecycle state. It excludes aliases, rollout paths, App Server previews, transcript bodies, prompts, responses, approvals, tool arguments, terminal streams, credentials, and provider identity.
 - Diagnostics report capability and redacted status, not secret values or credential paths.
 - Test credentials are synthetic and contain obvious non-production markers.
 - Claude token storage fails closed when a supported OS credential store is unavailable. Plaintext fallback is a non-goal unless a later ADR and security review define it.
@@ -57,6 +57,10 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   transcript/trace paths, provider test hooks, and future override families
   before the official CLI starts. This keeps the selected profile authoritative
   and prevents implicit transcript recording.
+- On Unix, Calcifer sets process umask `0077` before parsing commands, creating
+  state, or spawning coordinator, guardian, login, App Server, or interactive
+  provider children. This is process-global and happens before worker threads;
+  no around-spawn umask race or unsafe post-fork callback is used.
 - The same policy is applied before Unix run/resume coordinator and guardian
   helpers start; ambient `CODEX_HOME` returns only on the final provider command.
 - Calcifer revalidates the private `auth.json` and managed `config.toml` after
@@ -94,7 +98,8 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - If the provider guardian is killed after reporting the exact provider PID, the coordinator retains its lease until that PID exits. If failure lands in the unobservable post-authorization/pre-report window, the coordinator deliberately remains alive and locked rather than guessing that no provider exists.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
 - Bounded metadata-only App Servers for status and thread capture inherit only the provider-side lease. They issue no turn/tool methods and are started only while Calcifer owns the profile coordinator/provider order. This keeps a killed probe parent from admitting a second credential writer until stdio EOF terminates the probe.
-- Automatic same-profile restore never guesses the newest thread. A private pending baseline is synced before provider spawn; only one new or uniquely changed root CLI thread can be adopted after direct metadata validation. Zero candidates preserve the previous head, while multiple, archived, wrong-profile/cwd, missing, corrupt, unsupported, capped, or inconsistent results stop before automatic provider launch.
+- Automatic same-profile restore never guesses the newest thread. A private pending baseline is synced before provider spawn; only one new or uniquely changed root CLI thread can be adopted after direct metadata validation. Same-second changes use a path-free device/inode/length/nanosecond-mtime fingerprint in addition to provider timestamps. Zero candidates preserve the previous head only when every baseline ID remains present. Deleted, multiple, archived, wrong-profile/cwd, missing, corrupt, unsupported, capped, pre/post-mutated, or inconsistent results stop before automatic provider launch.
+- Codex 0.144.4 hides its 10,000-file rollout scan cap from the v2 App Server response. Calcifer proves a conservative upper bound by snapshotting active and archived roots separately before and after listing, requiring each root to remain below the cap, and mapping every wire path to the stable snapshot. Nested nodes must remain owned, real, non-symlink, and non-writable by group/other; files must have one hard link. The enclosing managed home remains owner-private.
 - Bare resume releases its initial conversation lock before waiting for a profile lease, then revalidates the unchanged UUID binding under that lease. Registry mutation order is coordinator lease, provider lease, then a short conversation lock; no conversation lock spans App Server or interactive provider I/O.
 - A conversation document update uses create-only private same-directory temporary files, file fsync, rename, and directory fsync. Post-rename sync uncertainty is read back and reported without retrying a provider launch. Newer schemas and unsafe owner/type/mode/hard-link state are never rewritten.
 - Lifecycle inspection is a version-pinned metadata projection. It validates the first session identity and recognizes only persisted start, complete, and abort tags; every response/tool payload is ignored. `interrupted` and `unknown_crash` may reopen the exact history with a warning, but no prompt, command, approval answer, or tool call is reconstructed or submitted.

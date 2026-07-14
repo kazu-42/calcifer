@@ -56,6 +56,13 @@ pub(crate) struct InventoryThread {
     pub(crate) updated_at: i64,
     pub(crate) recency_at: Option<i64>,
     pub(crate) archived: bool,
+    pub(crate) rollout_device: u64,
+    pub(crate) rollout_inode: u64,
+    pub(crate) rollout_length: u64,
+    pub(crate) rollout_modified_seconds: i64,
+    pub(crate) rollout_modified_nanoseconds: i64,
+    pub(crate) rollout_changed_seconds: i64,
+    pub(crate) rollout_changed_nanoseconds: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -238,12 +245,8 @@ impl ConversationRegistry {
     pub(crate) fn mark_capture_failed(&self, launch_id: &str) -> Result<(), ConversationError> {
         validate_uuid(launch_id, "launch id")?;
         self.transact(|document| {
-            let canonical_cwd = {
-                let pending = find_pending_mut(document, launch_id)?;
-                pending.phase = PendingPhase::CaptureFailed;
-                pending.canonical_cwd.clone()
-            };
-            mark_head_needs_selection(document, &canonical_cwd);
+            let pending = find_pending_mut(document, launch_id)?;
+            pending.phase = PendingPhase::CaptureFailed;
             Ok(())
         })
     }
@@ -832,6 +835,14 @@ fn normalize_inventory(inventory: &mut [InventoryThread]) -> Result<(), Conversa
                 "inventory timestamp is invalid".to_owned(),
             ));
         }
+        if thread.rollout_length > 64 * 1024 * 1024
+            || !(0..1_000_000_000).contains(&thread.rollout_modified_nanoseconds)
+            || !(0..1_000_000_000).contains(&thread.rollout_changed_nanoseconds)
+        {
+            return Err(ConversationError::RegistryInvalid(
+                "inventory rollout fingerprint is invalid".to_owned(),
+            ));
+        }
         if inventory
             .iter()
             .take(index)
@@ -1016,6 +1027,7 @@ pub(crate) enum ConversationError {
     CodexVersionUnsupported,
     SessionSchemaUnsupported,
     ThreadProtocolInvalid,
+    ThreadMetadataUnavailable,
     Io(io::Error),
 }
 
@@ -1033,6 +1045,7 @@ impl ConversationError {
             Self::CodexVersionUnsupported => "codex_session_schema_unsupported",
             Self::SessionSchemaUnsupported => "codex_session_schema_unsupported",
             Self::ThreadProtocolInvalid => "codex_thread_protocol_invalid",
+            Self::ThreadMetadataUnavailable => "codex_thread_metadata_unavailable",
             Self::Io(_) => "conversation_registry_invalid",
         }
     }
@@ -1071,6 +1084,9 @@ impl ConversationError {
                 "The Codex session metadata is not supported or is unsafe for automatic resume."
             }
             Self::ThreadProtocolInvalid => "Codex returned an invalid thread metadata response.",
+            Self::ThreadMetadataUnavailable => {
+                "Codex thread metadata is temporarily unavailable; retry the command."
+            }
         }
     }
 }
@@ -1089,7 +1105,7 @@ impl From<io::Error> for ConversationError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     use std::sync::{Arc, Barrier};
@@ -1197,6 +1213,62 @@ mod tests {
                 .err()
                 .map(|error| error.code()),
             Some("conversation_ambiguous")
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn retryable_capture_failure_blocks_then_allows_a_successful_rebind()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("retryable-capture")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let profile = Uuid::new_v4();
+        let original = registry.adopt(binding(&workspace, profile, Uuid::new_v4()))?;
+        let replacement = binding(&workspace, profile, Uuid::new_v4());
+
+        let launch = registry.begin_launch(
+            &profile.to_string(),
+            &workspace,
+            LaunchMode::Run,
+            "0.144.4",
+            Vec::new(),
+        )?;
+        registry.mark_provider_started(&launch)?;
+        registry.mark_capture_failed(&launch)?;
+
+        assert_eq!(
+            registry
+                .resolve_head(&workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_ambiguous"),
+            "a pending retry must block the old head"
+        );
+        let document = registry.load()?;
+        let head = document
+            .workspace_heads
+            .iter()
+            .find(|head| head.canonical_cwd == original.canonical_cwd)
+            .ok_or_else(|| io::Error::other("workspace head is missing"))?;
+        assert_eq!(head.state, HeadState::Ready);
+        assert_eq!(
+            head.conversation_id.as_deref(),
+            Some(original.conversation_id.as_str())
+        );
+
+        let rebound = registry
+            .finish_launch(&launch, LaunchResolution::Bind(replacement.clone()))?
+            .ok_or_else(|| io::Error::other("retryable capture could not rebind"))?;
+        assert_eq!(rebound.thread_id, replacement.thread_id);
+        assert_eq!(registry.resolve_head(&workspace)?, rebound);
+        assert!(
+            registry
+                .pending_for(&profile.to_string(), &workspace)?
+                .is_none()
         );
 
         fs::remove_dir_all(root)?;
@@ -1365,5 +1437,23 @@ mod tests {
         );
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use super::*;
+
+    #[test]
+    fn unverified_private_acl_boundaries_fail_closed() {
+        for result in [
+            verify_private_directory(Path::new("unused")),
+            verify_private_regular_file(Path::new("unused")),
+        ] {
+            assert_eq!(
+                result.err().map(|error| error.code()),
+                Some("codex_session_schema_unsupported")
+            );
+        }
     }
 }
