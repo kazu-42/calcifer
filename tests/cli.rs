@@ -354,6 +354,31 @@ if [ "${1:-}" = "-c" ]; then
   [ "${4:-}" = 'mcp_oauth_credentials_store="file"' ]
   shift 4
 fi
+thread_id=01900000-0000-7000-8000-000000000001
+thread_state="$CODEX_HOME/.fake-thread-state"
+thread_counter="$CODEX_HOME/.fake-thread-counter"
+thread_rollout="$CODEX_HOME/sessions/rollout-synthetic-$thread_id.jsonl"
+if [ "${1:-}" != "login" ] && [ "${1:-}" != "app-server" ] && [ "${FAKE_CODEX_NO_THREAD:-}" != "1" ]; then
+  umask 077
+  mkdir -p "$CODEX_HOME/sessions"
+  counter=0
+  if [ -f "$thread_counter" ]; then
+    counter=$(cat "$thread_counter")
+  fi
+  counter=$((counter + 1))
+  printf '%s\n' "$counter" > "$thread_counter"
+  printf '%s\n' "$PWD" > "$thread_state"
+  printf '{"timestamp":"2026-07-15T00:00:00Z","type":"session_meta","payload":{"id":"%s","cwd":"%s","cli_version":"0.144.4","source":"cli","parent_thread_id":null,"base_instructions":"prompt sentinel must not persist"}}\n' "$thread_id" "$PWD" > "$thread_rollout"
+  printf '%s\n' '{"timestamp":"2026-07-15T00:00:01Z","type":"response_item","payload":{"message":"response sentinel must not persist","tool_args":"tool arguments sentinel must not persist"}}' >> "$thread_rollout"
+  printf '%s\n' '{"timestamp":"2026-07-15T00:00:02Z","type":"event_msg","payload":{"type":"task_started"}}' >> "$thread_rollout"
+  case "${1:-}" in
+    hold|hold-ignore-int)
+      ;;
+    *)
+      printf '%s\n' '{"timestamp":"2026-07-15T00:00:03Z","type":"event_msg","payload":{"type":"task_complete"}}' >> "$thread_rollout"
+      ;;
+  esac
+fi
 case "${1:-}" in
   login)
     umask 077
@@ -365,6 +390,10 @@ case "${1:-}" in
       exec sleep 30
     fi
     IFS= read -r initialize
+    case "$initialize" in
+      *'"method":"initialize"'*'"experimentalApi":false'*) ;;
+      *) exit 93 ;;
+    esac
     printf '%s\n' 'app-server-initialize' >> "$FAKE_CODEX_LOG"
     version=${FAKE_CODEX_VERSION:-0.144.4}
     reported_home=${FAKE_CODEX_REPORTED_HOME:-$CODEX_HOME}
@@ -377,23 +406,67 @@ case "${1:-}" in
       printf '%s\n' 'app-server-gate-closed' >> "$FAKE_CODEX_LOG"
       exit 0
     fi
-    IFS= read -r request
-    printf '%s\n' 'app-server-usage-request' >> "$FAKE_CODEX_LOG"
-    case "${FAKE_CODEX_USAGE_SHAPE:-complete}" in
-      missing-rate-limits)
-        printf '%s\n' '{"id":1,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
-        ;;
-      null-rate-limits)
-        printf '%s\n' '{"id":1,"result":{"rateLimits":null,"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
-        ;;
-      complete)
-        printf '%s\n' '{"id":1,"result":{"rateLimits":{"limitId":"codex","limitName":"Codex","planType":"pro","rateLimitReachedType":null,"primary":{"usedPercent":41,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":70,"windowDurationMins":10080,"resetsAt":1800500000},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"individualLimit":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":[{"id":"must-not-leak","resetType":"codexRateLimits","status":"available","grantedAt":1700000000,"expiresAt":1900000000,"title":"must-not-leak","description":"must-not-leak"}]}}}'
-        ;;
-      *)
-        exit 95
-        ;;
-    esac
-    while IFS= read -r trailing; do :; done
+    while IFS= read -r request; do
+      request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      case "$request" in
+        *'"method":"thread/list"'*)
+          case "$request" in
+            *'"sourceKinds":["cli"]'*'"useStateDbOnly":false'*) ;;
+            *) exit 92 ;;
+          esac
+          printf '%s\n' 'app-server-thread-list' >> "$FAKE_CODEX_LOG"
+          case "$request" in
+            *'"archived":true'*)
+              printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$request_id"
+              ;;
+            *)
+              if [ -f "$thread_state" ] && [ -f "$thread_counter" ] && [ -f "$thread_rollout" ]; then
+                thread_cwd=$(cat "$thread_state")
+                updated_at=$(cat "$thread_counter")
+                printf '{"id":%s,"result":{"data":[{"id":"%s","parentThreadId":null,"ephemeral":false,"updatedAt":%s,"recencyAt":%s,"cwd":"%s","cliVersion":"0.144.4","source":"cli","path":"%s","preview":"preview sentinel must not persist","turns":[{"prompt":"prompt sentinel must not persist"}]}],"nextCursor":null}}\n' "$request_id" "$thread_id" "$updated_at" "$updated_at" "$thread_cwd" "$thread_rollout"
+              else
+                printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$request_id"
+              fi
+              ;;
+          esac
+          ;;
+        *'"method":"thread/read"'*)
+          case "$request" in
+            *'"includeTurns":false'*) ;;
+            *) exit 91 ;;
+          esac
+          printf '%s\n' 'app-server-thread-read' >> "$FAKE_CODEX_LOG"
+          requested_thread=$(printf '%s\n' "$request" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
+          if [ "$requested_thread" != "$thread_id" ] || [ ! -f "$thread_state" ] || [ ! -f "$thread_rollout" ]; then
+            printf '{"id":%s,"error":{"code":-32001,"message":"thread not found: account-owner@example.invalid"}}\n' "$request_id"
+          else
+            thread_cwd=$(cat "$thread_state")
+            updated_at=$(cat "$thread_counter")
+            printf '{"id":%s,"result":{"thread":{"id":"%s","parentThreadId":null,"ephemeral":false,"updatedAt":%s,"recencyAt":%s,"cwd":"%s","cliVersion":"0.144.4","source":"cli","path":"%s","preview":"preview sentinel must not persist","turns":[{"response":"response sentinel must not persist"}]}}}\n' "$request_id" "$thread_id" "$updated_at" "$updated_at" "$thread_cwd" "$thread_rollout"
+          fi
+          ;;
+        *'"method":"account/rateLimits/read"'*)
+          printf '%s\n' 'app-server-usage-request' >> "$FAKE_CODEX_LOG"
+          case "${FAKE_CODEX_USAGE_SHAPE:-complete}" in
+            missing-rate-limits)
+              printf '%s\n' '{"id":1,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
+              ;;
+            null-rate-limits)
+              printf '%s\n' '{"id":1,"result":{"rateLimits":null,"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
+              ;;
+            complete)
+              printf '%s\n' '{"id":1,"result":{"rateLimits":{"limitId":"codex","limitName":"Codex","planType":"pro","rateLimitReachedType":null,"primary":{"usedPercent":41,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":70,"windowDurationMins":10080,"resetsAt":1800500000},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"individualLimit":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":[{"id":"must-not-leak","resetType":"codexRateLimits","status":"available","grantedAt":1700000000,"expiresAt":1900000000,"title":"must-not-leak","description":"must-not-leak"}]}}}'
+              ;;
+            *)
+              exit 95
+              ;;
+          esac
+          ;;
+        *)
+          exit 94
+          ;;
+      esac
+    done
     printf '%s\n' 'app-server-eof' >> "$FAKE_CODEX_LOG"
     ;;
   hold)
@@ -446,6 +519,7 @@ esac
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_NO_THREAD", "1")
         .args(["run", "codex@work", "--", "trust-project"])
         .output()?;
     assert!(
@@ -762,6 +836,16 @@ config_file = "{sensitive_role_path}"
     assert_eq!(std::fs::read_to_string(&log)?, before_agents_node_rejection);
     std::fs::remove_dir(&agents)?;
 
+    let run = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["run", "codex@work", "--", "--help"])
+        .output()?;
+    assert!(run.status.success(), "{}", String::from_utf8(run.stderr)?);
+
+    let log_before_explicit_resume = std::fs::read_to_string(&log)?;
     let resume = calcifer_with_ambient_codex_auth_overrides()
         .current_dir(&workspace)
         .env("PATH", &path)
@@ -780,15 +864,26 @@ config_file = "{sensitive_role_path}"
         "{}",
         String::from_utf8(resume.stderr)?
     );
-
-    let run = calcifer_with_ambient_codex_auth_overrides()
-        .current_dir(&workspace)
-        .env("PATH", &path)
-        .env("CALCIFER_HOME", &root)
-        .env("FAKE_CODEX_LOG", &log)
-        .args(["run", "codex@work", "--", "--help"])
-        .output()?;
-    assert!(run.status.success(), "{}", String::from_utf8(run.stderr)?);
+    let log_after_explicit_resume = std::fs::read_to_string(&log)?;
+    assert_eq!(
+        log_after_explicit_resume
+            .matches("app-server-thread-list")
+            .count(),
+        log_before_explicit_resume
+            .matches("app-server-thread-list")
+            .count(),
+        "explicit exact adoption must use direct thread/read, not scan old sessions"
+    );
+    assert!(
+        log_after_explicit_resume
+            .matches("app-server-thread-read")
+            .count()
+            >= log_before_explicit_resume
+                .matches("app-server-thread-read")
+                .count()
+                + 2,
+        "explicit exact resume validates before launch and refreshes lifecycle after exit"
+    );
 
     let resume_last = calcifer_with_ambient_codex_auth_overrides()
         .current_dir(&workspace)
@@ -801,6 +896,96 @@ config_file = "{sensitive_role_path}"
         resume_last.status.success(),
         "{}",
         String::from_utf8(resume_last.stderr)?
+    );
+
+    let log_before_cold_resume = std::fs::read_to_string(&log)?;
+    let cold_resume = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume"])
+        .output()?;
+    assert!(
+        cold_resume.status.success(),
+        "{}",
+        String::from_utf8(cold_resume.stderr.clone())?
+    );
+    let cold_resume_log = std::fs::read_to_string(&log)?;
+    let cold_resume_log = cold_resume_log
+        .strip_prefix(&log_before_cold_resume)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced during cold resume"))?;
+    assert!(cold_resume_log.contains("resume 01900000-0000-7000-8000-000000000001"));
+    assert!(!cold_resume_log.contains("resume --last"));
+    assert!(!cold_resume_log.contains("prompt sentinel"));
+    assert!(String::from_utf8(cold_resume.stderr)?.contains("exact ID; no prompt replay"));
+
+    let conversation_path = root.join("conversations.json");
+    let conversation_bytes = std::fs::read(&conversation_path)?;
+    let conversation_document: serde_json::Value = serde_json::from_slice(&conversation_bytes)?;
+    assert_eq!(conversation_document["schema_version"], 1);
+    assert_eq!(
+        conversation_document["conversations"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        conversation_document["conversations"][0]["generations"][0]["thread_id"],
+        "01900000-0000-7000-8000-000000000001"
+    );
+    assert_eq!(
+        conversation_document["conversations"][0]["generations"][0]["canonical_cwd"],
+        std::fs::canonicalize(&workspace)?
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        conversation_document["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    let conversation_text = String::from_utf8(conversation_bytes.clone())?;
+    for forbidden in [
+        "prompt sentinel",
+        "response sentinel",
+        "tool arguments sentinel",
+        "preview sentinel",
+        "rollout-synthetic",
+        "synthetic-test-only",
+    ] {
+        assert!(
+            !conversation_text.contains(forbidden),
+            "conversation registry persisted forbidden provider content: {forbidden}"
+        );
+    }
+
+    let unsupported_exact = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_VERSION", "0.145.0")
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert!(
+        unsupported_exact.status.success(),
+        "{}",
+        String::from_utf8(unsupported_exact.stderr.clone())?
+    );
+    assert!(
+        String::from_utf8(unsupported_exact.stderr)?
+            .contains("continuing with explicit exact resume")
+    );
+    assert_eq!(
+        std::fs::read(&conversation_path)?,
+        conversation_bytes,
+        "unsupported explicit fallback must not rewrite tracked metadata"
     );
 
     let before_rejected = std::fs::read_to_string(&log)?;
@@ -1029,6 +1214,7 @@ config_file = "{sensitive_role_path}"
     // not inherit it after the official provider process exits.
     let background_pid_file = sandbox.join("provider-background.pid");
     let background = calcifer()
+        .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -1057,6 +1243,7 @@ config_file = "{sensitive_role_path}"
     // supervisor alive, so a live provider still blocks a second writer.
     let child_pid_file = sandbox.join("provider-child.pid");
     let mut parent = calcifer()
+        .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -1125,6 +1312,7 @@ config_file = "{sensitive_role_path}"
     let coordinator_tracked_file =
         marker_runtime.join(format!(".test-{coordinator_marker_id}-provider-tracked"));
     let mut coordinator_parent = calcifer()
+        .current_dir(&workspace)
         .process_group(0)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
@@ -1222,6 +1410,7 @@ config_file = "{sensitive_role_path}"
     let guardian_tracked_file =
         marker_runtime.join(format!(".test-{guardian_marker_id}-provider-tracked"));
     let mut guarded_parent = calcifer()
+        .current_dir(&workspace)
         .process_group(0)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
@@ -1322,12 +1511,53 @@ config_file = "{sensitive_role_path}"
         "lease must recover after the orphaned provider exits"
     );
 
+    let pending_after_guardian_crash: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        pending_after_guardian_crash["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "a dead guardian must leave one durable launch for reconciliation"
+    );
+    assert_eq!(
+        pending_after_guardian_crash["pending_launches"][0]["phase"],
+        "provider_started"
+    );
+
+    let log_before_crash_resume = std::fs::read_to_string(&log)?;
+    let crash_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume"])
+        .output()?;
+    let crash_resume_stderr = String::from_utf8(crash_resume.stderr)?;
+    assert!(crash_resume.status.success(), "{crash_resume_stderr}");
+    assert!(crash_resume_stderr.contains("did not have a provably clean boundary"));
+    let log_after_crash_resume = std::fs::read_to_string(&log)?;
+    let crash_resume_log = log_after_crash_resume
+        .strip_prefix(&log_before_crash_resume)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced during crash resume"))?;
+    assert!(crash_resume_log.contains("resume 01900000-0000-7000-8000-000000000001"));
+    assert!(!crash_resume_log.contains("resume --last"));
+    let recovered_conversation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        recovered_conversation["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
     // A terminal SIGINT reaches the whole foreground process group. The
     // guardian catches it while the provider receives the normal signal, so a
     // provider that ignores SIGINT cannot outlive every lease owner.
     let interrupted_child_pid_file = sandbox.join("interrupted-provider.pid");
     let interrupted_guardian_pid_file = sandbox.join("interrupted-guardian.pid");
     let mut interrupted_parent = calcifer()
+        .current_dir(&workspace)
         .process_group(0)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)

@@ -144,17 +144,22 @@ where
             if cli.json {
                 return render_app_error("resume", &AppError::InteractiveJsonUnsupported, true);
             }
-            match profile.provider {
-                ProviderArgument::Codex => {
-                    match commands::process::resume_codex(
+            let result = match profile {
+                Some(profile) => match profile.provider {
+                    ProviderArgument::Codex => commands::process::resume_codex(
                         &profile.alias,
                         session_id.as_deref(),
                         &provider_args,
-                    ) {
-                        Ok(status) => exit_code_from_status(status),
-                        Err(error) => render_app_error("resume", &error, false),
-                    }
+                    ),
+                },
+                None if session_id.is_none() => {
+                    commands::process::resume_workspace_codex(&provider_args)
                 }
+                None => Err(AppError::ProviderArgumentRejected),
+            };
+            match result {
+                Ok(status) => exit_code_from_status(status),
+                Err(error) => render_app_error("resume", &error, false),
             }
         }
         Commands::Status { profile } => match commands::status::StatusReport::inspect(
@@ -189,6 +194,10 @@ where
                         ),
                         cli::InternalProcessMode::ResumeExact => format!(
                             "Calcifer: resuming requested thread in codex@{} (same profile; no prompt replay).",
+                            profile.alias
+                        ),
+                        cli::InternalProcessMode::ResumeHead => format!(
+                            "Calcifer: resuming this workspace's tracked thread in codex@{} (same profile; exact ID; no prompt replay).",
                             profile.alias
                         ),
                     };

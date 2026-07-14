@@ -49,12 +49,12 @@ pub(crate) enum Commands {
         provider_args: Vec<OsString>,
     },
 
-    /// Resume a Codex session in the profile that owns it.
+    /// Resume a tracked workspace head or a session in an explicit profile.
     Resume {
-        /// Provider and local profile alias, for example codex@work.
-        profile: ProfileReference,
+        /// Provider and local profile alias; omit to resume this workspace's tracked head.
+        profile: Option<ProfileReference>,
 
-        /// Exact Codex session ID or name; omit to use official `codex resume --last` behavior.
+        /// Exact Codex session UUID; with a profile omitted, Calcifer uses the tracked head.
         session_id: Option<String>,
 
         /// Additional arguments passed to `codex resume` after `--`.
@@ -91,6 +91,7 @@ pub(crate) enum InternalProcessMode {
     Run,
     ResumeLast,
     ResumeExact,
+    ResumeHead,
 }
 
 #[derive(Debug, Subcommand)]

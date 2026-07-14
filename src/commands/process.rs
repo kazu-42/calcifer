@@ -24,11 +24,15 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::cli::InternalProcessMode;
+use crate::conversations::{ConversationError, ConversationRegistry};
 use crate::error::AppError;
 use crate::executable::resolve_codex;
 use crate::profiles::{Provider, Registry};
 use crate::project_config::verify_current_repository_config;
 use crate::providers::codex::{managed_command, sanitize_managed_environment};
+
+#[cfg(unix)]
+use super::codex_conversation::{CaptureContext, validate_head_target};
 
 #[cfg(unix)]
 const GUARDIAN_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,6 +58,55 @@ pub(crate) fn resume_codex(
     spawn_supervisor(alias, mode, session_id, provider_args)
 }
 
+pub(crate) fn resume_workspace_codex(provider_args: &[OsString]) -> Result<ExitStatus, AppError> {
+    validate_provider_arguments(provider_args)?;
+    let launch_context = verify_current_repository_config()?;
+    let registry = Registry::discover()?;
+    let conversations = ConversationRegistry::from_profiles(&registry);
+    // resolve_head drops its short conversation lock before profile lookup and
+    // the coordinator lease. The hidden coordinator revalidates the binding.
+    let head = match conversations.resolve_head(launch_context.working_directory()) {
+        Ok(head) => head,
+        Err(ConversationError::Ambiguous) => {
+            #[cfg(unix)]
+            {
+                let profile_id = conversations
+                    .pending_profile_for_workspace(launch_context.working_directory())?
+                    .ok_or(ConversationError::Ambiguous)?;
+                let profile = registry.find_by_id(Provider::Codex, &profile_id)?;
+                let lease = registry.lock_profile(&profile)?;
+                let executable = resolve_codex()?;
+                let home = registry.profile_home(&profile)?;
+                let neutral_working_directory = registry.neutral_working_directory()?;
+                CaptureContext::new(
+                    &conversations,
+                    &lease,
+                    &executable,
+                    &home,
+                    &neutral_working_directory,
+                    &profile.id,
+                    launch_context.working_directory(),
+                )
+                .reconcile_pending_launch()?;
+                drop(lease);
+                conversations.resolve_head(launch_context.working_directory())?
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(ConversationError::Ambiguous.into());
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let profile = registry.find_by_id(Provider::Codex, &head.profile_id)?;
+    spawn_supervisor(
+        &profile.alias,
+        InternalProcessMode::ResumeHead,
+        Some(&head.thread_id),
+        provider_args,
+    )
+}
+
 fn spawn_supervisor(
     alias: &str,
     mode: InternalProcessMode,
@@ -71,6 +124,7 @@ fn spawn_supervisor(
             InternalProcessMode::Run => "run",
             InternalProcessMode::ResumeLast => "resume-last",
             InternalProcessMode::ResumeExact => "resume-exact",
+            InternalProcessMode::ResumeHead => "resume-head",
         });
     if let Some(session_id) = session_id {
         command.arg(session_id);
@@ -101,6 +155,17 @@ pub(crate) fn supervise_codex(
         let _coordinator_lease = registry.lock_profile_coordinator(&profile)?;
         let _home = registry.profile_home(&profile)?;
         let launch_context = verify_current_repository_config()?;
+        if mode == InternalProcessMode::ResumeHead {
+            let thread_id = session_id.ok_or(AppError::ProviderArgumentRejected)?;
+            let conversations = ConversationRegistry::from_profiles(&registry);
+            let head = conversations.resolve_head(launch_context.working_directory())?;
+            validate_head_target(
+                &head,
+                &profile.id,
+                thread_id,
+                launch_context.working_directory(),
+            )?;
+        }
         let run_id = Uuid::new_v4();
         let socket_path = registry.supervisor_socket_path(&profile, &run_id)?;
         write_test_process_marker("coordinator.pid", std::process::id());
@@ -176,7 +241,7 @@ pub(crate) fn guard_codex(
         let executable = resolve_codex()?;
         let registry = Registry::discover()?;
         let profile = registry.find(Provider::Codex, alias)?;
-        let _provider_lease = registry.lock_profile_provider(&profile)?;
+        let provider_lease = registry.lock_profile_provider(&profile)?;
         let home = registry.profile_home(&profile)?;
         let initial_launch_context = verify_current_repository_config()?;
         let socket_path = registry.supervisor_socket_path(&profile, &run_id)?;
@@ -221,6 +286,25 @@ pub(crate) fn guard_codex(
             }
         };
 
+        let conversations = ConversationRegistry::from_profiles(&registry);
+        let neutral_working_directory = registry.neutral_working_directory()?;
+        let capture_context = CaptureContext::new(
+            &conversations,
+            &provider_lease,
+            &executable,
+            &home,
+            &neutral_working_directory,
+            &profile.id,
+            final_launch_context.working_directory(),
+        );
+        let capture = match capture_context.prepare(mode, session_id) {
+            Ok(capture) => capture,
+            Err(error) => {
+                send_guardian_abort(&mut reader);
+                return Err(error);
+            }
+        };
+
         let mut provider = match managed_command(&executable, &home)
             .args(arguments)
             .current_dir(final_launch_context.working_directory())
@@ -239,6 +323,14 @@ pub(crate) fn guard_codex(
         // this process still owns the provider lease and is now the sole guard.
         let _ = writeln!(reader.get_mut(), "START {}", provider.id());
         let _ = reader.get_mut().flush();
+        if let Some(launch_id) = capture.launch_id()
+            && let Err(error) = conversations.mark_provider_started(launch_id)
+        {
+            eprintln!(
+                "Calcifer: provider started, but its conversation checkpoint could not be confirmed ({}). The provider will not be launched twice.",
+                error.code()
+            );
+        }
         if termination_requested.load(Ordering::SeqCst) {
             // The request may have arrived after the pre-spawn check but before
             // this child existed, so it could not have received the original
@@ -246,6 +338,7 @@ pub(crate) fn guard_codex(
             let _ = provider.kill();
         }
         let status = provider.wait()?;
+        capture_context.complete(&capture, status.success());
         let _ = reader.get_mut().write_all(b"DONE\n");
         let _ = reader.get_mut().flush();
         Ok(status)
@@ -271,7 +364,8 @@ fn provider_arguments(
             arguments.push(OsString::from("--last"));
             arguments.extend(provider_args.iter().cloned());
         }
-        (InternalProcessMode::ResumeExact, Some(session_id)) => {
+        (InternalProcessMode::ResumeExact | InternalProcessMode::ResumeHead, Some(session_id)) => {
+            validate_canonical_thread_id(session_id)?;
             arguments.push(OsString::from("resume"));
             arguments.push(OsString::from(session_id));
             arguments.extend(provider_args.iter().cloned());
@@ -279,6 +373,15 @@ fn provider_arguments(
         _ => return Err(AppError::ProviderArgumentRejected),
     }
     Ok(arguments)
+}
+
+fn validate_canonical_thread_id(thread_id: &str) -> Result<(), AppError> {
+    let parsed =
+        uuid::Uuid::parse_str(thread_id).map_err(|_| AppError::ProviderArgumentRejected)?;
+    if parsed.to_string() != thread_id {
+        return Err(AppError::ProviderArgumentRejected);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -300,6 +403,7 @@ fn spawn_provider_guardian(
             InternalProcessMode::Run => "run",
             InternalProcessMode::ResumeLast => "resume-last",
             InternalProcessMode::ResumeExact => "resume-exact",
+            InternalProcessMode::ResumeHead => "resume-head",
         });
     if let Some(session_id) = session_id {
         command.arg(session_id);
