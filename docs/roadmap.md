@@ -8,7 +8,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Read-only human and JSON `doctor` output
 - [x] Linux, macOS, Windows, formatting, Clippy, and MSRV CI
 - [x] Architecture, security, contribution, and disclosure documentation
-- [ ] First signed pre-release binary
+- [ ] First checksummed and provenance-attested pre-release binary
 
 ## Phase 1: secure local registry
 
