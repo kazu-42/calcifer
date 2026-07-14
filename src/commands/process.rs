@@ -27,6 +27,7 @@ use crate::cli::InternalProcessMode;
 use crate::error::AppError;
 use crate::executable::resolve_codex;
 use crate::profiles::{Provider, Registry};
+use crate::project_config::verify_current_repository_config;
 use crate::providers::codex::{managed_command, sanitize_managed_environment};
 
 #[cfg(unix)]
@@ -99,16 +100,23 @@ pub(crate) fn supervise_codex(
         let profile = registry.find(Provider::Codex, alias)?;
         let _coordinator_lease = registry.lock_profile_coordinator(&profile)?;
         let _home = registry.profile_home(&profile)?;
+        let launch_context = verify_current_repository_config()?;
         let run_id = Uuid::new_v4();
         let socket_path = registry.supervisor_socket_path(&profile, &run_id)?;
         write_test_process_marker("coordinator.pid", std::process::id());
         let listener = UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-        let _socket_cleanup = SocketCleanup(socket_path);
+        let _socket_cleanup = PathCleanup(socket_path);
         listener.set_nonblocking(true)?;
 
-        let mut guardian =
-            spawn_provider_guardian(alias, &run_id, mode, session_id, provider_args)?;
+        let mut guardian = spawn_provider_guardian(
+            alias,
+            &run_id,
+            mode,
+            session_id,
+            provider_args,
+            launch_context.working_directory(),
+        )?;
         let control = match accept_provider_guardian(&listener, &mut guardian)? {
             GuardianAccept::Connected(control) => control,
             GuardianAccept::Exited(status) => return Ok(status),
@@ -139,8 +147,10 @@ pub(crate) fn supervise_codex(
         let profile = registry.find(Provider::Codex, alias)?;
         let _lease = registry.lock_profile(&profile)?;
         let home = registry.profile_home(&profile)?;
+        let launch_context = verify_current_repository_config()?;
         managed_command(&executable, &home)
             .args(_arguments)
+            .current_dir(launch_context.working_directory())
             .status()
             .map_err(AppError::from)
     }
@@ -168,9 +178,10 @@ pub(crate) fn guard_codex(
         let profile = registry.find(Provider::Codex, alias)?;
         let _provider_lease = registry.lock_profile_provider(&profile)?;
         let home = registry.profile_home(&profile)?;
+        let initial_launch_context = verify_current_repository_config()?;
         let socket_path = registry.supervisor_socket_path(&profile, &run_id)?;
         let mut control = UnixStream::connect(&socket_path)?;
-        let _socket_cleanup = SocketCleanup(socket_path);
+        let _socket_cleanup = PathCleanup(socket_path);
         control.write_all(b"READY\n")?;
         control.flush()?;
         control.set_read_timeout(Some(GUARDIAN_START_TIMEOUT))?;
@@ -193,15 +204,33 @@ pub(crate) fn guard_codex(
             .into());
         }
 
+        if let Err(error) = wait_for_final_preflight_test_barrier(&run_id) {
+            send_guardian_abort(&mut reader);
+            return Err(error);
+        }
+
+        let final_launch_context = match verify_current_repository_config() {
+            Ok(context)
+                if context.working_directory() == initial_launch_context.working_directory() =>
+            {
+                context
+            }
+            Ok(_) | Err(_) => {
+                send_guardian_abort(&mut reader);
+                return Err(crate::project_config::ProjectConfigError::Unsafe.into());
+            }
+        };
+
         let mut provider = match managed_command(&executable, &home)
             .args(arguments)
+            .current_dir(final_launch_context.working_directory())
+            .env_remove("CALCIFER_TEST_FINAL_PREFLIGHT_BARRIER")
             .env_remove("CALCIFER_TEST_MARKER_ID")
             .spawn()
         {
             Ok(provider) => provider,
             Err(error) => {
-                let _ = reader.get_mut().write_all(b"ABORT\n");
-                let _ = reader.get_mut().flush();
+                send_guardian_abort(&mut reader);
                 return Err(error.into());
             }
         };
@@ -259,6 +288,7 @@ fn spawn_provider_guardian(
     mode: InternalProcessMode,
     session_id: Option<&str>,
     provider_args: &[OsString],
+    working_directory: &std::path::Path,
 ) -> Result<Child, AppError> {
     let executable = std::env::current_exe()?;
     let mut command = internal_calcifer_command(&executable);
@@ -277,6 +307,7 @@ fn spawn_provider_guardian(
     if !provider_args.is_empty() {
         command.arg("--").args(provider_args);
     }
+    command.current_dir(working_directory);
     command.spawn().map_err(AppError::from)
 }
 
@@ -473,6 +504,69 @@ fn install_process_signal_guard() -> Result<Arc<AtomicBool>, AppError> {
 }
 
 #[cfg(unix)]
+fn send_guardian_abort(reader: &mut BufReader<UnixStream>) {
+    let _ = reader.get_mut().write_all(b"ABORT\n");
+    let _ = reader.get_mut().flush();
+}
+
+#[cfg(unix)]
+fn wait_for_final_preflight_test_barrier(run_id: &Uuid) -> Result<(), AppError> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let Some(enabled) = std::env::var_os("CALCIFER_TEST_FINAL_PREFLIGHT_BARRIER") else {
+        return Ok(());
+    };
+    if enabled != "1" {
+        return Err(io::Error::other("invalid final preflight test barrier").into());
+    }
+
+    let ready_path = test_marker_path("final-preflight-ready")
+        .ok_or_else(|| io::Error::other("missing final preflight test marker identifier"))?;
+    let release_path = test_marker_path("final-preflight-release")
+        .ok_or_else(|| io::Error::other("missing final preflight test marker identifier"))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut ready = options.open(&ready_path)?;
+    writeln!(ready, "{} {run_id}", std::process::id())?;
+    ready.sync_all()?;
+    let _barrier_cleanup = TestBarrierCleanup {
+        ready: ready_path,
+        release: release_path.clone(),
+    };
+
+    let deadline = Instant::now()
+        .checked_add(GUARDIAN_START_TIMEOUT)
+        .ok_or_else(|| io::Error::other("final preflight test deadline overflow"))?;
+    loop {
+        match std::fs::symlink_metadata(&release_path) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.uid() == rustix::process::getuid().as_raw()
+                    && metadata.mode() & 0o777 == 0o600 =>
+            {
+                std::fs::remove_file(&release_path)?;
+                return Ok(());
+            }
+            Ok(_) => {
+                return Err(io::Error::other("unsafe final preflight test release marker").into());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "final preflight test barrier timed out",
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
 // Integration tests use UUID-scoped, create-only markers in Calcifer's private
 // runtime directory to observe otherwise hidden lifecycle barriers. An
 // environment value can never select an arbitrary output path.
@@ -480,18 +574,9 @@ fn write_test_process_marker(kind: &str, value: u32) {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let Some(marker_id) = std::env::var_os("CALCIFER_TEST_MARKER_ID") else {
+    let Some(path) = test_marker_path(kind) else {
         return;
     };
-    let Some(marker_id) = marker_id.to_str() else {
-        return;
-    };
-    let Ok(marker_id) = Uuid::parse_str(marker_id) else {
-        return;
-    };
-    let runtime_root =
-        PathBuf::from("/tmp").join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
-    let path = runtime_root.join(format!(".test-{marker_id}-{kind}"));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     if let Ok(mut file) = options.open(path) {
@@ -500,25 +585,53 @@ fn write_test_process_marker(kind: &str, value: u32) {
 }
 
 #[cfg(unix)]
-struct SocketCleanup(PathBuf);
+fn test_marker_path(kind: &str) -> Option<PathBuf> {
+    let marker_id = std::env::var_os("CALCIFER_TEST_MARKER_ID")?;
+    let marker_id = marker_id.to_str()?;
+    let marker_id = Uuid::parse_str(marker_id).ok()?;
+    let runtime_root =
+        PathBuf::from("/tmp").join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
+    Some(runtime_root.join(format!(".test-{marker_id}-{kind}")))
+}
 
 #[cfg(unix)]
-impl Drop for SocketCleanup {
+struct PathCleanup(PathBuf);
+
+#[cfg(unix)]
+impl Drop for PathCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(unix)]
+struct TestBarrierCleanup {
+    ready: PathBuf,
+    release: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for TestBarrierCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.ready);
+        let _ = std::fs::remove_file(&self.release);
     }
 }
 
 fn validate_provider_arguments(arguments: &[OsString]) -> Result<(), AppError> {
     for argument in arguments {
         let Some(argument) = argument.to_str() else {
-            continue;
+            return Err(AppError::ProviderArgumentRejected);
         };
         let rejected = matches!(
             argument,
             "-c" | "--config"
                 | "-p"
                 | "--profile"
+                | "-C"
+                | "--cd"
+                | "--enable"
+                | "--disable"
                 | "--oss"
                 | "--local-provider"
                 | "--remote"
@@ -529,6 +642,10 @@ fn validate_provider_arguments(arguments: &[OsString]) -> Result<(), AppError> {
             || argument.starts_with("-p=")
             || (argument.starts_with("-p") && argument.len() > 2)
             || argument.starts_with("--profile=")
+            || (argument.starts_with("-C") && argument.len() > 2)
+            || argument.starts_with("--cd=")
+            || argument.starts_with("--enable=")
+            || argument.starts_with("--disable=")
             || argument.starts_with("--local-provider=")
             || argument.starts_with("--remote=")
             || argument.starts_with("--remote-auth-token-env=");
@@ -573,12 +690,30 @@ mod tests {
             "--local-provider=ollama",
             "--remote=unix:///tmp/socket",
             "--remote-auth-token-env=TOKEN",
+            "-C",
+            "-C/synthetic/project",
+            "-C=/synthetic/project",
+            "--cd",
+            "--cd=/synthetic/project",
+            "--enable",
+            "--enable=remote_plugin",
+            "--disable",
+            "--disable=secret_auth_storage",
         ] {
             assert!(
                 validate_provider_arguments(&[OsString::from(argument)]).is_err(),
                 "{argument} must be rejected"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_utf8_provider_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let argument = OsString::from_vec(vec![b'-', b'C', b'/', 0xff]);
+        assert!(validate_provider_arguments(&[argument]).is_err());
     }
 
     #[test]

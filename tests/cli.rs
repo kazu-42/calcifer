@@ -301,7 +301,7 @@ fn non_normalized_home_is_rejected_before_staging() -> Result<(), Box<dyn std::e
 #[test]
 fn managed_codex_profile_supports_status_run_and_exact_resume()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
 
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -310,9 +310,14 @@ fn managed_codex_profile_supports_status_run_and_exact_resume()
         std::process::id()
     ));
     let bin = sandbox.join("bin");
-    let root = sandbox.join("state");
     let log = sandbox.join("provider.log");
+    let workspace = sandbox.join("workspace");
+    let root = workspace.join(".calcifer-state");
+    let project_config = workspace.join(".codex").join("config.toml");
     std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(workspace.join(".git"))?;
+    std::fs::create_dir_all(workspace.join(".codex"))?;
+    std::fs::write(&project_config, "debug = {}\n")?;
     let fake_codex = bin.join("codex");
     std::fs::write(
         &fake_codex,
@@ -326,10 +331,28 @@ if [ "${FAKE_CODEX_EXPECT_PRESERVED_ENV:-}" = "1" ]; then
   [ "${CODEX_CA_CERTIFICATE:-}" = "/synthetic/enterprise-ca.pem" ]
   [ "${TERM:-}" = "xterm-calcifer-test" ]
 fi
+if [ "${FAKE_CODEX_REQUIRE_NEUTRAL_CWD:-}" = "1" ]; then
+  cursor=$PWD
+  while :; do
+    if [ -f "$cursor/.codex/config.toml" ] && grep -Eq '^debug[[:space:]]*=' "$cursor/.codex/config.toml"; then
+      exit 96
+    fi
+    if [ -e "$cursor/.git" ]; then
+      break
+    fi
+    parent=$(dirname "$cursor")
+    if [ "$parent" = "$cursor" ]; then
+      break
+    fi
+    cursor=$parent
+  done
+fi
 printf 'pwd=%s args=%s\n' "$PWD" "$*" >> "$FAKE_CODEX_LOG"
 if [ "${1:-}" = "-c" ]; then
   [ "${2:-}" = 'cli_auth_credentials_store="file"' ]
-  shift 2
+  [ "${3:-}" = "-c" ]
+  [ "${4:-}" = 'mcp_oauth_credentials_store="file"' ]
+  shift 4
 fi
 case "${1:-}" in
   login)
@@ -383,6 +406,7 @@ esac
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
         .args(["auth", "add", "codex", "work"])
         .output()?;
     assert!(add.status.success(), "{}", String::from_utf8(add.stderr)?);
@@ -391,6 +415,7 @@ esac
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
         .args(["--json", "status", "codex@work"])
         .output()?;
     let status_text = String::from_utf8(status.stdout)?;
@@ -422,8 +447,10 @@ esac
         "available"
     );
     assert!(!status_text.contains("must-not-leak"));
+    std::fs::write(&project_config, "model = \"gpt-5.4\"\n")?;
 
     let resume = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -442,6 +469,7 @@ esac
     );
 
     let run = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -450,6 +478,7 @@ esac
     assert!(run.status.success(), "{}", String::from_utf8(run.stderr)?);
 
     let resume_last = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -462,32 +491,185 @@ esac
     );
 
     let before_rejected = std::fs::read_to_string(&log)?;
-    let rejected = calcifer()
+    std::fs::write(&project_config, "debug = {}\n")?;
+    let blocked_commands: &[&[&str]] = &[
+        &["run", "codex@work"],
+        &[
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ],
+        &["resume", "codex@work"],
+    ];
+    for arguments in blocked_commands {
+        let rejected = calcifer()
+            .current_dir(&workspace)
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .args(*arguments)
+            .output()?;
+        let stderr = String::from_utf8(rejected.stderr)?;
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(stderr.contains("repository-local Codex configuration"));
+        assert!(!stderr.contains("debug"));
+        assert!(!stderr.contains(&workspace.display().to_string()));
+        assert_eq!(std::fs::read_to_string(&log)?, before_rejected);
+    }
+    std::fs::write(&project_config, "model = \"gpt-5.4\"\n")?;
+
+    for argument in ["--oss", "--cd=/synthetic/project", "--enable=synthetic"] {
+        let rejected = calcifer()
+            .current_dir(&workspace)
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .args(["run", "codex@work", "--", argument])
+            .output()?;
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(String::from_utf8(rejected.stderr)?.contains("rejected a provider argument"));
+        assert_eq!(std::fs::read_to_string(&log)?, before_rejected);
+    }
+
+    // Pause the provider guardian after launch authorization and mutate the
+    // repository configuration before its final preflight. The guardian must
+    // send ABORT, never spawn Codex, and release both lifecycle leases.
+    let marker_id = uuid::Uuid::new_v4();
+    let marker_runtime = std::path::PathBuf::from("/tmp")
+        .join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
+    let final_preflight_ready =
+        marker_runtime.join(format!(".test-{marker_id}-final-preflight-ready"));
+    let final_preflight_release =
+        marker_runtime.join(format!(".test-{marker_id}-final-preflight-release"));
+    let final_preflight_coordinator =
+        marker_runtime.join(format!(".test-{marker_id}-coordinator.pid"));
+    let before_final_preflight = std::fs::read_to_string(&log)?;
+    let mut preflight_parent = calcifer()
+        .process_group(0)
+        .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
-        .args(["run", "codex@work", "--", "--oss"])
+        .env("CALCIFER_TEST_MARKER_ID", marker_id.to_string())
+        .env("CALCIFER_TEST_FINAL_PREFLIGHT_BARRIER", "1")
+        .args(["run", "codex@work", "--", "--help"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    for _ in 0..500 {
+        if final_preflight_ready.is_file() {
+            break;
+        }
+        if preflight_parent.try_wait()?.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !final_preflight_ready.is_file() {
+        let process_group = format!("-{}", preflight_parent.id());
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &process_group])
+            .status();
+        let _ = preflight_parent.wait();
+        return Err(std::io::Error::other("guardian did not reach final preflight").into());
+    }
+    let final_preflight_identity = std::fs::read_to_string(&final_preflight_ready)?;
+    let mut final_preflight_identity = final_preflight_identity.split_whitespace();
+    let preflight_guardian_pid = final_preflight_identity
+        .next()
+        .ok_or_else(|| std::io::Error::other("missing final preflight guardian PID"))?
+        .to_owned();
+    let preflight_run_id = uuid::Uuid::parse_str(
+        final_preflight_identity
+            .next()
+            .ok_or_else(|| std::io::Error::other("missing final preflight run ID"))?,
+    )?;
+    assert!(final_preflight_identity.next().is_none());
+    let preflight_coordinator_pid = std::fs::read_to_string(&final_preflight_coordinator)?
+        .trim()
+        .to_owned();
+    let preflight_socket = marker_runtime.join(format!("{preflight_run_id}.sock"));
+    assert!(preflight_socket.exists());
+
+    std::fs::write(&project_config, "debug = {}\n")?;
+    let release = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&final_preflight_release)?;
+    release.sync_all()?;
+    drop(release);
+    let rejected_final_preflight = preflight_parent.wait_with_output()?;
+    let rejected_final_preflight_stderr = String::from_utf8(rejected_final_preflight.stderr)?;
+    assert_eq!(rejected_final_preflight.status.code(), Some(1));
+    assert!(rejected_final_preflight_stderr.contains("repository-local Codex configuration"));
+    assert!(!rejected_final_preflight_stderr.contains("debug"));
+    assert!(!rejected_final_preflight_stderr.contains(&workspace.display().to_string()));
+    assert_eq!(std::fs::read_to_string(&log)?, before_final_preflight);
+    assert!(!final_preflight_release.exists());
+    assert!(!final_preflight_ready.exists());
+    assert!(!preflight_socket.exists());
+    for exited_pid in [&preflight_guardian_pid, &preflight_coordinator_pid] {
+        assert!(
+            !std::process::Command::new("kill")
+                .args(["-0", exited_pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?
+                .success(),
+            "lifecycle process {exited_pid} must exit after ABORT"
+        );
+    }
+    std::fs::remove_file(&final_preflight_coordinator)?;
+
+    std::fs::write(&project_config, "model = \"gpt-5.4\"\n")?;
+    let retry_after_final_preflight = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["run", "codex@work", "--", "--help"])
         .output()?;
-    assert_eq!(rejected.status.code(), Some(1));
-    assert!(String::from_utf8(rejected.stderr)?.contains("rejected a provider argument"));
-    assert_eq!(std::fs::read_to_string(&log)?, before_rejected);
+    assert!(
+        retry_after_final_preflight.status.success(),
+        "{}",
+        String::from_utf8(retry_after_final_preflight.stderr)?
+    );
 
     let provider_log = std::fs::read_to_string(&log)?;
+    let canonical_workspace = std::fs::canonicalize(&workspace)?;
     assert!(provider_log.contains("resume 01900000-0000-7000-8000-000000000001 --no-alt-screen"));
     assert!(provider_log.contains("resume --last"));
-    assert!(
-        provider_log
-            .lines()
-            .any(|line| line.ends_with("args=-c cli_auth_credentials_store=\"file\" --help"))
-    );
+    assert!(provider_log.lines().any(|line| {
+        line.starts_with(&format!("pwd={} ", canonical_workspace.display()))
+            && line.ends_with("--help")
+    }));
+    assert!(provider_log.lines().any(|line| line.ends_with(
+        "args=-c cli_auth_credentials_store=\"file\" -c mcp_oauth_credentials_store=\"file\" --help"
+    )));
     assert!(provider_log.contains("app-server-eof"));
+    let neutral_working_directory = std::path::PathBuf::from("/tmp")
+        .join(format!("calcifer-{}", rustix::process::getuid().as_raw()))
+        .join("neutral");
+    let canonical_neutral_working_directory = std::fs::canonicalize(&neutral_working_directory)?;
+    assert!(neutral_working_directory.join(".git").is_dir());
+    assert_eq!(
+        std::fs::metadata(neutral_working_directory.join(".git"))?
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
     for line in provider_log
         .lines()
         .filter(|line| line.contains(" login") || line.contains(" app-server"))
     {
         assert!(
-            line.contains("/profiles/codex/") && line.contains("/home args="),
-            "login and status must use the managed neutral cwd: {line}"
+            line.starts_with(&format!(
+                "pwd={} ",
+                canonical_neutral_working_directory.display()
+            )),
+            "login and status must stop repository discovery at the private neutral cwd: {line}"
         );
     }
 

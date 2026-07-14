@@ -194,6 +194,13 @@ fn inspect_profile(
                 code: "unsafe_profile_state",
                 message: "Managed profile storage failed validation",
             })?;
+            let neutral_working_directory =
+                registry
+                    .neutral_working_directory()
+                    .map_err(|_| StatusFailure {
+                        code: "unsafe_profile_state",
+                        message: "Managed neutral working directory failed validation",
+                    })?;
             // The account app-server is a bounded, no-turn probe. Let only its
             // provider-side lease survive exec so a killed status parent cannot
             // briefly admit a second credential writer before stdio EOF stops
@@ -204,7 +211,13 @@ fn inspect_profile(
                     code: "unsafe_profile_state",
                     message: "Managed profile lease failed validation",
                 })?;
-            read_account_usage(executable, &home, STATUS_TIMEOUT).map_err(status_failure)
+            read_account_usage(
+                executable,
+                &home,
+                &neutral_working_directory,
+                STATUS_TIMEOUT,
+            )
+            .map_err(status_failure)
         });
 
     let observed_at = current_timestamp()?;

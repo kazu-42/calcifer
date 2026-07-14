@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub(crate) const FILE_CREDENTIALS_OVERRIDE: &str = r#"cli_auth_credentials_store="file""#;
+pub(crate) const CLI_FILE_CREDENTIALS_OVERRIDE: &str = r#"cli_auth_credentials_store="file""#;
+pub(crate) const MCP_OAUTH_FILE_CREDENTIALS_OVERRIDE: &str =
+    r#"mcp_oauth_credentials_store="file""#;
 
 const MANAGED_ENVIRONMENT_DENYLIST: &[&str] = &[
     "OPENAI_API_KEY",
@@ -54,7 +56,12 @@ pub(crate) fn managed_command(executable: &Path, codex_home: &Path) -> Command {
     let mut command = Command::new(executable);
     sanitize_managed_environment(&mut command);
     command
-        .args(["-c", FILE_CREDENTIALS_OVERRIDE])
+        .args([
+            "-c",
+            CLI_FILE_CREDENTIALS_OVERRIDE,
+            "-c",
+            MCP_OAUTH_FILE_CREDENTIALS_OVERRIDE,
+        ])
         .env("CODEX_HOME", codex_home);
 
     command
@@ -184,6 +191,7 @@ impl std::error::Error for CodexUsageError {}
 pub fn read_account_usage(
     codex_executable: &Path,
     codex_home: &Path,
+    working_directory: &Path,
     timeout: Duration,
 ) -> Result<CodexUsage, CodexUsageError> {
     if !codex_executable.is_absolute() {
@@ -193,7 +201,7 @@ pub fn read_account_usage(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(CodexUsageError::Timeout)?;
-    let mut process = AppServerProcess::spawn(codex_executable, codex_home)?;
+    let mut process = AppServerProcess::spawn(codex_executable, codex_home, working_directory)?;
 
     process.send(&json!({
         "id": INITIALIZE_REQUEST_ID,
@@ -237,13 +245,17 @@ struct AppServerProcess {
 }
 
 impl AppServerProcess {
-    fn spawn(codex_executable: &Path, codex_home: &Path) -> Result<Self, CodexUsageError> {
+    fn spawn(
+        codex_executable: &Path,
+        codex_home: &Path,
+        working_directory: &Path,
+    ) -> Result<Self, CodexUsageError> {
         let mut child = managed_command(codex_executable, codex_home)
             .args(["app-server", "--stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .current_dir(codex_home)
+            .current_dir(working_directory)
             .spawn()
             .map_err(|_| CodexUsageError::Spawn)?;
 
@@ -732,6 +744,28 @@ mod tests {
     }
 
     #[test]
+    fn managed_commands_force_profile_local_cli_and_mcp_oauth_stores() {
+        let command = managed_command(
+            Path::new("/synthetic/codex"),
+            Path::new("/synthetic/profile-home"),
+        );
+        let arguments = command
+            .get_args()
+            .map(OsStr::to_str)
+            .collect::<Option<Vec<_>>>();
+
+        assert_eq!(
+            arguments,
+            Some(vec![
+                "-c",
+                r#"cli_auth_credentials_store="file""#,
+                "-c",
+                r#"mcp_oauth_credentials_store="file""#,
+            ])
+        );
+    }
+
+    #[test]
     fn parses_full_usage_without_exposing_opaque_reset_credit_fields()
     -> Result<(), Box<dyn std::error::Error>> {
         let usage = parse_rate_limits_result(json!({
@@ -920,6 +954,7 @@ mod tests {
         let result = read_account_usage(
             Path::new("codex"),
             Path::new("profile-home"),
+            Path::new("neutral-working-directory"),
             Duration::from_secs(1),
         );
 

@@ -18,7 +18,8 @@ selected Calcifer profile.
 ## Outputs
 
 - A direct `std::process::Command` for the official Codex executable.
-- The selected `CODEX_HOME` and forced file credential-store setting.
+- The selected `CODEX_HOME` and forced profile-local file settings for CLI and
+  MCP OAuth credential stores.
 - Ordinary non-provider environment such as terminal, locale, and proxy
   configuration remains available.
 - Reviewed Codex authentication, routing, state, config, remote-auth, and test
@@ -31,8 +32,8 @@ selected Calcifer profile.
 2. Unix run/resume also applies the same sanitizer before spawning Calcifer's
    internal coordinator and provider guardian. Ambient `CODEX_HOME` is removed
    from those helpers and reintroduced only on the final provider command.
-3. The builder forces `cli_auth_credentials_store="file"` and the selected
-   `CODEX_HOME`.
+3. The builder forces both `cli_auth_credentials_store="file"` and
+   `mcp_oauth_credentials_store="file"`, plus the selected `CODEX_HOME`.
 4. It removes the explicit environment variables currently known to override
    stored credentials, request headers, OAuth/provider endpoints, login
    routing, App Server config, Codex state location, remote execution, or
@@ -106,6 +107,9 @@ execution environment, or provider route.
       their existing behavior.
 - [x] Unit tests cover exact, patterned, mixed-case, and unrelated names.
 - [x] Internal run/resume helpers drop explicit provider secrets before spawn.
+- [x] Every managed command forces both CLI and MCP OAuth credential stores to
+      the selected profile's file-backed `CODEX_HOME`; new profiles persist
+      both settings and the previous exact pre-alpha config remains accepted.
 - [x] No fixture or failure output includes a secret-shaped environment value.
 - [x] Security policy, security model, architecture, and changelog match the
       implemented credential behavior and residual proxy/CA boundary.

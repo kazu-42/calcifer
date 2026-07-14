@@ -39,11 +39,12 @@ impl AuthReport {
 pub(crate) fn add_codex(alias: &str) -> Result<AuthReport, AppError> {
     let executable = resolve_codex()?;
     let registry = Registry::discover()?;
+    let neutral_working_directory = registry.neutral_working_directory()?;
     let pending = registry.begin_codex_registration(alias)?;
     let home = pending.home();
     let status = managed_command(&executable, &home)
         .arg("login")
-        .current_dir(&home)
+        .current_dir(&neutral_working_directory)
         .status();
     let status = match status {
         Ok(status) => status,

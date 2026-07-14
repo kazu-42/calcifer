@@ -3,6 +3,7 @@ use std::io;
 
 use crate::executable::ExecutableError;
 use crate::profiles::ProfileError;
+use crate::project_config::ProjectConfigError;
 
 #[derive(Debug)]
 pub(crate) enum AppError {
@@ -10,6 +11,7 @@ pub(crate) enum AppError {
     InteractiveJsonUnsupported,
     Io(io::Error),
     Profile(ProfileError),
+    ProjectConfig(ProjectConfigError),
     ProviderArgumentRejected,
     ProviderLoginFailed,
 }
@@ -21,6 +23,7 @@ impl AppError {
             Self::InteractiveJsonUnsupported => "interactive_json_unsupported",
             Self::Io(_) => "process_io_error",
             Self::Profile(error) => error.code(),
+            Self::ProjectConfig(error) => error.code(),
             Self::ProviderArgumentRejected => "provider_argument_rejected",
             Self::ProviderLoginFailed => "provider_login_failed",
         }
@@ -35,6 +38,7 @@ impl AppError {
                 "Calcifer could not start or wait for the official provider CLI.".to_owned()
             }
             Self::Profile(error) => error.safe_message(),
+            Self::ProjectConfig(error) => error.safe_message().to_owned(),
             Self::ProviderArgumentRejected => "Calcifer rejected a provider argument that could bypass the selected managed account or provider.".to_owned(),
             Self::ProviderLoginFailed => "The official Codex login command did not complete successfully. No profile was registered.".to_owned(),
         }
@@ -58,6 +62,12 @@ impl From<ExecutableError> for AppError {
 impl From<ProfileError> for AppError {
     fn from(error: ProfileError) -> Self {
         Self::Profile(error)
+    }
+}
+
+impl From<ProjectConfigError> for AppError {
+    fn from(error: ProjectConfigError) -> Self {
+        Self::ProjectConfig(error)
     }
 }
 

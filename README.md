@@ -58,6 +58,14 @@ calcifer resume codex@work 01900000-0000-7000-8000-000000000001
 
 Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes both authentication and session state there, so exiting Calcifer does not discard the conversation. `resume` without an ID delegates to official `codex resume --last`; an exact thread ID is preferred for automation because `--last` is affected by the working directory and can be ambiguous.
 
+Before interactive `run` and `resume`, Calcifer canonicalizes the working directory and checks every repository-local `.codex/config.toml` layer from the nearest real `.git` root to that directory. Only a Codex 0.144.4-scoped set of repository settings that do not own managed authentication, provider routing, dynamic features, or state locations is accepted; unknown keys, ambiguous filesystem nodes, invalid TOML, and files larger than 1 MiB fail before Codex starts. This protects Calcifer's account-routing boundary, but it does not make repository hooks, plugins, tools, or code safe.
+
+Account-only operations do not need repository context. `auth add` and `status`
+therefore run the official CLI from a private runtime directory with its own
+`.git` boundary, while retaining the selected profile-specific `CODEX_HOME`.
+This remains isolated even when `CALCIFER_HOME` itself is stored inside a Git
+repository with local Codex configuration.
+
 This is cold resume after restarting the wrapper, but it is currently explicit: the user invokes `calcifer resume`. Calcifer does not yet capture `{profile, cwd, thread ID}` and automatically choose the exact previous thread on startup. Resume restores persisted history, not a dead process or in-flight tool call, and never resends the last prompt.
 
 `status` starts the installed official `codex app-server` inside each idle profile and calls the structured `account/rateLimits/read` method. It displays all returned limit buckets, primary and secondary used/remaining percentages, reset times, workspace credit state, monthly spend control when present, and rate-limit reset-credit count and expirations. It does not scrape the interactive `/status` screen or read token values from `auth.json`.
@@ -108,7 +116,7 @@ calcifer pool create codex personal --profiles personal-a,personal-b
 calcifer supervise codex@personal
 ```
 
-Arguments after `--` are arguments to the provider adapter's resolved, permission-checked `codex` executable; users do not supply an arbitrary executable. Account/provider-routing flags such as `-c`, `--profile`, `--oss`, `--local-provider`, and remote-routing options are rejected, while Calcifer forces file-backed credential storage on every managed invocation. Calcifer does not yet cryptographically verify binary provenance, so users remain responsible for installing the official CLI on a trusted `PATH`. Unimplemented commands fail as unknown commands rather than pretending to succeed.
+Arguments after `--` are arguments to the provider adapter's resolved, permission-checked `codex` executable; users do not supply an arbitrary executable. Account/provider-routing flags such as `-c`, `--profile`, `--oss`, `--local-provider`, and remote-routing options are rejected, as are `-C`/`--cd`, dynamic `--enable`/`--disable` feature overrides, and non-UTF-8 arguments that cannot be mediated safely. Calcifer forces profile-local file storage for both CLI and MCP OAuth credentials on every managed invocation. Existing pre-alpha profiles with the previous exact managed config remain usable because the per-invocation overrides are authoritative; new profiles persist both settings. Calcifer does not yet cryptographically verify binary provenance, so users remain responsible for installing the official CLI on a trusted `PATH`. Unimplemented commands fail as unknown commands rather than pretending to succeed.
 
 ## What "automatic failover" will mean
 
@@ -165,6 +173,9 @@ Core invariants for future implementation are:
     managed config/state paths, remote execution and connector credentials,
     test hooks, and transcript/trace paths cannot override a selected Calcifer
     profile.
+12. Repository-local Codex configuration cannot replace managed authentication,
+    provider routing, dynamic feature policy, project-root discovery, or state
+    locations; unknown future settings fail closed until reviewed.
 
 File-based Codex credentials remain readable by the current OS user and the official Codex CLI; Calcifer is not an encrypted vault. Calcifer also does not sandbox the wrapped CLI, its hooks, or commands executed from the current repository.
 

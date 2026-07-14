@@ -4,6 +4,7 @@ mod error;
 mod executable;
 mod output;
 mod profiles;
+mod project_config;
 mod providers;
 
 use std::ffi::OsString;

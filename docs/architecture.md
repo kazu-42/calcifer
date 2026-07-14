@@ -64,6 +64,7 @@ Future code that violates one of these invariants requires an architecture decis
 12. **Selection is visible.** Before launch, Calcifer reports the local profile alias, provider, trust domain, and reason code without exposing stable provider identifiers.
 13. **Conversations have lineage.** Every provider thread is bound to its credential profile and canonical working directory, while one user-visible conversation may advance through multiple profile-local thread generations in one trust domain.
 14. **Resume is not replay.** Restoring persisted conversation history never resubmits an interrupted prompt, command, or tool action.
+15. **Repository configuration cannot route accounts.** Interactive launch accepts only version-reviewed repository settings and binds the final provider to the canonical working directory that was inspected.
 
 ## Codex profile model
 
@@ -80,7 +81,7 @@ managed root/
         provider.lock     <- provider-guardian side of the lifetime lease
 ```
 
-The display name is not used as a filesystem path. A generated opaque ID is mapped from a validated, normalized display name. Calcifer writes and revalidates an exact managed `config.toml`, forces `cli_auth_credentials_store="file"` on every provider invocation, and rejects child arguments that can change account/provider routing. Codex then updates its own profile-local credentials. No managed-to-runtime credential copy-back step is needed.
+The display name is not used as a filesystem path. A generated opaque ID is mapped from a validated, normalized display name. Calcifer writes and revalidates an exact managed `config.toml`, forces both `cli_auth_credentials_store="file"` and `mcp_oauth_credentials_store="file"` on every provider invocation, and rejects child arguments that can change account/provider routing. Codex then updates its own profile-local credentials. Existing pre-alpha profiles with the previous exact config remain accepted during upgrade because the invocation overrides still enforce both stores. No managed-to-runtime credential copy-back step is needed.
 
 Different profiles may run concurrently. The same profile has at most one official CLI child or usage probe because either operation may refresh profile-local credentials.
 
@@ -103,10 +104,16 @@ Stable `thread/resume` lookup is scoped to the current `CODEX_HOME`. Codex 0.144
 
 ## Implemented Codex usage observation
 
-For every selected idle profile, Calcifer holds the exclusive profile lease and starts the resolved, permission-checked executable named `codex` from the verified profile home as:
+For every selected idle profile, Calcifer holds the exclusive profile lease and
+starts the resolved, permission-checked executable named `codex` with the
+verified profile home as `CODEX_HOME` and a private neutral runtime directory
+as its cwd:
 
 ```text
-CODEX_HOME=<managed-home> codex -c 'cli_auth_credentials_store="file"' app-server --stdio
+CODEX_HOME=<managed-home> codex \
+  -c 'cli_auth_credentials_store="file"' \
+  -c 'mcp_oauth_credentials_store="file"' \
+  app-server --stdio
 ```
 
 It completes the stable JSONL initialization handshake with `experimentalApi: false`, calls `account/rateLimits/read`, closes stdin, waits briefly for a clean provider exit, and only then kills/reaps a stuck probe. The bounded no-turn app-server inherits only the provider side of the lease; if the status parent is killed, a second writer remains blocked until that app-server exits on stdio EOF. Input is bounded to a 1 MiB JSONL line. Normalized output includes all returned metered buckets, primary and secondary windows, reset timestamps, workspace credits, individual spend controls, and safe reset-credit count/status/expiry fields. Opaque reset-credit IDs and backend display copy are discarded before the public model is constructed.
@@ -173,14 +180,27 @@ The current process launcher:
 - let every Calcifer wrapper layer catch terminal termination signals while the official provider receives its normal process-group delivery, so a provider that handles `SIGINT` remains attached to the foreground wrapper and cannot outlive every lease owner;
 - preserve ordinary child exit codes; polished cross-platform signal forwarding and job-control semantics remain release gates;
 - avoid persisting child stdout or stderr by default;
-- force file-backed credentials on every operation and reject provider arguments that can override the account, provider, endpoint, profile, or remote route;
+- force profile-local file storage for CLI and MCP OAuth credentials on every
+  operation and reject provider arguments that can override the account,
+  provider, endpoint, profile, or remote route;
+- reject child working-directory and dynamic-feature overrides, and reject
+  non-UTF-8 provider arguments that cannot be mediated safely;
+- after acquiring the profile lease, canonicalize the interactive working
+  directory and inspect every real, bounded `.codex/config.toml` layer from the
+  nearest `.git` root to that directory against a Codex-version-scoped safe-key
+  policy;
+- repeat that inspection in the provider guardian after spawn authorization,
+  then set the final Codex process cwd explicitly to the inspected canonical
+  directory;
 - sanitize the internal run/resume coordinator and guardian before spawn, then
   construct every final login, run, resume, and App Server process through one
   managed command policy that removes ambient Codex credentials, authentication and
   endpoint overrides, alternate config/state paths, remote execution routes,
   connector credentials, transcript/trace paths, provider test hooks, and
   future override families;
-- run login and status from the managed profile home so repository-local configuration cannot influence those account-sensitive operations;
+- run login and status from a private neutral runtime directory with its own
+  `.git` boundary, independently of `CALCIFER_HOME`, so account-only operations
+  cannot discover repository-local configuration through an ancestor;
 - avoid logging raw arguments or the child environment.
 
 The official CLI still receives ordinary terminal, locale, proxy, and CA
@@ -188,6 +208,13 @@ environment needed for interactive and enterprise operation. Calcifer does not
 claim to protect credentials from a hostile same-user proxy or trust store.
 
 The wrapped CLI, repository hooks, tools, and provider remain outside Calcifer's sandbox because Calcifer does not provide one.
+
+The coordinator and guardian checks reduce replacement races but cannot stop an
+actor that can mutate the repository tree, including same-user malware or a
+different writer in a shared workspace, from changing files between the final
+check and Codex's own read. A supported upstream switch that disables project
+configuration, or an effective-configuration API with source provenance, would
+be required to remove that residual boundary completely.
 
 ## Error and rollback boundaries
 

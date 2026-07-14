@@ -12,6 +12,32 @@ Verified on 2026-07-15 against:
 
 The official Codex App Server command is still marked experimental as a whole. Calcifer negotiates its stable protocol subset with `experimentalApi: false` and fails closed when the method or response shape is unavailable.
 
+## Codex repository configuration
+
+Interactive Codex 0.144.4 loads repository configuration from the nearest
+project root through the current working directory. Calcifer mirrors the
+default `.git` root boundary, accepts directory and worktree-file markers, and
+checks each `.codex/config.toml` before `run` or `resume`. The current policy is
+an explicit safe-key allowlist: unknown future top-level keys and settings that
+can alter managed authentication, provider routing, dynamic feature policy,
+root discovery, or state locations fail closed.
+
+The policy is intentionally version-scoped. Calcifer does not claim equivalent
+coverage for an unaudited Codex release merely because the TOML parses. A
+separate executable/schema compatibility gate remains required before
+automatic failover is enabled.
+
+Login and account-rate-limit reads intentionally have no repository semantics.
+Calcifer starts them with the selected profile home in `CODEX_HOME`, but uses a
+private runtime cwd containing its own `.git` boundary. This prevents an
+ancestor repository from contributing configuration even when the user places
+`CALCIFER_HOME` inside that repository.
+
+Relevant sources and local policy:
+
+- [Codex 0.144.4 configuration loader](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/config/src/loader/mod.rs);
+- [managed repository configuration specification](../specs/managed-codex-project-config.md).
+
 ## Codex resume
 
 Codex persists sessions beneath the selected `CODEX_HOME`, normally as:

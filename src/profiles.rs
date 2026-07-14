@@ -15,6 +15,9 @@ const LOCK_FILE: &str = "registry.lock";
 const OWNER_MARKER: &str = ".calcifer-profile";
 const COORDINATOR_LOCK_FILE: &str = "profile.lock";
 const PROVIDER_LOCK_FILE: &str = "provider.lock";
+const MANAGED_CODEX_CONFIG: &[u8] = b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = \"file\"\n";
+const LEGACY_MANAGED_CODEX_CONFIG: &[u8] =
+    b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\n";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,10 +143,7 @@ impl Registry {
         write_private_file(&staging.join(OWNER_MARKER), id.as_bytes())?;
         let home = staging.join("home");
         secure_create_dir(&home)?;
-        write_private_file(
-            &home.join("config.toml"),
-            b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\n",
-        )?;
+        write_private_file(&home.join("config.toml"), MANAGED_CODEX_CONFIG)?;
 
         Ok(PendingProfile {
             registry: self,
@@ -166,6 +166,24 @@ impl Registry {
         verify_managed_codex_config(&home.join("config.toml"))?;
         verify_codex_auth_file(&home.join("auth.json"))?;
         Ok(home)
+    }
+
+    /// Returns a private working directory with its own project-root marker.
+    ///
+    /// Login and account-only App Server probes must not discover repository
+    /// configuration through an ancestor of a user-selected `CALCIFER_HOME`.
+    #[cfg(unix)]
+    pub(crate) fn neutral_working_directory(&self) -> Result<PathBuf, ProfileError> {
+        let runtime_root = managed_runtime_root()?;
+        let neutral = runtime_root.join("neutral");
+        ensure_private_subdirectory(&neutral)?;
+        ensure_private_subdirectory(&neutral.join(".git"))?;
+        Ok(neutral)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn neutral_working_directory(&self) -> Result<PathBuf, ProfileError> {
+        Err(ProfileError::UnsupportedPlatform)
     }
 
     fn profile_directory(&self, profile: &Profile) -> Result<PathBuf, ProfileError> {
@@ -240,21 +258,11 @@ impl Registry {
         profile: &Profile,
         run_id: &Uuid,
     ) -> Result<PathBuf, ProfileError> {
-        use std::os::unix::fs::MetadataExt;
-
         // Revalidate the profile even though the socket uses a short runtime
         // path. Unix-domain socket paths are very small on macOS and a full
         // CALCIFER_HOME/profile UUID path can exceed the kernel limit.
         let _profile_dir = self.profile_directory(profile)?;
-        let runtime_root =
-            PathBuf::from("/tmp").join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
-        ensure_private_subdirectory(&runtime_root)?;
-        let metadata = fs::symlink_metadata(&runtime_root)?;
-        if metadata.uid() != rustix::process::getuid().as_raw() {
-            return Err(ProfileError::UnsafeState(
-                "supervisor runtime directory has an unexpected owner".to_owned(),
-            ));
-        }
+        let runtime_root = managed_runtime_root()?;
         Ok(runtime_root.join(format!("{run_id}.sock")))
     }
 
@@ -506,7 +514,7 @@ impl ProfileError {
                 let _ = error.kind();
                 "The profile registry became visible but its durability could not be confirmed. Run `calcifer auth list` before retrying; Calcifer preserved the profile credentials.".to_owned()
             }
-            Self::UnsupportedPlatform => "Managed profile registration is not supported on this platform yet because private ACL creation has not been verified.".to_owned(),
+            Self::UnsupportedPlatform => "Managed profiles are not supported on this platform yet because private ACL creation has not been verified.".to_owned(),
             Self::UnsafeState(reason) => format!("Calcifer refused unsafe profile storage: {reason}."),
         }
     }
@@ -692,6 +700,22 @@ fn ensure_private_subdirectory(path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(unix)]
+fn managed_runtime_root() -> Result<PathBuf, ProfileError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let runtime_root =
+        PathBuf::from("/tmp").join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
+    ensure_private_subdirectory(&runtime_root)?;
+    let metadata = fs::symlink_metadata(&runtime_root)?;
+    if metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err(ProfileError::UnsafeState(
+            "managed runtime directory has an unexpected owner".to_owned(),
+        ));
+    }
+    Ok(runtime_root)
+}
+
+#[cfg(unix)]
 fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -808,8 +832,8 @@ fn verify_managed_codex_config(path: &Path) -> Result<(), ProfileError> {
         }
         other => other,
     })?;
-    let expected = b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\n";
-    if fs::read(path)? != expected {
+    let contents = fs::read(path)?;
+    if contents != MANAGED_CODEX_CONFIG && contents != LEGACY_MANAGED_CODEX_CONFIG {
         return Err(ProfileError::UnsafeState(
             "managed Codex config.toml was modified".to_owned(),
         ));
@@ -910,10 +934,43 @@ mod tests {
         let registry = Registry::at(root.clone());
         let pending = registry.begin_codex_registration("work")?;
         let staging = pending.staging.clone();
-        assert!(pending.home().join("config.toml").is_file());
+        assert_eq!(
+            fs::read(pending.home().join("config.toml"))?,
+            b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = \"file\"\n"
+        );
         assert!(staging.is_dir());
         drop(pending);
         assert!(!staging.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_profiles_accept_the_previous_managed_config_during_upgrade()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("legacy-config-upgrade");
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_codex_registration("work")?;
+        write_private_file(
+            &pending.home().join("auth.json"),
+            br#"{"synthetic":"test-only"}"#,
+        )?;
+        let profile = pending.commit()?;
+        let config = root
+            .join("profiles")
+            .join("codex")
+            .join(&profile.id)
+            .join("home")
+            .join("config.toml");
+        fs::remove_file(&config)?;
+        write_private_file(
+            &config,
+            b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\n",
+        )?;
+
+        assert!(registry.profile_home(&profile).is_ok());
+
         fs::remove_dir_all(root)?;
         Ok(())
     }

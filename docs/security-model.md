@@ -58,8 +58,25 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   and prevents implicit transcript recording.
 - The same policy is applied before Unix run/resume coordinator and guardian
   helpers start; ambient `CODEX_HOME` returns only on the final provider command.
-- Calcifer revalidates the private `auth.json` and exact managed `config.toml` after acquiring the profile lease, forces file-backed storage on every invocation, and rejects provider/account-routing overrides.
-- Login and status probes use a verified neutral managed directory rather than the caller's repository cwd.
+- Calcifer revalidates the private `auth.json` and exact managed `config.toml`
+  after acquiring the profile lease, forces profile-local file storage for both
+  CLI and MCP OAuth credentials on every invocation, and rejects
+  provider/account-routing overrides. The command-line enforcement also keeps
+  previous pre-alpha managed configs safe during upgrade.
+- Interactive run/resume canonicalizes its cwd and validates all repository
+  `.codex/config.toml` layers from the nearest real `.git` root to that cwd.
+  Unknown keys and settings that can own authentication, provider routing,
+  dynamic feature policy, root discovery, or managed state fail before spawn.
+  Reads are bounded to 1 MiB, symlinks and special nodes fail closed, and public
+  errors omit paths, keys, values, and parser diagnostics.
+- The coordinator performs the check after acquiring its profile lease and
+  before publishing the lifecycle socket. The guardian independently repeats
+  it after spawn authorization and starts Codex with the inspected canonical
+  cwd. Child cwd and feature-policy flags, including non-UTF-8 forms that cannot
+  be parsed safely, are rejected at every wrapper boundary.
+- Login and status probes use a verified private runtime directory with its own
+  `.git` boundary rather than either the caller's repository cwd or a profile
+  home below user-selected `CALCIFER_HOME`.
 - Interactive launch uses a coordinator/provider-guardian pair with two fixed-order lease files. Either surviving process blocks a second writer after a selective crash, while the official provider and its background tools inherit neither descriptor.
 - If the provider guardian is killed after reporting the exact provider PID, the coordinator retains its lease until that PID exits. If failure lands in the unobservable post-authorization/pre-report window, the coordinator deliberately remains alive and locked rather than guessing that no provider exists.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
@@ -68,6 +85,12 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   enterprise networks. Calcifer does not defend against a hostile proxy, trust
   store, root, administrator, or same-user malware; managed provider endpoints
   still rely on normal TLS verification by the official CLI.
+- Repository preflight narrows Calcifer's account-routing boundary; it does not
+  make a malicious trusted repository safe. Mutation by any actor able to write
+  the repository tree, including same-user malware or another writer in a
+  shared workspace, between the guardian's final check and the official CLI's
+  own file read remains outside the guarantee until Codex exposes a supported
+  project-config disable or provenance-checked effective-config interface.
 
 ## Failover requirements
 
