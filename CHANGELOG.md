@@ -29,6 +29,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - A coordinator/provider-guardian pair uses split advisory leases so either side can survive a selective crash without exposing interactive lock FDs to provider background tools.
 - Wrapper, coordinator, and guardian layers survive terminal cancellation signals until the official provider exits, including when that provider handles or ignores `SIGINT`.
 - The bounded status app-server inherits only the provider-side lease, preventing a killed status parent from briefly admitting a second credential writer.
+- Login, run, resume, and status now share one managed Codex command policy
+  that strips ambient credentials, authentication/endpoint overrides,
+  alternate config/state paths, cloud-task and remote-execution routes,
+  connector/remote-auth tokens, test hooks, and implicit transcript/trace paths
+  before the official provider starts; Unix coordinator and guardian helpers
+  are sanitized before spawn as well.
 
 ### Known limitations
 

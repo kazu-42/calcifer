@@ -1,11 +1,9 @@
-use std::process::Command;
-
 use serde::Serialize;
 
 use crate::error::AppError;
 use crate::executable::resolve_codex;
 use crate::profiles::{Profile, Provider, Registry};
-use crate::providers::codex::FILE_CREDENTIALS_OVERRIDE;
+use crate::providers::codex::managed_command;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct AuthReport {
@@ -43,11 +41,8 @@ pub(crate) fn add_codex(alias: &str) -> Result<AuthReport, AppError> {
     let registry = Registry::discover()?;
     let pending = registry.begin_codex_registration(alias)?;
     let home = pending.home();
-    let status = Command::new(executable)
-        .args(["-c", FILE_CREDENTIALS_OVERRIDE, "login"])
-        .env("CODEX_HOME", &home)
-        .env_remove("CODEX_API_KEY")
-        .env_remove("OPENAI_API_KEY")
+    let status = managed_command(&executable, &home)
+        .arg("login")
         .current_dir(&home)
         .status();
     let status = match status {

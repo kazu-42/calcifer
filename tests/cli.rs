@@ -5,6 +5,98 @@ fn calcifer() -> Command {
     Command::new(env!("CARGO_BIN_EXE_calcifer"))
 }
 
+#[cfg(unix)]
+const AMBIENT_CODEX_AUTH_OVERRIDES: &[(&str, &str)] = &[
+    ("OPENAI_API_KEY", "synthetic-ambient-value"),
+    ("CODEX_API_KEY", ""),
+    ("CODEX_ACCESS_TOKEN", "synthetic-ambient-value"),
+    ("CoDeX_AcCeSs_ToKeN", "synthetic-ambient-value"),
+    ("OPENAI_ORGANIZATION", "synthetic-ambient-value"),
+    ("OPENAI_PROJECT", "synthetic-ambient-value"),
+    (
+        "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+        "synthetic-ambient-value",
+    ),
+    ("CODEX_REVOKE_TOKEN_URL_OVERRIDE", "synthetic-ambient-value"),
+    (
+        "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+        "synthetic-ambient-value",
+    ),
+    ("CODEX_AUTHAPI_BASE_URL", "synthetic-ambient-value"),
+    ("CODEX_APP_SERVER_LOGIN_ISSUER", "synthetic-ambient-value"),
+    (
+        "CODEX_APP_SERVER_DEV_OPEN_APP_URL",
+        "synthetic-ambient-value",
+    ),
+    (
+        "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+        "synthetic-ambient-value",
+    ),
+    (
+        "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG",
+        "synthetic-ambient-value",
+    ),
+    (
+        "CODEX_APP_SERVER_TEST_USER_CONFIG_FILE",
+        "synthetic-ambient-value",
+    ),
+    ("CODEX_SQLITE_HOME", "synthetic-ambient-value"),
+    ("CODEX_REMOTE_AUTH_TOKEN", "synthetic-ambient-value"),
+    ("CODEX_CONNECTORS_TOKEN", "synthetic-ambient-value"),
+    ("CODEX_CODE_MODE_HOST_PATH", "synthetic-ambient-value"),
+    ("CODEX_CLOUD_TASKS_BASE_URL", "synthetic-ambient-value"),
+    (
+        "CODEX_CLOUD_TASKS_FORCE_INTERNAL",
+        "synthetic-ambient-value",
+    ),
+    ("CODEX_STARTING_DIFF", "synthetic-ambient-value"),
+    ("CODEX_EXEC_SERVER_URL", "synthetic-ambient-value"),
+    (
+        "CODEX_EXEC_SERVER_NOISE_REGISTRY_URL",
+        "synthetic-ambient-value",
+    ),
+    (
+        "CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID",
+        "synthetic-ambient-value",
+    ),
+    (
+        "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN",
+        "synthetic-ambient-value",
+    ),
+    (
+        "CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID",
+        "synthetic-ambient-value",
+    ),
+    ("CODEX_OSS_BASE_URL", "synthetic-ambient-value"),
+    ("CODEX_OSS_PORT", "synthetic-ambient-value"),
+    (
+        "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+        "synthetic-ambient-value",
+    ),
+    ("CODEX_TUI_RECORD_SESSION", "synthetic-ambient-value"),
+    ("CODEX_TUI_SESSION_LOG_PATH", "synthetic-ambient-value"),
+    ("CODEX_ROLLOUT_TRACE_ROOT", "synthetic-ambient-value"),
+    (
+        "CODEX_ANALYTICS_EVENTS_CAPTURE_FILE",
+        "synthetic-ambient-value",
+    ),
+    ("CoDeX_TeSt_Future_Auth_Hook", "synthetic-ambient-value"),
+    ("CoDeX_FuTuRe_EnDpOiNt_OvErRiDe", "synthetic-ambient-value"),
+];
+
+#[cfg(unix)]
+fn calcifer_with_ambient_codex_auth_overrides() -> Command {
+    let mut command = calcifer();
+    command
+        .envs(AMBIENT_CODEX_AUTH_OVERRIDES.iter().copied())
+        .env("CODEX_HOME", "/synthetic/ambient/codex-home")
+        .env("HTTPS_PROXY", "http://127.0.0.1:17842")
+        .env("CODEX_CA_CERTIFICATE", "/synthetic/enterprise-ca.pem")
+        .env("TERM", "xterm-calcifer-test")
+        .env("FAKE_CODEX_EXPECT_PRESERVED_ENV", "1");
+    command
+}
+
 #[test]
 fn help_lists_only_implemented_commands() -> Result<(), Box<dyn std::error::Error>> {
     let output = calcifer().arg("--help").output()?;
@@ -226,6 +318,14 @@ fn managed_codex_profile_supports_status_run_and_exact_resume()
         &fake_codex,
         r#"#!/bin/sh
 set -eu
+if env | grep -Eq '^(OPENAI_API_KEY|OPENAI_ORGANIZATION|OPENAI_PROJECT|CODEX_API_KEY|CODEX_ACCESS_TOKEN|CoDeX_AcCeSs_ToKeN|CODEX_REFRESH_TOKEN_URL_OVERRIDE|CODEX_REVOKE_TOKEN_URL_OVERRIDE|CODEX_APP_SERVER_LOGIN_CLIENT_ID|CODEX_AUTHAPI_BASE_URL|CODEX_APP_SERVER_LOGIN_ISSUER|CODEX_APP_SERVER_DEV_OPEN_APP_URL|CODEX_APP_SERVER_MANAGED_CONFIG_PATH|CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG|CODEX_APP_SERVER_TEST_USER_CONFIG_FILE|CODEX_SQLITE_HOME|CODEX_REMOTE_AUTH_TOKEN|CODEX_CONNECTORS_TOKEN|CODEX_CODE_MODE_HOST_PATH|CODEX_CLOUD_TASKS_BASE_URL|CODEX_CLOUD_TASKS_FORCE_INTERNAL|CODEX_STARTING_DIFF|CODEX_EXEC_SERVER_URL|CODEX_EXEC_SERVER_NOISE_REGISTRY_URL|CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID|CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN|CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID|CODEX_OSS_BASE_URL|CODEX_OSS_PORT|CODEX_INTERNAL_ORIGINATOR_OVERRIDE|CODEX_TUI_RECORD_SESSION|CODEX_TUI_SESSION_LOG_PATH|CODEX_ROLLOUT_TRACE_ROOT|CODEX_ANALYTICS_EVENTS_CAPTURE_FILE|CoDeX_TeSt_Future_Auth_Hook|CoDeX_FuTuRe_EnDpOiNt_OvErRiDe)='; then
+  exit 97
+fi
+if [ "${FAKE_CODEX_EXPECT_PRESERVED_ENV:-}" = "1" ]; then
+  [ "${HTTPS_PROXY:-}" = "http://127.0.0.1:17842" ]
+  [ "${CODEX_CA_CERTIFICATE:-}" = "/synthetic/enterprise-ca.pem" ]
+  [ "${TERM:-}" = "xterm-calcifer-test" ]
+fi
 printf 'pwd=%s args=%s\n' "$PWD" "$*" >> "$FAKE_CODEX_LOG"
 if [ "${1:-}" = "-c" ]; then
   [ "${2:-}" = 'cli_auth_credentials_store="file"' ]
@@ -279,7 +379,7 @@ esac
     path_entries.extend(std::env::split_paths(&inherited_path));
     let path = std::env::join_paths(path_entries)?;
 
-    let add = calcifer()
+    let add = calcifer_with_ambient_codex_auth_overrides()
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -287,7 +387,7 @@ esac
         .output()?;
     assert!(add.status.success(), "{}", String::from_utf8(add.stderr)?);
 
-    let status = calcifer()
+    let status = calcifer_with_ambient_codex_auth_overrides()
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -323,7 +423,7 @@ esac
     );
     assert!(!status_text.contains("must-not-leak"));
 
-    let resume = calcifer()
+    let resume = calcifer_with_ambient_codex_auth_overrides()
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -341,7 +441,7 @@ esac
         String::from_utf8(resume.stderr)?
     );
 
-    let run = calcifer()
+    let run = calcifer_with_ambient_codex_auth_overrides()
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -349,7 +449,7 @@ esac
         .output()?;
     assert!(run.status.success(), "{}", String::from_utf8(run.stderr)?);
 
-    let resume_last = calcifer()
+    let resume_last = calcifer_with_ambient_codex_auth_overrides()
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)

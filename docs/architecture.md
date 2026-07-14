@@ -173,10 +173,19 @@ The current process launcher:
 - let every Calcifer wrapper layer catch terminal termination signals while the official provider receives its normal process-group delivery, so a provider that handles `SIGINT` remains attached to the foreground wrapper and cannot outlive every lease owner;
 - preserve ordinary child exit codes; polished cross-platform signal forwarding and job-control semantics remain release gates;
 - avoid persisting child stdout or stderr by default;
-- remove `CODEX_API_KEY` and `OPENAI_API_KEY` before managed login, run, resume, and status operations;
 - force file-backed credentials on every operation and reject provider arguments that can override the account, provider, endpoint, profile, or remote route;
+- sanitize the internal run/resume coordinator and guardian before spawn, then
+  construct every final login, run, resume, and App Server process through one
+  managed command policy that removes ambient Codex credentials, authentication and
+  endpoint overrides, alternate config/state paths, remote execution routes,
+  connector credentials, transcript/trace paths, provider test hooks, and
+  future override families;
 - run login and status from the managed profile home so repository-local configuration cannot influence those account-sensitive operations;
 - avoid logging raw arguments or the child environment.
+
+The official CLI still receives ordinary terminal, locale, proxy, and CA
+environment needed for interactive and enterprise operation. Calcifer does not
+claim to protect credentials from a hostile same-user proxy or trust store.
 
 The wrapped CLI, repository hooks, tools, and provider remain outside Calcifer's sandbox because Calcifer does not provide one.
 

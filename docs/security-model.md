@@ -21,6 +21,7 @@ This document covers both implemented and intended guarantees. The current Unix 
 - concurrent refresh or mutation corrupting one profile
 - PATH hijacking or shell injection when launching a provider CLI
 - repository configuration forcing a more privileged or differently governed account
+- ambient provider authentication, endpoint, config, state, or session-log overrides replacing the selected managed profile
 - automatic failover causing organization-boundary data disclosure
 - incorrect quota classification causing failover loops
 - automatic replay duplicating file, Git, deployment, billing, or messaging side effects
@@ -48,13 +49,25 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Claude token storage fails closed when a supported OS credential store is unavailable. Plaintext fallback is a non-goal unless a later ADR and security review define it.
 - Export, backup, telemetry, and crash-report features exclude credentials by design.
 - Credential-bearing environments are passed only to a provider adapter's validated executable, never to an arbitrary command supplied after `--`.
-- Managed Codex operations remove conflicting API-key environment variables so the selected subscription profile is not silently bypassed.
+- Every managed Codex login, run, resume, and App Server process is built by one
+  environment policy. It removes ambient API/access tokens, authentication and
+  endpoint overrides, cloud-task and remote-execution routes, connector and
+  remote-auth tokens, App Server config hooks, alternate state homes,
+  transcript/trace paths, provider test hooks, and future override families
+  before the official CLI starts. This keeps the selected profile authoritative
+  and prevents implicit transcript recording.
+- The same policy is applied before Unix run/resume coordinator and guardian
+  helpers start; ambient `CODEX_HOME` returns only on the final provider command.
 - Calcifer revalidates the private `auth.json` and exact managed `config.toml` after acquiring the profile lease, forces file-backed storage on every invocation, and rejects provider/account-routing overrides.
 - Login and status probes use a verified neutral managed directory rather than the caller's repository cwd.
 - Interactive launch uses a coordinator/provider-guardian pair with two fixed-order lease files. Either surviving process blocks a second writer after a selective crash, while the official provider and its background tools inherit neither descriptor.
 - If the provider guardian is killed after reporting the exact provider PID, the coordinator retains its lease until that PID exits. If failure lands in the unobservable post-authorization/pre-report window, the coordinator deliberately remains alive and locked rather than guessing that no provider exists.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
 - The bounded status app-server is the narrow exception: it inherits only the provider-side lease because it cannot start turns or tools. This keeps a killed status parent from admitting a second credential writer until stdio EOF terminates the probe.
+- Standard proxy and CA environment variables remain available for legitimate
+  enterprise networks. Calcifer does not defend against a hostile proxy, trust
+  store, root, administrator, or same-user malware; managed provider endpoints
+  still rely on normal TLS verification by the official CLI.
 
 ## Failover requirements
 
