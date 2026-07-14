@@ -27,9 +27,12 @@ For every interactive `run` and `resume`:
    or special node fails closed; Windows reparse points are also rejected.
 4. If a marker exists, inspect each directory from that repository root through
    the canonical cwd in root-to-leaf order. Otherwise inspect only the cwd.
-5. At each layer, `.codex` must be a real directory when present and
-   `config.toml` must be a real regular file when present. Symlinks, special
-   nodes, and filesystem errors fail closed.
+5. At each layer, `.codex` must be a real directory when present. An
+   auto-discovered `.codex/agents` path must not exist as any filesystem node,
+   regardless of whether `config.toml` exists, because each role file is a
+   complete indirect configuration layer. `config.toml` must be a real regular
+   file when present. Symlinks, dangling symlinks, special nodes, and filesystem
+   errors fail closed.
 6. Read at most 1 MiB plus one sentinel byte. Invalid UTF-8, invalid TOML, and
    oversized input fail closed.
 
@@ -100,6 +103,14 @@ check and before Codex reads the file is outside Calcifer's guarantee. Complete
 mediation requires an upstream-supported project-config disable switch or
 effective-configuration API with provenance.
 
+For a linked worktree, Codex 0.144.4 has an additional special case that reads
+the primary checkout's `.codex/config.toml` and merges only its `hooks` field.
+Calcifer currently stops discovery at the linked worktree's regular `.git`
+marker file and does not resolve or inspect that external hook source. The
+upstream merge cannot import account/provider/state settings, and repository
+hooks are outside this preflight's sandbox guarantee, but this behavior must be
+re-reviewed if Codex expands the merged field set.
+
 Recovery is non-destructive: remove or revise the unsupported repository
 setting and retry. Profile credentials and session files are not changed on a
 preflight failure.
@@ -110,6 +121,9 @@ preflight failure.
       markers are covered by unit tests.
 - [x] Invalid, oversized, unknown, managed, symlinked, and non-regular inputs
       fail closed with redacted output.
+- [x] Every repository `.codex/agents` node type fails closed with or without a
+      sibling config, and run/resume never spawn the provider or disclose role
+      names and paths.
 - [x] Exactly 1 MiB and representative benign configuration remain accepted.
 - [x] Fresh run, exact resume, and latest resume fail before a synthetic provider
       starts when repository policy fails.

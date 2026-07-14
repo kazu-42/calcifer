@@ -179,6 +179,12 @@ fn verify_config_layer(directory: &Path) -> Result<(), ProjectConfigError> {
         Err(error) => return Err(error.into()),
     }
 
+    match fs::symlink_metadata(codex_directory.join("agents")) {
+        Ok(_) => return Err(ProjectConfigError::Unsafe),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
     let config = codex_directory.join("config.toml");
     let path_metadata = match fs::symlink_metadata(&config) {
         Ok(metadata) if metadata.is_file() && !is_link_like(&metadata) => metadata,
@@ -410,6 +416,99 @@ mod tests {
         fs::create_dir(root.join(".codex"))?;
         fs::create_dir(root.join(".codex").join("config.toml"))?;
         assert!(verify_repository_config(&root).is_err());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_auto_discovered_project_agents_nodes_with_or_without_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = sandbox("agents-node")?;
+        fs::create_dir(root.join(".git"))?;
+        fs::create_dir(root.join(".codex"))?;
+        let agents = root.join(".codex").join("agents");
+
+        fs::create_dir(&agents)?;
+        let directory_error = match verify_repository_config(&root) {
+            Err(error) => error,
+            Ok(_) => return Err(io::Error::other("project agents directory was accepted").into()),
+        };
+        fs::remove_dir(&agents)?;
+
+        write_config(&root, b"model = \"gpt-5.4\"\n")?;
+        fs::write(&agents, "synthetic role")?;
+        let file_error = match verify_repository_config(&root) {
+            Err(error) => error,
+            Ok(_) => return Err(io::Error::other("project agents file was accepted").into()),
+        };
+
+        for error in [directory_error, file_error] {
+            assert_eq!(error.code(), "unsafe_project_configuration");
+            let message = error.safe_message();
+            assert!(!message.contains("agents"));
+            assert!(!message.contains(&root.display().to_string()));
+        }
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_dangling_and_special_project_agents_nodes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let unique = uuid::Uuid::new_v4().to_string();
+        let root = std::env::temp_dir().join(format!("ca-{}", &unique[..8]));
+        fs::create_dir(&root)?;
+        fs::create_dir(root.join(".git"))?;
+        fs::create_dir(root.join(".codex"))?;
+        let agents = root.join(".codex").join("agents");
+        let target = root.join("synthetic-role.toml");
+        fs::write(&target, "model = \"gpt-5.4\"\n")?;
+
+        symlink(&target, &agents)?;
+        assert!(verify_repository_config(&root).is_err());
+        fs::remove_file(&agents)?;
+
+        symlink(root.join("missing-role.toml"), &agents)?;
+        assert!(verify_repository_config(&root).is_err());
+        fs::remove_file(&agents)?;
+
+        let listener = UnixListener::bind(&agents)?;
+        assert!(verify_repository_config(&root).is_err());
+        drop(listener);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fails_closed_when_project_agents_metadata_cannot_be_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+
+        let root = sandbox("agents-metadata-error")?;
+        fs::create_dir(root.join(".git"))?;
+        let codex_directory = root.join(".codex");
+        fs::create_dir(&codex_directory)?;
+        fs::set_permissions(&codex_directory, fs::Permissions::from_mode(0o600))?;
+
+        let result = verify_repository_config(&root);
+        fs::set_permissions(&codex_directory, fs::Permissions::from_mode(0o700))?;
+        assert!(matches!(
+            result,
+            Err(ProjectConfigError::Io(ref error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
 
         fs::remove_dir_all(root)?;
         Ok(())

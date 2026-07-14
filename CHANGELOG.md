@@ -22,12 +22,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   checksums, provenance attestations, dry-run validation, and a maintainer
   release/rollback runbook.
 
+### Fixed
+
+- Official Codex project-trust updates no longer make a managed profile unusable
+  on its next status, run, or resume operation. Managed configuration is now
+  checked by a bounded Codex-version-scoped semantic policy instead of complete
+  byte equality, and MCP OAuth credentials are forced into the selected
+  profile's file store rather than an implicit shared keyring.
+
 ### Security
 
 - Managed directories and files are created with private Unix modes, profile metadata is atomically replaced, and profile mutation and child lifetime are protected by advisory locks.
 - Reset-credit opaque IDs and provider display copy are excluded from Calcifer output.
 - Displayed `0% remaining` is not treated as authoritative exhaustion because Codex rounds the upstream usage percentage.
-- Managed auth/config are revalidated under an exclusive lease; account/provider-routing overrides are rejected and profile-local file storage is forced for both CLI and MCP OAuth credentials on every invocation.
+- Managed auth/config are revalidated under an exclusive lease; valid
+  provider-owned project trust is accepted, while unknown and
+  account/provider/state/dynamic-extension settings are rejected and
+  profile-local file storage is forced for both CLI and MCP OAuth credentials
+  on every invocation.
+- Managed profiles cannot replace the pinned project-root discovery markers, so
+  Calcifer and Codex evaluate the same repository configuration boundary.
+- Managed profiles reject top-level role definitions and every auto-discovered
+  `CODEX_HOME/agents` filesystem node before registry publication or provider
+  spawn, preventing indirect role files from importing unvalidated complete
+  configuration layers.
+- Managed profiles reject MCP OAuth callback URL and port overrides so connector
+  authorization cannot be redirected outside the reviewed endpoint route.
 - Login and status use a neutral managed cwd, provider JSONL input is bounded, and status probes receive a graceful shutdown window.
 - A coordinator/provider-guardian pair uses split advisory leases so either side can survive a selective crash without exposing interactive lock FDs to provider background tools.
 - Wrapper, coordinator, and guardian layers survive terminal cancellation signals until the official provider exits, including when that provider handles or ignores `SIGINT`.
@@ -42,6 +62,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   against a version-scoped safe-key policy at both coordinator and guardian
   boundaries, binds the provider to the inspected canonical cwd, and rejects
   child cwd, dynamic-feature, and non-UTF-8 argument bypasses before spawn.
+- Every repository `.codex/agents` filesystem node now fails closed before
+  provider spawn, including when the sibling `config.toml` is absent, preventing
+  auto-discovered role files from importing a complete provider-routing layer.
 
 ### Known limitations
 

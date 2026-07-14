@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,8 +16,137 @@ const OWNER_MARKER: &str = ".calcifer-profile";
 const COORDINATOR_LOCK_FILE: &str = "profile.lock";
 const PROVIDER_LOCK_FILE: &str = "provider.lock";
 const MANAGED_CODEX_CONFIG: &[u8] = b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = \"file\"\n";
-const LEGACY_MANAGED_CODEX_CONFIG: &[u8] =
-    b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\n";
+const MAX_MANAGED_CODEX_CONFIG_BYTES: usize = 1024 * 1024;
+
+// Version-scoped to Codex 0.144.4's published core/config.schema.json. Unknown
+// top-level keys fail closed until the compatibility adapter is reviewed.
+const CODEX_0_144_4_CONFIG_KEYS: &[&str] = &[
+    "agents",
+    "allow_login_shell",
+    "analytics",
+    "approval_policy",
+    "approvals_reviewer",
+    "apps",
+    "apps_mcp_product_sku",
+    "audio",
+    "auto_review",
+    "background_terminal_max_timeout",
+    "chatgpt_base_url",
+    "check_for_update_on_startup",
+    "cli_auth_credentials_store",
+    "compact_prompt",
+    "debug",
+    "default_permissions",
+    "desktop",
+    "developer_instructions",
+    "disable_paste_burst",
+    "experimental_compact_prompt_file",
+    "experimental_realtime_start_instructions",
+    "experimental_realtime_webrtc_call_base_url",
+    "experimental_realtime_ws_backend_prompt",
+    "experimental_realtime_ws_base_url",
+    "experimental_realtime_ws_model",
+    "experimental_realtime_ws_startup_context",
+    "experimental_thread_config_endpoint",
+    "experimental_thread_store",
+    "experimental_use_unified_exec_tool",
+    "features",
+    "feedback",
+    "file_opener",
+    "forced_chatgpt_workspace_id",
+    "forced_login_method",
+    "ghost_snapshot",
+    "hide_agent_reasoning",
+    "history",
+    "hooks",
+    "include_apps_instructions",
+    "include_collaboration_mode_instructions",
+    "include_environment_context",
+    "include_permissions_instructions",
+    "instructions",
+    "log_dir",
+    "marketplaces",
+    "mcp_oauth_callback_port",
+    "mcp_oauth_callback_url",
+    "mcp_oauth_credentials_store",
+    "mcp_servers",
+    "memories",
+    "model",
+    "model_auto_compact_token_limit",
+    "model_auto_compact_token_limit_scope",
+    "model_catalog_json",
+    "model_context_window",
+    "model_instructions_file",
+    "model_provider",
+    "model_providers",
+    "model_reasoning_effort",
+    "model_reasoning_summary",
+    "model_supports_reasoning_summaries",
+    "model_verbosity",
+    "notice",
+    "notify",
+    "openai_base_url",
+    "orchestrator",
+    "oss_provider",
+    "otel",
+    "permissions",
+    "personality",
+    "plan_mode_reasoning_effort",
+    "plugins",
+    "profile",
+    "profiles",
+    "project_doc_fallback_filenames",
+    "project_doc_max_bytes",
+    "project_root_markers",
+    "projects",
+    "realtime",
+    "review_model",
+    "sandbox_mode",
+    "sandbox_workspace_write",
+    "service_tier",
+    "shell_environment_policy",
+    "show_raw_agent_reasoning",
+    "skills",
+    "sqlite_home",
+    "suppress_unstable_features_warning",
+    "tool_output_token_limit",
+    "tool_suggest",
+    "tools",
+    "tui",
+    "web_search",
+    "windows",
+];
+
+// These supported Codex keys can redirect the selected account/provider or
+// move managed session state outside its profile. Calcifer therefore owns them.
+const MANAGED_CODEX_FORBIDDEN_CONFIG_KEYS: &[&str] = &[
+    "agents",
+    "apps_mcp_product_sku",
+    "chatgpt_base_url",
+    "debug",
+    "experimental_realtime_webrtc_call_base_url",
+    "experimental_realtime_ws_base_url",
+    "experimental_thread_config_endpoint",
+    "experimental_thread_store",
+    "features",
+    "forced_chatgpt_workspace_id",
+    "forced_login_method",
+    "log_dir",
+    "marketplaces",
+    "mcp_oauth_callback_port",
+    "mcp_oauth_callback_url",
+    "mcp_servers",
+    "model_catalog_json",
+    "model_provider",
+    "model_providers",
+    "openai_base_url",
+    "oss_provider",
+    "plugins",
+    "profile",
+    "profiles",
+    "project_root_markers",
+    "sqlite_home",
+];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,9 +291,7 @@ impl Registry {
     pub(crate) fn profile_home(&self, profile: &Profile) -> Result<PathBuf, ProfileError> {
         let directory = self.profile_directory(profile)?;
         let home = directory.join("home");
-        verify_private_directory(&home)?;
-        verify_managed_codex_config(&home.join("config.toml"))?;
-        verify_codex_auth_file(&home.join("auth.json"))?;
+        verify_managed_codex_home(&home)?;
         Ok(home)
     }
 
@@ -336,7 +463,7 @@ impl PendingProfile<'_> {
     }
 
     pub(crate) fn commit(mut self) -> Result<Profile, ProfileError> {
-        verify_codex_auth_file(&self.home().join("auth.json"))?;
+        verify_managed_codex_home(&self.home())?;
         let final_directory = self
             .staging
             .parent()
@@ -825,6 +952,20 @@ fn verify_codex_auth_file(path: &Path) -> Result<(), ProfileError> {
     })
 }
 
+fn verify_managed_codex_home(home: &Path) -> Result<(), ProfileError> {
+    verify_private_directory(home)?;
+    verify_managed_codex_agents_absent(&home.join("agents"))?;
+    verify_managed_codex_config(&home.join("config.toml"))?;
+    verify_codex_auth_file(&home.join("auth.json"))
+}
+
+fn verify_managed_codex_agents_absent(path: &Path) -> Result<(), ProfileError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) | Err(_) => Err(managed_codex_config_policy_error()),
+    }
+}
+
 fn verify_managed_codex_config(path: &Path) -> Result<(), ProfileError> {
     verify_private_regular_file(path).map_err(|error| match error {
         ProfileError::Io(io_error) if io_error.kind() == io::ErrorKind::NotFound => {
@@ -832,13 +973,73 @@ fn verify_managed_codex_config(path: &Path) -> Result<(), ProfileError> {
         }
         other => other,
     })?;
-    let contents = fs::read(path)?;
-    if contents != MANAGED_CODEX_CONFIG && contents != LEGACY_MANAGED_CODEX_CONFIG {
-        return Err(ProfileError::UnsafeState(
-            "managed Codex config.toml was modified".to_owned(),
-        ));
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take((MAX_MANAGED_CODEX_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_MANAGED_CODEX_CONFIG_BYTES {
+        return Err(managed_codex_config_policy_error());
     }
+    validate_managed_codex_config(&bytes)
+}
+
+fn validate_managed_codex_config(bytes: &[u8]) -> Result<(), ProfileError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| managed_codex_config_policy_error())?;
+    let config =
+        toml::from_str::<toml::Table>(text).map_err(|_| managed_codex_config_policy_error())?;
+
+    for key in config.keys() {
+        if !CODEX_0_144_4_CONFIG_KEYS.contains(&key.as_str())
+            || MANAGED_CODEX_FORBIDDEN_CONFIG_KEYS.contains(&key.as_str())
+        {
+            return Err(managed_codex_config_policy_error());
+        }
+    }
+
+    if config
+        .get("cli_auth_credentials_store")
+        .and_then(toml::Value::as_str)
+        != Some("file")
+    {
+        return Err(managed_codex_config_policy_error());
+    }
+
+    if config
+        .get("mcp_oauth_credentials_store")
+        .is_some_and(|store| store.as_str() != Some("file"))
+    {
+        return Err(managed_codex_config_policy_error());
+    }
+
+    if let Some(projects) = config.get("projects") {
+        let projects = projects
+            .as_table()
+            .ok_or_else(managed_codex_config_policy_error)?;
+        for (project_path, project) in projects {
+            if project_path.is_empty() || !Path::new(project_path).is_absolute() {
+                return Err(managed_codex_config_policy_error());
+            }
+            let project = project
+                .as_table()
+                .ok_or_else(managed_codex_config_policy_error)?;
+            if project.len() != 1
+                || !matches!(
+                    project.get("trust_level").and_then(toml::Value::as_str),
+                    Some("trusted" | "untrusted")
+                )
+            {
+                return Err(managed_codex_config_policy_error());
+            }
+        }
+    }
+
     Ok(())
+}
+
+fn managed_codex_config_policy_error() -> ProfileError {
+    ProfileError::UnsafeState(
+        "managed Codex profile violates the supported compatibility policy".to_owned(),
+    )
 }
 
 fn atomic_write_private(
@@ -927,6 +1128,183 @@ mod tests {
         }
     }
 
+    #[test]
+    fn managed_codex_config_accepts_supported_provider_and_user_state() {
+        let absolute_root = if cfg!(windows) {
+            "C:/synthetic"
+        } else {
+            "/synthetic"
+        };
+        let supported = [
+            r#"# Managed by Calcifer.
+cli_auth_credentials_store = "file"
+mcp_oauth_credentials_store = "file"
+"#
+            .to_owned(),
+            format!(
+                r#"# Comments, whitespace, and root-key order are not invariants.
+model = "gpt-5.4"
+cli_auth_credentials_store = "file"
+mcp_oauth_credentials_store = "file"
+
+[projects."{absolute_root}/first"]
+trust_level = "trusted"
+
+[projects."{absolute_root}/stale/nonexistent"]
+trust_level = "untrusted"
+"#
+            ),
+            format!(
+                r#"cli_auth_credentials_store = "file"
+projects = {{ "{absolute_root}/inline" = {{ trust_level = "trusted" }} }}
+sandbox_mode = "workspace-write"
+"#
+            ),
+        ];
+
+        for config in supported {
+            assert!(
+                validate_managed_codex_config(config.as_bytes()).is_ok(),
+                "supported semantic config must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_codex_config_rejects_invalid_or_ambiguous_state() {
+        let rejected = [
+            "",
+            "not valid = [toml",
+            "model = \"gpt-5.4\"\n",
+            "cli_auth_credentials_store = \"auto\"\n",
+            "cli_auth_credentials_store = \"keyring\"\n",
+            "cli_auth_credentials_store = \"ephemeral\"\n",
+            "cli_auth_credentials_store = 1\n",
+            "cli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = \"auto\"\n",
+            "cli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = \"keyring\"\n",
+            "cli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = 1\n",
+            "cli_auth_credentials_store = \"file\"\nfuture_provider_key = true\n",
+            "cli_auth_credentials_store = \"file\"\nprojects = \"trusted\"\n",
+            "cli_auth_credentials_store = \"file\"\nprojects = { \"/synthetic\" = \"trusted\" }\n",
+            "cli_auth_credentials_store = \"file\"\nprojects = { \"/synthetic\" = { trust_level = \"maybe\" } }\n",
+            "cli_auth_credentials_store = \"file\"\nprojects = { \"/synthetic\" = { trust_level = \"trusted\", extra = true } }\n",
+            "cli_auth_credentials_store = \"file\"\nprojects = { \"\" = { trust_level = \"trusted\" } }\n",
+            "cli_auth_credentials_store = \"file\"\nprojects = { \"relative/path\" = { trust_level = \"trusted\" } }\n",
+        ];
+
+        for config in rejected {
+            assert!(
+                validate_managed_codex_config(config.as_bytes()).is_err(),
+                "unsupported semantic config must be rejected"
+            );
+        }
+
+        let sensitive_path = "relative/account-owner@example.invalid";
+        let config = format!(
+            "cli_auth_credentials_store = \"file\"\nprojects = {{ \"{sensitive_path}\" = {{ trust_level = \"trusted\" }} }}\n"
+        );
+        let error = match validate_managed_codex_config(config.as_bytes()) {
+            Ok(()) => panic!("sensitive project path was unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(!error.safe_message().contains(sensitive_path));
+    }
+
+    #[test]
+    fn managed_codex_config_rejects_role_definitions_without_disclosure() {
+        let sensitive_role = "account-owner@example.invalid";
+        let sensitive_path = "/private/synthetic/role-config.toml";
+        let config = format!(
+            r#"cli_auth_credentials_store = "file"
+
+[agents."{sensitive_role}"]
+description = "synthetic role"
+config_file = "{sensitive_path}"
+"#
+        );
+
+        let error = match validate_managed_codex_config(config.as_bytes()) {
+            Err(error) => error,
+            Ok(()) => panic!("managed role definitions must fail closed"),
+        };
+        let message = error.safe_message();
+        assert!(!message.contains("agents"));
+        assert!(!message.contains(sensitive_role));
+        assert!(!message.contains(sensitive_path));
+    }
+
+    #[test]
+    fn managed_codex_config_rejects_oauth_callback_overrides_without_disclosure() {
+        let sensitive_url = "https://account-owner@example.invalid/private/callback";
+        let overrides = [
+            (
+                "mcp_oauth_callback_url",
+                format!("mcp_oauth_callback_url = \"{sensitive_url}\"\n"),
+                sensitive_url,
+            ),
+            (
+                "mcp_oauth_callback_port",
+                "mcp_oauth_callback_port = 48765\n".to_owned(),
+                "48765",
+            ),
+        ];
+
+        for (key, callback_override, sensitive_value) in overrides {
+            let config = format!("cli_auth_credentials_store = \"file\"\n{callback_override}");
+            let error = match validate_managed_codex_config(config.as_bytes()) {
+                Err(error) => error,
+                Ok(()) => panic!("managed OAuth callback override {key} must fail closed"),
+            };
+            assert_eq!(error.code(), "unsafe_profile_state");
+            let message = error.safe_message();
+            assert!(!message.contains(key));
+            assert!(!message.contains(sensitive_value));
+        }
+    }
+
+    #[test]
+    fn managed_codex_config_rejects_owned_routing_and_state_keys() {
+        assert_eq!(
+            CODEX_0_144_4_CONFIG_KEYS.len(),
+            94,
+            "the pinned Codex 0.144.4 schema contains 94 top-level keys"
+        );
+        assert!(
+            CODEX_0_144_4_CONFIG_KEYS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "version-scoped schema keys must remain sorted and unique"
+        );
+        for key in MANAGED_CODEX_FORBIDDEN_CONFIG_KEYS {
+            assert!(
+                CODEX_0_144_4_CONFIG_KEYS.contains(key),
+                "owned key {key} must exist in the pinned schema"
+            );
+            let config = format!("cli_auth_credentials_store = \"file\"\n{key} = true\n");
+            assert!(
+                validate_managed_codex_config(config.as_bytes()).is_err(),
+                "Calcifer-owned key {key} must be rejected"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_codex_config_read_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("oversized-managed-config");
+        secure_create_dir(&root)?;
+        let config = root.join("config.toml");
+        write_private_file(&config, &vec![b' '; MAX_MANAGED_CODEX_CONFIG_BYTES + 1])?;
+
+        assert!(matches!(
+            verify_managed_codex_config(&config),
+            Err(ProfileError::UnsafeState(_))
+        ));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn pending_registration_is_private_and_rolls_back() -> Result<(), Box<dyn std::error::Error>> {
@@ -990,9 +1368,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn registration_revalidates_complete_home_before_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("registration-home-revalidation");
+        let registry = Registry::at(root.clone());
+
+        let pending = registry.begin_codex_registration("work")?;
+        write_private_file(
+            &pending.home().join("auth.json"),
+            br#"{"synthetic":"test-only"}"#,
+        )?;
+        fs::write(
+            pending.home().join("config.toml"),
+            b"cli_auth_credentials_store = \"file\"\n[agents.reviewer]\ndescription = \"synthetic\"\n",
+        )?;
+        let role_error = match pending.commit() {
+            Err(error) => error,
+            Ok(_) => panic!("registration published a role config"),
+        };
+        assert_eq!(role_error.code(), "unsafe_profile_state");
+        assert!(!role_error.safe_message().contains("agents"));
+        assert!(registry.list()?.is_empty());
+
+        let pending = registry.begin_codex_registration("work")?;
+        write_private_file(
+            &pending.home().join("auth.json"),
+            br#"{"synthetic":"test-only"}"#,
+        )?;
+        fs::create_dir(pending.home().join("agents"))?;
+        let node_error = match pending.commit() {
+            Err(error) => error,
+            Ok(_) => panic!("registration published an auto-discovered agents node"),
+        };
+        assert_eq!(node_error.code(), "unsafe_profile_state");
+        assert!(!node_error.safe_message().contains("agents"));
+        assert!(registry.list()?.is_empty());
+
+        let provider_root = root.join("profiles").join("codex");
+        assert!(std::fs::read_dir(provider_root)?.next().is_none());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn published_profiles_revalidate_config_and_auth_before_use()
     -> Result<(), Box<dyn std::error::Error>> {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let root = temporary_root("profile-revalidation");
         let registry = Registry::at(root.clone());
@@ -1022,11 +1444,72 @@ mod tests {
             &config,
             b"# Managed by Calcifer.\ncli_auth_credentials_store = \"file\"\n",
         )?;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644))?;
+        assert!(matches!(
+            registry.profile_home(&profile),
+            Err(ProfileError::UnsafeState(_))
+        ));
+
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
         fs::remove_file(&auth)?;
         assert!(matches!(
             registry.profile_home(&profile),
             Err(ProfileError::UnsafeState(_))
         ));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_profiles_reject_every_auto_discovered_agents_node()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("profile-agents-revalidation");
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_codex_registration("work")?;
+        write_private_file(
+            &pending.home().join("auth.json"),
+            br#"{"synthetic":"test-only"}"#,
+        )?;
+        let profile = pending.commit()?;
+        let home = root
+            .join("profiles")
+            .join("codex")
+            .join(&profile.id)
+            .join("home");
+        let agents = home.join("agents");
+        let auth = home.join("auth.json");
+
+        fs::create_dir(&agents)?;
+        let directory_error = match registry.profile_home(&profile) {
+            Err(error) => error,
+            Ok(_) => panic!("an agents directory must fail closed"),
+        };
+        fs::remove_dir(&agents)?;
+
+        write_private_file(&agents, b"synthetic test-only role")?;
+        let file_error = match registry.profile_home(&profile) {
+            Err(error) => error,
+            Ok(_) => panic!("an agents file must fail closed"),
+        };
+        fs::remove_file(&agents)?;
+
+        symlink(&auth, &agents)?;
+        let symlink_error = match registry.profile_home(&profile) {
+            Err(error) => error,
+            Ok(_) => panic!("an agents symlink must fail closed"),
+        };
+        fs::remove_file(&agents)?;
+
+        for error in [directory_error, file_error, symlink_error] {
+            assert_eq!(error.code(), "unsafe_profile_state");
+            let message = error.safe_message();
+            assert!(!message.contains("agents"));
+            assert!(!message.contains(&home.display().to_string()));
+        }
 
         fs::remove_dir_all(root)?;
         Ok(())

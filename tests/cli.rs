@@ -391,6 +391,13 @@ case "${1:-}" in
     nohup sleep 30 >/dev/null 2>&1 &
     printf '%s\n' "$!" > "$FAKE_CODEX_BACKGROUND_PID"
     ;;
+  trust-project)
+    cat >> "$CODEX_HOME/config.toml" <<'EOF'
+
+[projects."/synthetic/repository"]
+trust_level = "trusted"
+EOF
+    ;;
 esac
 "#,
     )?;
@@ -410,6 +417,18 @@ esac
         .args(["auth", "add", "codex", "work"])
         .output()?;
     assert!(add.status.success(), "{}", String::from_utf8(add.stderr)?);
+
+    let trust_project = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["run", "codex@work", "--", "trust-project"])
+        .output()?;
+    assert!(
+        trust_project.status.success(),
+        "{}",
+        String::from_utf8(trust_project.stderr)?
+    );
 
     let status = calcifer_with_ambient_codex_auth_overrides()
         .env("PATH", &path)
@@ -448,6 +467,106 @@ esac
     );
     assert!(!status_text.contains("must-not-leak"));
     std::fs::write(&project_config, "model = \"gpt-5.4\"\n")?;
+
+    let provider_root = root.join("profiles").join("codex");
+    let mut profile_directories = std::fs::read_dir(&provider_root)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'));
+    let managed_home = profile_directories
+        .next()
+        .ok_or_else(|| std::io::Error::other("missing published profile home"))?
+        .path()
+        .join("home");
+    assert!(profile_directories.next().is_none());
+    let managed_config = managed_home.join("config.toml");
+    let supported_managed_config = std::fs::read(&managed_config)?;
+    let sensitive_role = "account-owner@example.invalid";
+    let sensitive_role_path = "/private/synthetic/role-config.toml";
+    let mut role_config = supported_managed_config.clone();
+    role_config.extend_from_slice(
+        format!(
+            r#"
+[agents."{sensitive_role}"]
+description = "synthetic role"
+config_file = "{sensitive_role_path}"
+"#
+        )
+        .as_bytes(),
+    );
+    std::fs::write(&managed_config, role_config)?;
+    let before_role_config_rejection = std::fs::read_to_string(&log)?;
+    let rejected_role_config = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["run", "codex@work", "--", "--help"])
+        .output()?;
+    let role_config_stderr = String::from_utf8(rejected_role_config.stderr)?;
+    assert_eq!(rejected_role_config.status.code(), Some(1));
+    assert!(role_config_stderr.contains("supported compatibility policy"));
+    assert!(!role_config_stderr.contains("agents"));
+    assert!(!role_config_stderr.contains(sensitive_role));
+    assert!(!role_config_stderr.contains(sensitive_role_path));
+    assert!(!role_config_stderr.contains(&managed_home.display().to_string()));
+    assert_eq!(std::fs::read_to_string(&log)?, before_role_config_rejection);
+    std::fs::write(&managed_config, &supported_managed_config)?;
+
+    let sensitive_callback_url = "https://account-owner@example.invalid/private/callback";
+    let callback_overrides: [(&str, String, &[&str], &str); 2] = [
+        (
+            "mcp_oauth_callback_url",
+            format!("mcp_oauth_callback_url = \"{sensitive_callback_url}\"\n"),
+            &["run", "codex@work", "--", "--help"],
+            sensitive_callback_url,
+        ),
+        (
+            "mcp_oauth_callback_port",
+            "mcp_oauth_callback_port = 48765\n".to_owned(),
+            &["resume", "codex@work"],
+            "48765",
+        ),
+    ];
+    for (key, callback_override, arguments, sensitive_value) in callback_overrides {
+        let mut callback_config = callback_override.into_bytes();
+        callback_config.extend_from_slice(&supported_managed_config);
+        std::fs::write(&managed_config, callback_config)?;
+        let before_callback_rejection = std::fs::read_to_string(&log)?;
+        let rejected_callback = calcifer()
+            .current_dir(&workspace)
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .args(arguments)
+            .output()?;
+        let callback_stderr = String::from_utf8(rejected_callback.stderr)?;
+        assert_eq!(rejected_callback.status.code(), Some(1));
+        assert!(callback_stderr.contains("supported compatibility policy"));
+        assert!(!callback_stderr.contains(key));
+        assert!(!callback_stderr.contains(sensitive_value));
+        assert!(!callback_stderr.contains(&managed_home.display().to_string()));
+        assert_eq!(std::fs::read_to_string(&log)?, before_callback_rejection);
+        std::fs::write(&managed_config, &supported_managed_config)?;
+    }
+
+    let agents = managed_home.join("agents");
+    std::fs::create_dir(&agents)?;
+    let before_agents_node_rejection = std::fs::read_to_string(&log)?;
+    let rejected_agents_node = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume", "codex@work"])
+        .output()?;
+    let agents_node_stderr = String::from_utf8(rejected_agents_node.stderr)?;
+    assert_eq!(rejected_agents_node.status.code(), Some(1));
+    assert!(agents_node_stderr.contains("supported compatibility policy"));
+    assert!(!agents_node_stderr.contains("agents"));
+    assert!(!agents_node_stderr.contains(&managed_home.display().to_string()));
+    assert_eq!(std::fs::read_to_string(&log)?, before_agents_node_rejection);
+    std::fs::remove_dir(&agents)?;
 
     let resume = calcifer_with_ambient_codex_auth_overrides()
         .current_dir(&workspace)
@@ -517,6 +636,45 @@ esac
         assert_eq!(std::fs::read_to_string(&log)?, before_rejected);
     }
     std::fs::write(&project_config, "model = \"gpt-5.4\"\n")?;
+
+    let project_agents = workspace.join(".codex").join("agents");
+    let sensitive_project_role = "account-owner@example.invalid";
+    let sensitive_project_role_path = project_agents.join(format!("{sensitive_project_role}.toml"));
+    std::fs::remove_file(&project_config)?;
+    std::fs::create_dir(&project_agents)?;
+    std::fs::write(
+        &sensitive_project_role_path,
+        "model_provider = \"synthetic-external-provider\"\n",
+    )?;
+    let before_project_agents_rejection = std::fs::read_to_string(&log)?;
+    let project_agents_commands: &[&[&str]] = &[
+        &["run", "codex@work", "--", "--help"],
+        &["resume", "codex@work"],
+    ];
+    for (index, arguments) in project_agents_commands.iter().enumerate() {
+        if index == 1 {
+            std::fs::write(&project_config, "model = \"gpt-5.4\"\n")?;
+        }
+        let rejected = calcifer()
+            .current_dir(&workspace)
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .args(*arguments)
+            .output()?;
+        let stderr = String::from_utf8(rejected.stderr)?;
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(stderr.contains("repository-local Codex configuration"));
+        assert!(!stderr.contains("agents"));
+        assert!(!stderr.contains(sensitive_project_role));
+        assert!(!stderr.contains(&sensitive_project_role_path.display().to_string()));
+        assert!(!stderr.contains(&workspace.display().to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&log)?,
+            before_project_agents_rejection
+        );
+    }
+    std::fs::remove_dir_all(&project_agents)?;
 
     for argument in ["--oss", "--cd=/synthetic/project", "--enable=synthetic"] {
         let rejected = calcifer()
