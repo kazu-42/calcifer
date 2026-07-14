@@ -1,6 +1,7 @@
 //! Read-only Codex account usage through the official app-server protocol.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
@@ -14,8 +15,76 @@ use serde_json::{Value, json};
 
 pub(crate) const FILE_CREDENTIALS_OVERRIDE: &str = r#"cli_auth_credentials_store="file""#;
 
+const MANAGED_ENVIRONMENT_DENYLIST: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_PROJECT",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+    "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+    "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+    "CODEX_AUTHAPI_BASE_URL",
+    "CODEX_APP_SERVER_LOGIN_ISSUER",
+    "CODEX_APP_SERVER_DEV_OPEN_APP_URL",
+    "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+    "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG",
+    "CODEX_APP_SERVER_TEST_USER_CONFIG_FILE",
+    "CODEX_SQLITE_HOME",
+    "CODEX_REMOTE_AUTH_TOKEN",
+    "CODEX_CONNECTORS_TOKEN",
+    "CODEX_CODE_MODE_HOST_PATH",
+    "CODEX_STARTING_DIFF",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+    "CODEX_TUI_RECORD_SESSION",
+    "CODEX_TUI_SESSION_LOG_PATH",
+    "CODEX_ROLLOUT_TRACE_ROOT",
+    "CODEX_ANALYTICS_EVENTS_CAPTURE_FILE",
+];
+
 const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Builds a Codex command bound to one managed credential and state home.
+///
+/// Provider-owned authentication and development overrides are removed from
+/// the inherited environment so ambient shell or repository tooling cannot
+/// replace the profile selected by Calcifer.
+pub(crate) fn managed_command(executable: &Path, codex_home: &Path) -> Command {
+    let mut command = Command::new(executable);
+    sanitize_managed_environment(&mut command);
+    command
+        .args(["-c", FILE_CREDENTIALS_OVERRIDE])
+        .env("CODEX_HOME", codex_home);
+
+    command
+}
+
+/// Removes provider-owned secrets and routing controls before a process in the
+/// managed Codex launch chain starts.
+pub(crate) fn sanitize_managed_environment(command: &mut Command) {
+    for name in MANAGED_ENVIRONMENT_DENYLIST {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if is_managed_environment_override(&name) {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn is_managed_environment_override(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let normalized = name.to_ascii_uppercase();
+    MANAGED_ENVIRONMENT_DENYLIST.contains(&normalized.as_str())
+        || normalized.starts_with("CODEX_TEST_")
+        || normalized.starts_with("CODEX_CLOUD_TASKS_")
+        || normalized.starts_with("CODEX_EXEC_SERVER_")
+        || normalized.starts_with("CODEX_OSS_")
+        || (normalized.starts_with("CODEX_") && normalized.ends_with("_OVERRIDE"))
+}
 
 /// A normalized Codex account usage snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -169,11 +238,8 @@ struct AppServerProcess {
 
 impl AppServerProcess {
     fn spawn(codex_executable: &Path, codex_home: &Path) -> Result<Self, CodexUsageError> {
-        let mut child = Command::new(codex_executable)
-            .args(["-c", FILE_CREDENTIALS_OVERRIDE, "app-server", "--stdio"])
-            .env("CODEX_HOME", codex_home)
-            .env_remove("CODEX_API_KEY")
-            .env_remove("OPENAI_API_KEY")
+        let mut child = managed_command(codex_executable, codex_home)
+            .args(["app-server", "--stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -615,11 +681,55 @@ fn parse_rate_limits_result(result: Value) -> Result<CodexUsage, CodexUsageError
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::io::{BufReader, Cursor};
 
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn managed_environment_filter_rejects_auth_config_and_future_overrides() {
+        for name in [
+            "OPENAI_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "CoDeX_AcCeSs_ToKeN",
+            "CODEX_AUTHAPI_BASE_URL",
+            "CODEX_SQLITE_HOME",
+            "CODEX_CONNECTORS_TOKEN",
+            "CODEX_CLOUD_TASKS_BASE_URL",
+            "CODEX_EXEC_SERVER_URL",
+            "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN",
+            "CODEX_OSS_BASE_URL",
+            "CODEX_CODE_MODE_HOST_PATH",
+            "CODEX_TUI_RECORD_SESSION",
+            "CODEX_TUI_SESSION_LOG_PATH",
+            "CODEX_ROLLOUT_TRACE_ROOT",
+            "CODEX_ANALYTICS_EVENTS_CAPTURE_FILE",
+            "CODEX_TEST_FUTURE_AUTH_HOOK",
+            "CoDeX_TeSt_Future_Auth_Hook",
+            "CODEX_FUTURE_ENDPOINT_OVERRIDE",
+            "CoDeX_FuTuRe_EnDpOiNt_OvErRiDe",
+        ] {
+            assert!(
+                is_managed_environment_override(OsStr::new(name)),
+                "{name} must not reach a managed Codex process"
+            );
+        }
+
+        for name in [
+            "CODEX_HOME",
+            "CODEX_SANDBOX",
+            "CODEX_THREAD_ID",
+            "HTTPS_PROXY",
+            "TERM",
+        ] {
+            assert!(
+                !is_managed_environment_override(OsStr::new(name)),
+                "{name} is outside the managed authentication denylist"
+            );
+        }
+    }
 
     #[test]
     fn parses_full_usage_without_exposing_opaque_reset_credit_fields()

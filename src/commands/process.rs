@@ -27,7 +27,7 @@ use crate::cli::InternalProcessMode;
 use crate::error::AppError;
 use crate::executable::resolve_codex;
 use crate::profiles::{Provider, Registry};
-use crate::providers::codex::FILE_CREDENTIALS_OVERRIDE;
+use crate::providers::codex::{managed_command, sanitize_managed_environment};
 
 #[cfg(unix)]
 const GUARDIAN_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -62,7 +62,7 @@ fn spawn_supervisor(
     #[cfg(unix)]
     let _termination_guard = install_process_signal_guard()?;
     let executable = std::env::current_exe()?;
-    let mut command = Command::new(executable);
+    let mut command = internal_calcifer_command(&executable);
     command
         .arg("__internal-codex")
         .arg(format!("codex@{alias}"))
@@ -139,12 +139,8 @@ pub(crate) fn supervise_codex(
         let profile = registry.find(Provider::Codex, alias)?;
         let _lease = registry.lock_profile(&profile)?;
         let home = registry.profile_home(&profile)?;
-        Command::new(executable)
-            .args(["-c", FILE_CREDENTIALS_OVERRIDE])
+        managed_command(&executable, &home)
             .args(_arguments)
-            .env("CODEX_HOME", home)
-            .env_remove("CODEX_API_KEY")
-            .env_remove("OPENAI_API_KEY")
             .status()
             .map_err(AppError::from)
     }
@@ -197,12 +193,8 @@ pub(crate) fn guard_codex(
             .into());
         }
 
-        let mut provider = match Command::new(executable)
-            .args(["-c", FILE_CREDENTIALS_OVERRIDE])
+        let mut provider = match managed_command(&executable, &home)
             .args(arguments)
-            .env("CODEX_HOME", home)
-            .env_remove("CODEX_API_KEY")
-            .env_remove("OPENAI_API_KEY")
             .env_remove("CALCIFER_TEST_MARKER_ID")
             .spawn()
         {
@@ -269,7 +261,7 @@ fn spawn_provider_guardian(
     provider_args: &[OsString],
 ) -> Result<Child, AppError> {
     let executable = std::env::current_exe()?;
-    let mut command = Command::new(executable);
+    let mut command = internal_calcifer_command(&executable);
     command
         .arg("__internal-codex-provider")
         .arg(format!("codex@{alias}"))
@@ -286,6 +278,15 @@ fn spawn_provider_guardian(
         command.arg("--").args(provider_args);
     }
     command.spawn().map_err(AppError::from)
+}
+
+fn internal_calcifer_command(executable: &std::path::Path) -> Command {
+    let mut command = Command::new(executable);
+    sanitize_managed_environment(&mut command);
+    // Calcifer itself does not use CODEX_HOME. The selected managed home is
+    // reintroduced only on the final, validated official Codex command.
+    command.env_remove("CODEX_HOME");
+    command
 }
 
 #[cfg(unix)]
@@ -541,6 +542,24 @@ fn validate_provider_arguments(arguments: &[OsString]) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_calcifer_helpers_drop_explicit_provider_secrets() {
+        let command = internal_calcifer_command(std::path::Path::new("/synthetic/calcifer"));
+
+        for denied in [
+            "OPENAI_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_CONNECTORS_TOKEN",
+        ] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == denied && value.is_none()),
+                "{denied} must be removed before the helper process starts"
+            );
+        }
+    }
 
     #[test]
     fn rejects_arguments_that_can_bypass_managed_account_routing() {

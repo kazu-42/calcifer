@@ -161,6 +161,10 @@ Core invariants for future implementation are:
 8. Credential-bearing environments are passed only to the selected adapter's validated executable, never to an arbitrary user-supplied command.
 9. A credential profile and a logical conversation have independent lifecycles; a handoff may move the conversation only between stopped processes in one explicit trust domain.
 10. Resume restores persisted history but never replays an interrupted prompt or tool action.
+11. Ambient Codex credentials, authentication/provider endpoints, alternate
+    managed config/state paths, remote execution and connector credentials,
+    test hooks, and transcript/trace paths cannot override a selected Calcifer
+    profile.
 
 File-based Codex credentials remain readable by the current OS user and the official Codex CLI; Calcifer is not an encrypted vault. Calcifer also does not sandbox the wrapped CLI, its hooks, or commands executed from the current repository.
 

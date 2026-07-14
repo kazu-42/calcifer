@@ -39,7 +39,14 @@ Use the provider's official logout, revoke, or re-authentication procedure immed
 
 ## Security guarantees and non-goals
 
-The pre-alpha scaffold does not read or mutate credentials. Future functional releases will follow the invariants in [docs/architecture.md](docs/architecture.md) and [docs/security-model.md](docs/security-model.md).
+The current Unix pre-alpha asks the official Codex CLI to create and refresh
+file-backed credentials inside Calcifer-managed profile homes. Calcifer
+validates the presence, type, permissions, and Calcifer-owned marker/path
+boundary of those files but does not parse or log their token values. Stable
+provider-account identity and explicit owner-UID verification remain release
+gates. Implemented and planned
+guarantees are documented in [docs/architecture.md](docs/architecture.md) and
+[docs/security-model.md](docs/security-model.md).
 
 Calcifer will not:
 
