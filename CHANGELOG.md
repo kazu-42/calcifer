@@ -16,6 +16,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Profile-pinned `run` and same-profile `resume` commands.
 - Read-only per-profile Codex usage windows, reset times, workspace credits, spend controls, and rate-limit reset-credit status through the official app-server protocol.
 - Stable JSON status output with redacted provider errors and display-only remaining percentages.
+- Fail-closed Codex `0.144.4` status compatibility gate with canonical managed-home verification and explicit human/JSON compatibility metadata.
 - Checked cold resume after wrapper restart by exact thread ID or official `--last` behavior.
 - ADR for profile-independent conversation lineage and required cross-profile continuation after automatic failover.
 - Native five-target release packaging with deterministic archive metadata,
@@ -65,6 +66,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Every repository `.codex/agents` filesystem node now fails closed before
   provider spawn, including when the sibling `config.toml` is absent, preventing
   auto-discovered role files from importing a complete provider-routing layer.
+- Untested or malformed App Server initialize contracts stop before the usage
+  request; unsupported, unverified, authentication, timeout, and protocol
+  failures remain `unknown` and cannot authorize failover.
 
 ### Known limitations
 

@@ -114,7 +114,7 @@ The selector must distinguish:
 available | exhausted | unknown
 ```
 
-The observation records its provider, profile ID, source, observation time, optional reset time, and adapter version. Every error that cannot be proven to mean exhaustion becomes `unknown` and stops selection.
+The observation records its provider, profile ID, source, observation time, optional reset time, detected provider version, adapter version, tested-version set, and compatibility state. On-demand Codex status accepts only the tested `0.144.4` initialize/home and typed usage contract. Every incompatible or unverified contract and every error that cannot be proven to mean exhaustion becomes `unknown` and stops selection.
 
 The selector keeps an attempted-profile set, traverses a pool no more than once, and observes a cooldown. Cached state may prefilter candidates, but identity and fresh authoritative usage are revalidated after acquiring the profile lease. It never changes the credentials of a running process and never replays a started command.
 

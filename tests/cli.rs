@@ -365,10 +365,34 @@ case "${1:-}" in
       exec sleep 30
     fi
     IFS= read -r initialize
-    printf '%s\n' '{"id":0,"result":{"userAgent":"fake","platformFamily":"unix","platformOs":"test","codexHome":"redacted"}}'
-    IFS= read -r initialized
+    printf '%s\n' 'app-server-initialize' >> "$FAKE_CODEX_LOG"
+    version=${FAKE_CODEX_VERSION:-0.144.4}
+    reported_home=${FAKE_CODEX_REPORTED_HOME:-$CODEX_HOME}
+    if [ "${FAKE_CODEX_NULL_INITIALIZE:-}" = "1" ]; then
+      printf '%s\n' '{"id":0,"result":null}'
+    else
+      printf '{"id":0,"result":{"userAgent":"calcifer/%s (test)","platformFamily":"unix","platformOs":"test","codexHome":"%s"}}\n' "$version" "$reported_home"
+    fi
+    if ! IFS= read -r initialized; then
+      printf '%s\n' 'app-server-gate-closed' >> "$FAKE_CODEX_LOG"
+      exit 0
+    fi
     IFS= read -r request
-    printf '%s\n' '{"id":1,"result":{"rateLimits":{"limitId":"codex","limitName":"Codex","planType":"pro","rateLimitReachedType":null,"primary":{"usedPercent":41,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":70,"windowDurationMins":10080,"resetsAt":1800500000},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"individualLimit":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":[{"id":"must-not-leak","resetType":"codexRateLimits","status":"available","grantedAt":1700000000,"expiresAt":1900000000,"title":"must-not-leak","description":"must-not-leak"}]}}}'
+    printf '%s\n' 'app-server-usage-request' >> "$FAKE_CODEX_LOG"
+    case "${FAKE_CODEX_USAGE_SHAPE:-complete}" in
+      missing-rate-limits)
+        printf '%s\n' '{"id":1,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
+        ;;
+      null-rate-limits)
+        printf '%s\n' '{"id":1,"result":{"rateLimits":null,"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
+        ;;
+      complete)
+        printf '%s\n' '{"id":1,"result":{"rateLimits":{"limitId":"codex","limitName":"Codex","planType":"pro","rateLimitReachedType":null,"primary":{"usedPercent":41,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":70,"windowDurationMins":10080,"resetsAt":1800500000},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"individualLimit":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":[{"id":"must-not-leak","resetType":"codexRateLimits","status":"available","grantedAt":1700000000,"expiresAt":1900000000,"title":"must-not-leak","description":"must-not-leak"}]}}}'
+        ;;
+      *)
+        exit 95
+        ;;
+    esac
     while IFS= read -r trailing; do :; done
     printf '%s\n' 'app-server-eof' >> "$FAKE_CODEX_LOG"
     ;;
@@ -445,6 +469,23 @@ esac
         String::from_utf8(status.stderr)?
     );
     assert_eq!(document["profiles"][0]["availability"], "available");
+    assert_eq!(document["profiles"][0]["codex_version"], "0.144.4");
+    assert_eq!(
+        document["profiles"][0]["adapter_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        document["profiles"][0]["compatibility"]["status"],
+        "compatible"
+    );
+    assert_eq!(
+        document["profiles"][0]["compatibility"]["protocol"],
+        "account/rateLimits/read"
+    );
+    assert_eq!(
+        document["profiles"][0]["compatibility"]["supported_codex_versions"],
+        serde_json::json!(["0.144.4"])
+    );
     assert_eq!(
         document["profiles"][0]["usage"]["rate_limits"]["primary"]["remaining_percent"],
         59
@@ -466,6 +507,159 @@ esac
         "available"
     );
     assert!(!status_text.contains("must-not-leak"));
+
+    let usage_reads_before_rejections = std::fs::read_to_string(&log)?
+        .matches("app-server-usage-request")
+        .count();
+    let unsupported = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
+        .env("FAKE_CODEX_VERSION", "0.145.0")
+        .args(["--json", "status", "codex@work"])
+        .output()?;
+    let unsupported_document: serde_json::Value = serde_json::from_slice(&unsupported.stdout)?;
+    assert_eq!(unsupported.status.code(), Some(1));
+    assert_eq!(
+        unsupported_document["profiles"][0]["availability"],
+        "unknown"
+    );
+    assert_eq!(
+        unsupported_document["profiles"][0]["codex_version"],
+        "0.145.0"
+    );
+    assert_eq!(
+        unsupported_document["profiles"][0]["compatibility"]["status"],
+        "incompatible"
+    );
+    assert_eq!(
+        unsupported_document["profiles"][0]["error"]["code"],
+        "unsupported"
+    );
+    assert!(unsupported_document["profiles"][0]["usage"].is_null());
+
+    let malformed_initialize = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
+        .env("FAKE_CODEX_NULL_INITIALIZE", "1")
+        .args(["--json", "status", "codex@work"])
+        .output()?;
+    let malformed_initialize_document: serde_json::Value =
+        serde_json::from_slice(&malformed_initialize.stdout)?;
+    assert_eq!(malformed_initialize.status.code(), Some(1));
+    assert_eq!(
+        malformed_initialize_document["profiles"][0]["availability"],
+        "unknown"
+    );
+    assert!(malformed_initialize_document["profiles"][0]["codex_version"].is_null());
+    assert_eq!(
+        malformed_initialize_document["profiles"][0]["compatibility"]["status"],
+        "incompatible"
+    );
+    assert_eq!(
+        malformed_initialize_document["profiles"][0]["error"]["code"],
+        "protocol_error"
+    );
+    assert!(malformed_initialize_document["profiles"][0]["usage"].is_null());
+
+    let unsupported_human = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
+        .env("FAKE_CODEX_VERSION", "0.145.0")
+        .args(["status", "codex@work"])
+        .output()?;
+    let unsupported_human_text = String::from_utf8(unsupported_human.stdout)?;
+    assert_eq!(unsupported_human.status.code(), Some(1));
+    assert!(unsupported_human_text.contains("[unknown]"));
+    assert!(
+        unsupported_human_text
+            .contains("compatibility incompatible · Codex 0.145.0 · tested 0.144.4")
+    );
+
+    let wrong_home = sandbox.join("wrong-codex-home");
+    std::fs::create_dir(&wrong_home)?;
+    std::fs::set_permissions(&wrong_home, std::fs::Permissions::from_mode(0o700))?;
+    let mismatched_home = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
+        .env("FAKE_CODEX_REPORTED_HOME", &wrong_home)
+        .args(["--json", "status", "codex@work"])
+        .output()?;
+    let mismatched_home_text = String::from_utf8(mismatched_home.stdout)?;
+    let mismatched_home_document: serde_json::Value = serde_json::from_str(&mismatched_home_text)?;
+    assert_eq!(mismatched_home.status.code(), Some(1));
+    assert_eq!(
+        mismatched_home_document["profiles"][0]["codex_version"],
+        "0.144.4"
+    );
+    assert_eq!(
+        mismatched_home_document["profiles"][0]["compatibility"]["status"],
+        "incompatible"
+    );
+    assert_eq!(
+        mismatched_home_document["profiles"][0]["error"]["code"],
+        "unsupported"
+    );
+    assert!(!mismatched_home_text.contains(wrong_home.to_string_lossy().as_ref()));
+    let rejected_log = std::fs::read_to_string(&log)?;
+    assert_eq!(
+        rejected_log.matches("app-server-usage-request").count(),
+        usage_reads_before_rejections,
+        "incompatible App Servers must be rejected before usage is requested"
+    );
+    assert_eq!(rejected_log.matches("app-server-gate-closed").count(), 4);
+
+    for shape in ["missing-rate-limits", "null-rate-limits"] {
+        let malformed_usage = calcifer_with_ambient_codex_auth_overrides()
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
+            .env("FAKE_CODEX_USAGE_SHAPE", shape)
+            .args(["--json", "status", "codex@work"])
+            .output()?;
+        let malformed_usage_text = String::from_utf8(malformed_usage.stdout)?;
+        let malformed_usage_document: serde_json::Value =
+            serde_json::from_str(&malformed_usage_text)?;
+        assert_eq!(
+            malformed_usage.status.code(),
+            Some(1),
+            "{shape} must fail closed: {malformed_usage_text}"
+        );
+        assert_eq!(
+            malformed_usage_document["profiles"][0]["availability"],
+            "unknown"
+        );
+        assert_eq!(
+            malformed_usage_document["profiles"][0]["compatibility"]["status"],
+            "incompatible"
+        );
+        assert_eq!(
+            malformed_usage_document["profiles"][0]["error"]["code"],
+            "protocol_error"
+        );
+        assert!(malformed_usage_document["profiles"][0]["usage"].is_null());
+        assert!(!malformed_usage_text.contains("must-not-leak-malformed"));
+    }
+
+    let human_status = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
+        .args(["status", "codex@work"])
+        .output()?;
+    let human_status_text = String::from_utf8(human_status.stdout)?;
+    assert!(human_status.status.success());
+    assert!(human_status_text.contains("Codex 0.144.4"));
+    assert!(human_status_text.contains("tested 0.144.4"));
     std::fs::write(&project_config, "model = \"gpt-5.4\"\n")?;
 
     let provider_root = root.join("profiles").join("codex");

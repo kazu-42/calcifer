@@ -38,7 +38,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 ## Phase 3: usage observations
 
 - [x] Use official structured `account/rateLimits/read`; do not scrape TUI text
-- [ ] Explicit supported-version/schema gate (unknown methods and malformed payloads already fail closed)
+- [x] Explicit supported-version/initialize-home/usage-schema gate for on-demand status
 - [x] `available | exhausted | unknown` classification without treating rounded 100% as exhaustion
 - [x] Timestamped source, window reset metadata, spend control, and reset-credit count/expiry
 - [x] Provider failure, auth failure, timeout, missing-field, and unknown-format handling
