@@ -1,0 +1,25 @@
+/target/
+
+# Local editor and OS state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local environment and credentials. Real credentials must never be fixtures.
+.env
+.env.*
+!.env.example
+auth.json
+.credentials.json
+*.token
+*.key
+*.pem
+
+# Calcifer local state
+.calcifer/
+/calcifer-data/
+
+# Never use repository-local provider homes for real sessions.
+/.codex/
+/.claude/

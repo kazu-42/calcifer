@@ -1,0 +1,29 @@
+[package]
+name = "calcifer"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Pre-alpha local-first wrapper for isolated coding-agent CLI profiles"
+license = "MIT"
+repository = "https://github.com/kazu-42/calcifer"
+homepage = "https://github.com/kazu-42/calcifer"
+readme = "README.md"
+keywords = ["cli", "codex", "claude", "profiles", "automation"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+which = "8.0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+expect_used = "deny"
+todo = "deny"
+unwrap_used = "deny"

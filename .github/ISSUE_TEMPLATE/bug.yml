@@ -1,0 +1,72 @@
+name: Bug report
+description: Report reproducible behavior that differs from Calcifer's contract
+title: "[Bug]: "
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Never paste tokens, credential files, Keychain output, full environments, account identifiers, private source, or raw logs.
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, personal data, account identifiers, and private source from this report.
+          required: true
+        - label: This is not a security vulnerability. I will use private vulnerability reporting for security issues.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Calcifer version or commit
+      placeholder: calcifer 0.1.0-alpha.1 or commit SHA
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [macOS, Linux, Windows, Other]
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider CLI
+      options: [Codex, Claude Code, None or doctor-only, Other]
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic profile names and fake values only.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Prefer `calcifer --json doctor`. Review the output before submitting.
+      render: json
