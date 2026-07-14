@@ -701,6 +701,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_command_forces_profile_local_auth_stores() {
+        let command = managed_command(
+            Path::new("/synthetic/codex"),
+            Path::new("/synthetic/profile"),
+        );
+        let arguments = command
+            .get_args()
+            .map(OsStr::to_str)
+            .collect::<Option<Vec<_>>>();
+
+        assert_eq!(
+            arguments,
+            Some(vec![
+                "-c",
+                r#"cli_auth_credentials_store="file""#,
+                "-c",
+                r#"mcp_oauth_credentials_store="file""#,
+            ])
+        );
+    }
+
+    #[test]
     fn managed_environment_filter_rejects_auth_config_and_future_overrides() {
         for name in [
             "OPENAI_API_KEY",

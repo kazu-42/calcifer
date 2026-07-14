@@ -81,7 +81,23 @@ managed root/
         provider.lock     <- provider-guardian side of the lifetime lease
 ```
 
-The display name is not used as a filesystem path. A generated opaque ID is mapped from a validated, normalized display name. Calcifer writes and revalidates an exact managed `config.toml`, forces both `cli_auth_credentials_store="file"` and `mcp_oauth_credentials_store="file"` on every provider invocation, and rejects child arguments that can change account/provider routing. Codex then updates its own profile-local credentials. Existing pre-alpha profiles with the previous exact config remain accepted during upgrade because the invocation overrides still enforce both stores. No managed-to-runtime credential copy-back step is needed.
+The display name is not used as a filesystem path. A generated opaque ID is
+mapped from a validated, normalized display name. Calcifer writes a minimal
+managed `config.toml` and revalidates it with a Codex-version-scoped semantic
+policy. Supported project trust and reviewed user settings may change, while
+account/provider routing, state locations, dynamic extensions, and project-root
+discovery remain Calcifer-owned. Top-level role definitions and any
+auto-discovered `CODEX_HOME/agents` node are rejected because role files are
+indirect complete configuration layers; managed role configuration requires a
+future provenance-aware mediation design. MCP OAuth callback URL and port are
+also rejected because they alter the reviewed connector authorization route.
+Existing pre-alpha profiles with
+only `cli_auth_credentials_store="file"` remain accepted during upgrade, while
+new profiles persist both file-store settings. Calcifer forces both credential
+stores to `file` on every provider invocation and rejects child arguments that
+can change account/provider routing. Codex then updates its own profile-local
+credentials. No managed-to-runtime credential copy-back step is needed. See
+the [managed config specification](../specs/managed-codex-config.md).
 
 Different profiles may run concurrently. The same profile has at most one official CLI child or usage probe because either operation may refresh profile-local credentials.
 
@@ -186,9 +202,10 @@ The current process launcher:
 - reject child working-directory and dynamic-feature overrides, and reject
   non-UTF-8 provider arguments that cannot be mediated safely;
 - after acquiring the profile lease, canonicalize the interactive working
-  directory and inspect every real, bounded `.codex/config.toml` layer from the
-  nearest `.git` root to that directory against a Codex-version-scoped safe-key
-  policy;
+  directory and inspect every real, bounded `.codex` layer from the nearest
+  `.git` root to that directory against a Codex-version-scoped safe-key policy,
+  rejecting every `.codex/agents` node before reading an optional
+  `config.toml`;
 - repeat that inspection in the provider guardian after spawn authorization,
   then set the final Codex process cwd explicitly to the inspected canonical
   directory;

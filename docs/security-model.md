@@ -58,17 +58,29 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   and prevents implicit transcript recording.
 - The same policy is applied before Unix run/resume coordinator and guardian
   helpers start; ambient `CODEX_HOME` returns only on the final provider command.
-- Calcifer revalidates the private `auth.json` and exact managed `config.toml`
-  after acquiring the profile lease, forces profile-local file storage for both
-  CLI and MCP OAuth credentials on every invocation, and rejects
-  provider/account-routing overrides. The command-line enforcement also keeps
-  previous pre-alpha managed configs safe during upgrade.
-- Interactive run/resume canonicalizes its cwd and validates all repository
-  `.codex/config.toml` layers from the nearest real `.git` root to that cwd.
-  Unknown keys and settings that can own authentication, provider routing,
-  dynamic feature policy, root discovery, or managed state fail before spawn.
-  Reads are bounded to 1 MiB, symlinks and special nodes fail closed, and public
-  errors omit paths, keys, values, and parser diagnostics.
+- Calcifer revalidates the private `auth.json` and managed `config.toml` after
+  acquiring the profile lease. The bounded, version-scoped semantic policy
+  requires file-backed Codex account credentials, accepts absent or file-backed
+  MCP OAuth storage and official project-trust state, and rejects unknown,
+  OAuth callback endpoint, account/provider/state-routing, root-discovery,
+  dynamic-extension, and role keys. Any auto-discovered `CODEX_HOME/agents`
+  node is also rejected before provider spawn because it can introduce indirect
+  full configuration layers.
+  Both stores are forced to `file` on every invocation, so previous pre-alpha
+  managed configs remain safe and usable during upgrade.
+- Interactive run/resume canonicalizes its cwd and validates every repository
+  `.codex` layer from the nearest real `.git` root to that cwd. Any
+  `.codex/agents` filesystem node fails closed independently of whether
+  `config.toml` exists. Unknown keys and settings that can own authentication,
+  provider routing, dynamic feature policy, root discovery, or managed state
+  fail before spawn. Reads are bounded to 1 MiB, symlinks and special nodes fail
+  closed, and public errors omit paths, keys, values, and parser diagnostics.
+- In a linked worktree, Codex 0.144.4 can additionally merge only the `hooks`
+  field from the primary checkout's `.codex/config.toml`. Calcifer does not
+  resolve or inspect that external hook source. This does not add an unvalidated
+  account/provider/state layer, and repository hooks are already outside
+  Calcifer's sandbox guarantee, but compatibility review must track this
+  upstream special case.
 - The coordinator performs the check after acquiring its profile lease and
   before publishing the lifecycle socket. The guardian independently repeats
   it after spawn authorization and starts Codex with the inspected canonical

@@ -12,15 +12,59 @@ Verified on 2026-07-15 against:
 
 The official Codex App Server command is still marked experimental as a whole. Calcifer negotiates its stable protocol subset with `experimentalApi: false` and fails closed when the method or response shape is unavailable.
 
+## Managed Codex profile configuration
+
+Codex 0.144.4 stores user configuration in the selected
+`CODEX_HOME/config.toml`. A new Calcifer profile starts with file-backed
+credential storage only. When the user accepts Codex's first project-trust
+prompt, the official TUI legitimately adds a
+`projects."<absolute-path>".trust_level` entry to that same file.
+
+Calcifer therefore validates profile configuration semantically rather than
+requiring the original bytes. The known top-level key set is pinned to
+0.144.4's `core/config.schema.json`; unknown future keys fail closed.
+File-backed Codex account credentials remain mandatory, and MCP OAuth storage
+is either absent or `file` in the profile; runtime overrides force both stores
+to `file`. Project entries may contain only a trusted or untrusted decision for
+an absolute path. Keys that replace account/provider routing, remote
+configuration, managed state locations, project-root discovery, dynamic
+features, marketplaces, MCP servers, plugins, or role definitions are rejected.
+MCP OAuth callback URL and port settings are rejected as authentication endpoint
+overrides even though they are known schema keys.
+Calcifer also rejects any `CODEX_HOME/agents` filesystem node because Codex
+auto-discovers complete role-specific configuration layers there. Managed role
+configuration is unsupported until Calcifer can discover and mediate every
+referenced layer. Other reviewed known user settings remain the official CLI's
+value-validation responsibility. The read is bounded to 1 MiB and errors do not
+include parser details, role names, or paths. Calcifer never rewrites a valid
+provider-owned configuration.
+
+Relevant sources and local policy:
+
+- [Codex 0.144.4 configuration schema](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/core/config.schema.json);
+- [project trust config update](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/tui/src/config_update.rs#L45-L82);
+- [trust prompt persistence](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/tui/src/onboarding/onboarding_screen.rs#L560-L600);
+- [Calcifer managed profile config specification](../specs/managed-codex-config.md).
+
 ## Codex repository configuration
 
 Interactive Codex 0.144.4 loads repository configuration from the nearest
 project root through the current working directory. Calcifer mirrors the
 default `.git` root boundary, accepts directory and worktree-file markers, and
-checks each `.codex/config.toml` before `run` or `resume`. The current policy is
+checks each `.codex` layer before `run` or `resume`. Every `.codex/agents`
+filesystem node is rejected because the discovered role files are complete
+indirect configuration layers; this applies even when no sibling `config.toml`
+exists. The current config policy is
 an explicit safe-key allowlist: unknown future top-level keys and settings that
 can alter managed authentication, provider routing, dynamic feature policy,
 root discovery, or state locations fail closed.
+
+Codex 0.144.4 has one linked-worktree special case: it can read the primary
+checkout's `.codex/config.toml` and merge only its `hooks` field. Calcifer does
+not resolve or inspect that external hook source. This does not import a second
+account/provider/state layer, and repository hooks remain outside Calcifer's
+sandbox guarantee; a future upstream expansion beyond `hooks` must fail the
+compatibility review before support is claimed.
 
 The policy is intentionally version-scoped. Calcifer does not claim equivalent
 coverage for an unaudited Codex release merely because the TOML parses. A
