@@ -304,6 +304,10 @@ pub(crate) fn guard_codex(
                 return Err(error);
             }
         };
+        if let Err(error) = capture_context.authorize_provider_spawn(&capture) {
+            send_guardian_abort(&mut reader);
+            return Err(error);
+        }
 
         let mut provider = match managed_command(&executable, &home)
             .args(arguments)
@@ -315,6 +319,7 @@ pub(crate) fn guard_codex(
             Ok(provider) => provider,
             Err(error) => {
                 send_guardian_abort(&mut reader);
+                capture_context.provider_spawn_failed(&capture)?;
                 return Err(error.into());
             }
         };
@@ -323,14 +328,6 @@ pub(crate) fn guard_codex(
         // this process still owns the provider lease and is now the sole guard.
         let _ = writeln!(reader.get_mut(), "START {}", provider.id());
         let _ = reader.get_mut().flush();
-        if let Some(launch_id) = capture.launch_id()
-            && let Err(error) = conversations.mark_provider_started(launch_id)
-        {
-            eprintln!(
-                "Calcifer: provider started, but its conversation checkpoint could not be confirmed ({}). The provider will not be launched twice.",
-                error.code()
-            );
-        }
         if termination_requested.load(Ordering::SeqCst) {
             // The request may have arrived after the pre-spawn check but before
             // this child existed, so it could not have received the original

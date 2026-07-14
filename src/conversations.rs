@@ -684,6 +684,16 @@ fn validate_document(document: &ConversationDocument) -> Result<(), Conversation
                 "conversation {conversation_index} violates schema v1 lineage"
             )));
         }
+        if !matches!(
+            conversation.last_safe_lifecycle,
+            ConversationLifecycle::Clean
+                | ConversationLifecycle::Interrupted
+                | ConversationLifecycle::UnknownCrash
+        ) {
+            return Err(ConversationError::RegistryInvalid(format!(
+                "conversation {conversation_index} has an unusable lifecycle"
+            )));
+        }
         let generation = &conversation.generations[0];
         if generation.generation != 0 {
             return Err(ConversationError::RegistryInvalid(
@@ -1003,6 +1013,7 @@ pub(crate) enum ConversationError {
     Archived,
     RegistryInvalid(String),
     CommitUncertain,
+    CodexVersionUnsupported,
     SessionSchemaUnsupported,
     ThreadProtocolInvalid,
     Io(io::Error),
@@ -1019,6 +1030,7 @@ impl ConversationError {
             Self::Archived => "conversation_archived",
             Self::RegistryInvalid(_) => "conversation_registry_invalid",
             Self::CommitUncertain => "conversation_commit_uncertain",
+            Self::CodexVersionUnsupported => "codex_session_schema_unsupported",
             Self::SessionSchemaUnsupported => "codex_session_schema_unsupported",
             Self::ThreadProtocolInvalid => "codex_thread_protocol_invalid",
             Self::Io(_) => "conversation_registry_invalid",
@@ -1052,8 +1064,11 @@ impl ConversationError {
             Self::CommitUncertain => {
                 "The conversation update became visible, but durability could not be confirmed. Inspect the registry before retrying."
             }
+            Self::CodexVersionUnsupported => {
+                "The installed Codex version is not supported for automatic resume."
+            }
             Self::SessionSchemaUnsupported => {
-                "The installed Codex session schema is not supported for automatic resume."
+                "The Codex session metadata is not supported or is unsafe for automatic resume."
             }
             Self::ThreadProtocolInvalid => "Codex returned an invalid thread metadata response.",
         }
@@ -1317,6 +1332,24 @@ mod tests {
             );
             fs::remove_dir_all(root)?;
         }
+
+        let root = test_root("invalid-lifecycle")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let mut document = registry.load()?;
+        document.conversations[0].last_safe_lifecycle = ConversationLifecycle::Missing;
+        fs::write(
+            root.join(REGISTRY_FILE),
+            serde_json::to_vec_pretty(&document)?,
+        )?;
+        assert_eq!(
+            registry.load().err().map(|error| error.code()),
+            Some("conversation_registry_invalid"),
+            "a ready head with an unusable lifecycle must never resolve"
+        );
+        fs::remove_dir_all(root)?;
 
         let root = test_root("linked")?;
         let path = root.join(REGISTRY_FILE);

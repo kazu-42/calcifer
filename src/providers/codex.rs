@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -64,6 +64,13 @@ pub(crate) struct CodexThreadMetadata {
     pub(crate) recency_at: Option<i64>,
     pub(crate) archived: bool,
     rollout_path: PathBuf,
+    rollout_identity: RolloutIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RolloutIdentity {
+    device: u64,
+    inode: u64,
 }
 
 /// A complete bounded inventory from active and archived thread stores.
@@ -692,7 +699,7 @@ fn validate_thread_projection(
         return Err(CodexThreadError::CwdMismatch);
     }
     let rollout_path = wire.path.ok_or(CodexThreadError::Missing)?;
-    let archived = validate_rollout_path(codex_home, &rollout_path)?;
+    let (archived, rollout_identity) = validate_rollout_path(codex_home, &rollout_path)?;
     if expected_archived.is_some_and(|expected| expected != archived) {
         return Err(CodexThreadError::Protocol);
     }
@@ -704,6 +711,7 @@ fn validate_thread_projection(
         recency_at: wire.recency_at,
         archived,
         rollout_path,
+        rollout_identity,
     })
 }
 
@@ -715,7 +723,10 @@ fn validate_canonical_uuid(value: &str) -> Result<(), CodexThreadError> {
     Ok(())
 }
 
-fn validate_rollout_path(codex_home: &Path, path: &Path) -> Result<bool, CodexThreadError> {
+fn validate_rollout_path(
+    codex_home: &Path,
+    path: &Path,
+) -> Result<(bool, RolloutIdentity), CodexThreadError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -744,10 +755,14 @@ fn validate_rollout_path(codex_home: &Path, path: &Path) -> Result<bool, CodexTh
         let canonical_path = fs::canonicalize(path).map_err(|_| CodexThreadError::Missing)?;
         let active_root = canonical_home.join("sessions");
         let archived_root = canonical_home.join("archived_sessions");
+        let identity = RolloutIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
         if canonical_path.starts_with(&active_root) {
-            Ok(false)
+            Ok((false, identity))
         } else if canonical_path.starts_with(&archived_root) {
-            Ok(true)
+            Ok((true, identity))
         } else {
             Err(CodexThreadError::SessionSchema)
         }
@@ -771,7 +786,8 @@ fn inspect_rollout_lifecycle(
             CodexThreadError::SessionSchema
         }
     })?;
-    let mut reader = BufReader::new(file);
+    validate_open_rollout(&file, metadata)?;
+    let mut reader = BufReader::new(CappedReader::new(file, MAX_ROLLOUT_BYTES as u64));
     let first = read_bounded_line(&mut reader)
         .map_err(|_| CodexThreadError::SessionSchema)?
         .ok_or(CodexThreadError::SessionSchema)?;
@@ -804,6 +820,84 @@ fn inspect_rollout_lifecycle(
         }
     }
     Ok(lifecycle)
+}
+
+#[cfg(unix)]
+fn validate_open_rollout(
+    file: &fs::File,
+    expected: &CodexThreadMetadata,
+) -> Result<(), CodexThreadError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = file
+        .metadata()
+        .map_err(|_| CodexThreadError::SessionSchema)?;
+    let path = fs::symlink_metadata(&expected.rollout_path)
+        .map_err(|_| CodexThreadError::SessionSchema)?;
+    let current_identity = RolloutIdentity {
+        device: opened.dev(),
+        inode: opened.ino(),
+    };
+    if current_identity != expected.rollout_identity
+        || path.dev() != opened.dev()
+        || path.ino() != opened.ino()
+        || !opened.file_type().is_file()
+        || !path.file_type().is_file()
+        || path.file_type().is_symlink()
+        || opened.uid() != rustix::process::getuid().as_raw()
+        || opened.mode() & 0o077 != 0
+        || opened.nlink() != 1
+        || opened.len() > MAX_ROLLOUT_BYTES as u64
+    {
+        return Err(CodexThreadError::SessionSchema);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_open_rollout(
+    _file: &fs::File,
+    _expected: &CodexThreadMetadata,
+) -> Result<(), CodexThreadError> {
+    Err(CodexThreadError::SessionSchema)
+}
+
+struct CappedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> CappedReader<R> {
+    const fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+
+impl<R: Read> Read for CappedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0_u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "rollout exceeds limit",
+                )),
+            };
+        }
+        let allowed = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.remaining = self.remaining.saturating_sub(read as u64);
+        Ok(read)
+    }
 }
 
 fn validate_session_meta_line(
@@ -2153,6 +2247,20 @@ mod tests {
             .err()
             .ok_or_else(|| io::Error::other("oversized JSONL must fail"))?;
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut exact_total = CappedReader::new(Cursor::new(vec![b'd'; 4]), 4);
+        let mut exact_bytes = Vec::new();
+        exact_total.read_to_end(&mut exact_bytes)?;
+        assert_eq!(exact_bytes, vec![b'd'; 4]);
+
+        let mut oversized_total = CappedReader::new(Cursor::new(vec![b'e'; 5]), 4);
+        let mut bounded_bytes = Vec::new();
+        let total_error = oversized_total
+            .read_to_end(&mut bounded_bytes)
+            .err()
+            .ok_or_else(|| io::Error::other("oversized rollout must fail"))?;
+        assert_eq!(total_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(bounded_bytes, vec![b'e'; 4]);
         Ok(())
     }
 
@@ -2326,6 +2434,22 @@ mod tests {
                 Some(true)
             )?
             .archived
+        );
+
+        let replaced_rollout = sessions.join("replaced-rollout.jsonl");
+        std::fs::rename(&rollout, &replaced_rollout)?;
+        let mut replacement_options = std::fs::OpenOptions::new();
+        replacement_options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&rollout)?
+            .write_all(b"{}\n")?;
+        assert_eq!(
+            inspect_rollout_lifecycle(&metadata, &canonical_workspace)
+                .err()
+                .ok_or_else(|| io::Error::other("replaced rollout inode was accepted"))?,
+            CodexThreadError::SessionSchema
         );
 
         std::fs::remove_dir_all(sandbox)?;

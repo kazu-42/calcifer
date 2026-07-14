@@ -111,6 +111,32 @@ impl<'a> CaptureContext<'a> {
         }
     }
 
+    /// Durably crosses the non-idempotent spawn boundary. Once this returns,
+    /// crash recovery must assume that a provider may have existed even if no
+    /// thread was materialized. Keeping `Prepared` strictly pre-spawn makes a
+    /// zero-candidate prepared launch safe to discard.
+    pub(super) fn authorize_provider_spawn(
+        &self,
+        capture: &GuardianCapture,
+    ) -> Result<(), AppError> {
+        if let Some(launch_id) = capture.launch_id() {
+            self.conversations.mark_provider_started(launch_id)?;
+        }
+        Ok(())
+    }
+
+    /// `Command::spawn` returned an error, so no interactive child can be
+    /// waited on. Remove the conservative spawn marker without changing an
+    /// existing workspace head.
+    pub(super) fn provider_spawn_failed(&self, capture: &GuardianCapture) -> Result<(), AppError> {
+        if let Some(launch_id) = capture.launch_id() {
+            let _ = self
+                .conversations
+                .finish_launch(launch_id, LaunchResolution::NoThread)?;
+        }
+        Ok(())
+    }
+
     fn prepare_exact(
         &self,
         mode: InternalProcessMode,
@@ -124,7 +150,7 @@ impl<'a> CaptureContext<'a> {
 
         let read = match self.read_thread(thread_id) {
             Ok(read) => read,
-            Err(AppError::Conversation(ConversationError::SessionSchemaUnsupported))
+            Err(AppError::Conversation(ConversationError::CodexVersionUnsupported))
                 if mode == InternalProcessMode::ResumeExact =>
             {
                 eprintln!(
@@ -281,15 +307,20 @@ impl<'a> CaptureContext<'a> {
         }
 
         match inventory_candidate(&pending.pre_inventory, &inventory_projection(&inventory)) {
-            InventoryCandidate::None => {
-                let _ = self
-                    .conversations
-                    .finish_launch(&pending.launch_id, LaunchResolution::NoThread)?;
-                if pending.phase == PendingPhase::CaptureFailed {
-                    return Err(ConversationError::Ambiguous.into());
+            InventoryCandidate::None => match pending.phase {
+                PendingPhase::Prepared => {
+                    let _ = self
+                        .conversations
+                        .finish_launch(&pending.launch_id, LaunchResolution::NoThread)?;
+                    Ok(())
                 }
-                Ok(())
-            }
+                PendingPhase::ProviderStarted | PendingPhase::CaptureFailed => {
+                    let _ = self
+                        .conversations
+                        .finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
+                    Err(ConversationError::Ambiguous.into())
+                }
+            },
             InventoryCandidate::One(thread_id) => {
                 let read = match self.read_thread(&thread_id) {
                     Ok(read) => read,
@@ -401,9 +432,8 @@ pub(super) fn validate_head_target(
 
 fn map_thread_error(error: CodexThreadError) -> ConversationError {
     match error {
-        CodexThreadError::UnsupportedVersion | CodexThreadError::SessionSchema => {
-            ConversationError::SessionSchemaUnsupported
-        }
+        CodexThreadError::UnsupportedVersion => ConversationError::CodexVersionUnsupported,
+        CodexThreadError::SessionSchema => ConversationError::SessionSchemaUnsupported,
         CodexThreadError::CwdMismatch => ConversationError::CwdMismatch,
         CodexThreadError::Missing => ConversationError::RolloutMissing,
         CodexThreadError::Archived => ConversationError::Archived,

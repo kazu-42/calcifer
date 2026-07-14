@@ -988,6 +988,38 @@ config_file = "{sensitive_role_path}"
         "unsupported explicit fallback must not rewrite tracked metadata"
     );
 
+    let rollout = managed_home
+        .join("sessions")
+        .join("rollout-synthetic-01900000-0000-7000-8000-000000000001.jsonl");
+    std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o644))?;
+    let provider_log_before_unsafe_rollout = std::fs::read_to_string(&log)?;
+    let exact_invocations_before = provider_log_before_unsafe_rollout
+        .matches(" resume 01900000-0000-7000-8000-000000000001")
+        .count();
+    let unsafe_rollout_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    let unsafe_rollout_stderr = String::from_utf8(unsafe_rollout_resume.stderr)?;
+    assert_eq!(unsafe_rollout_resume.status.code(), Some(1));
+    assert!(unsafe_rollout_stderr.contains("session metadata is not supported or is unsafe"));
+    assert!(!unsafe_rollout_stderr.contains(&rollout.display().to_string()));
+    assert_eq!(
+        std::fs::read_to_string(&log)?
+            .matches(" resume 01900000-0000-7000-8000-000000000001")
+            .count(),
+        exact_invocations_before,
+        "a supported-version unsafe rollout must fail before the official TUI starts"
+    );
+    std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o600))?;
+
     let before_rejected = std::fs::read_to_string(&log)?;
     std::fs::write(&project_config, "debug = {}\n")?;
     let blocked_commands: &[&[&str]] = &[
@@ -1399,6 +1431,18 @@ config_file = "{sensitive_role_path}"
         recovered_after_coordinator_kill,
         "guardian B-lock must release after the provider exits"
     );
+    let coordinator_crash_conversation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        coordinator_crash_conversation["conversations"][0]["last_safe_lifecycle"], "unknown_crash",
+        "the surviving guardian must commit an unclean boundary after coordinator failure"
+    );
+    assert_eq!(
+        coordinator_crash_conversation["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
 
     // Killing the provider-side guardian leaves the coordinator lease alive.
     // Once the exact provider PID exits, the coordinator can safely recover.
@@ -1417,6 +1461,7 @@ config_file = "{sensitive_role_path}"
         .env("FAKE_CODEX_LOG", &log)
         .env("FAKE_CODEX_CHILD_PID", &guarded_child_pid_file)
         .env("FAKE_CODEX_GUARD_PID", &guardian_pid_file)
+        .env("FAKE_CODEX_NO_THREAD", "1")
         .env("CALCIFER_TEST_MARKER_ID", guardian_marker_id.to_string())
         .args(["run", "codex@work", "--", "hold"])
         .stdout(std::process::Stdio::null())
@@ -1534,13 +1579,16 @@ config_file = "{sensitive_role_path}"
         .args(["resume"])
         .output()?;
     let crash_resume_stderr = String::from_utf8(crash_resume.stderr)?;
-    assert!(crash_resume.status.success(), "{crash_resume_stderr}");
-    assert!(crash_resume_stderr.contains("did not have a provably clean boundary"));
+    assert_eq!(crash_resume.status.code(), Some(1));
+    assert!(crash_resume_stderr.contains("ambiguous"));
     let log_after_crash_resume = std::fs::read_to_string(&log)?;
     let crash_resume_log = log_after_crash_resume
         .strip_prefix(&log_before_crash_resume)
         .ok_or_else(|| std::io::Error::other("provider log was replaced during crash resume"))?;
-    assert!(crash_resume_log.contains("resume 01900000-0000-7000-8000-000000000001"));
+    assert!(
+        !crash_resume_log.contains("resume 01900000-0000-7000-8000-000000000001"),
+        "a started launch with no materialized candidate must not start a second provider"
+    );
     assert!(!crash_resume_log.contains("resume --last"));
     let recovered_conversation: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
@@ -1549,6 +1597,27 @@ config_file = "{sensitive_role_path}"
             .as_array()
             .map(Vec::len),
         Some(0)
+    );
+    assert_eq!(
+        recovered_conversation["workspace_heads"][0]["state"],
+        "needs_selection"
+    );
+
+    let explicit_crash_recovery = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert!(
+        explicit_crash_recovery.status.success(),
+        "{}",
+        String::from_utf8(explicit_crash_recovery.stderr)?
     );
 
     // A terminal SIGINT reaches the whole foreground process group. The
