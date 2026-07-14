@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod conversations;
 mod error;
 mod executable;
 mod output;

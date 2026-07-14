@@ -209,6 +209,23 @@ impl Registry {
         })
     }
 
+    /// Returns the already validated Calcifer data-root location.
+    ///
+    /// Callers must still validate it immediately before opening their own
+    /// managed files because filesystem state can change between operations.
+    pub(crate) fn managed_root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn find_by_id(&self, provider: Provider, id: &str) -> Result<Profile, ProfileError> {
+        validate_profile_id(id)?;
+        self.load()?
+            .profiles
+            .into_iter()
+            .find(|profile| profile.provider == provider && profile.id == id)
+            .ok_or_else(|| ProfileError::NotFound(format!("{} profile", provider.as_str())))
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn at(root: PathBuf) -> Self {
         Self {

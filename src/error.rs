@@ -1,12 +1,14 @@
 use std::fmt;
 use std::io;
 
+use crate::conversations::ConversationError;
 use crate::executable::ExecutableError;
 use crate::profiles::ProfileError;
 use crate::project_config::ProjectConfigError;
 
 #[derive(Debug)]
 pub(crate) enum AppError {
+    Conversation(ConversationError),
     Executable(ExecutableError),
     InteractiveJsonUnsupported,
     Io(io::Error),
@@ -19,6 +21,7 @@ pub(crate) enum AppError {
 impl AppError {
     pub(crate) const fn code(&self) -> &'static str {
         match self {
+            Self::Conversation(error) => error.code(),
             Self::Executable(error) => error.code(),
             Self::InteractiveJsonUnsupported => "interactive_json_unsupported",
             Self::Io(_) => "process_io_error",
@@ -31,6 +34,7 @@ impl AppError {
 
     pub(crate) fn safe_message(&self) -> String {
         match self {
+            Self::Conversation(error) => error.safe_message().to_owned(),
             Self::Executable(error) => error.safe_message().to_owned(),
             Self::InteractiveJsonUnsupported => "--json is not available for interactive auth, run, or resume commands because provider output owns the terminal.".to_owned(),
             Self::Io(error) => {
@@ -56,6 +60,12 @@ impl std::error::Error for AppError {}
 impl From<ExecutableError> for AppError {
     fn from(error: ExecutableError) -> Self {
         Self::Executable(error)
+    }
+}
+
+impl From<ConversationError> for AppError {
+    fn from(error: ConversationError) -> Self {
+        Self::Conversation(error)
     }
 }
 
