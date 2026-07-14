@@ -346,6 +346,40 @@ impl ConversationRegistry {
         self.read(|document| resolve_head_document(document, &canonical_cwd))
     }
 
+    /// Finds one exact immutable binding without consulting mutable workspace
+    /// selection or launch state. Explicit recovery already names the profile,
+    /// thread, and cwd, so it may use this only to retain persisted lifecycle
+    /// metadata while a pending launch or `needs_selection` hides the head.
+    pub(crate) fn find_bound_thread(
+        &self,
+        profile_id: &str,
+        thread_id: &str,
+        canonical_cwd: &Path,
+    ) -> Result<Option<HeadBinding>, ConversationError> {
+        validate_uuid(profile_id, "profile id")?;
+        validate_uuid(thread_id, "thread id")?;
+        let canonical_cwd = canonical_path_string(canonical_cwd)?;
+        self.read(|document| {
+            let binding = document.conversations.iter().find_map(|conversation| {
+                let generation = conversation.generations.iter().find(|generation| {
+                    generation.profile_id == profile_id
+                        && generation.thread_id == thread_id
+                        && generation.canonical_cwd == canonical_cwd
+                })?;
+                Some(HeadBinding {
+                    conversation_id: conversation.conversation_id.clone(),
+                    generation: generation.generation,
+                    profile_id: generation.profile_id.clone(),
+                    thread_id: generation.thread_id.clone(),
+                    canonical_cwd: generation.canonical_cwd.clone(),
+                    codex_version: generation.codex_version.clone(),
+                    lifecycle: conversation.last_safe_lifecycle,
+                })
+            });
+            Ok(binding)
+        })
+    }
+
     pub(crate) fn mark_workspace_ambiguous(
         &self,
         canonical_cwd: &Path,

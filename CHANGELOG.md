@@ -25,9 +25,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
-- Exact resume preserves persisted interrupted or unknown-crash state through
-  pre-launch validation, and terminal profile/cwd ownership conflicts no longer
-  leave an unrecoverable pending launch in an infinite retry loop.
+- Bare and explicit exact resume preserve persisted interrupted or unknown-crash
+  state through pre-launch validation, including behind pending or
+  needs-selection workspace state. Terminal profile/cwd ownership conflicts no
+  longer leave an unrecoverable pending launch in an infinite retry loop.
 
 ## [0.1.0-alpha.3] - 2026-07-15
 

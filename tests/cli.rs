@@ -489,6 +489,9 @@ case "${1:-}" in
       esac
     done
     printf '%s\n' 'app-server-eof' >> "$FAKE_CODEX_LOG"
+    if [ "${FAKE_CODEX_REMOVE_AFTER_APP_SERVER:-}" = "1" ]; then
+      rm -f "$0"
+    fi
     ;;
   hold)
     printf '%s\n' "$$" > "$FAKE_CODEX_CHILD_PID"
@@ -1978,6 +1981,94 @@ config_file = "{sensitive_role_path}"
     assert!(
         recovered_after_status_kill,
         "provider-side status lease must recover after app-server exit"
+    );
+
+    // Explicit exact recovery must retain an existing unclean lifecycle even
+    // when a pending launch hides the workspace head and thread/read observes
+    // a later clean record. Removing the fixture executable after thread/read
+    // makes the provider spawn fail, proving pre-launch adoption alone cannot
+    // clear the durable uncertainty.
+    let mut explicit_failure_registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        explicit_failure_registry["conversations"][0]["last_safe_lifecycle"],
+        "unknown_crash"
+    );
+    clean_rollout.write_all(
+        br#"{"timestamp":"2026-07-15T00:00:05Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+    )?;
+    clean_rollout.write_all(b"\n")?;
+    clean_rollout.sync_all()?;
+    let exact_profile_id =
+        explicit_failure_registry["conversations"][0]["generations"][0]["profile_id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing exact-resume profile ID"))?
+            .to_owned();
+    let exact_canonical_cwd = std::fs::canonicalize(&workspace)?
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("non-UTF-8 exact-resume workspace"))?
+        .to_owned();
+    explicit_failure_registry["revision"] = serde_json::json!(
+        explicit_failure_registry["revision"]
+            .as_u64()
+            .ok_or_else(|| std::io::Error::other("missing registry revision"))?
+            + 1
+    );
+    explicit_failure_registry["workspace_heads"][0]["state"] = serde_json::json!("needs_selection");
+    explicit_failure_registry["pending_launches"] = serde_json::json!([{
+        "launch_id": uuid::Uuid::new_v4().to_string(),
+        "profile_id": exact_profile_id,
+        "canonical_cwd": exact_canonical_cwd,
+        "mode": "resume_last",
+        "codex_version": "0.144.4",
+        "adapter_version": env!("CARGO_PKG_VERSION"),
+        "pre_inventory": [],
+        "phase": "capture_failed",
+        "started_at": 1
+    }]);
+    std::fs::write(
+        &conversation_path,
+        serde_json::to_vec_pretty(&explicit_failure_registry)?,
+    )?;
+
+    let explicit_spawn_failure = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REMOVE_AFTER_APP_SERVER", "1")
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    let explicit_spawn_failure_stderr = String::from_utf8(explicit_spawn_failure.stderr)?;
+    assert_eq!(explicit_spawn_failure.status.code(), Some(1));
+    assert!(
+        explicit_spawn_failure_stderr.contains("did not have a provably clean boundary"),
+        "explicit exact recovery erased persisted uncertainty before spawn"
+    );
+    let explicit_failure_after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        explicit_failure_after["conversations"][0]["last_safe_lifecycle"], "unknown_crash",
+        "a failed provider spawn must not clear persisted uncertainty"
+    );
+    assert_eq!(
+        explicit_failure_after["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "explicit recovery must resolve the matching stale pending launch"
+    );
+    assert_eq!(
+        explicit_failure_after["workspace_heads"][0]["state"], "ready",
+        "explicit selection must restore the exact immutable workspace head"
+    );
+    assert!(
+        !fake_codex.exists(),
+        "the provider spawn fixture did not fail"
     );
 
     std::fs::remove_dir_all(sandbox)?;

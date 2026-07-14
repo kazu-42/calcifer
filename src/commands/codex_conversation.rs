@@ -162,32 +162,37 @@ impl<'a> CaptureContext<'a> {
 
         let read = self.read_thread(thread_id)?;
 
-        let persisted_lifecycle = if mode == InternalProcessMode::ResumeHead {
-            let head = self.conversations.resolve_head(self.working_directory)?;
-            validate_head_target(&head, self.profile_id, thread_id, self.working_directory)?;
-            if head.codex_version != read.codex_version {
-                return Err(ConversationError::SessionSchemaUnsupported.into());
+        let persisted_binding = match mode {
+            InternalProcessMode::ResumeHead => {
+                let head = self.conversations.resolve_head(self.working_directory)?;
+                validate_head_target(&head, self.profile_id, thread_id, self.working_directory)?;
+                Some(head)
             }
-            Some(head.lifecycle)
-        } else {
-            None
+            InternalProcessMode::ResumeExact => self.conversations.find_bound_thread(
+                self.profile_id,
+                thread_id,
+                self.working_directory,
+            )?,
+            InternalProcessMode::Run | InternalProcessMode::ResumeLast => None,
         };
+        if persisted_binding
+            .as_ref()
+            .is_some_and(|binding| binding.codex_version != read.codex_version)
+        {
+            return Err(ConversationError::SessionSchemaUnsupported.into());
+        }
 
         let mut binding = self.binding_from_read(read)?;
-        if let Some(persisted_lifecycle) = persisted_lifecycle {
-            binding.lifecycle = preserve_resume_uncertainty(persisted_lifecycle, binding.lifecycle);
+        if let Some(persisted_binding) = persisted_binding {
+            binding.lifecycle =
+                preserve_resume_uncertainty(persisted_binding.lifecycle, binding.lifecycle);
         }
-        if let Some(pending) = self
-            .conversations
-            .pending_for(self.profile_id, self.working_directory)?
-        {
-            // Explicit selection is authoritative recovery. Adoption below
-            // clears an older needs_selection head after pending removal.
-            let _ = self
-                .conversations
-                .finish_launch(&pending.launch_id, LaunchResolution::Bind(binding.clone()))?;
-        }
-        let adopted = self.conversations.adopt(binding)?;
+        let adopted = adopt_exact_binding(
+            self.conversations,
+            self.profile_id,
+            self.working_directory,
+            binding,
+        )?;
         warn_if_unclean_resume(adopted.lifecycle);
         Ok(GuardianCapture::Bound {
             thread_id: thread_id.to_owned(),
@@ -280,7 +285,11 @@ impl<'a> CaptureContext<'a> {
                 if !provider_succeeded && binding.lifecycle == ConversationLifecycle::Clean {
                     binding.lifecycle = ConversationLifecycle::UnknownCrash;
                 }
-                finish_candidate_binding(self.conversations, launch_id, binding)
+                if finish_candidate_binding(self.conversations, launch_id, binding)? {
+                    Ok(())
+                } else {
+                    Err(ConversationError::Ambiguous.into())
+                }
             }
             InventoryCandidate::Ambiguous => {
                 let _ = self
@@ -396,7 +405,11 @@ impl<'a> CaptureContext<'a> {
                         );
                     }
                 };
-                finish_candidate_binding(self.conversations, &pending.launch_id, binding)
+                if finish_candidate_binding(self.conversations, &pending.launch_id, binding)? {
+                    Ok(())
+                } else {
+                    Err(ConversationError::Ambiguous.into())
+                }
             }
             InventoryCandidate::Ambiguous => {
                 let _ = self
@@ -496,15 +509,30 @@ fn finish_candidate_binding(
     conversations: &ConversationRegistry,
     launch_id: &str,
     binding: BindingInput,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     match conversations.finish_launch(launch_id, LaunchResolution::Bind(binding)) {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(ConversationError::Ambiguous.into()),
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
         Err(error @ (ConversationError::ProfileMismatch | ConversationError::CwdMismatch)) => {
-            finish_reconciliation_failure(conversations, launch_id, error.into())
+            finish_reconciliation_failure(conversations, launch_id, error.into()).map(|()| false)
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn adopt_exact_binding(
+    conversations: &ConversationRegistry,
+    profile_id: &str,
+    working_directory: &Path,
+    binding: BindingInput,
+) -> Result<HeadBinding, AppError> {
+    if let Some(pending) = conversations.pending_for(profile_id, working_directory)? {
+        // Explicit selection is authoritative recovery. A false result means
+        // the pending launch was resolved beneath an older needs-selection
+        // marker; adoption below replaces that marker with the exact binding.
+        let _ = finish_candidate_binding(conversations, &pending.launch_id, binding.clone())?;
+    }
+    conversations.adopt(binding).map_err(AppError::from)
 }
 
 fn finish_reconciliation_failure(
@@ -777,9 +805,10 @@ mod tests {
         )?;
         conversations.mark_provider_started(&launch_id)?;
 
-        let error = finish_candidate_binding(
+        let error = adopt_exact_binding(
             &conversations,
-            &launch_id,
+            &pending_profile,
+            &pending_workspace,
             binding_for(&pending_profile, &thread_id, &pending_workspace),
         )
         .err()
@@ -929,13 +958,73 @@ mod tests {
     }
 
     #[test]
-    fn profile_conflict_terminalizes_candidate_binding() -> Result<(), Box<dyn std::error::Error>> {
+    fn explicit_recovery_profile_conflict_terminalizes_pending_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
         assert_terminal_binding_conflict("profile", true)
     }
 
     #[test]
-    fn cwd_conflict_terminalizes_candidate_binding() -> Result<(), Box<dyn std::error::Error>> {
+    fn explicit_recovery_cwd_conflict_terminalizes_pending_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
         assert_terminal_binding_conflict("cwd", false)
+    }
+
+    #[test]
+    fn exact_binding_lookup_ignores_pending_and_selection_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = registry_fixture("exact-binding-lookup", false)?;
+        let thread_id = Uuid::new_v4().to_string();
+        let mut binding = binding_for(&fixture.profile_id, &thread_id, &fixture.workspace);
+        binding.lifecycle = ConversationLifecycle::UnknownCrash;
+        fixture.conversations.adopt(binding)?;
+        fixture
+            .conversations
+            .mark_workspace_ambiguous(&fixture.workspace)?;
+
+        let found = fixture
+            .conversations
+            .find_bound_thread(&fixture.profile_id, &thread_id, &fixture.workspace)?
+            .ok_or_else(|| std::io::Error::other("immutable binding was hidden"))?;
+        assert_eq!(found.lifecycle, ConversationLifecycle::UnknownCrash);
+        assert_eq!(found.thread_id, thread_id);
+        assert!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .is_some(),
+            "the lookup must not resolve or mutate the pending launch"
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn new_explicit_binding_keeps_observed_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = registry_fixture("new-explicit-binding", false)?;
+        let _ = fixture
+            .conversations
+            .finish_launch(&fixture.launch_id, LaunchResolution::NoThread)?;
+        let thread_id = Uuid::new_v4().to_string();
+        assert!(
+            fixture
+                .conversations
+                .find_bound_thread(&fixture.profile_id, &thread_id, &fixture.workspace)?
+                .is_none()
+        );
+        let mut observed = binding_for(&fixture.profile_id, &thread_id, &fixture.workspace);
+        observed.lifecycle = ConversationLifecycle::Interrupted;
+
+        let adopted = adopt_exact_binding(
+            &fixture.conversations,
+            &fixture.profile_id,
+            &fixture.workspace,
+            observed,
+        )?;
+        assert_eq!(adopted.lifecycle, ConversationLifecycle::Interrupted);
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
     }
 
     #[test]
