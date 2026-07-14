@@ -51,12 +51,13 @@ calcifer --json status
 calcifer run codex@work
 calcifer run codex@personal -- --no-alt-screen
 
-# Reopen the newest session in that profile, or pin the exact thread ID.
+# Reopen the newest session in a profile, pin an exact thread, or restore this workspace head.
 calcifer resume codex@work
 calcifer resume codex@work 01900000-0000-7000-8000-000000000001
+calcifer resume
 ```
 
-Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes authentication, project trust, and session state there, so exiting Calcifer does not discard the conversation. Calcifer accepts supported Codex project-trust updates semantically while continuing to require profile-local file storage for both Codex account and MCP OAuth credentials and reject profile/provider routing overrides, including MCP OAuth callback URL and port overrides. Managed Codex role configuration is currently unsupported: both a top-level `agents` table and any auto-discovered `CODEX_HOME/agents` node fail closed because role files can add indirect complete configuration layers. `resume` without an ID delegates to official `codex resume --last`; an exact thread ID is preferred for automation because `--last` is affected by the working directory and can be ambiguous.
+Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes authentication, project trust, and session state there, so exiting Calcifer does not discard the conversation. Calcifer accepts supported Codex project-trust updates semantically while continuing to require profile-local file storage for both Codex account and MCP OAuth credentials and reject profile/provider routing overrides, including MCP OAuth callback URL and port overrides. Managed Codex role configuration is currently unsupported: both a top-level `agents` table and any auto-discovered `CODEX_HOME/agents` node fail closed because role files can add indirect complete configuration layers. `calcifer resume codex@work` remains the explicit official `codex resume --last` convenience; bare `calcifer resume` resolves Calcifer's exact tracked workspace thread and never falls back to `--last`.
 
 Before interactive `run` and `resume`, Calcifer canonicalizes the working directory and checks every repository-local `.codex` layer from the nearest real `.git` root to that directory. Any `.codex/agents` filesystem node fails closed even when `config.toml` is absent; otherwise only a Codex 0.144.4-scoped set of repository settings that do not own managed authentication, provider routing, dynamic features, or state locations is accepted. Unknown keys, ambiguous filesystem nodes, invalid TOML, and files larger than 1 MiB fail before Codex starts. In a linked worktree, Codex 0.144.4 can additionally merge only `hooks` from the primary checkout; Calcifer does not resolve that external hook source, and repository hooks remain outside its sandbox guarantee. This preflight protects Calcifer's account-routing boundary, but it does not make repository hooks, plugins, tools, or code safe.
 
@@ -66,7 +67,7 @@ therefore run the official CLI from a private runtime directory with its own
 This remains isolated even when `CALCIFER_HOME` itself is stored inside a Git
 repository with local Codex configuration.
 
-This is cold resume after restarting the wrapper, but it is currently explicit: the user invokes `calcifer resume`. Calcifer does not yet capture `{profile, cwd, thread ID}` and automatically choose the exact previous thread on startup. Resume restores persisted history, not a dead process or in-flight tool call, and never resends the last prompt.
+For supported Codex 0.144.4 sessions, Calcifer captures the immutable `{profile ID, canonical cwd, thread ID}` binding in a separate private `conversations.json`. Bare `calcifer resume` validates that exact rollout under its source-profile lease and invokes `codex resume <exact-uuid>` without a prompt. A clean wrapper restart therefore restores the tracked history without an account selector or thread lookup. Interrupted and uncertain crash boundaries show a warning before reopening; missing, archived, incompatible, cross-profile, cross-cwd, corrupt, or ambiguous state stops before provider launch. Resume restores persisted history, not a dead process or in-flight tool call, and never resends the last prompt, approval answer, command, or tool call.
 
 `status` starts the installed official `codex app-server` inside each idle profile and calls the structured `account/rateLimits/read` method. Before that read, it requires the tested Codex `0.144.4` initialize contract and verifies that the server reports the selected canonical `CODEX_HOME`. Untested versions, changed initialize data, a different home, or a changed usage schema fail closed as `unknown`; Calcifer does not send the usage request after an initialize-gate rejection. It displays all returned limit buckets, primary and secondary used/remaining percentages, reset times, workspace credit state, monthly spend control when present, and rate-limit reset-credit count and expirations. It does not scrape the interactive `/status` screen or read token values from `auth.json`.
 
@@ -139,7 +140,7 @@ Failover will follow conservative semantics:
 - After the old child has stopped, the supervisor will continue the same user-visible conversation under the selected profile. Internally, the preferred handoff forks the validated source rollout into a new profile-local Codex thread, so the logical conversation stays stable while the provider thread ID changes. Calcifer never automatically replays the last command or prompt; a partially completed turn may already have changed files or external systems.
 - Before launch, Calcifer shows the local profile alias, provider, trust domain, and selection reason without exposing provider account identifiers.
 
-Same-profile resume is stable today and delegates directly to the official CLI in the selected home; it does not depend on Calcifer parsing an App Server status schema. Cross-profile continuation is a required part of the planned failover experience, but its upstream import field is experimental: stable Codex thread lookup is scoped to one `CODEX_HOME`. Calcifer will use a separate version-gated target-profile App Server to fork a validated source rollout into a new target-profile thread, then attach the official TUI over a private local transport. The handoff stays inside one configured trust domain, preserves one writer per rollout, and restores history without resubmitting a turn. See [ADR 0001](docs/adr/0001-cross-profile-conversation-handoff.md).
+Same-profile resume delegates the final operation directly to the official CLI in the selected home. Calcifer uses the pinned stable `thread/list` and `thread/read(includeTurns=false)` App Server projections only to capture and validate the opaque thread key; it never persists transcript content. Cross-profile continuation is a required part of the planned failover experience, but its upstream import field is experimental: stable Codex thread lookup is scoped to one `CODEX_HOME`. Calcifer will use a separate version-gated target-profile App Server to fork a validated source rollout into a new target-profile thread, then attach the official TUI over a private local transport. The handoff stays inside one configured trust domain, preserves one writer per rollout, and restores history without resubmitting a turn. See [ADR 0001](docs/adr/0001-cross-profile-conversation-handoff.md).
 
 ## Provider direction
 
@@ -147,7 +148,7 @@ Same-profile resume is stable today and delegates directly to the official CLI i
 | --- | --- | --- |
 | Read-only environment diagnostics | Implemented | No credential access |
 | Codex profile isolation | Implemented on Unix | One `CODEX_HOME` per profile; official Codex login and refresh |
-| Same-profile Codex resume | Implemented | Exact thread ID or official `--last`; no prompt replay |
+| Same-profile Codex resume | Implemented on Unix for Codex 0.144.4 | Tracked workspace head, explicit exact thread ID, or official `--last`; no prompt replay |
 | Codex usage observation | Implemented on demand for idle profiles | Structured app-server response; active profiles need the planned supervisor |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
 | Opt-in profile pools | Design | Same provider and trust domain; bounded selection |
@@ -244,7 +245,7 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 
 1. **Implemented:** private Unix registry, profile-name validation, ownership markers, and atomic metadata writes.
 2. **Implemented:** `auth add/list`, `run`, same-profile `resume`, profile leases, and structured on-demand status.
-3. Add exact thread-ID capture for automatic cold restore, provider identity verification, safe remove/reauth flows, and crash recovery.
+3. **Implemented:** exact same-profile thread capture, crash reconciliation, and no-argument cold restore. Provider identity verification and safe remove/reauth flows remain.
 4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
 6. Add version-gated cross-profile conversation handoff as the default successful failover path; preserve one profile-local writer per lineage generation.

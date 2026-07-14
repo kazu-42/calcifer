@@ -2,7 +2,7 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow and may let the official CLI refresh them during run, resume, or status. Automatic failover and cross-profile conversation handoff are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
+This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, and captures an exact same-profile thread key for crash-safe cold restore. Automatic failover and cross-profile conversation handoff are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
 
 ## Assets
 
@@ -44,6 +44,7 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Managed directories are private to the current user; secret files are private at creation time.
 - Tokens and reset-credit IDs are never accepted as ordinary command-line flags because process listings and shell history can expose them.
 - Raw arguments, child environments, credential files, account email, and stable provider IDs are not logged.
+- Conversation metadata stores only Calcifer/profile/thread UUIDs, canonical cwd, tested adapter versions, bounded inventory timestamps, and lifecycle state. It excludes aliases, rollout paths, App Server previews, transcript bodies, prompts, responses, approvals, tool arguments, terminal streams, credentials, and provider identity.
 - Diagnostics report capability and redacted status, not secret values or credential paths.
 - Test credentials are synthetic and contain obvious non-production markers.
 - Claude token storage fails closed when a supported OS credential store is unavailable. Plaintext fallback is a non-goal unless a later ADR and security review define it.
@@ -92,7 +93,11 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Interactive launch uses a coordinator/provider-guardian pair with two fixed-order lease files. Either surviving process blocks a second writer after a selective crash, while the official provider and its background tools inherit neither descriptor.
 - If the provider guardian is killed after reporting the exact provider PID, the coordinator retains its lease until that PID exits. If failure lands in the unobservable post-authorization/pre-report window, the coordinator deliberately remains alive and locked rather than guessing that no provider exists.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
-- The bounded status app-server is the narrow exception: it inherits only the provider-side lease because it cannot start turns or tools. This keeps a killed status parent from admitting a second credential writer until stdio EOF terminates the probe.
+- Bounded metadata-only App Servers for status and thread capture inherit only the provider-side lease. They issue no turn/tool methods and are started only while Calcifer owns the profile coordinator/provider order. This keeps a killed probe parent from admitting a second credential writer until stdio EOF terminates the probe.
+- Automatic same-profile restore never guesses the newest thread. A private pending baseline is synced before provider spawn; only one new or uniquely changed root CLI thread can be adopted after direct metadata validation. Zero candidates preserve the previous head, while multiple, archived, wrong-profile/cwd, missing, corrupt, unsupported, capped, or inconsistent results stop before automatic provider launch.
+- Bare resume releases its initial conversation lock before waiting for a profile lease, then revalidates the unchanged UUID binding under that lease. Registry mutation order is coordinator lease, provider lease, then a short conversation lock; no conversation lock spans App Server or interactive provider I/O.
+- A conversation document update uses create-only private same-directory temporary files, file fsync, rename, and directory fsync. Post-rename sync uncertainty is read back and reported without retrying a provider launch. Newer schemas and unsafe owner/type/mode/hard-link state are never rewritten.
+- Lifecycle inspection is a version-pinned metadata projection. It validates the first session identity and recognizes only persisted start, complete, and abort tags; every response/tool payload is ignored. `interrupted` and `unknown_crash` may reopen the exact history with a warning, but no prompt, command, approval answer, or tool call is reconstructed or submitted.
 - Standard proxy and CA environment variables remain available for legitimate
   enterprise networks. Calcifer does not defend against a hostile proxy, trust
   store, root, administrator, or same-user malware; managed provider endpoints

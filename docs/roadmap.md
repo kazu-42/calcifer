@@ -33,7 +33,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] No writes to the user's global `~/.codex`
 - [x] Same-profile lifetime lease; different profiles may run concurrently
 - [x] Same-profile `resume` by exact thread ID or official `--last`
-- [ ] Automatic `{profile_id, cwd, thread_id}` capture and cold restore
+- [x] Automatic same-profile `{profile_id, cwd, thread_id}` capture, crash reconciliation, and exact cold restore
 
 ## Phase 3: usage observations
 

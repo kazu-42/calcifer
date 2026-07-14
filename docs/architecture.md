@@ -72,6 +72,8 @@ The planned Codex adapter gives each profile its own managed home and launches C
 
 ```text
 managed root/
+  conversations.json  <- private same-profile thread bindings and workspace heads
+  conversations.lock
   profiles/
     codex/
       <opaque-profile-id>/
@@ -110,11 +112,16 @@ Codex owns its rollout files and state database inside the profile-specific `COD
 ```text
 calcifer resume codex@<alias> <thread-id>
 calcifer resume codex@<alias>              # delegates to codex resume --last
+calcifer resume                            # validates and resumes the exact workspace head
 ```
 
-The exact thread ID is the reliable resume key. `--last` remains a convenience fallback and is not suitable for a future automatic cold restore because Codex filters it by the current working directory and multiple sessions may be eligible.
+The exact thread ID is the reliable resume key. `--last` remains an explicitly requested convenience because Codex filters it by the current working directory and multiple sessions may be eligible. Automatic restore never falls back to it.
 
-The current slice does not yet install a session hook or persist `{profile_id, cwd, thread_id}` automatically. That registry is required before Calcifer can cold-restore a session without the user supplying an ID. Restored state is the persisted conversation transcript; a dead process, stream, or in-flight tool call is not restarted.
+For the pinned Codex 0.144.4 adapter, the provider guardian captures bounded active and archived `thread/list` inventories before and after an interactive `run` or explicit `--last` resume. Exactly one new or uniquely changed root CLI thread is confirmed with direct `thread/read(includeTurns=false)` and atomically bound to immutable `{profile_id, canonical_cwd, thread_id}` metadata. Zero candidates preserve the old head; multiple candidates, pagination-cap exhaustion, overlapping launches, or inconsistent metadata require explicit selection. Explicit exact resume skips the inventory and adopts only the directly validated thread.
+
+The separate schema-v1 `conversations.json` contains opaque local IDs, versions, timestamps, lifecycle state, pending launch baselines, and workspace-head references. It never contains profile aliases, provider account IDs, rollout paths, previews, prompts, responses, tool arguments, terminal output, or credentials. A whole-document update uses a private same-directory temporary file, file fsync, atomic rename, and parent-directory fsync under `conversations.lock`. A post-rename directory-sync failure is read back and reported as `conversation_commit_uncertain`; it never authorizes relaunching the provider.
+
+Bare `calcifer resume` reads and releases the workspace-head lock, acquires the immutable source profile by UUID, and revalidates the same binding under the profile lease before executing `codex resume <exact-uuid>`. If a guardian crash left a pending launch, the command first reacquires both profile locks and reconciles its before/after inventory; one candidate becomes `interrupted` or `unknown_crash`, while ambiguity stops. Restored state is the persisted conversation transcript; a dead process, stream, in-flight tool call, prompt, command, approval, or tool action is not restarted or replayed.
 
 Stable `thread/resume` lookup is scoped to the current `CODEX_HOME`. Codex 0.144.4 also exposes experimental external rollout paths for resume and fork, but Calcifer does not enable them yet. The accepted cross-profile design uses a target-profile App Server to fork validated source history into a new target-profile rollout. It requires same-trust-domain policy, source-profile provenance, canonical containment under a Calcifer-managed sessions root, one writer per lineage generation, version gating, and no prompt replay; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
 
@@ -253,7 +260,7 @@ Before the first stable release, the project still needs reviewed ADRs for:
 - provider identity verification;
 - process/PTY supervision on Linux, macOS, and Windows;
 - supported Codex version/schema gates and observation cache TTL/backoff;
-- exact thread capture, interrupted-turn state, and cold-restore recovery;
+- cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
 - OS credential-store support for Claude setup tokens;
 - trust-domain configuration and failover pool UX.

@@ -20,6 +20,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Stable JSON status output with redacted provider errors and display-only remaining percentages.
 - Fail-closed Codex `0.144.4` status compatibility gate with canonical managed-home verification and explicit human/JSON compatibility metadata.
 - Checked cold resume after wrapper restart by exact thread ID or official `--last` behavior.
+- Crash-safe same-profile Codex thread capture and bare `calcifer resume`, which
+  validates the tracked workspace head and invokes exact official CLI resume
+  without replaying a prompt.
 - ADR for profile-independent conversation lineage and required cross-profile continuation after automatic failover.
 - Native five-target release packaging with deterministic archive metadata,
   checksums, provenance attestations, dry-run validation, and a maintainer
@@ -77,7 +80,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Automatic account failover and the accepted cross-profile conversation handoff design are not implemented.
 - Managed profile registration is disabled on Windows until current-user-only ACL creation is verified.
 - `resume` restores persisted Codex conversation state; it does not restart an in-flight tool call or replay a prompt.
-- Exact previous-thread auto-selection, active-profile monitoring, and provider account-identity verification are not implemented; current status reads idle local profiles, which may alias the same underlying account.
+- Active-profile monitoring and provider account-identity verification are not implemented; current status reads idle local profiles, which may alias the same underlying account.
 
 [Unreleased]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.3...HEAD
 [0.1.0-alpha.3]: https://github.com/kazu-42/calcifer/releases/tag/v0.1.0-alpha.3

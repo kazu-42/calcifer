@@ -96,11 +96,25 @@ The stable same-home operations are the CLI's `codex resume <thread-id>` and App
 
 Calcifer's current profile-specific `CODEX_HOME` preserves these files across wrapper restarts. Resume restores persisted conversation state, not the terminated process, live stream, or an in-flight tool call. Calcifer does not replay the previous prompt.
 
-The current command is an explicit cold restore: `calcifer resume codex@<alias> [thread-id]`. Automatic previous-thread selection still requires Calcifer to persist the source profile, canonical cwd, exact thread ID, and interruption state.
+Calcifer supports three same-home restore modes:
+
+```text
+calcifer resume codex@<alias> <thread-id>  # direct validation and exact adoption
+calcifer resume codex@<alias>              # explicit official --last convenience
+calcifer resume                            # exact Calcifer-owned workspace head
+```
+
+For automatic capture, the 0.144.4 adapter initializes with `experimentalApi: false`, then pages both active and archived `thread/list` results filtered to the exact canonical cwd and `cli` source. It admits only canonical UUID root threads with no parent, non-ephemeral persistence, matching recorded CLI version, and a private rollout canonically contained in the selected `CODEX_HOME/sessions` or `archived_sessions`. It drops preview, turns, model/provider fields, and rollout content before constructing Calcifer metadata. An authoritative explicit thread uses direct `thread/read(includeTurns=false)` and never scans every old session.
+
+`run` and explicit `--last` capture a private pre-launch inventory before the TUI starts. After the TUI exits, exactly one new or uniquely changed thread may update the workspace head; zero preserves it, while multiple candidates, active/archive inconsistency, duplicate IDs, pagination-cap exhaustion, wrong cwd/source/profile, malformed protocol, or unsupported schema fail closed. A pending pre-launch inventory survives a guardian crash and is reconciled under the same profile lease. Only the first `session_meta` identity and bounded persisted task-start, task-complete, and turn-aborted tags are used to classify `clean`, `interrupted`, or `unknown_crash`; transcript payloads are ignored and never replayed.
+
+The final restore is always official `codex resume <exact-thread-id>` with no automatically supplied prompt. Stable thread lookup is profile-local: a thread captured from profile A cannot be resumed through profile B. Unsupported Codex versions disable capture and bare automatic selection, but preserve the explicit exact CLI fallback without mutating provider-owned sessions or Calcifer's conversation registry.
 
 Relevant upstream sources:
 
 - [official App Server documentation](https://developers.openai.com/codex/app-server/);
+- [non-experimental `thread/list` and `thread/read` request types](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/common.rs#L621-L648);
+- [profile-local session inventory lookup](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/rollout/src/list.rs#L1515-L1533);
 - [thread resume types and experimental-field markers](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L310-L438);
 - [session layout](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/rollout/src/list.rs#L418-L421).
 
@@ -201,10 +215,11 @@ The safe future decision path is:
 
 Context-window exhaustion, session budgets, unauthorized responses, 5xx errors, timeouts, disconnects, parser failures, and rounded 100% are not account failover signals. See the [structured Codex error enum](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/shared.rs#L64-L113).
 
-Same-profile `calcifer resume` remains direct official CLI delegation inside
-the selected `CODEX_HOME`; Calcifer does not parse its transcript schema or
-replay input. Experimental cross-profile `thread/fork.path` and remote-TUI
-resume remain disabled behind their separate Phase 4.5 runtime/schema gate.
+Same-profile `calcifer resume` still delegates the final restore to the official
+CLI inside the selected `CODEX_HOME`. Its pinned metadata adapter never
+constructs a prompt or parses transcript message/tool payloads. Experimental
+cross-profile `thread/fork.path` and remote-TUI resume remain disabled behind
+their separate Phase 4.5 runtime/schema gate.
 
 ## What Orca currently does
 
