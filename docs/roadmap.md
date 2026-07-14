@@ -58,14 +58,19 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [ ] No mid-session credential swap
 - [ ] No automatic command or prompt replay
 - [ ] Audit events containing no secret or stable account identifier
+- [ ] Continue the same logical conversation after confirmed exhaustion by advancing its profile-local thread generation
 
-## Phase 4.5: optional session handoff
+## Phase 4.5: required conversation handoff
 
-- [ ] Decide whether cross-profile resume belongs in Calcifer's supported surface
-- [ ] Bind every captured thread to source profile, canonical cwd, trust domain, and exact rollout path
-- [ ] Version-gate Codex's experimental external-rollout resume field
-- [ ] Canonical containment, symlink/owner/mode validation, and a single-writer session lease
-- [ ] Stop and reap the old child before reopening history under a target profile
+- [x] Decide that successful automatic failover continues the same user-visible conversation; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
+- [ ] Model one logical conversation as a lineage of profile-local provider threads
+- [ ] Bind every lineage generation to profile, canonical cwd, trust domain, thread ID, and exact rollout path
+- [ ] Version-gate Codex's experimental `thread/fork.path` field and remote TUI contract with `codex app-server generate-json-schema --experimental --out <dir>` drift checks plus a synthetic runtime smoke test
+- [ ] Canonical containment, hard-link/symlink/owner/mode validation, serialized handoff, and explicit source-to-target lease transfer
+- [ ] Stop and reap the old TUI and App Server before reading its rollout under the target profile
+- [ ] Preserve source effective settings while keeping authentication/provider routing target-profile-owned
+- [ ] Materialize a new target-profile rollout, atomically commit the generation, and reconcile non-idempotent fork crash ambiguity
+- [ ] Keep the monitor event-only and require the official TUI before accepting a new turn
 - [ ] Restore transcript only; never replay an interrupted turn
 
 ## Phase 5: Claude support

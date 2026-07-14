@@ -7,7 +7,7 @@ This document records the upstream contracts behind Calcifer's resume and usage 
 Verified on 2026-07-15 against:
 
 - installed and released Codex CLI `0.144.4`, tag [`rust-v0.144.4`](https://github.com/openai/codex/releases/tag/rust-v0.144.4), commit [`8c68d4c87dc54d38861f5114e920c3de2efa5876`](https://github.com/openai/codex/commit/8c68d4c87dc54d38861f5114e920c3de2efa5876);
-- OpenAI Codex `main` commit [`0396f99cf1a27fc87dd12d23403b25e840b6ecbd`](https://github.com/openai/codex/commit/0396f99cf1a27fc87dd12d23403b25e840b6ecbd), where the fields used here were unchanged;
+- OpenAI Codex `main` commit [`f90e7deea6a715bbd153044af6f475eefa749177`](https://github.com/openai/codex/commit/f90e7deea6a715bbd153044af6f475eefa749177), where the fields used here were unchanged;
 - Orca `main` commit [`e0edc8ef76d341f7ab8083a006f785322bcaeb23`](https://github.com/stablyai/orca/commit/e0edc8ef76d341f7ab8083a006f785322bcaeb23).
 
 The official Codex App Server command is still marked experimental as a whole. Calcifer negotiates its stable protocol subset with `experimentalApi: false` and fails closed when the method or response shape is unavailable.
@@ -34,16 +34,31 @@ Relevant upstream sources:
 - [thread resume types and experimental-field markers](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L310-L438);
 - [session layout](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/rollout/src/list.rs#L418-L421).
 
-### Cross-profile resume
+### Cross-profile conversation handoff
 
-A stable thread-ID lookup is scoped to the current `CODEX_HOME`. Codex 0.144.4 has an experimental `thread/resume.path` field that can read an absolute external rollout path. The upstream resolver canonicalizes the file but does not constrain it to the active home. Calcifer therefore does not enable this field today.
+A stable thread-ID lookup is scoped to the current `CODEX_HOME`, but credential profile and conversation identity are not intrinsically the same thing. Calcifer's successful automatic-failover path will continue the same user-visible conversation under the next profile.
 
-If cross-profile handoff is added, the path must come only from Calcifer-owned metadata, remain canonically contained in a registered source profile's sessions root, pass type/symlink/owner/mode checks, and have one writer. The source and target profiles must share an explicitly configured trust domain. The field must be version-gated and optional because upstream marks it unstable.
+Codex 0.144.4 provides two experimental external-rollout fields:
+
+- `thread/resume.path` loads the external rollout and continues appending to that supplied path. It preserves the Codex thread ID but requires a cross-profile writer lease for the source rollout's lifetime.
+- `thread/fork.path` loads the external rollout as history and materializes a new persistent thread and rollout under the target profile. It changes the provider thread ID while keeping the transcript and source lineage.
+
+Calcifer prefers `thread/fork.path` for automatic handoff. One logical Calcifer conversation can contain multiple profile-local Codex thread generations, and each generation has one writer. The target profile's App Server owns authentication and persistence; the official TUI attaches with `codex resume --remote <local-socket> <target-thread-id>`. The source rollout remains unchanged after import. Because a newly forked thread is already loaded, its effective model, cwd, sandbox, and approval settings must be fixed in the fork request; the later TUI rejoin is not used to change credential or provider routing.
+
+The connection that creates or resumes a thread is subscribed to thread events. A future Calcifer monitor may stay subscribed for structured usage signals, but it must never answer approvals or other server-initiated requests; the official TUI is the sole responder and must be attached before user input is accepted. `thread/fork` has no Calcifer-supplied idempotency key, so a prepared transition is synced before the request and crash recovery adopts only one uniquely matching fork.
+
+The path must come only from Calcifer-owned lineage metadata, remain canonically contained in a registered source profile's sessions root, pass type/hard-link/symlink/owner/mode checks, and be read only after the source TUI/App Server are stopped and reaped while Calcifer retains the source lease. Source and target profiles must share an explicitly configured trust domain. The installed Codex version and `codex app-server generate-json-schema --experimental --out <dir>` output must match a tested adapter because the default generated schema omits these unstable fields. CI must also perform a synthetic fork-by-path protocol smoke test; schema presence alone does not prove runtime acceptance or materialization semantics.
+
+`ThreadForkParams.threadId` remains a required string even for a path-based fork. Calcifer sends `threadId: ""` together with a non-empty validated `path`; Codex then ignores the empty lookup ID and imports by path.
+
+This design is accepted in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) but is not implemented in the current alpha.
 
 Relevant upstream sources:
 
+- [`ThreadForkParams.path` and `ThreadResumeParams.path`](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L310-L600);
+- [fork implementation and target rollout materialization](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server/src/request_processors/thread_processor.rs#L3444-L3721);
 - [external rollout resolver](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/thread-store/src/local/read_thread.rs#L150-L188);
-- [upstream external-rollout resume test](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/thread-store/src/local/mod.rs#L1031-L1067).
+- [resume recorder appends to the supplied path](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/rollout/src/recorder.rs#L813-L826).
 
 ## Codex rate limits and reset credits
 

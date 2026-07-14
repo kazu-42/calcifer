@@ -121,10 +121,10 @@ Failover will follow conservative semantics:
 - Only authoritative, fresh `exhausted` state permits selecting another profile. A rounded display value of `0% remaining`, authentication failure, provider error, network failure, unknown output, or stale status cannot authorize a switch.
 - A pool is traversed at most once per invocation and uses cooldown state to prevent loops.
 - Calcifer never hot-swaps credentials in a running process.
-- A future supervisor may reopen a persisted transcript after the old child has stopped, but it will never automatically replay the last command or prompt. A partially completed turn may already have changed files or external systems, so replay could duplicate side effects.
+- After the old child has stopped, the supervisor will continue the same user-visible conversation under the selected profile. Internally, the preferred handoff forks the validated source rollout into a new profile-local Codex thread, so the logical conversation stays stable while the provider thread ID changes. Calcifer never automatically replays the last command or prompt; a partially completed turn may already have changed files or external systems.
 - Before launch, Calcifer shows the local profile alias, provider, trust domain, and selection reason without exposing provider account identifiers.
 
-Same-profile resume is stable today. Cross-profile resume is not: stable Codex thread lookup is scoped to one `CODEX_HOME`, while the available external-rollout-path field is explicitly experimental. Any future cross-profile handoff must bind the thread to its source profile, stay inside one configured trust domain, hold a single-writer lease, validate a Calcifer-owned rollout path, and restore history without resubmitting a turn.
+Same-profile resume is stable today. Cross-profile continuation is a required part of the planned failover experience, but its upstream import field is experimental: stable Codex thread lookup is scoped to one `CODEX_HOME`. Calcifer will use a version-gated target-profile App Server to fork a validated source rollout into a new target-profile thread, then attach the official TUI over a private local transport. The handoff stays inside one configured trust domain, preserves one writer per rollout, and restores history without resubmitting a turn. See [ADR 0001](docs/adr/0001-cross-profile-conversation-handoff.md).
 
 ## Provider direction
 
@@ -136,7 +136,7 @@ Same-profile resume is stable today. Cross-profile resume is not: stable Codex t
 | Codex usage observation | Implemented on demand for idle profiles | Structured app-server response; active profiles need the planned supervisor |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
 | Opt-in profile pools | Design | Same provider and trust domain; bounded selection |
-| Cross-profile transcript handoff | Experimental design | Not enabled; external-path resume is an unstable upstream field |
+| Cross-profile conversation handoff | Required failover design | Not enabled; version-gated fork into a target-profile thread, tracked as one logical conversation |
 | Claude setup-token profiles | Experimental plan | OS credential store where officially supported |
 | Claude subscription OAuth replication | Not planned for MVP | No undocumented OAuth endpoint or Keychain-name emulation |
 | Mid-session account hot-swap or command replay | Non-goal | Unsafe side-effect semantics |
@@ -159,12 +159,12 @@ Core invariants for future implementation are:
 6. State changes are permission-checked, atomic, bounded, and recoverable.
 7. Old rotated credentials are never restored over newer credentials.
 8. Credential-bearing environments are passed only to the selected adapter's validated executable, never to an arbitrary user-supplied command.
-9. A resumable thread remains bound to its source profile unless an explicit, reviewed same-trust-domain handoff is used.
+9. A credential profile and a logical conversation have independent lifecycles; a handoff may move the conversation only between stopped processes in one explicit trust domain.
 10. Resume restores persisted history but never replays an interrupted prompt or tool action.
 
 File-based Codex credentials remain readable by the current OS user and the official Codex CLI; Calcifer is not an encrypted vault. Calcifer also does not sandbox the wrapped CLI, its hooks, or commands executed from the current repository.
 
-See [Architecture](docs/architecture.md), [Provider compatibility](docs/provider-compatibility.md), [Security model](docs/security-model.md), and [Security policy](SECURITY.md) before contributing to authentication, storage, process execution, or failover behavior.
+See [Architecture](docs/architecture.md), [ADR 0001: cross-profile conversation handoff](docs/adr/0001-cross-profile-conversation-handoff.md), [Provider compatibility](docs/provider-compatibility.md), [Security model](docs/security-model.md), and [Security policy](SECURITY.md) before contributing to authentication, storage, process execution, or failover behavior.
 
 ## Build from source
 
@@ -212,7 +212,7 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 3. Add exact thread-ID capture for automatic cold restore, provider identity verification, safe remove/reauth flows, and crash recovery.
 4. Add observation caching, supported-version/schema gates, and adaptive refresh without aggressive polling.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
-6. Evaluate cross-profile resume behind an experimental gate; do not use it as the default failover path.
+6. Add version-gated cross-profile conversation handoff as the default successful failover path; preserve one profile-local writer per lineage generation.
 7. Add Claude only through provider-supported authentication and usage-observation surfaces.
 
 Detailed gates and non-goals are tracked in [docs/roadmap.md](docs/roadmap.md).

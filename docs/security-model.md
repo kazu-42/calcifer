@@ -2,7 +2,7 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow and may let the official CLI refresh them during run, resume, or status. Automatic failover and cross-profile resume are not implemented.
+This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow and may let the official CLI refresh them during run, resume, or status. Automatic failover and cross-profile conversation handoff are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
 
 ## Assets
 
@@ -24,7 +24,7 @@ This document covers both implemented and intended guarantees. The current Unix 
 - automatic failover causing organization-boundary data disclosure
 - incorrect quota classification causing failover loops
 - automatic replay duplicating file, Git, deployment, billing, or messaging side effects
-- one thread being resumed concurrently or under an account outside its configured trust domain
+- one conversation lineage being written concurrently, handed to an account outside its configured trust domain, or imported from an attacker-selected path
 
 ## Threats outside the guarantee
 
@@ -70,6 +70,12 @@ The observation records its provider, profile ID, source, observation time, opti
 
 The selector keeps an attempted-profile set, traverses a pool no more than once, and observes a cooldown. Cached state may prefilter candidates, but identity and fresh authoritative usage are revalidated after acquiring the profile lease. It never changes the credentials of a running process and never replays a started command.
 
+A successful switch continues the same logical conversation. Credential profile identity remains immutable for each provider process, while the conversation advances to a new target-profile Codex thread generation. A serialized handoff retains the existing source-profile lease and reserves a freshly revalidated target profile. The source TUI and App Server must then be stopped and reaped while Calcifer retains source ownership. The source rollout is accepted only from Calcifer-owned metadata after canonical containment, owner, mode, regular-file, single-hard-link, and symlink validation. The target App Server imports that history through a version-gated provider API and must return the expected lineage plus a distinct rollout contained under the target profile before activation; Calcifer verifies that the source rollout content is unchanged and never copies credentials into a shared runtime home. The prepared transition is synced before the non-idempotent fork request, so crash recovery adopts only one uniquely matching target fork and otherwise fails closed. Source ownership is released only after the target generation is committed and attached.
+
+The supervisor may subscribe to thread events for usage monitoring, but it never answers approvals or any other server-initiated request. Only the attached official TUI may respond, and no new turn is admitted while that TUI is absent. Source effective execution settings are fixed at fork time; target authentication and provider routing cannot be replaced by a remote-client override.
+
+If the provider version, experimental schema, path provenance, target identity, or transition state is ambiguous, the handoff stops with the source rollout intact. A fresh thread may be offered as an explicit recovery choice, but it is not reported as a successful automatic resume.
+
 The displayed remaining percentage is derived from a rounded provider value. `0% remaining` alone is not exhaustion. Current status requires a recognized structured `rateLimitReachedType` to report `exhausted`; all missing, malformed, stale, auth, network, and unsupported states are `unknown` for future switching logic.
 
 Current on-demand status is intentionally limited to idle profiles. An active profile retains an exclusive single-writer lease and reports busy/unknown rather than starting another app-server that could refresh the same credential file. A future long-lived supervisor must own both the provider session and its usage observations before active monitoring or automatic failover can be enabled.
@@ -90,4 +96,6 @@ Minimum future test classes include:
 6. Adapter compatibility tests for versions, changed output, auth errors, timeouts, rate limits, and provider failures.
 7. Process tests for exact argv, PATH resolution, arbitrary-command rejection, symlink swaps, signal forwarding, exit status, and authentication environment cleanup.
 8. Deletion tests proving Calcifer never recursively removes a path outside its ownership-marked managed root.
-9. Session tests proving exact source-profile binding, one writer per rollout, canonical path containment, and no prompt replay across crash or handoff paths.
+9. Session tests proving lineage/profile separation, one writer per rollout generation, canonical path containment, hard-link rejection, serialized lease transfer, and no prompt replay across crash or handoff paths.
+10. Transition-recovery tests for crashes before source stop, after source stop, after sending the non-idempotent target fork, before registry commit, and before remote TUI attach.
+11. Subscription tests proving the monitor cannot answer approvals, a TUI must attach before input, and target authentication/provider routing cannot be overridden during rejoin.
