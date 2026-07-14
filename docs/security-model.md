@@ -2,7 +2,7 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document describes intended guarantees. The pre-alpha scaffold does not read, store, or mutate credentials.
+This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow and may let the official CLI refresh them during run, resume, or status. Automatic failover and cross-profile resume are not implemented.
 
 ## Assets
 
@@ -24,6 +24,7 @@ This document describes intended guarantees. The pre-alpha scaffold does not rea
 - automatic failover causing organization-boundary data disclosure
 - incorrect quota classification causing failover loops
 - automatic replay duplicating file, Git, deployment, billing, or messaging side effects
+- one thread being resumed concurrently or under an account outside its configured trust domain
 
 ## Threats outside the guarantee
 
@@ -40,13 +41,20 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 ## Secret-handling requirements
 
 - Managed directories are private to the current user; secret files are private at creation time.
-- Tokens are never accepted as ordinary command-line flags because process listings and shell history can expose them.
+- Tokens and reset-credit IDs are never accepted as ordinary command-line flags because process listings and shell history can expose them.
 - Raw arguments, child environments, credential files, account email, and stable provider IDs are not logged.
 - Diagnostics report capability and redacted status, not secret values or credential paths.
 - Test credentials are synthetic and contain obvious non-production markers.
 - Claude token storage fails closed when a supported OS credential store is unavailable. Plaintext fallback is a non-goal unless a later ADR and security review define it.
 - Export, backup, telemetry, and crash-report features exclude credentials by design.
 - Credential-bearing environments are passed only to a provider adapter's validated executable, never to an arbitrary command supplied after `--`.
+- Managed Codex operations remove conflicting API-key environment variables so the selected subscription profile is not silently bypassed.
+- Calcifer revalidates the private `auth.json` and exact managed `config.toml` after acquiring the profile lease, forces file-backed storage on every invocation, and rejects provider/account-routing overrides.
+- Login and status probes use a verified neutral managed directory rather than the caller's repository cwd.
+- Interactive launch uses a coordinator/provider-guardian pair with two fixed-order lease files. Either surviving process blocks a second writer after a selective crash, while the official provider and its background tools inherit neither descriptor.
+- If the provider guardian is killed after reporting the exact provider PID, the coordinator retains its lease until that PID exits. If failure lands in the unobservable post-authorization/pre-report window, the coordinator deliberately remains alive and locked rather than guessing that no provider exists.
+- The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
+- The bounded status app-server is the narrow exception: it inherits only the provider-side lease because it cannot start turns or tools. This keeps a killed status parent from admitting a second credential writer until stdio EOF terminates the probe.
 
 ## Failover requirements
 
@@ -61,6 +69,10 @@ available | exhausted | unknown
 The observation records its provider, profile ID, source, observation time, optional reset time, and adapter version. Every error that cannot be proven to mean exhaustion becomes `unknown` and stops selection.
 
 The selector keeps an attempted-profile set, traverses a pool no more than once, and observes a cooldown. Cached state may prefilter candidates, but identity and fresh authoritative usage are revalidated after acquiring the profile lease. It never changes the credentials of a running process and never replays a started command.
+
+The displayed remaining percentage is derived from a rounded provider value. `0% remaining` alone is not exhaustion. Current status requires a recognized structured `rateLimitReachedType` to report `exhausted`; all missing, malformed, stale, auth, network, and unsupported states are `unknown` for future switching logic.
+
+Current on-demand status is intentionally limited to idle profiles. An active profile retains an exclusive single-writer lease and reports busy/unknown rather than starting another app-server that could refresh the same credential file. A future long-lived supervisor must own both the provider session and its usage observations before active monitoring or automatic failover can be enabled.
 
 Immediately before launch, Calcifer reports the local profile alias, provider, trust domain, and selection reason. It does not display email or stable provider account, workspace, or organization identifiers, and repository-local configuration cannot suppress this notice.
 
@@ -78,3 +90,4 @@ Minimum future test classes include:
 6. Adapter compatibility tests for versions, changed output, auth errors, timeouts, rate limits, and provider failures.
 7. Process tests for exact argv, PATH resolution, arbitrary-command rejection, symlink swaps, signal forwarding, exit status, and authentication environment cleanup.
 8. Deletion tests proving Calcifer never recursively removes a path outside its ownership-marked managed root.
+9. Session tests proving exact source-profile binding, one writer per rollout, canonical path containment, and no prompt replay across crash or handoff paths.

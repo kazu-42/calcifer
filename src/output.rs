@@ -116,26 +116,38 @@ impl DoctorReport {
 #[derive(Debug, Serialize)]
 pub(crate) struct ErrorReport {
     schema_version: u8,
-    command: Option<&'static str>,
+    command: Option<String>,
     ok: bool,
     error: ErrorBody,
 }
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
-    code: &'static str,
-    message: &'static str,
+    code: String,
+    message: String,
 }
 
 impl ErrorReport {
-    pub(crate) const fn usage() -> Self {
+    pub(crate) fn usage() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             command: None,
             ok: false,
             error: ErrorBody {
-                code: "usage_error",
-                message: "Invalid command-line arguments. Run calcifer --help.",
+                code: "usage_error".to_owned(),
+                message: "Invalid command-line arguments. Run calcifer --help.".to_owned(),
+            },
+        }
+    }
+
+    pub(crate) fn command(command: &str, code: &str, message: String) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            command: Some(command.to_owned()),
+            ok: false,
+            error: ErrorBody {
+                code: code.to_owned(),
+                message,
             },
         }
     }

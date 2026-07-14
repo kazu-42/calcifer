@@ -44,10 +44,15 @@ fn inspect_with(locator: &impl ExecutableLocator) -> DoctorReport {
         host,
         executable_check(locator, "codex_cli", "codex"),
         executable_check(locator, "claude_cli", "claude"),
+        Check::pass(
+            "manual_profile_selection",
+            "implemented",
+            "Explicit Codex profile registration, launch, and resume are available",
+        ),
         Check::warn(
-            "account_switching",
+            "automatic_failover",
             "not_implemented",
-            "Account switching and automatic failover are not available in this preview",
+            "Default-profile switching and automatic failover are not available in this preview",
         ),
     ];
 
