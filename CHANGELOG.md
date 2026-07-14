@@ -23,6 +23,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   child is created, while owner-safe legacy `0755`/`0644` nested rollouts remain
   readable behind the private managed-home boundary.
 
+### Fixed
+
+- Exact resume preserves persisted interrupted or unknown-crash state through
+  pre-launch validation, and terminal profile/cwd ownership conflicts no longer
+  leave an unrecoverable pending launch in an infinite retry loop.
+
 ## [0.1.0-alpha.3] - 2026-07-15
 
 ### Added

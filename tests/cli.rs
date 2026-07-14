@@ -301,6 +301,7 @@ fn non_normalized_home_is_rejected_before_staging() -> Result<(), Box<dyn std::e
 #[test]
 fn managed_codex_profile_supports_status_run_and_exact_resume()
 -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
 
@@ -1607,6 +1608,35 @@ config_file = "{sensitive_role_path}"
             .as_array()
             .map(Vec::len),
         Some(0)
+    );
+
+    let mut clean_rollout = std::fs::OpenOptions::new().append(true).open(&rollout)?;
+    clean_rollout.write_all(
+        br#"{"timestamp":"2026-07-15T00:00:04Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+    )?;
+    clean_rollout.write_all(b"\n")?;
+    clean_rollout.sync_all()?;
+    let resume_unknown_head_over_clean_rollout = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume"])
+        .output()?;
+    let resume_unknown_stderr = String::from_utf8(resume_unknown_head_over_clean_rollout.stderr)?;
+    assert!(
+        resume_unknown_head_over_clean_rollout.status.success(),
+        "{resume_unknown_stderr}"
+    );
+    assert!(
+        resume_unknown_stderr.contains("did not have a provably clean boundary"),
+        "a clean rollout observation must not erase persisted unknown-crash state before launch"
+    );
+    let completed_resume_conversation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        completed_resume_conversation["conversations"][0]["last_safe_lifecycle"], "clean",
+        "only the completed provider lifecycle may clear persisted uncertainty"
     );
 
     // Killing the provider-side guardian leaves the coordinator lease alive.

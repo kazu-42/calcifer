@@ -162,15 +162,21 @@ impl<'a> CaptureContext<'a> {
 
         let read = self.read_thread(thread_id)?;
 
-        if mode == InternalProcessMode::ResumeHead {
+        let persisted_lifecycle = if mode == InternalProcessMode::ResumeHead {
             let head = self.conversations.resolve_head(self.working_directory)?;
             validate_head_target(&head, self.profile_id, thread_id, self.working_directory)?;
             if head.codex_version != read.codex_version {
                 return Err(ConversationError::SessionSchemaUnsupported.into());
             }
-        }
+            Some(head.lifecycle)
+        } else {
+            None
+        };
 
-        let binding = self.binding_from_read(read)?;
+        let mut binding = self.binding_from_read(read)?;
+        if let Some(persisted_lifecycle) = persisted_lifecycle {
+            binding.lifecycle = preserve_resume_uncertainty(persisted_lifecycle, binding.lifecycle);
+        }
         if let Some(pending) = self
             .conversations
             .pending_for(self.profile_id, self.working_directory)?
@@ -274,13 +280,7 @@ impl<'a> CaptureContext<'a> {
                 if !provider_succeeded && binding.lifecycle == ConversationLifecycle::Clean {
                     binding.lifecycle = ConversationLifecycle::UnknownCrash;
                 }
-                let resolved = self
-                    .conversations
-                    .finish_launch(launch_id, LaunchResolution::Bind(binding))?;
-                if resolved.is_none() {
-                    return Err(ConversationError::Ambiguous.into());
-                }
-                Ok(())
+                finish_candidate_binding(self.conversations, launch_id, binding)
             }
             InventoryCandidate::Ambiguous => {
                 let _ = self
@@ -396,13 +396,7 @@ impl<'a> CaptureContext<'a> {
                         );
                     }
                 };
-                let resolved = self
-                    .conversations
-                    .finish_launch(&pending.launch_id, LaunchResolution::Bind(binding))?;
-                if resolved.is_none() {
-                    return Err(ConversationError::Ambiguous.into());
-                }
-                Ok(())
+                finish_candidate_binding(self.conversations, &pending.launch_id, binding)
             }
             InventoryCandidate::Ambiguous => {
                 let _ = self
@@ -483,6 +477,36 @@ fn require_started_candidate(
     Err(ConversationError::Ambiguous.into())
 }
 
+const fn preserve_resume_uncertainty(
+    persisted: ConversationLifecycle,
+    observed: ConversationLifecycle,
+) -> ConversationLifecycle {
+    match persisted {
+        ConversationLifecycle::Clean => observed,
+        ConversationLifecycle::Interrupted
+        | ConversationLifecycle::UnknownCrash
+        | ConversationLifecycle::Missing
+        | ConversationLifecycle::Archived
+        | ConversationLifecycle::Incompatible
+        | ConversationLifecycle::Ambiguous => persisted,
+    }
+}
+
+fn finish_candidate_binding(
+    conversations: &ConversationRegistry,
+    launch_id: &str,
+    binding: BindingInput,
+) -> Result<(), AppError> {
+    match conversations.finish_launch(launch_id, LaunchResolution::Bind(binding)) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(ConversationError::Ambiguous.into()),
+        Err(error @ (ConversationError::ProfileMismatch | ConversationError::CwdMismatch)) => {
+            finish_reconciliation_failure(conversations, launch_id, error.into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn finish_reconciliation_failure(
     conversations: &ConversationRegistry,
     launch_id: &str,
@@ -495,6 +519,7 @@ fn finish_reconciliation_failure(
                 | ConversationError::Archived
                 | ConversationError::SessionSchemaUnsupported
                 | ConversationError::CodexVersionUnsupported
+                | ConversationError::ProfileMismatch
                 | ConversationError::CwdMismatch
                 | ConversationError::ThreadProtocolInvalid
         )
@@ -698,6 +723,98 @@ mod tests {
         }
     }
 
+    fn binding_for(profile_id: &str, thread_id: &str, workspace: &Path) -> BindingInput {
+        BindingInput {
+            profile_id: profile_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            canonical_cwd: fs::canonicalize(workspace)
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned))
+                .unwrap_or_default(),
+            codex_version: "0.144.4".to_owned(),
+            lifecycle: ConversationLifecycle::Clean,
+        }
+    }
+
+    fn assert_terminal_binding_conflict(
+        name: &str,
+        profile_mismatch: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "calcifer-binding-conflict-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let existing_workspace = root.join("existing-workspace");
+        let pending_workspace = root.join("pending-workspace");
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&existing_workspace)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&pending_workspace)?;
+        let registry = Registry::at(root.clone());
+        let conversations = ConversationRegistry::from_profiles(&registry);
+        let existing_profile = Uuid::new_v4().to_string();
+        let pending_profile = if profile_mismatch {
+            Uuid::new_v4().to_string()
+        } else {
+            existing_profile.clone()
+        };
+        let thread_id = Uuid::new_v4().to_string();
+        conversations.adopt(binding_for(
+            &existing_profile,
+            &thread_id,
+            &existing_workspace,
+        ))?;
+        let launch_id = conversations.begin_launch(
+            &pending_profile,
+            &pending_workspace,
+            LaunchMode::Run,
+            "0.144.4",
+            Vec::new(),
+        )?;
+        conversations.mark_provider_started(&launch_id)?;
+
+        let error = finish_candidate_binding(
+            &conversations,
+            &launch_id,
+            binding_for(&pending_profile, &thread_id, &pending_workspace),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("immutable ownership conflict was accepted"))?;
+        assert_eq!(
+            error.code(),
+            if profile_mismatch {
+                "conversation_profile_mismatch"
+            } else {
+                "conversation_cwd_mismatch"
+            }
+        );
+        assert!(
+            conversations
+                .pending_for(&pending_profile, &pending_workspace)?
+                .is_none(),
+            "a permanent bind conflict must not leave a retry loop"
+        );
+        assert_eq!(
+            conversations
+                .resolve_head(&pending_workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_ambiguous")
+        );
+        assert_eq!(
+            conversations.resolve_head(&existing_workspace)?.thread_id,
+            thread_id,
+            "terminalizing the candidate must preserve the immutable owner"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn inventory_diff_never_guesses_between_new_changed_or_archived_threads() {
         let first = inventory_thread("01900000-0000-7000-8000-000000000001", 10);
@@ -789,6 +906,36 @@ mod tests {
                 ConversationError::ThreadMetadataUnavailable
             ));
         }
+    }
+
+    #[test]
+    fn resume_preparation_preserves_persisted_uncertainty() {
+        for persisted in [
+            ConversationLifecycle::UnknownCrash,
+            ConversationLifecycle::Interrupted,
+        ] {
+            assert_eq!(
+                preserve_resume_uncertainty(persisted, ConversationLifecycle::Clean),
+                persisted
+            );
+        }
+        assert_eq!(
+            preserve_resume_uncertainty(
+                ConversationLifecycle::Clean,
+                ConversationLifecycle::Interrupted
+            ),
+            ConversationLifecycle::Interrupted
+        );
+    }
+
+    #[test]
+    fn profile_conflict_terminalizes_candidate_binding() -> Result<(), Box<dyn std::error::Error>> {
+        assert_terminal_binding_conflict("profile", true)
+    }
+
+    #[test]
+    fn cwd_conflict_terminalizes_candidate_binding() -> Result<(), Box<dyn std::error::Error>> {
+        assert_terminal_binding_conflict("cwd", false)
     }
 
     #[test]
