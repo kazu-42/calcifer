@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration, pinned launch, same-profile resume, and structured on-demand status are implemented. Automatic failover and cross-profile transcript handoff remain design work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration, pinned launch, same-profile resume, and structured on-demand status are implemented. The cross-profile conversation handoff design is accepted; its supervisor and automatic failover implementation remain future work.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -38,10 +38,12 @@ A repository-local file must never be able to select an account or failover pool
 | --- | --- | --- |
 | CLI parser | Parse explicit commands and the `--` provider-argument boundary | Accept implicit external subcommands or an arbitrary executable |
 | Registry | Store non-secret opaque profile metadata | Store raw tokens in diagnostics or logs |
+| Conversation lineage registry | Bind one logical conversation to ordered profile-local thread generations | Treat a credential profile ID as the conversation ID |
 | Provider adapter | Build an isolated environment and classify supported structured signals | Reimplement undocumented OAuth flows or scrape TUI text |
 | Profile lease | Serialize profile mutation, usage probes, and child lifetime | Rely on PID files as the lock authority |
+| Conversation lease | Serialize lineage transitions and rollout imports across profiles | Allow two generations to write one rollout |
 | Selector | Choose one profile from an explicit pool | Cross trust domains or loop indefinitely |
-| Process supervisor | Spawn directly, forward signals, preserve exit semantics | Replay prompts or commands |
+| Process supervisor | Own the profile App Server, attach the official TUI, observe events, forward signals, and preserve exit semantics | Replay prompts or commands, or answer provider approval requests |
 | Observation cache | Record bounded, timestamped usage state | Treat stale or unknown data as exhaustion |
 
 ## Normative invariants
@@ -60,7 +62,7 @@ Future code that violates one of these invariants requires an architecture decis
 10. **Providers own authentication.** Login and refresh stay in official, supported provider flows.
 11. **Provider executable only.** Credential-bearing environments are passed only to the selected adapter's validated executable, never to an arbitrary user-supplied command.
 12. **Selection is visible.** Before launch, Calcifer reports the local profile alias, provider, trust domain, and reason code without exposing stable provider identifiers.
-13. **Sessions have provenance.** An automatically resumable thread is bound to the profile and canonical working directory that created it.
+13. **Conversations have lineage.** Every provider thread is bound to its credential profile and canonical working directory, while one user-visible conversation may advance through multiple profile-local thread generations in one trust domain.
 14. **Resume is not replay.** Restoring persisted conversation history never resubmits an interrupted prompt, command, or tool action.
 
 ## Codex profile model
@@ -97,7 +99,7 @@ The exact thread ID is the reliable resume key. `--last` remains a convenience f
 
 The current slice does not yet install a session hook or persist `{profile_id, cwd, thread_id}` automatically. That registry is required before Calcifer can cold-restore a session without the user supplying an ID. Restored state is the persisted conversation transcript; a dead process, stream, or in-flight tool call is not restarted.
 
-Stable `thread/resume` lookup is scoped to the current `CODEX_HOME`. Codex 0.144.4 also exposes an experimental external rollout `path`, but Calcifer does not enable it. A future cross-profile handoff requires same-trust-domain policy, source-profile provenance, canonical path containment under a Calcifer-managed sessions root, a single-writer session lease, version gating, and no prompt replay.
+Stable `thread/resume` lookup is scoped to the current `CODEX_HOME`. Codex 0.144.4 also exposes experimental external rollout paths for resume and fork, but Calcifer does not enable them yet. The accepted cross-profile design uses a target-profile App Server to fork validated source history into a new target-profile rollout. It requires same-trust-domain policy, source-profile provenance, canonical containment under a Calcifer-managed sessions root, one writer per lineage generation, version gating, and no prompt replay; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
 
 ## Implemented Codex usage observation
 
@@ -117,27 +119,30 @@ The one-shot probe cannot inspect a profile while its `run` or `resume` child ow
 
 The verified upstream versions, exact fields, and source links are recorded in [Provider compatibility notes](provider-compatibility.md).
 
-## Planned failover state machine
+## Planned supervised failover and conversation handoff
 
 ```text
 resolve pinned profile or explicit pool
   -> reject cross-provider or cross-trust-domain candidates
-  -> use cached usage state only as a candidate prefilter
-  -> acquire the candidate profile lease
-  -> revalidate identity, credentials, and fresh authoritative usage under the lease
-     -> available: display selection and launch exactly once
-     -> exhausted: record cooldown, release the lease, and try the next candidate
-     -> unknown: release the lease and stop without switching
-  -> child exits
-     -> confirmed exhaustion: record it for a future invocation
-     -> auth/network/provider/parser error: stop without switching
-     -> other exit: propagate the status
-  -> release lease
+  -> launch a profile-owned App Server and attach the official TUI locally
+  -> observe structured turn and rate-limit events
+     -> ordinary completion/error: keep the current profile or stop
+     -> confirmed exhaustion: revalidate under the current lease
+  -> acquire handoff/conversation leases, retain the source lease, reserve a fresh target
+  -> stop and reap the source TUI and App Server while retaining source ownership
+  -> validate the source rollout and fsync a prepared handoff
+  -> start the target profile App Server
+  -> version-gated thread/fork(path=source rollout, effective settings)
+  -> verify new lineage ID, target containment, and unchanged source
+  -> atomically commit the new lineage generation
+  -> attach the official TUI to the target thread before accepting input
+  -> release source/transition leases; retain the target lifetime lease
+  -> continue monitoring; never replay the failed turn
 
 A pool is traversed at most once per invocation.
 ```
 
-The current `run` command does not restart or re-submit a command after the child begins execution. A future supervisor may reopen a persisted transcript only after the old child is confirmed stopped, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion.
+The current `run` command does not restart or re-submit a command after the child begins execution. The planned supervisor treats credential profiles and conversation lineage as separate aggregates. It continues the same user-visible conversation after failover by creating a target-profile Codex thread from the validated source rollout, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion. The supervisor connection remains event-only and never races the official TUI to answer approvals or other server-initiated requests; no new turn is admitted without an attached TUI. The full decision and recovery model is in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
 
 ## Filesystem and credential mutations
 
@@ -196,7 +201,7 @@ Before the first stable release, the project still needs reviewed ADRs for:
 - process/PTY supervision on Linux, macOS, and Windows;
 - supported Codex version/schema gates and observation cache TTL/backoff;
 - exact thread capture, interrupted-turn state, and cold-restore recovery;
-- cross-profile transcript handoff or a decision to keep it out of scope;
+- cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
 - OS credential-store support for Claude setup tokens;
 - trust-domain configuration and failover pool UX.
 

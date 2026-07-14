@@ -17,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Read-only per-profile Codex usage windows, reset times, workspace credits, spend controls, and rate-limit reset-credit status through the official app-server protocol.
 - Stable JSON status output with redacted provider errors and display-only remaining percentages.
 - Checked cold resume after wrapper restart by exact thread ID or official `--last` behavior.
+- ADR for profile-independent conversation lineage and required cross-profile continuation after automatic failover.
 
 ### Security
 
@@ -31,7 +32,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Known limitations
 
-- Automatic account failover and cross-profile session handoff are not implemented.
+- Automatic account failover and the accepted cross-profile conversation handoff design are not implemented.
 - Managed profile registration is disabled on Windows until current-user-only ACL creation is verified.
 - `resume` restores persisted Codex conversation state; it does not restart an in-flight tool call or replay a prompt.
 - Exact previous-thread auto-selection, active-profile monitoring, and provider account-identity verification are not implemented; current status reads idle local profiles, which may alias the same underlying account.
