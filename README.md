@@ -82,7 +82,7 @@ codex@work [available]
   reset credits: 2 available
     codexRateLimits · available · expires 2027-02-01T08:00:00Z
   observed 2026-07-15T12:34:56Z · fresh · codex_app_server
-  compatibility compatible · Codex 0.144.4 · tested 0.144.4 · adapter 0.1.0-alpha.2
+  compatibility compatible · Codex 0.144.4 · tested 0.144.4 · adapter 0.1.0-alpha.3
 ```
 
 Stable JSON adds `codex_version`, `adapter_version`, and a `compatibility`
@@ -101,7 +101,7 @@ Example JSON envelope:
 {
   "schema_version": 1,
   "command": "doctor",
-  "calcifer_version": "0.1.0-alpha.2",
+  "calcifer_version": "0.1.0-alpha.3",
   "ok": true,
   "status": "warn",
   "checks": []

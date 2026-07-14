@@ -22,7 +22,7 @@ body:
     id: version
     attributes:
       label: Calcifer version or commit
-      placeholder: calcifer 0.1.0-alpha.1 or commit SHA
+      placeholder: Paste the exact calcifer --version output or a commit SHA
     validations:
       required: true
 

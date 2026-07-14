@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-07-15
+
 ### Added
 
 - Initial Rust CLI scaffold.
@@ -76,3 +78,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Managed profile registration is disabled on Windows until current-user-only ACL creation is verified.
 - `resume` restores persisted Codex conversation state; it does not restart an in-flight tool call or replay a prompt.
 - Exact previous-thread auto-selection, active-profile monitoring, and provider account-identity verification are not implemented; current status reads idle local profiles, which may alias the same underlying account.
+
+[Unreleased]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.3...HEAD
+[0.1.0-alpha.3]: https://github.com/kazu-42/calcifer/releases/tag/v0.1.0-alpha.3
