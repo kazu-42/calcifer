@@ -68,7 +68,7 @@ repository with local Codex configuration.
 
 This is cold resume after restarting the wrapper, but it is currently explicit: the user invokes `calcifer resume`. Calcifer does not yet capture `{profile, cwd, thread ID}` and automatically choose the exact previous thread on startup. Resume restores persisted history, not a dead process or in-flight tool call, and never resends the last prompt.
 
-`status` starts the installed official `codex app-server` inside each idle profile and calls the structured `account/rateLimits/read` method. It displays all returned limit buckets, primary and secondary used/remaining percentages, reset times, workspace credit state, monthly spend control when present, and rate-limit reset-credit count and expirations. It does not scrape the interactive `/status` screen or read token values from `auth.json`.
+`status` starts the installed official `codex app-server` inside each idle profile and calls the structured `account/rateLimits/read` method. Before that read, it requires the tested Codex `0.144.4` initialize contract and verifies that the server reports the selected canonical `CODEX_HOME`. Untested versions, changed initialize data, a different home, or a changed usage schema fail closed as `unknown`; Calcifer does not send the usage request after an initialize-gate rejection. It displays all returned limit buckets, primary and secondary used/remaining percentages, reset times, workspace credit state, monthly spend control when present, and rate-limit reset-credit count and expirations. It does not scrape the interactive `/status` screen or read token values from `auth.json`.
 
 An active `run` or `resume` holds a split exclusive lease because a second Codex process could race credential refresh and session writes. A launch coordinator owns one half and a provider guardian owns the other; either process surviving a selective crash keeps the profile busy until the exact provider exits. Consequently, status for that active profile is currently `profile_busy` / `unknown`; a list query inspects profiles serially with a per-profile timeout. Active-session monitoring, cached last-known observations, and automatic failover still require a profile-owned usage supervisor. Also, a Calcifer profile is a local alias: provider identity is not yet verified, so two aliases may point to the same underlying account and quota.
 
@@ -82,7 +82,14 @@ codex@work [available]
   reset credits: 2 available
     codexRateLimits · available · expires 2027-02-01T08:00:00Z
   observed 2026-07-15T12:34:56Z · fresh · codex_app_server
+  compatibility compatible · Codex 0.144.4 · tested 0.144.4 · adapter 0.1.0-alpha.2
 ```
+
+Stable JSON adds `codex_version`, `adapter_version`, and a `compatibility`
+object for every profile. The object reports `compatible`, `incompatible`, or
+`unverified`, the protocol name, and Calcifer's explicit tested-version set.
+Only `compatible` observations can contain authoritative usage; every failure
+still has `availability: "unknown"` and cannot authorize future failover.
 
 The remaining percentage is explicitly display-only. Codex rounds the upstream used percentage, so displayed `0% remaining` is not by itself proof that the provider rejected the account. Calcifer reports `exhausted` only when the structured response contains a recognized `rateLimitReachedType`; otherwise a rounded 100% result is `unknown` for failover purposes.
 
@@ -132,7 +139,7 @@ Failover will follow conservative semantics:
 - After the old child has stopped, the supervisor will continue the same user-visible conversation under the selected profile. Internally, the preferred handoff forks the validated source rollout into a new profile-local Codex thread, so the logical conversation stays stable while the provider thread ID changes. Calcifer never automatically replays the last command or prompt; a partially completed turn may already have changed files or external systems.
 - Before launch, Calcifer shows the local profile alias, provider, trust domain, and selection reason without exposing provider account identifiers.
 
-Same-profile resume is stable today. Cross-profile continuation is a required part of the planned failover experience, but its upstream import field is experimental: stable Codex thread lookup is scoped to one `CODEX_HOME`. Calcifer will use a version-gated target-profile App Server to fork a validated source rollout into a new target-profile thread, then attach the official TUI over a private local transport. The handoff stays inside one configured trust domain, preserves one writer per rollout, and restores history without resubmitting a turn. See [ADR 0001](docs/adr/0001-cross-profile-conversation-handoff.md).
+Same-profile resume is stable today and delegates directly to the official CLI in the selected home; it does not depend on Calcifer parsing an App Server status schema. Cross-profile continuation is a required part of the planned failover experience, but its upstream import field is experimental: stable Codex thread lookup is scoped to one `CODEX_HOME`. Calcifer will use a separate version-gated target-profile App Server to fork a validated source rollout into a new target-profile thread, then attach the official TUI over a private local transport. The handoff stays inside one configured trust domain, preserves one writer per rollout, and restores history without resubmitting a turn. See [ADR 0001](docs/adr/0001-cross-profile-conversation-handoff.md).
 
 ## Provider direction
 
@@ -238,7 +245,7 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 1. **Implemented:** private Unix registry, profile-name validation, ownership markers, and atomic metadata writes.
 2. **Implemented:** `auth add/list`, `run`, same-profile `resume`, profile leases, and structured on-demand status.
 3. Add exact thread-ID capture for automatic cold restore, provider identity verification, safe remove/reauth flows, and crash recovery.
-4. Add observation caching, supported-version/schema gates, and adaptive refresh without aggressive polling.
+4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
 6. Add version-gated cross-profile conversation handoff as the default successful failover path; preserve one profile-local writer per lineage generation.
 7. Add Claude only through provider-supported authentication and usage-observation surfaces.

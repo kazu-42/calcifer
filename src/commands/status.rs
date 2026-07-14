@@ -7,7 +7,8 @@ use crate::error::AppError;
 use crate::executable::resolve_codex;
 use crate::profiles::{Profile, Provider, Registry};
 use crate::providers::codex::{
-    CodexUsage, CodexUsageError, RateLimitSnapshot, RateLimitWindow, read_account_usage,
+    CODEX_STATUS_PROTOCOL, CodexCompatibilityStatus, CodexUsage, CodexUsageError,
+    RateLimitSnapshot, RateLimitWindow, SUPPORTED_CODEX_STATUS_VERSIONS, read_account_usage,
 };
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,14 +47,41 @@ struct ProfileStatus {
     observed_at: i64,
     source: &'static str,
     freshness: &'static str,
+    codex_version: Option<String>,
+    adapter_version: &'static str,
+    compatibility: CompatibilityReport,
     usage: Option<CodexUsage>,
     error: Option<StatusFailure>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompatibilityReport {
+    status: CodexCompatibilityStatus,
+    protocol: &'static str,
+    supported_codex_versions: &'static [&'static str],
 }
 
 #[derive(Debug, Serialize)]
 struct StatusFailure {
     code: &'static str,
     message: &'static str,
+}
+
+#[derive(Debug)]
+struct InspectionFailure {
+    status: StatusFailure,
+    codex_version: Option<String>,
+    compatibility: CodexCompatibilityStatus,
+}
+
+impl InspectionFailure {
+    fn local(status: StatusFailure) -> Self {
+        Self {
+            status,
+            codex_version: None,
+            compatibility: CodexCompatibilityStatus::Unverified,
+        }
+    }
 }
 
 impl StatusReport {
@@ -169,6 +197,13 @@ impl ProfileStatus {
             self.freshness,
             self.source
         ));
+        let codex_version = self.codex_version.as_deref().unwrap_or("unknown");
+        lines.push(format!(
+            "  compatibility {} · Codex {codex_version} · tested {} · adapter {}",
+            self.compatibility.status.label(),
+            self.compatibility.supported_codex_versions.join(", "),
+            self.adapter_version
+        ));
         lines.join("\n")
     }
 }
@@ -179,70 +214,92 @@ fn inspect_profile(
     executable: Result<&std::path::Path, &crate::executable::ExecutableError>,
 ) -> Result<ProfileStatus, AppError> {
     let result = executable
-        .map_err(|error| StatusFailure {
-            code: error.code(),
-            message: error.safe_message(),
+        .map_err(|error| {
+            InspectionFailure::local(StatusFailure {
+                code: error.code(),
+                message: error.safe_message(),
+            })
         })
         .and_then(|executable| {
-            let _lease = registry
-                .lock_profile(profile)
-                .map_err(|error| StatusFailure {
+            let _lease = registry.lock_profile(profile).map_err(|error| {
+                InspectionFailure::local(StatusFailure {
                     code: error.code(),
                     message: "Profile is busy or failed validation",
-                })?;
-            let home = registry.profile_home(profile).map_err(|_| StatusFailure {
-                code: "unsafe_profile_state",
-                message: "Managed profile storage failed validation",
+                })
             })?;
-            let neutral_working_directory =
-                registry
-                    .neutral_working_directory()
-                    .map_err(|_| StatusFailure {
-                        code: "unsafe_profile_state",
-                        message: "Managed neutral working directory failed validation",
-                    })?;
+            let home = registry.profile_home(profile).map_err(|_| {
+                InspectionFailure::local(StatusFailure {
+                    code: "unsafe_profile_state",
+                    message: "Managed profile storage failed validation",
+                })
+            })?;
+            let neutral_working_directory = registry.neutral_working_directory().map_err(|_| {
+                InspectionFailure::local(StatusFailure {
+                    code: "unsafe_profile_state",
+                    message: "Managed neutral working directory failed validation",
+                })
+            })?;
             // The account app-server is a bounded, no-turn probe. Let only its
             // provider-side lease survive exec so a killed status parent cannot
             // briefly admit a second credential writer before stdio EOF stops
             // the app-server.
             #[cfg(unix)]
-            let _provider_lock_inheritance =
-                _lease.inherit_provider_lock().map_err(|_| StatusFailure {
+            let _provider_lock_inheritance = _lease.inherit_provider_lock().map_err(|_| {
+                InspectionFailure::local(StatusFailure {
                     code: "unsafe_profile_state",
                     message: "Managed profile lease failed validation",
-                })?;
+                })
+            })?;
             read_account_usage(
                 executable,
                 &home,
                 &neutral_working_directory,
                 STATUS_TIMEOUT,
             )
-            .map_err(status_failure)
+            .map_err(|failure| InspectionFailure {
+                status: status_failure(failure.kind()),
+                codex_version: failure.codex_version().map(str::to_owned),
+                compatibility: failure.compatibility(),
+            })
         });
 
     let observed_at = current_timestamp()?;
     Ok(match result {
-        Ok(usage) => ProfileStatus {
+        Ok(observation) => ProfileStatus {
             profile: profile.reference(),
             provider: "codex",
-            availability: classify(&usage),
+            availability: classify(&observation.usage),
             observed_at,
             source: "codex_app_server",
             freshness: "fresh",
-            usage: Some(usage),
+            codex_version: Some(observation.codex_version),
+            adapter_version: env!("CARGO_PKG_VERSION"),
+            compatibility: compatibility_report(CodexCompatibilityStatus::Compatible),
+            usage: Some(observation.usage),
             error: None,
         },
-        Err(error) => ProfileStatus {
+        Err(failure) => ProfileStatus {
             profile: profile.reference(),
             provider: "codex",
             availability: Availability::Unknown,
             observed_at,
             source: "codex_app_server",
             freshness: "unknown",
+            codex_version: failure.codex_version,
+            adapter_version: env!("CARGO_PKG_VERSION"),
+            compatibility: compatibility_report(failure.compatibility),
             usage: None,
-            error: Some(error),
+            error: Some(failure.status),
         },
     })
+}
+
+const fn compatibility_report(status: CodexCompatibilityStatus) -> CompatibilityReport {
+    CompatibilityReport {
+        status,
+        protocol: CODEX_STATUS_PROTOCOL,
+        supported_codex_versions: SUPPORTED_CODEX_STATUS_VERSIONS,
+    }
 }
 
 fn classify(usage: &CodexUsage) -> Availability {
@@ -377,6 +434,14 @@ fn status_failure(error: CodexUsageError) -> StatusFailure {
             code: "protocol_error",
             message: "Codex returned an unsupported or malformed response",
         },
+        CodexUsageError::Transport => StatusFailure {
+            code: "protocol_error",
+            message: "Codex status observation ended before completion",
+        },
+        CodexUsageError::Provider => StatusFailure {
+            code: "protocol_error",
+            message: "Codex returned an unrecognized provider error",
+        },
         CodexUsageError::Authentication => StatusFailure {
             code: "authentication_required",
             message: "Profile requires Codex authentication",
@@ -473,5 +538,27 @@ mod tests {
                 resets_at: 1_900_000_000,
             });
         assert_eq!(classify(&usage(spend_control_empty)), Availability::Unknown);
+    }
+
+    #[test]
+    fn indeterminate_failures_preserve_the_schema_v1_protocol_error_code() {
+        for (error, expected_message) in [
+            (
+                CodexUsageError::Protocol,
+                "Codex returned an unsupported or malformed response",
+            ),
+            (
+                CodexUsageError::Transport,
+                "Codex status observation ended before completion",
+            ),
+            (
+                CodexUsageError::Provider,
+                "Codex returned an unrecognized provider error",
+            ),
+        ] {
+            let failure = status_failure(error);
+            assert_eq!(failure.code, "protocol_error");
+            assert_eq!(failure.message, expected_message);
+        }
     }
 }

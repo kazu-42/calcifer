@@ -10,7 +10,7 @@ Verified on 2026-07-15 against:
 - OpenAI Codex `main` commit [`f90e7deea6a715bbd153044af6f475eefa749177`](https://github.com/openai/codex/commit/f90e7deea6a715bbd153044af6f475eefa749177), where the fields used here were unchanged;
 - Orca `main` commit [`e0edc8ef76d341f7ab8083a006f785322bcaeb23`](https://github.com/stablyai/orca/commit/e0edc8ef76d341f7ab8083a006f785322bcaeb23).
 
-The official Codex App Server command is still marked experimental as a whole. Calcifer negotiates its stable protocol subset with `experimentalApi: false` and fails closed when the method or response shape is unavailable.
+The official Codex App Server command is still marked experimental as a whole. Calcifer negotiates its stable protocol subset with `experimentalApi: false`. On-demand status accepts exactly Codex `0.144.4`; adding a release requires generated-schema fixtures, synthetic protocol coverage, and a live initialize smoke test before the allowlist changes.
 
 ## Managed Codex profile configuration
 
@@ -142,6 +142,29 @@ Calcifer sends the following read-only request after the App Server initializati
 }
 ```
 
+Before sending that request, Calcifer validates the version-specific initialize
+response. The client-scoped user-agent must contain a normalized numeric
+`0.144.4` release, all required initialize fields must have the expected types,
+and the returned absolute `codexHome` must canonicalize to the selected managed
+profile home. A missing or malformed field returns redacted `protocol_error` /
+`incompatible` status; an untested release or different home returns
+`unsupported` / `incompatible`. Both close the probe before `initialized` or
+`account/rateLimits/read` is sent. Canonical comparison deliberately accepts
+platform aliases such as macOS `/tmp` and `/private/tmp` while preventing a
+different profile from being observed.
+
+After the gate, Calcifer accepts only a JSON-RPC response containing exactly
+one of `result` or `error`. For the `0.144.4` adapter, `result.rateLimits` is a
+required non-null object even when `rateLimitsByLimitId` contains usable named
+buckets. Missing/null legacy limits and ambiguous envelopes (both fields or
+neither field) fail closed as redacted `protocol_error` / `incompatible`.
+Otherwise, the response is decoded into required typed window and credit fields
+while allowing unknown additive fields. A successful read reports the detected
+Codex version, Calcifer adapter version, protocol name, explicit tested version
+set, and `compatible` state. Protocol drift is `incompatible`; failures where
+the contract could not be observed are `unverified`. Both states have
+`availability: unknown` and cannot become a failover signal.
+
 The normalized response can contain:
 
 - legacy `rateLimits` and all `rateLimitsByLimitId` buckets;
@@ -177,6 +200,11 @@ The safe future decision path is:
 6. never replay the failed prompt.
 
 Context-window exhaustion, session budgets, unauthorized responses, 5xx errors, timeouts, disconnects, parser failures, and rounded 100% are not account failover signals. See the [structured Codex error enum](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/shared.rs#L64-L113).
+
+Same-profile `calcifer resume` remains direct official CLI delegation inside
+the selected `CODEX_HOME`; Calcifer does not parse its transcript schema or
+replay input. Experimental cross-profile `thread/fork.path` and remote-TUI
+resume remain disabled behind their separate Phase 4.5 runtime/schema gate.
 
 ## What Orca currently does
 

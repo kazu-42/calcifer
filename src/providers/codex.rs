@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
+use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -46,6 +47,10 @@ const MANAGED_ENVIRONMENT_DENYLIST: &[&str] = &[
 
 const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+const APP_SERVER_CLIENT_NAME: &str = "calcifer";
+
+pub(crate) const CODEX_STATUS_PROTOCOL: &str = "account/rateLimits/read";
+pub(crate) const SUPPORTED_CODEX_STATUS_VERSIONS: &[&str] = &["0.144.4"];
 
 /// Builds a Codex command bound to one managed credential and state home.
 ///
@@ -99,6 +104,32 @@ pub struct CodexUsage {
     pub rate_limits: Option<RateLimitSnapshot>,
     pub rate_limits_by_limit_id: BTreeMap<String, RateLimitSnapshot>,
     pub reset_credits: Option<ResetCredits>,
+}
+
+/// A usage snapshot admitted by Calcifer's version and initialize-schema gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexUsageObservation {
+    pub codex_version: String,
+    pub usage: CodexUsage,
+}
+
+/// Whether the installed App Server contract was verified for this read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexCompatibilityStatus {
+    Compatible,
+    Incompatible,
+    Unverified,
+}
+
+impl CodexCompatibilityStatus {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Incompatible => "incompatible",
+            Self::Unverified => "unverified",
+        }
+    }
 }
 
 /// A normalized rate-limit bucket.
@@ -169,6 +200,8 @@ pub enum CodexUsageError {
     Protocol,
     Authentication,
     Timeout,
+    Transport,
+    Provider,
     Spawn,
 }
 
@@ -179,6 +212,8 @@ impl fmt::Display for CodexUsageError {
             Self::Protocol => "the Codex app-server returned an invalid protocol response",
             Self::Authentication => "the Codex profile is not authenticated",
             Self::Timeout => "the Codex app-server usage read timed out",
+            Self::Transport => "communication with the Codex app-server ended unexpectedly",
+            Self::Provider => "the Codex app-server returned an unrecognized provider error",
             Self::Spawn => "the Codex app-server could not be started",
         };
         formatter.write_str(message)
@@ -187,54 +222,240 @@ impl fmt::Display for CodexUsageError {
 
 impl std::error::Error for CodexUsageError {}
 
+/// A redacted read failure with any compatibility evidence collected first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexUsageFailure {
+    kind: CodexUsageError,
+    codex_version: Option<String>,
+    compatibility: CodexCompatibilityStatus,
+}
+
+impl CodexUsageFailure {
+    fn before_gate(kind: CodexUsageError) -> Self {
+        let compatibility = match kind {
+            CodexUsageError::Unsupported | CodexUsageError::Protocol => {
+                CodexCompatibilityStatus::Incompatible
+            }
+            CodexUsageError::Authentication
+            | CodexUsageError::Timeout
+            | CodexUsageError::Transport
+            | CodexUsageError::Provider
+            | CodexUsageError::Spawn => CodexCompatibilityStatus::Unverified,
+        };
+        Self {
+            kind,
+            codex_version: None,
+            compatibility,
+        }
+    }
+
+    fn incompatible(kind: CodexUsageError, codex_version: Option<String>) -> Self {
+        Self {
+            kind,
+            codex_version,
+            compatibility: CodexCompatibilityStatus::Incompatible,
+        }
+    }
+
+    fn after_gate(kind: CodexUsageError, codex_version: &str) -> Self {
+        let compatibility = match kind {
+            CodexUsageError::Authentication => CodexCompatibilityStatus::Compatible,
+            CodexUsageError::Unsupported | CodexUsageError::Protocol => {
+                CodexCompatibilityStatus::Incompatible
+            }
+            CodexUsageError::Timeout
+            | CodexUsageError::Transport
+            | CodexUsageError::Provider
+            | CodexUsageError::Spawn => CodexCompatibilityStatus::Unverified,
+        };
+        Self {
+            kind,
+            codex_version: Some(codex_version.to_owned()),
+            compatibility,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> CodexUsageError {
+        self.kind
+    }
+
+    pub(crate) fn codex_version(&self) -> Option<&str> {
+        self.codex_version.as_deref()
+    }
+
+    pub(crate) const fn compatibility(&self) -> CodexCompatibilityStatus {
+        self.compatibility
+    }
+}
+
+impl fmt::Display for CodexUsageFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl std::error::Error for CodexUsageFailure {}
+
 /// Reads one account usage snapshot from the official Codex app-server.
 pub fn read_account_usage(
     codex_executable: &Path,
     codex_home: &Path,
     working_directory: &Path,
     timeout: Duration,
-) -> Result<CodexUsage, CodexUsageError> {
+) -> Result<CodexUsageObservation, CodexUsageFailure> {
     if !codex_executable.is_absolute() {
-        return Err(CodexUsageError::Spawn);
+        return Err(CodexUsageFailure::before_gate(CodexUsageError::Spawn));
     }
 
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or(CodexUsageError::Timeout)?;
-    let mut process = AppServerProcess::spawn(codex_executable, codex_home, working_directory)?;
+        .ok_or_else(|| CodexUsageFailure::before_gate(CodexUsageError::Timeout))?;
+    let mut process = AppServerProcess::spawn(codex_executable, codex_home, working_directory)
+        .map_err(CodexUsageFailure::before_gate)?;
 
-    process.send(&json!({
-        "id": INITIALIZE_REQUEST_ID,
-        "method": "initialize",
-        "params": {
-            "clientInfo": {
-                "name": "calcifer",
-                "title": "Calcifer",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "capabilities": {
-                "experimentalApi": false
+    process
+        .send(&json!({
+            "id": INITIALIZE_REQUEST_ID,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": APP_SERVER_CLIENT_NAME,
+                    "title": "Calcifer",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": false
+                }
             }
-        }
-    }))?;
-    let initialize_result = process.receive_result(INITIALIZE_REQUEST_ID, deadline)?;
-    if !initialize_result.is_object() {
-        return Err(CodexUsageError::Protocol);
-    }
+        }))
+        .map_err(CodexUsageFailure::before_gate)?;
+    let initialize_result = process
+        .receive_result(INITIALIZE_REQUEST_ID, deadline)
+        .map_err(CodexUsageFailure::before_gate)?;
+    let codex_version = validate_initialize_result(initialize_result, codex_home)
+        .map_err(|error| CodexUsageFailure::incompatible(error.kind, error.codex_version))?;
 
-    process.send(&json!({ "method": "initialized", "params": {} }))?;
-    process.send(&json!({
-        "id": RATE_LIMITS_REQUEST_ID,
-        "method": "account/rateLimits/read",
-        "params": null
-    }))?;
+    process
+        .send(&json!({ "method": "initialized", "params": {} }))
+        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
+    process
+        .send(&json!({
+            "id": RATE_LIMITS_REQUEST_ID,
+            "method": CODEX_STATUS_PROTOCOL,
+            "params": null
+        }))
+        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
 
-    let result = process.receive_result(RATE_LIMITS_REQUEST_ID, deadline)?;
-    parse_rate_limits_result(result)
+    let result = process
+        .receive_result(RATE_LIMITS_REQUEST_ID, deadline)
+        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
+    let usage = parse_rate_limits_result(result)
+        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
+    Ok(CodexUsageObservation {
+        codex_version,
+        usage,
+    })
 }
 
 const INITIALIZE_REQUEST_ID: u64 = 0;
 const RATE_LIMITS_REQUEST_ID: u64 = 1;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireInitializeResult {
+    user_agent: String,
+    codex_home: String,
+    platform_family: String,
+    platform_os: String,
+}
+
+#[derive(Debug)]
+struct InitializeCompatibilityError {
+    kind: CodexUsageError,
+    codex_version: Option<String>,
+}
+
+impl fmt::Display for InitializeCompatibilityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the Codex initialize compatibility check failed")
+    }
+}
+
+impl std::error::Error for InitializeCompatibilityError {}
+
+fn validate_initialize_result(
+    result: Value,
+    selected_codex_home: &Path,
+) -> Result<String, InitializeCompatibilityError> {
+    let wire: WireInitializeResult =
+        serde_json::from_value(result).map_err(|_| InitializeCompatibilityError {
+            kind: CodexUsageError::Protocol,
+            codex_version: None,
+        })?;
+    let codex_version = parse_codex_version(&wire.user_agent);
+    let unsupported = || InitializeCompatibilityError {
+        kind: CodexUsageError::Unsupported,
+        codex_version: codex_version.clone(),
+    };
+    let malformed = || InitializeCompatibilityError {
+        kind: CodexUsageError::Protocol,
+        codex_version: codex_version.clone(),
+    };
+
+    if wire.platform_family.is_empty() || wire.platform_os.is_empty() {
+        return Err(malformed());
+    }
+
+    let reported_home = Path::new(&wire.codex_home);
+    if !reported_home.is_absolute() {
+        return Err(unsupported());
+    }
+    let reported_home = fs::canonicalize(reported_home).map_err(|_| unsupported())?;
+    let selected_codex_home = fs::canonicalize(selected_codex_home).map_err(|_| unsupported())?;
+    if reported_home != selected_codex_home {
+        return Err(unsupported());
+    }
+
+    let codex_version = match codex_version.as_deref() {
+        Some(codex_version) => codex_version.to_owned(),
+        None => return Err(unsupported()),
+    };
+    if !SUPPORTED_CODEX_STATUS_VERSIONS.contains(&codex_version.as_str()) {
+        return Err(unsupported());
+    }
+    Ok(codex_version)
+}
+
+fn parse_codex_version(user_agent: &str) -> Option<String> {
+    let token = user_agent.split_ascii_whitespace().next()?;
+    let version = token
+        .strip_prefix(APP_SERVER_CLIENT_NAME)?
+        .strip_prefix('/')?;
+    if version.is_empty() || version.len() > 32 {
+        return None;
+    }
+
+    let mut components = version.split('.');
+    let major = parse_version_component(components.next()?)?;
+    let minor = parse_version_component(components.next()?)?;
+    let patch = parse_version_component(components.next()?)?;
+    if components.next().is_some() {
+        return None;
+    }
+    let normalized = format!("{major}.{minor}.{patch}");
+    (normalized == version).then_some(normalized)
+}
+
+fn parse_version_component(component: &str) -> Option<u32> {
+    if component.is_empty()
+        || component.len() > 10
+        || !component.bytes().all(|byte| byte.is_ascii_digit())
+        || (component.len() > 1 && component.starts_with('0'))
+    {
+        return None;
+    }
+    component.parse().ok()
+}
 
 struct AppServerProcess {
     child: Child,
@@ -313,12 +534,8 @@ impl AppServerProcess {
     }
 
     fn send(&mut self, message: &Value) -> Result<(), CodexUsageError> {
-        let stdin = self.stdin.as_mut().ok_or(CodexUsageError::Protocol)?;
-        serde_json::to_writer(&mut *stdin, message).map_err(|_| CodexUsageError::Protocol)?;
-        stdin
-            .write_all(b"\n")
-            .and_then(|()| stdin.flush())
-            .map_err(|_| CodexUsageError::Protocol)
+        let stdin = self.stdin.as_mut().ok_or(CodexUsageError::Transport)?;
+        write_json_line(stdin, message)
     }
 
     fn receive_result(
@@ -329,9 +546,17 @@ impl AppServerProcess {
         let events = self
             .stdout_events
             .as_ref()
-            .ok_or(CodexUsageError::Protocol)?;
+            .ok_or(CodexUsageError::Transport)?;
         receive_result_from(events, expected_id, deadline)
     }
+}
+
+fn write_json_line(writer: &mut impl Write, message: &Value) -> Result<(), CodexUsageError> {
+    serde_json::to_writer(&mut *writer, message).map_err(|_| CodexUsageError::Transport)?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|_| CodexUsageError::Transport)
 }
 
 fn receive_result_from(
@@ -346,12 +571,13 @@ fn receive_result_from(
         let event = match events.recv_timeout(remaining) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => return Err(CodexUsageError::Timeout),
-            Err(RecvTimeoutError::Disconnected) => return Err(CodexUsageError::Protocol),
+            Err(RecvTimeoutError::Disconnected) => return Err(CodexUsageError::Transport),
         };
         let line = match event {
             StdoutEvent::Line(line) => line,
-            StdoutEvent::ReadError | StdoutEvent::Eof => {
-                return Err(CodexUsageError::Protocol);
+            StdoutEvent::ProtocolError => return Err(CodexUsageError::Protocol),
+            StdoutEvent::TransportError | StdoutEvent::Eof => {
+                return Err(CodexUsageError::Transport);
             }
         };
         if let Some(result) = decode_response(&line, expected_id)? {
@@ -376,7 +602,8 @@ impl Drop for AppServerProcess {
 
 enum StdoutEvent {
     Line(String),
-    ReadError,
+    ProtocolError,
+    TransportError,
     Eof,
 }
 
@@ -393,8 +620,13 @@ fn read_stdout(stdout: impl io::Read, sender: &mpsc::SyncSender<StdoutEvent>) {
                 let _ = sender.send(StdoutEvent::Eof);
                 return;
             }
-            Err(_) => {
-                let _ = sender.send(StdoutEvent::ReadError);
+            Err(error) => {
+                let event = if error.kind() == io::ErrorKind::InvalidData {
+                    StdoutEvent::ProtocolError
+                } else {
+                    StdoutEvent::TransportError
+                };
+                let _ = sender.send(event);
                 return;
             }
         }
@@ -460,25 +692,23 @@ fn decode_response(line: &str, expected_id: u64) -> Result<Option<Value>, CodexU
     if envelope.get("id").and_then(Value::as_u64) != Some(expected_id) {
         return Ok(None);
     }
-    if let Some(error) = envelope.get("error") {
-        return Err(classify_rpc_error(error));
+    match (envelope.get("result"), envelope.get("error")) {
+        (Some(result), None) => Ok(Some(result.clone())),
+        (None, Some(error)) => Err(classify_rpc_error(error)),
+        _ => Err(CodexUsageError::Protocol),
     }
-    envelope
-        .get("result")
-        .cloned()
-        .map(Some)
-        .ok_or(CodexUsageError::Protocol)
 }
 
 fn classify_rpc_error(error: &Value) -> CodexUsageError {
-    let code = error.get("code").and_then(Value::as_i64);
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let Some(code) = error.get("code").and_then(Value::as_i64) else {
+        return CodexUsageError::Protocol;
+    };
+    let Some(message) = error.get("message").and_then(Value::as_str) else {
+        return CodexUsageError::Protocol;
+    };
+    let message = message.to_ascii_lowercase();
 
-    if code == Some(-32601)
+    if code == -32601
         || [
             "method not found",
             "not supported",
@@ -501,7 +731,7 @@ fn classify_rpc_error(error: &Value) -> CodexUsageError {
     {
         CodexUsageError::Authentication
     } else {
-        CodexUsageError::Protocol
+        CodexUsageError::Provider
     }
 }
 
@@ -527,8 +757,7 @@ fn graceful_terminate(child: &mut Child, timeout: Duration) {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireRateLimitsResult {
-    #[serde(default)]
-    rate_limits: Option<WireRateLimitSnapshot>,
+    rate_limits: WireRateLimitSnapshot,
     #[serde(default)]
     rate_limits_by_limit_id: Option<BTreeMap<String, WireRateLimitSnapshot>>,
     #[serde(default)]
@@ -675,12 +904,9 @@ impl From<WireResetCreditDetail> for ResetCreditDetail {
 fn parse_rate_limits_result(result: Value) -> Result<CodexUsage, CodexUsageError> {
     let wire: WireRateLimitsResult =
         serde_json::from_value(result).map_err(|_| CodexUsageError::Protocol)?;
-    if wire.rate_limits.is_none() && wire.rate_limits_by_limit_id.is_none() {
-        return Err(CodexUsageError::Protocol);
-    }
 
     Ok(CodexUsage {
-        rate_limits: wire.rate_limits.map(Into::into),
+        rate_limits: Some(wire.rate_limits.into()),
         rate_limits_by_limit_id: wire
             .rate_limits_by_limit_id
             .unwrap_or_default()
@@ -694,7 +920,8 @@ fn parse_rate_limits_result(result: Value) -> Result<CodexUsage, CodexUsageError
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::io::{BufReader, Cursor};
+    use std::io::{BufReader, Cursor, Write};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
@@ -785,6 +1012,254 @@ mod tests {
                 r#"mcp_oauth_credentials_store="file""#,
             ])
         );
+    }
+
+    #[test]
+    fn initialize_gate_accepts_only_the_tested_version_and_selected_home()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sandbox = std::env::temp_dir().join(format!(
+            "calcifer-codex-compatibility-{}-{nonce}",
+            std::process::id()
+        ));
+        let selected_home = sandbox.join("selected-home");
+        let other_home = sandbox.join("other-home");
+        std::fs::create_dir_all(&selected_home)?;
+        std::fs::create_dir_all(&other_home)?;
+
+        let supported = validate_initialize_result(
+            json!({
+                "userAgent": "calcifer/0.144.4 (synthetic test)",
+                "platformFamily": "unix",
+                "platformOs": "test",
+                "codexHome": selected_home
+            }),
+            &selected_home,
+        )?;
+        assert_eq!(supported, "0.144.4");
+
+        let alias_parent = sandbox.join("alias-parent");
+        std::fs::create_dir(&alias_parent)?;
+        let canonical_alias = alias_parent.join("..").join("selected-home");
+        let supported_through_alias = validate_initialize_result(
+            json!({
+                "userAgent": "calcifer/0.144.4 (synthetic test)",
+                "platformFamily": "unix",
+                "platformOs": "test",
+                "codexHome": canonical_alias
+            }),
+            &selected_home,
+        )?;
+        assert_eq!(supported_through_alias, "0.144.4");
+
+        let unsupported = validate_initialize_result(
+            json!({
+                "userAgent": "calcifer/0.145.0 (synthetic test)",
+                "platformFamily": "unix",
+                "platformOs": "test",
+                "codexHome": selected_home
+            }),
+            &selected_home,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("untested version must fail"))?;
+        assert_eq!(unsupported.kind, CodexUsageError::Unsupported);
+        assert_eq!(unsupported.codex_version.as_deref(), Some("0.145.0"));
+
+        let wrong_home = validate_initialize_result(
+            json!({
+                "userAgent": "calcifer/0.144.4 (synthetic test)",
+                "platformFamily": "unix",
+                "platformOs": "test",
+                "codexHome": other_home
+            }),
+            &selected_home,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("wrong managed home must fail"))?;
+        assert_eq!(wrong_home.kind, CodexUsageError::Unsupported);
+        assert_eq!(wrong_home.codex_version.as_deref(), Some("0.144.4"));
+
+        std::fs::remove_dir_all(sandbox)?;
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_gate_rejects_malformed_schema_without_echoing_raw_user_agent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sandbox = std::env::temp_dir().join(format!(
+            "calcifer-codex-initialize-schema-{}-{nonce}",
+            std::process::id()
+        ));
+        let selected_home = sandbox.join("selected-home");
+        std::fs::create_dir_all(&selected_home)?;
+
+        for (malformed, expected_kind) in [
+            (
+                json!({
+                    "userAgent": "calcifer/0.144.4 secret@example.test",
+                    "platformFamily": "unix",
+                    "codexHome": selected_home
+                }),
+                CodexUsageError::Protocol,
+            ),
+            (
+                json!({
+                    "userAgent": "calcifer/not-a-version secret@example.test",
+                    "platformFamily": "unix",
+                    "platformOs": "test",
+                    "codexHome": selected_home
+                }),
+                CodexUsageError::Unsupported,
+            ),
+            (
+                json!({
+                    "userAgent": "calcifer/0.144.4 secret@example.test",
+                    "platformFamily": "unix",
+                    "platformOs": "test",
+                    "codexHome": "relative/home"
+                }),
+                CodexUsageError::Unsupported,
+            ),
+        ] {
+            let error = validate_initialize_result(malformed, &selected_home)
+                .err()
+                .ok_or_else(|| io::Error::other("malformed initialize result must fail"))?;
+            assert_eq!(error.kind, expected_kind);
+            assert!(!format!("{error:?}").contains("secret@example.test"));
+        }
+
+        std::fs::remove_dir_all(sandbox)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compatibility_metadata_distinguishes_contract_drift_from_unverified_failures() {
+        for kind in [CodexUsageError::Unsupported, CodexUsageError::Protocol] {
+            let failure = CodexUsageFailure::after_gate(kind, "0.144.4");
+            assert_eq!(
+                failure.compatibility(),
+                CodexCompatibilityStatus::Incompatible
+            );
+            assert_eq!(failure.codex_version(), Some("0.144.4"));
+        }
+
+        let authentication =
+            CodexUsageFailure::after_gate(CodexUsageError::Authentication, "0.144.4");
+        assert_eq!(
+            authentication.compatibility(),
+            CodexCompatibilityStatus::Compatible
+        );
+
+        let timeout = CodexUsageFailure::after_gate(CodexUsageError::Timeout, "0.144.4");
+        assert_eq!(
+            timeout.compatibility(),
+            CodexCompatibilityStatus::Unverified
+        );
+
+        let spawn = CodexUsageFailure::before_gate(CodexUsageError::Spawn);
+        assert_eq!(spawn.compatibility(), CodexCompatibilityStatus::Unverified);
+        assert!(spawn.codex_version().is_none());
+
+        for kind in [CodexUsageError::Transport, CodexUsageError::Provider] {
+            let failure = CodexUsageFailure::before_gate(kind);
+            assert_eq!(
+                failure.compatibility(),
+                CodexCompatibilityStatus::Unverified
+            );
+            assert!(failure.codex_version().is_none());
+
+            let failure = CodexUsageFailure::after_gate(kind, "0.144.4");
+            assert_eq!(
+                failure.compatibility(),
+                CodexCompatibilityStatus::Unverified
+            );
+            assert_eq!(failure.codex_version(), Some("0.144.4"));
+        }
+    }
+
+    #[test]
+    fn version_parser_rejects_spoofed_or_unbounded_releases() {
+        assert_eq!(
+            parse_codex_version("calcifer/0.144.4 (synthetic test)"),
+            Some("0.144.4".to_owned())
+        );
+
+        for user_agent in [
+            "codex-cli/0.144.4",
+            "calcifer/00.144.4",
+            "calcifer/0.0144.4",
+            "calcifer/0.144.04",
+            "calcifer/0.144.4-beta.1",
+            "calcifer/0.144.4+build",
+            "calcifer/0.144.4.1",
+            "calcifer/4294967296.144.4",
+            "calcifer/12345678901.144.4",
+            "calcifer/0.144.4secret@example.test",
+            "calcifer/０.１４４.４",
+        ] {
+            assert_eq!(
+                parse_codex_version(user_agent),
+                None,
+                "{user_agent} must not spoof a supported release"
+            );
+        }
+    }
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "synthetic broken pipe",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn eof_and_broken_pipe_are_unverified_before_and_after_the_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, events) = mpsc::sync_channel(1);
+        sender
+            .send(StdoutEvent::Eof)
+            .map_err(|_| io::Error::other("synthetic EOF must reach the receiver"))?;
+        let eof = receive_result_from(
+            &events,
+            RATE_LIMITS_REQUEST_ID,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("EOF must interrupt the observation"))?;
+
+        let mut writer = BrokenPipeWriter;
+        let broken_pipe = write_json_line(&mut writer, &json!({ "id": 1 }))
+            .err()
+            .ok_or_else(|| io::Error::other("broken pipe must interrupt the observation"))?;
+
+        for transport in [eof, broken_pipe] {
+            assert_eq!(transport, CodexUsageError::Transport);
+
+            let before_gate = CodexUsageFailure::before_gate(transport);
+            assert_eq!(
+                before_gate.compatibility(),
+                CodexCompatibilityStatus::Unverified
+            );
+            assert!(before_gate.codex_version().is_none());
+
+            let after_gate = CodexUsageFailure::after_gate(transport, "0.144.4");
+            assert_eq!(
+                after_gate.compatibility(),
+                CodexCompatibilityStatus::Unverified
+            );
+            assert_eq!(after_gate.codex_version(), Some("0.144.4"));
+        }
+        Ok(())
     }
 
     #[test]
@@ -910,9 +1385,26 @@ mod tests {
             }
         }));
         let empty = parse_rate_limits_result(json!({ "futureField": true }));
+        let missing_required_rate_limits = parse_rate_limits_result(json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": { "usedPercent": 73 }
+                }
+            }
+        }));
+        let null_required_rate_limits = parse_rate_limits_result(json!({
+            "rateLimits": null,
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": { "usedPercent": 73 }
+                }
+            }
+        }));
 
         assert_eq!(malformed, Err(CodexUsageError::Protocol));
         assert_eq!(empty, Err(CodexUsageError::Protocol));
+        assert_eq!(missing_required_rate_limits, Err(CodexUsageError::Protocol));
+        assert_eq!(null_required_rate_limits, Err(CodexUsageError::Protocol));
     }
 
     #[test]
@@ -942,20 +1434,44 @@ mod tests {
             r#"{"id":1,"error":{"code":-32600,"message":"raw authentication required"}}"#,
             1,
         );
-        let protocol = decode_response(
+        let provider = decode_response(
             r#"{"id":1,"error":{"code":-32000,"message":"raw backend detail"}}"#,
             1,
         );
+        let malformed_error = decode_response(r#"{"id":1,"error":null}"#, 1);
 
         assert_eq!(unsupported, Err(CodexUsageError::Unsupported));
         assert_eq!(authentication, Err(CodexUsageError::Authentication));
-        assert_eq!(protocol, Err(CodexUsageError::Protocol));
+        assert_eq!(provider, Err(CodexUsageError::Provider));
+        assert_eq!(malformed_error, Err(CodexUsageError::Protocol));
         for error in [
             CodexUsageError::Unsupported,
             CodexUsageError::Authentication,
             CodexUsageError::Protocol,
+            CodexUsageError::Provider,
         ] {
             assert!(!error.to_string().contains("raw"));
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_json_rpc_response_envelopes() {
+        for malformed in [
+            r#"{"id":1,"result":{},"error":{"code":-32600,"message":"raw authentication required"}}"#,
+            r#"{"id":1}"#,
+        ] {
+            assert_eq!(
+                decode_response(malformed, 1),
+                Err(CodexUsageError::Protocol),
+                "a response must contain exactly one of result or error"
+            );
+
+            let failure = CodexUsageFailure::after_gate(CodexUsageError::Protocol, "0.144.4");
+            assert_eq!(
+                failure.compatibility(),
+                CodexCompatibilityStatus::Incompatible
+            );
+            assert!(!failure.to_string().contains("raw"));
         }
     }
 
@@ -972,7 +1488,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unvalidated_executable_names_before_spawning() {
+    fn rejects_unvalidated_executable_names_before_spawning()
+    -> Result<(), Box<dyn std::error::Error>> {
         let result = read_account_usage(
             Path::new("codex"),
             Path::new("profile-home"),
@@ -980,7 +1497,16 @@ mod tests {
             Duration::from_secs(1),
         );
 
-        assert_eq!(result, Err(CodexUsageError::Spawn));
+        let failure = result
+            .err()
+            .ok_or_else(|| io::Error::other("relative executable must fail"))?;
+        assert_eq!(failure.kind(), CodexUsageError::Spawn);
+        assert_eq!(
+            failure.compatibility(),
+            CodexCompatibilityStatus::Unverified
+        );
+        assert!(failure.codex_version().is_none());
+        Ok(())
     }
 
     #[test]
