@@ -5,6 +5,8 @@
 .idea/
 .vscode/
 *.swp
+__pycache__/
+*.pyc
 
 # Local environment and credentials. Real credentials must never be fixtures.
 .env
