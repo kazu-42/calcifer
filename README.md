@@ -206,6 +206,19 @@ calcifer --json doctor
 The default install prefix is `~/.local`. Override it with `make install-local PREFIX=/your/prefix`.
 If `~/.local/bin` is not on `PATH`, run `~/.local/bin/calcifer --json doctor` or add that directory to `PATH`.
 
+## Binary releases
+
+Starting with `v0.1.0-alpha.3`, Calcifer publishes pre-release archives for
+Linux glibc 2.35+ on x86-64/ARM64, macOS Intel/Apple silicon, and Windows x86-64 on the
+[GitHub Releases page](https://github.com/kazu-42/calcifer/releases). Every
+release includes SHA-256 checksums and GitHub build-provenance attestations.
+The binaries are not yet code-signed or notarized.
+
+Download only the archive for your operating system and architecture, verify it
+before installation, and keep in mind that Calcifer is still pre-alpha. See the
+[release and rollback runbook](docs/releasing.md) for exact checksum,
+attestation, install, uninstall, and recovery commands.
+
 ## Development
 
 ```console
@@ -216,7 +229,7 @@ make test
 make check
 ```
 
-The CI contract covers formatting and Clippy on Rust 1.96, tests on Linux/macOS/Windows, and an MSRV check on Rust 1.85. See [CONTRIBUTING.md](CONTRIBUTING.md) for security-sensitive review expectations.
+The CI contract covers formatting and Clippy on Rust 1.96, tests on Linux/macOS/Windows, deterministic archive-package tests, and an MSRV check on Rust 1.85. See [CONTRIBUTING.md](CONTRIBUTING.md) for security-sensitive review expectations.
 
 ## Roadmap
 

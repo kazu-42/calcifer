@@ -42,6 +42,11 @@ Keep each pull request focused. Include:
 
 Do not include real credentials, account identifiers, provider payloads, or copied production logs. Use synthetic fixtures whose values are obviously fake.
 
+Changes to release metadata, packaging, or GitHub Actions must also follow the
+[release runbook](docs/releasing.md). Release actions stay pinned by full commit
+SHA, pull requests and manual runs cannot publish, and published assets are
+never replaced in place.
+
 The JSON contract uses a numeric `schema_version`. Existing fields in schema version 1 cannot be removed, renamed, retyped, or assigned a different meaning. Additive fields are allowed.
 
 ## Security-sensitive changes

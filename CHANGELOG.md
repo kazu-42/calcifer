@@ -18,6 +18,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Stable JSON status output with redacted provider errors and display-only remaining percentages.
 - Checked cold resume after wrapper restart by exact thread ID or official `--last` behavior.
 - ADR for profile-independent conversation lineage and required cross-profile continuation after automatic failover.
+- Native five-target release packaging with deterministic archive metadata,
+  checksums, provenance attestations, dry-run validation, and a maintainer
+  release/rollback runbook.
 
 ### Security
 
