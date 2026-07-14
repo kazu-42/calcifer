@@ -48,6 +48,10 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Conversation metadata stores only Calcifer/profile/thread UUIDs, canonical cwd, tested adapter versions, bounded inventory timestamps, path-free file identity/size/mtime/ctime fingerprints, and lifecycle state. It excludes aliases, rollout paths, App Server previews, transcript bodies, prompts, responses, approvals, tool arguments, terminal streams, credentials, and provider identity.
 - Diagnostics report capability and redacted status, not secret values or credential paths.
 - Test credentials are synthetic and contain obvious non-production markers.
+- Profile aliases are mutable display metadata, never filesystem ownership
+  keys. Rename holds the published profile lease and registry lock, updates
+  only the bounded atomic registry document, and leaves credentials, identity
+  markers, managed homes, sessions, and conversation records untouched.
 - Claude token storage fails closed when a supported OS credential store is unavailable. Plaintext fallback is a non-goal unless a later ADR and security review define it.
 - Export, backup, telemetry, and crash-report features exclude credentials by design.
 - Credential-bearing environments are passed only to a provider adapter's validated executable, never to an arbitrary command supplied after `--`.

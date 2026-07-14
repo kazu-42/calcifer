@@ -14,6 +14,7 @@ use crate::providers::codex::CodexIdentityAdapter;
 
 const REGISTRY_SCHEMA_VERSION: u8 = 1;
 const REGISTRY_FILE: &str = "profiles.json";
+const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
 const LOCK_FILE: &str = "registry.lock";
 const OWNER_MARKER: &str = ".calcifer-profile";
 const COORDINATOR_LOCK_FILE: &str = "profile.lock";
@@ -187,6 +188,15 @@ struct RegistryDocument {
     profiles: Vec<Profile>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistryWriteStep {
+    TemporaryCreate,
+    Write,
+    FileSync,
+    AtomicRename,
+    DirectorySync,
+}
+
 impl Default for RegistryDocument {
     fn default() -> Self {
         Self {
@@ -200,7 +210,7 @@ impl Default for RegistryDocument {
 pub(crate) struct Registry {
     root: PathBuf,
     #[cfg(test)]
-    fail_registry_directory_sync: bool,
+    registry_write_fault: Option<RegistryWriteStep>,
     #[cfg(test)]
     fail_identity_marker_directory_sync: bool,
     #[cfg(test)]
@@ -216,7 +226,7 @@ impl Registry {
         Ok(Self {
             root: data_root()?,
             #[cfg(test)]
-            fail_registry_directory_sync: false,
+            registry_write_fault: None,
             #[cfg(test)]
             fail_identity_marker_directory_sync: false,
             #[cfg(test)]
@@ -249,7 +259,7 @@ impl Registry {
     pub(crate) fn at(root: PathBuf) -> Self {
         Self {
             root,
-            fail_registry_directory_sync: false,
+            registry_write_fault: None,
             fail_identity_marker_directory_sync: false,
             fail_identity_recovery_directory_sync: false,
             fail_identity_key_directory_sync: false,
@@ -261,7 +271,7 @@ impl Registry {
     fn at_with_registry_sync_failure(root: PathBuf) -> Self {
         Self {
             root,
-            fail_registry_directory_sync: true,
+            registry_write_fault: Some(RegistryWriteStep::DirectorySync),
             fail_identity_marker_directory_sync: false,
             fail_identity_recovery_directory_sync: false,
             fail_identity_key_directory_sync: false,
@@ -273,7 +283,7 @@ impl Registry {
     fn at_with_identity_sync_failures(root: PathBuf, fail_recovery: bool) -> Self {
         Self {
             root,
-            fail_registry_directory_sync: false,
+            registry_write_fault: None,
             fail_identity_marker_directory_sync: true,
             fail_identity_recovery_directory_sync: fail_recovery,
             fail_identity_key_directory_sync: false,
@@ -285,11 +295,23 @@ impl Registry {
     fn at_with_identity_key_sync_failures(root: PathBuf, fail_recovery: bool) -> Self {
         Self {
             root,
-            fail_registry_directory_sync: false,
+            registry_write_fault: None,
             fail_identity_marker_directory_sync: false,
             fail_identity_recovery_directory_sync: false,
             fail_identity_key_directory_sync: true,
             fail_identity_key_recovery_directory_sync: fail_recovery,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn at_with_registry_write_fault(root: PathBuf, fault: RegistryWriteStep) -> Self {
+        Self {
+            root,
+            registry_write_fault: Some(fault),
+            fail_identity_marker_directory_sync: false,
+            fail_identity_recovery_directory_sync: false,
+            fail_identity_key_directory_sync: false,
+            fail_identity_key_recovery_directory_sync: false,
         }
     }
 
@@ -310,6 +332,55 @@ impl Registry {
             .into_iter()
             .find(|profile| profile.provider == provider && profile.alias == alias)
             .ok_or_else(|| ProfileError::NotFound(format!("{}@{alias}", provider.as_str())))
+    }
+
+    /// Changes only the display alias of one immutable profile.
+    ///
+    /// Published-profile operations acquire the profile lease before the
+    /// registry lock. Identity verification and future lifecycle mutations
+    /// must keep the same order to avoid deadlocks. Re-reading the registry
+    /// after both locks are held makes a rename/launch race choose exactly one
+    /// winner without touching provider-owned state.
+    pub(crate) fn rename(
+        &self,
+        provider: Provider,
+        old_alias: &str,
+        new_alias: &str,
+    ) -> Result<(Profile, bool), ProfileError> {
+        validate_alias(new_alias)?;
+        ensure_registration_supported()?;
+
+        let original = self.find(provider, old_alias)?;
+        let _profile_lease = self.lock_profile(&original)?;
+        let _registry_lock = self.lock_exclusive()?;
+        let mut document = self.load()?;
+        let old_reference = format!("{}@{old_alias}", provider.as_str());
+        let profile_index = document
+            .profiles
+            .iter()
+            .position(|profile| {
+                profile.id == original.id
+                    && profile.provider == provider
+                    && profile.alias == old_alias
+            })
+            .ok_or(ProfileError::NotFound(old_reference))?;
+
+        if document.profiles[profile_index].alias == new_alias {
+            return Ok((document.profiles[profile_index].clone(), false));
+        }
+        if document.profiles.iter().any(|profile| {
+            profile.provider == provider && profile.alias == new_alias && profile.id != original.id
+        }) {
+            return Err(ProfileError::AlreadyExists(format!(
+                "{}@{new_alias}",
+                provider.as_str()
+            )));
+        }
+
+        document.profiles[profile_index].alias = new_alias.to_owned();
+        let renamed = document.profiles[profile_index].clone();
+        self.save(&document)?;
+        Ok((renamed, true))
     }
 
     pub(crate) fn begin_codex_registration(
@@ -496,6 +567,32 @@ impl Registry {
         })
     }
 
+    /// Acquires both profile locks and reloads the alias while the lease is
+    /// held. Callers selected through a public alias pass that alias as
+    /// `expected_alias`; ID-based enumeration can accept the current alias by
+    /// passing `None`.
+    ///
+    /// Rename takes these same locks before changing the registry, so the
+    /// reload establishes a single winner: either this lease protects the old
+    /// alias, or a completed rename makes that alias fail before provider work.
+    pub(crate) fn lock_profile_current(
+        &self,
+        profile: &Profile,
+        expected_alias: Option<&str>,
+    ) -> Result<(Profile, ProfileLease), ProfileError> {
+        let lease = self.lock_profile(profile)?;
+        let current = self.find_by_id(profile.provider, &profile.id)?;
+        if let Some(expected_alias) = expected_alias {
+            if current.alias != expected_alias {
+                return Err(ProfileError::NotFound(format!(
+                    "{}@{expected_alias}",
+                    profile.provider.as_str()
+                )));
+            }
+        }
+        Ok((current, lease))
+    }
+
     /// Acquires the coordinator side of the split process lease.
     ///
     /// A launch coordinator holds this lock while its provider guardian holds
@@ -559,7 +656,15 @@ impl Registry {
             }
             Err(error) => return Err(ProfileError::Io(error)),
         }
-        let bytes = fs::read(&path)?;
+        let mut bytes = Vec::new();
+        File::open(&path)?
+            .take((MAX_REGISTRY_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_REGISTRY_BYTES {
+            return Err(ProfileError::InvalidRegistry(
+                "registry exceeds the supported size limit".to_owned(),
+            ));
+        }
         let document: RegistryDocument = serde_json::from_slice(&bytes)
             .map_err(|_| ProfileError::InvalidRegistry("registry is not valid JSON".to_owned()))?;
         if document.schema_version != REGISTRY_SCHEMA_VERSION {
@@ -577,15 +682,18 @@ impl Registry {
         let bytes = serde_json::to_vec_pretty(document).map_err(|_| {
             ProfileError::InvalidRegistry("registry serialization failed".to_owned())
         })?;
-        atomic_write_private(&self.root, REGISTRY_FILE, &bytes, |root| {
-            #[cfg(test)]
-            if self.fail_registry_directory_sync {
-                return Err(ProfileError::Io(io::Error::other(
-                    "injected registry directory sync failure",
-                )));
-            }
-            sync_directory(root)
-        })
+        if bytes.len() > MAX_REGISTRY_BYTES {
+            return Err(ProfileError::InvalidRegistry(
+                "registry exceeds the supported size limit".to_owned(),
+            ));
+        }
+        atomic_write_private(
+            &self.root,
+            REGISTRY_FILE,
+            &bytes,
+            |step| self.inject_registry_write_fault(step),
+            sync_directory,
+        )
     }
 
     fn ensure_root(&self) -> Result<(), ProfileError> {
@@ -639,6 +747,16 @@ impl Registry {
             }
         }
         Ok(None)
+    }
+
+    fn inject_registry_write_fault(&self, _step: RegistryWriteStep) -> Result<(), ProfileError> {
+        #[cfg(test)]
+        if self.registry_write_fault == Some(_step) {
+            return Err(ProfileError::Io(io::Error::other(
+                "injected registry write failure",
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1375,20 +1493,36 @@ fn atomic_write_private(
     root: &Path,
     name: &str,
     bytes: &[u8],
+    mut before_step: impl FnMut(RegistryWriteStep) -> Result<(), ProfileError>,
     sync_parent: impl FnOnce(&Path) -> Result<(), ProfileError>,
 ) -> Result<(), ProfileError> {
     let temporary_name = format!(".{name}.{}.tmp", Uuid::new_v4());
     let temporary = root.join(temporary_name);
     let destination = root.join(name);
-    write_private_file(&temporary, bytes)?;
-    if let Err(error) = fs::rename(&temporary, &destination) {
+    let publication = (|| {
+        before_step(RegistryWriteStep::TemporaryCreate)?;
+        let mut options = private_open_options();
+        let mut file = options.write(true).create_new(true).open(&temporary)?;
+        before_step(RegistryWriteStep::Write)?;
+        file.write_all(bytes)?;
+        before_step(RegistryWriteStep::FileSync)?;
+        file.sync_all()?;
+        verify_private_regular_file(&temporary)?;
+        drop(file);
+        before_step(RegistryWriteStep::AtomicRename)?;
+        fs::rename(&temporary, &destination)?;
+        Ok(())
+    })();
+    if let Err(error) = publication {
         let _ = fs::remove_file(&temporary);
-        return Err(ProfileError::Io(error));
+        return Err(error);
     }
-    sync_parent(root).map_err(|error| match error {
-        ProfileError::Io(io_error) => ProfileError::RegistryCommitUncertain(io_error),
-        other => other,
-    })
+    before_step(RegistryWriteStep::DirectorySync)
+        .and_then(|()| sync_parent(root))
+        .map_err(|error| match error {
+            ProfileError::Io(io_error) => ProfileError::RegistryCommitUncertain(io_error),
+            other => other,
+        })
 }
 
 #[cfg(unix)]
@@ -1494,6 +1628,13 @@ mod tests {
     #[cfg(unix)]
     const fn test_identity_adapter() -> CodexIdentityAdapter {
         CodexIdentityAdapter::for_test()
+    }
+
+    #[cfg(unix)]
+    fn register_test_profile(registry: &Registry, alias: &str) -> Result<Profile, ProfileError> {
+        let pending = registry.begin_codex_registration(alias)?;
+        write_test_codex_auth(&pending.home())?;
+        pending.commit(test_identity_adapter())
     }
 
     #[test]
@@ -2438,6 +2579,386 @@ config_file = "{sensitive_path}"
                 .and_then(|entry| entry.file_name().into_string().ok())
                 .is_some_and(|name| name.starts_with(".staging-"))
         }));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_changes_only_alias_and_same_alias_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = temporary_root("rename-alias-only");
+        let registry = Registry::at(root.clone());
+        let original = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&original)?;
+        let inode = fs::metadata(&profile_directory)?.ino();
+        let marker = fs::read(profile_directory.join(OWNER_MARKER))?;
+        let home_entries = fs::read_dir(profile_directory.join("home"))?
+            .map(|entry| {
+                let entry = entry?;
+                Ok((entry.file_name(), fs::read(entry.path())?))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        let (renamed, changed) = registry.rename(Provider::Codex, "work", "client-a")?;
+        assert!(changed);
+        assert_eq!(renamed.id, original.id);
+        assert_eq!(renamed.provider, original.provider);
+        assert_eq!(renamed.created_at, original.created_at);
+        assert_eq!(renamed.alias, "client-a");
+        assert_eq!(fs::metadata(&profile_directory)?.ino(), inode);
+        assert_eq!(fs::read(profile_directory.join(OWNER_MARKER))?, marker);
+        assert_eq!(
+            fs::read_dir(profile_directory.join("home"))?
+                .map(|entry| {
+                    let entry = entry?;
+                    Ok((entry.file_name(), fs::read(entry.path())?))
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+            home_entries
+        );
+        assert!(matches!(
+            registry.find(Provider::Codex, "work"),
+            Err(ProfileError::NotFound(_))
+        ));
+        assert_eq!(registry.find(Provider::Codex, "client-a")?.id, original.id);
+
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+        let (unchanged, changed) = registry.rename(Provider::Codex, "client-a", "client-a")?;
+        assert!(!changed);
+        assert_eq!(unchanged, renamed);
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_lease_revalidates_alias_after_a_completed_rename()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("profile-lease-alias-revalidation");
+        let registry = Registry::at(root.clone());
+        let stale = register_test_profile(&registry, "work")?;
+
+        registry.rename(Provider::Codex, "work", "client-a")?;
+
+        let error = registry
+            .lock_profile_current(&stale, Some("work"))
+            .err()
+            .ok_or("an explicit stale alias must not acquire a status lease")?;
+        assert_eq!(error.code(), "profile_not_found");
+
+        let (current, _lease) = registry.lock_profile_current(&stale, None)?;
+        assert_eq!(current.id, stale.id);
+        assert_eq!(current.alias, "client-a");
+
+        drop(_lease);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_does_not_inspect_provider_or_conversation_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("rename-does-not-read-provider-state");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let home = profile_directory.join("home");
+        let private_sentinel = root.join("synthetic-private-sentinel");
+        write_private_file(&private_sentinel, b"must-not-be-read")?;
+        for name in ["auth.json", "config.toml"] {
+            fs::remove_file(home.join(name))?;
+            symlink(&private_sentinel, home.join(name))?;
+        }
+        let session = home.join("sessions.jsonl");
+        symlink(&private_sentinel, &session)?;
+        let identity = profile_directory.join(".calcifer-provider-identity");
+        symlink(&private_sentinel, &identity)?;
+
+        let (renamed, changed) = registry.rename(Provider::Codex, "work", "client-a")?;
+        assert!(changed);
+        assert_eq!(renamed.id, profile.id);
+        for path in [
+            home.join("auth.json"),
+            home.join("config.toml"),
+            session,
+            identity,
+        ] {
+            assert!(fs::symlink_metadata(&path)?.file_type().is_symlink());
+            assert_eq!(fs::read_link(path)?, private_sentinel);
+        }
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_rejects_invalid_duplicate_and_missing_aliases_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("rename-invalid-inputs");
+        let registry = Registry::at(root.clone());
+        register_test_profile(&registry, "work")?;
+        register_test_profile(&registry, "personal")?;
+        let before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let cases = [
+            (
+                registry.rename(Provider::Codex, "work", "../private-sentinel"),
+                "invalid_profile_alias",
+            ),
+            (
+                registry.rename(Provider::Codex, "work", "personal"),
+                "profile_already_exists",
+            ),
+            (
+                registry.rename(Provider::Codex, "missing", "client-a"),
+                "profile_not_found",
+            ),
+        ];
+        for (result, expected_code) in cases {
+            let error = result.err().ok_or("rename should fail")?;
+            assert_eq!(error.code(), expected_code);
+            assert!(!error.safe_message().contains("private-sentinel"));
+            assert_eq!(fs::read(root.join(REGISTRY_FILE))?, before);
+        }
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_rejects_corrupt_registry_and_unsafe_profile_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let corrupt_root = temporary_root("rename-corrupt-registry");
+        let corrupt_registry = Registry::at(corrupt_root.clone());
+        register_test_profile(&corrupt_registry, "work")?;
+        let corrupt_bytes = b"{synthetic-private-sentinel";
+        fs::write(corrupt_root.join(REGISTRY_FILE), corrupt_bytes)?;
+        let error = corrupt_registry
+            .rename(Provider::Codex, "work", "client-a")
+            .err()
+            .ok_or("corrupt registry must fail")?;
+        assert_eq!(error.code(), "invalid_registry");
+        assert!(!error.safe_message().contains("synthetic-private-sentinel"));
+        assert_eq!(fs::read(corrupt_root.join(REGISTRY_FILE))?, corrupt_bytes);
+        fs::remove_dir_all(corrupt_root)?;
+
+        let oversized_root = temporary_root("rename-oversized-registry");
+        let oversized_registry = Registry::at(oversized_root.clone());
+        register_test_profile(&oversized_registry, "work")?;
+        let oversized = vec![b' '; MAX_REGISTRY_BYTES + 1];
+        fs::write(oversized_root.join(REGISTRY_FILE), &oversized)?;
+        let error = oversized_registry
+            .rename(Provider::Codex, "work", "client-a")
+            .err()
+            .ok_or("oversized registry must fail")?;
+        assert_eq!(error.code(), "invalid_registry");
+        assert_eq!(
+            fs::metadata(oversized_root.join(REGISTRY_FILE))?.len(),
+            oversized.len() as u64
+        );
+        fs::remove_dir_all(oversized_root)?;
+
+        let unsafe_root = temporary_root("rename-unsafe-profile");
+        let unsafe_registry = Registry::at(unsafe_root.clone());
+        let profile = register_test_profile(&unsafe_registry, "work")?;
+        let profile_directory = unsafe_registry.profile_directory(&profile)?;
+        let before = fs::read(unsafe_root.join(REGISTRY_FILE))?;
+        fs::write(
+            profile_directory.join(OWNER_MARKER),
+            b"synthetic-private-sentinel",
+        )?;
+        let error = unsafe_registry
+            .rename(Provider::Codex, "work", "client-a")
+            .err()
+            .ok_or("unsafe profile must fail")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        assert!(!error.safe_message().contains("synthetic-private-sentinel"));
+        assert_eq!(fs::read(unsafe_root.join(REGISTRY_FILE))?, before);
+        fs::remove_dir_all(unsafe_root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_respects_coordinator_guardian_and_status_leases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("rename-active-leases");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let coordinator = open_private_lock_file(&profile_directory.join(COORDINATOR_LOCK_FILE))?;
+        FileExt::lock_exclusive(&coordinator)?;
+        let error = registry
+            .rename(Provider::Codex, "work", "coordinator-blocked")
+            .err()
+            .ok_or("coordinator lease must block rename")?;
+        assert_eq!(error.code(), "profile_busy");
+        FileExt::unlock(&coordinator)?;
+
+        let provider = open_private_lock_file(&profile_directory.join(PROVIDER_LOCK_FILE))?;
+        FileExt::lock_exclusive(&provider)?;
+        let error = registry
+            .rename(Provider::Codex, "work", "guardian-blocked")
+            .err()
+            .ok_or("guardian lease must block rename")?;
+        assert_eq!(error.code(), "profile_busy");
+        FileExt::unlock(&provider)?;
+
+        let status_lease = registry.lock_profile(&profile)?;
+        let error = registry
+            .rename(Provider::Codex, "work", "status-blocked")
+            .err()
+            .ok_or("status lease must block rename")?;
+        assert_eq!(error.code(), "profile_busy");
+        drop(status_lease);
+
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, before);
+        assert_eq!(registry.find(Provider::Codex, "work")?, profile);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_renames_do_not_lose_updates_or_create_duplicates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let root = temporary_root("concurrent-renames");
+        let registry = Registry::at(root.clone());
+        register_test_profile(&registry, "work")?;
+        register_test_profile(&registry, "personal")?;
+
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = ["client-a", "client-b"]
+            .into_iter()
+            .map(|new_alias| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    Registry::at(root)
+                        .rename(Provider::Codex, "work", new_alias)
+                        .map(|(profile, _)| profile.alias)
+                        .map_err(|error| error.code())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().map_err(|_| "rename worker panicked"))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(registry.list()?.len(), 2);
+
+        let current_work_alias = results
+            .iter()
+            .find_map(|result| result.as_ref().ok())
+            .ok_or("one rename must succeed")?
+            .clone();
+        let barrier = Arc::new(Barrier::new(3));
+        let source_aliases = [current_work_alias, "personal".to_owned()];
+        let workers = source_aliases
+            .into_iter()
+            .map(|old_alias| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    Registry::at(root)
+                        .rename(Provider::Codex, &old_alias, "shared")
+                        .map(|_| ())
+                        .map_err(|error| error.code())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().map_err(|_| "rename worker panicked"))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let profiles = registry.list()?;
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles
+                .iter()
+                .filter(|profile| profile.alias == "shared")
+                .count(),
+            1
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_faults_before_visibility_preserve_old_registry_and_sync_failure_is_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for fault in [
+            RegistryWriteStep::TemporaryCreate,
+            RegistryWriteStep::Write,
+            RegistryWriteStep::FileSync,
+            RegistryWriteStep::AtomicRename,
+        ] {
+            let root = temporary_root("rename-previsibility-fault");
+            let registry = Registry::at(root.clone());
+            register_test_profile(&registry, "work")?;
+            let before = fs::read(root.join(REGISTRY_FILE))?;
+            let faulting = Registry::at_with_registry_write_fault(root.clone(), fault);
+
+            let error = faulting
+                .rename(Provider::Codex, "work", "client-a")
+                .err()
+                .ok_or("fault injection must fail")?;
+            assert_eq!(error.code(), "io_error");
+            assert_eq!(fs::read(root.join(REGISTRY_FILE))?, before);
+            assert!(registry.find(Provider::Codex, "work").is_ok());
+            assert!(matches!(
+                registry.find(Provider::Codex, "client-a"),
+                Err(ProfileError::NotFound(_))
+            ));
+            assert!(!fs::read_dir(&root)?.any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| entry.file_name().into_string().ok())
+                    .is_some_and(|name| name.starts_with(".profiles.json."))
+            }));
+            fs::remove_dir_all(root)?;
+        }
+
+        let root = temporary_root("rename-directory-sync-fault");
+        let registry = Registry::at(root.clone());
+        let original = register_test_profile(&registry, "work")?;
+        let faulting =
+            Registry::at_with_registry_write_fault(root.clone(), RegistryWriteStep::DirectorySync);
+        let error = faulting
+            .rename(Provider::Codex, "work", "client-a")
+            .err()
+            .ok_or("directory sync fault must be uncertain")?;
+        assert_eq!(error.code(), "registry_commit_uncertain");
+        assert!(error.safe_message().contains("auth list"));
+        assert!(matches!(
+            registry.find(Provider::Codex, "work"),
+            Err(ProfileError::NotFound(_))
+        ));
+        assert_eq!(registry.find(Provider::Codex, "client-a")?.id, original.id);
 
         fs::remove_dir_all(root)?;
         Ok(())

@@ -126,10 +126,13 @@ fn spawn_supervisor(
 ) -> Result<ExitStatus, AppError> {
     #[cfg(unix)]
     let _termination_guard = install_process_signal_guard()?;
+    let registry = Registry::discover()?;
+    let profile = registry.find(Provider::Codex, alias)?;
     let executable = std::env::current_exe()?;
     let mut command = internal_calcifer_command(&executable);
     command
         .arg("__internal-codex")
+        .arg(&profile.id)
         .arg(format!("codex@{alias}"))
         .arg(match mode {
             InternalProcessMode::Run => "run",
@@ -149,10 +152,12 @@ fn spawn_supervisor(
 }
 
 pub(crate) fn supervise_codex(
-    alias: &str,
+    profile_id: &str,
+    expected_alias: &str,
     mode: InternalProcessMode,
     session_id: Option<&str>,
     provider_args: &[OsString],
+    announce: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<ExitStatus, AppError> {
     validate_provider_arguments(provider_args)?;
     let _arguments = provider_arguments(mode, session_id, provider_args)?;
@@ -164,8 +169,12 @@ pub(crate) fn supervise_codex(
         // The provider guardian repeats these checks immediately before spawn.
         let _executable = resolve_codex()?;
         let registry = Registry::discover()?;
-        let profile = registry.find(Provider::Codex, alias)?;
+        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
+        require_expected_alias(&profile, expected_alias)?;
         let _coordinator_lease = registry.lock_profile_coordinator(&profile)?;
+        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
+        require_expected_alias(&profile, expected_alias)?;
+        announce()?;
         let _home = registry.profile_home(&profile)?;
         let launch_context = verify_current_repository_config()?;
         if mode == InternalProcessMode::ResumeHead {
@@ -188,7 +197,7 @@ pub(crate) fn supervise_codex(
         listener.set_nonblocking(true)?;
 
         let mut guardian = spawn_provider_guardian(
-            alias,
+            &profile.id,
             &run_id,
             mode,
             session_id,
@@ -228,8 +237,12 @@ pub(crate) fn supervise_codex(
         }
         let executable = resolve_codex()?;
         let registry = Registry::discover()?;
-        let profile = registry.find(Provider::Codex, alias)?;
+        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
+        require_expected_alias(&profile, expected_alias)?;
         let _lease = registry.lock_profile(&profile)?;
+        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
+        require_expected_alias(&profile, expected_alias)?;
+        announce()?;
         let home = registry.profile_home(&profile)?;
         let launch_context = verify_current_repository_config()?;
         managed_command(&executable, &home)
@@ -244,7 +257,7 @@ pub(crate) fn supervise_codex(
 /// lease. The coordinator owns the other half and authorizes spawn over a
 /// private, per-run Unix socket.
 pub(crate) fn guard_codex(
-    alias: &str,
+    profile_id: &str,
     run_id: &str,
     mode: InternalProcessMode,
     session_id: Option<&str>,
@@ -259,7 +272,7 @@ pub(crate) fn guard_codex(
         let run_id = parse_run_id(run_id)?;
         let executable = resolve_codex()?;
         let registry = Registry::discover()?;
-        let profile = registry.find(Provider::Codex, alias)?;
+        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
         let provider_lease = registry.lock_profile_provider(&profile)?;
         let home = registry.profile_home(&profile)?;
         let initial_launch_context = verify_current_repository_config()?;
@@ -362,8 +375,23 @@ pub(crate) fn guard_codex(
 
     #[cfg(not(unix))]
     {
-        let _ = (alias, run_id, arguments);
+        let _ = (profile_id, run_id, arguments);
         Err(crate::profiles::ProfileError::UnsupportedPlatform.into())
+    }
+}
+
+fn require_expected_alias(
+    profile: &crate::profiles::Profile,
+    expected_alias: &str,
+) -> Result<(), AppError> {
+    if profile.alias == expected_alias {
+        Ok(())
+    } else {
+        Err(crate::profiles::ProfileError::NotFound(format!(
+            "{}@{expected_alias}",
+            profile.provider.as_str()
+        ))
+        .into())
     }
 }
 
@@ -404,7 +432,7 @@ fn validate_canonical_thread_id(thread_id: &str) -> Result<(), AppError> {
 
 #[cfg(unix)]
 fn spawn_provider_guardian(
-    alias: &str,
+    profile_id: &str,
     run_id: &Uuid,
     mode: InternalProcessMode,
     session_id: Option<&str>,
@@ -415,7 +443,7 @@ fn spawn_provider_guardian(
     let mut command = internal_calcifer_command(&executable);
     command
         .arg("__internal-codex-provider")
-        .arg(format!("codex@{alias}"))
+        .arg(profile_id)
         .arg(run_id.to_string())
         .arg(match mode {
             InternalProcessMode::Run => "run",

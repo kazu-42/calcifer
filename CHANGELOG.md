@@ -22,6 +22,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   digests for all five supported native targets.
 - Draft-staged immutable releases with a read-first maintainer-local publisher
   that binds the single publication write to an exact numeric release ID.
+- Offline, atomic `auth rename` for changing a local profile alias without
+  changing its immutable ID, managed home, authentication, provider identity,
+  or conversation state, with stable human/JSON output and commit-uncertain
+  read-back guidance.
 
 ### Changed
 

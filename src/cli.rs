@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,7 +28,7 @@ pub(crate) enum Commands {
     /// Inspect the local environment without reading or changing credentials.
     Doctor,
 
-    /// Register, verify, or list isolated provider profiles.
+    /// Register, verify, rename, or list isolated provider profiles.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -73,7 +74,8 @@ pub(crate) enum Commands {
     /// Internal single-profile process supervisor.
     #[command(name = "__internal-codex", hide = true)]
     InternalCodex {
-        profile: ProfileReference,
+        profile_id: ProfileId,
+        expected_profile: ProfileReference,
         mode: InternalProcessMode,
         session_id: Option<String>,
 
@@ -84,7 +86,7 @@ pub(crate) enum Commands {
     /// Internal provider guardian; requires a coordinator-owned socket.
     #[command(name = "__internal-codex-provider", hide = true)]
     InternalCodexProvider {
-        profile: ProfileReference,
+        profile_id: ProfileId,
         run_id: String,
         mode: InternalProcessMode,
         session_id: Option<String>,
@@ -92,6 +94,27 @@ pub(crate) enum Commands {
         #[arg(last = true, allow_hyphen_values = true)]
         provider_args: Vec<OsString>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProfileId(String);
+
+impl ProfileId {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ProfileId {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parsed = Uuid::parse_str(value).map_err(|_| "profile id must be a canonical UUID")?;
+        if parsed.to_string() != value {
+            return Err("profile id must be a canonical UUID");
+        }
+        Ok(Self(value.to_owned()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -119,6 +142,15 @@ pub(crate) enum AuthCommand {
     Verify {
         /// Existing profile to verify, for example codex@work.
         profile: ProfileReference,
+    },
+
+    /// Rename a local profile alias without re-authenticating.
+    Rename {
+        /// Existing profile to rename, for example codex@work.
+        profile: ProfileReference,
+
+        /// New local alias for the same immutable profile.
+        new_alias: String,
     },
 
     /// List registered profiles without reading credentials.
