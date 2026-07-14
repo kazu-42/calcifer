@@ -4,10 +4,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
-Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-agent CLIs with isolated account profiles and usage-aware profile selection.
+Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-agent CLIs with isolated account profiles and structured usage visibility.
 
 > [!WARNING]
-> **Status: pre-alpha scaffold.** Account registration, switching, usage monitoring, and automatic failover are not implemented yet. The only implemented command is the read-only `doctor` diagnostic.
+> **Status: functional pre-alpha.** Codex profile registration, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. Automatic failover, cross-profile session handoff, remove/reauth flows, and verified Windows credential ACLs are not implemented yet.
 
 Calcifer is intended to make routine selection among accounts that you already own or are authorized to use feel boring: authenticate each profile through the provider's official CLI, keep each profile isolated, and start every new CLI process with an explicit profile.
 
@@ -34,14 +34,51 @@ A running process keeps the profile it started with. Switching affects newly sta
 
 ## What works today
 
-The bootstrap release deliberately exposes only read-only diagnostics:
+The first functional slice manages isolated Codex homes on macOS and Linux:
 
 ```console
-cargo run -- doctor
-cargo run -- --json doctor
+# Browser authentication is handled by the official Codex CLI.
+calcifer auth add codex work
+calcifer auth add codex personal
+calcifer auth list
+
+# Read every idle registered profile, or one idle profile, without changing the global login.
+calcifer status
+calcifer status codex@work
+calcifer --json status
+
+# Start Codex in one immutable profile.
+calcifer run codex@work
+calcifer run codex@personal -- --no-alt-screen
+
+# Reopen the newest session in that profile, or pin the exact thread ID.
+calcifer resume codex@work
+calcifer resume codex@work 01900000-0000-7000-8000-000000000001
 ```
 
-`doctor` checks the host and whether executables named `codex` and `claude` are discoverable on `PATH`. Name discovery does not verify their origin, version, or compatibility. The command does not execute those binaries or read or write `auth.json`, Keychain entries, provider configuration, or Calcifer state.
+Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes both authentication and session state there, so exiting Calcifer does not discard the conversation. `resume` without an ID delegates to official `codex resume --last`; an exact thread ID is preferred for automation because `--last` is affected by the working directory and can be ambiguous.
+
+This is cold resume after restarting the wrapper, but it is currently explicit: the user invokes `calcifer resume`. Calcifer does not yet capture `{profile, cwd, thread ID}` and automatically choose the exact previous thread on startup. Resume restores persisted history, not a dead process or in-flight tool call, and never resends the last prompt.
+
+`status` starts the installed official `codex app-server` inside each idle profile and calls the structured `account/rateLimits/read` method. It displays all returned limit buckets, primary and secondary used/remaining percentages, reset times, workspace credit state, monthly spend control when present, and rate-limit reset-credit count and expirations. It does not scrape the interactive `/status` screen or read token values from `auth.json`.
+
+An active `run` or `resume` holds a split exclusive lease because a second Codex process could race credential refresh and session writes. A launch coordinator owns one half and a provider guardian owns the other; either process surviving a selective crash keeps the profile busy until the exact provider exits. Consequently, status for that active profile is currently `profile_busy` / `unknown`; a list query inspects profiles serially with a per-profile timeout. Active-session monitoring, cached last-known observations, and automatic failover still require a profile-owned usage supervisor. Also, a Calcifer profile is a local alias: provider identity is not yet verified, so two aliases may point to the same underlying account and quota.
+
+Example human output:
+
+```text
+codex@work [available]
+  Codex
+    primary: 41% used · 59% remaining (display) · 300m window · resets 2027-01-15T08:00:00Z
+    secondary: 70% used · 30% remaining (display) · 10080m window · resets 2027-01-20T08:00:00Z
+  reset credits: 2 available
+    codexRateLimits · available · expires 2027-02-01T08:00:00Z
+  observed 2026-07-15T12:34:56Z · fresh · codex_app_server
+```
+
+The remaining percentage is explicitly display-only. Codex rounds the upstream used percentage, so displayed `0% remaining` is not by itself proof that the provider rejected the account. Calcifer reports `exhausted` only when the structured response contains a recognized `rateLimitReachedType`; otherwise a rounded 100% result is `unknown` for failover purposes.
+
+`doctor` remains credential-free. It checks the host and whether executables named `codex` and `claude` are discoverable on `PATH`; it does not execute them or read provider state.
 
 Example JSON envelope:
 
@@ -49,34 +86,29 @@ Example JSON envelope:
 {
   "schema_version": 1,
   "command": "doctor",
-  "calcifer_version": "0.1.0-alpha.1",
+  "calcifer_version": "0.1.0-alpha.2",
   "ok": true,
   "status": "warn",
   "checks": []
 }
 ```
 
-For structured command results (currently `doctor`), `--json` emits one JSON document on stdout. Usage failures emit one redacted JSON document on stderr with exit code `2`. Clap's standard `--help` and `--version` output remains text even when `--json` is present. Within schema version 1, existing field names and meanings will remain stable; new fields may be added.
+For structured `doctor`, `auth list`, and `status` results, `--json` emits one JSON document on stdout. Interactive `auth add`, `run`, and `resume` reject `--json` because the official provider owns the terminal and mixing its stream with a Calcifer JSON document would break the contract. Usage failures emit one redacted JSON document on stderr with exit code `2`. Clap's standard `--help` and `--version` output remains text even when `--json` is present. Within schema version 1, existing field names and meanings will remain stable; new fields may be added.
 
 ## Planned interface
 
-The following is a design target, **not an implemented quick start**:
+The following pool and default-selection commands remain design targets, not an implemented quick start:
 
 ```console
-# Register profiles through each provider's official login flow.
-calcifer auth add codex work
-calcifer auth add codex personal
-
 # Select a default for future processes, or pin one invocation.
 calcifer use codex work
-calcifer run codex@personal -- --help
 
 # Opt in to a bounded failover pool within one trust domain.
 calcifer pool create codex personal --profiles personal-a,personal-b
-calcifer run codex@personal -- --help
+calcifer supervise codex@personal
 ```
 
-Arguments after `--` are planned as arguments to the provider adapter's validated official executable; users will not supply an arbitrary executable. The exact command surface may change before the first functional release. Unimplemented commands currently fail as unknown commands rather than pretending to succeed.
+Arguments after `--` are arguments to the provider adapter's resolved, permission-checked `codex` executable; users do not supply an arbitrary executable. Account/provider-routing flags such as `-c`, `--profile`, `--oss`, `--local-provider`, and remote-routing options are rejected, while Calcifer forces file-backed credential storage on every managed invocation. Calcifer does not yet cryptographically verify binary provenance, so users remain responsible for installing the official CLI on a trusted `PATH`. Unimplemented commands fail as unknown commands rather than pretending to succeed.
 
 ## What "automatic failover" will mean
 
@@ -86,29 +118,32 @@ Failover will follow conservative semantics:
 
 - It is disabled by default and limited to a user-created pool of explicitly authorized profiles.
 - A pool cannot cross provider or configured trust-domain boundaries.
-- Only authoritative, fresh `exhausted` state permits selecting another profile. Authentication failures, provider errors, network failures, unknown output, and stale status fail closed.
+- Only authoritative, fresh `exhausted` state permits selecting another profile. A rounded display value of `0% remaining`, authentication failure, provider error, network failure, unknown output, or stale status cannot authorize a switch.
 - A pool is traversed at most once per invocation and uses cooldown state to prevent loops.
 - Calcifer never hot-swaps credentials in a running process.
-- Calcifer never automatically replays a command or prompt under another account. A partially completed agent run may already have changed files or external systems, so replay could duplicate side effects.
+- A future supervisor may reopen a persisted transcript after the old child has stopped, but it will never automatically replay the last command or prompt. A partially completed turn may already have changed files or external systems, so replay could duplicate side effects.
 - Before launch, Calcifer shows the local profile alias, provider, trust domain, and selection reason without exposing provider account identifiers.
 
-A confirmed in-process exhaustion may influence the **next** invocation, but it will not silently restart the completed or interrupted work.
+Same-profile resume is stable today. Cross-profile resume is not: stable Codex thread lookup is scoped to one `CODEX_HOME`, while the available external-rollout-path field is explicitly experimental. Any future cross-profile handoff must bind the thread to its source profile, stay inside one configured trust domain, hold a single-writer lease, validate a Calcifer-owned rollout path, and restore history without resubmitting a turn.
 
 ## Provider direction
 
 | Capability | Status | Direction |
 | --- | --- | --- |
 | Read-only environment diagnostics | Implemented | No credential access |
-| Codex profile isolation | Planned first | One `CODEX_HOME` per profile; official Codex login and refresh |
-| Codex usage observation | Research/design | Structured, version-gated provider signal only |
+| Codex profile isolation | Implemented on Unix | One `CODEX_HOME` per profile; official Codex login and refresh |
+| Same-profile Codex resume | Implemented | Exact thread ID or official `--last`; no prompt replay |
+| Codex usage observation | Implemented on demand for idle profiles | Structured app-server response; active profiles need the planned supervisor |
+| Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
 | Opt-in profile pools | Design | Same provider and trust domain; bounded selection |
+| Cross-profile transcript handoff | Experimental design | Not enabled; external-path resume is an unstable upstream field |
 | Claude setup-token profiles | Experimental plan | OS credential store where officially supported |
 | Claude subscription OAuth replication | Not planned for MVP | No undocumented OAuth endpoint or Keychain-name emulation |
 | Mid-session account hot-swap or command replay | Non-goal | Unsafe side-effect semantics |
 
 Calcifer will prefer documented provider interfaces and official CLI behavior. Provider compatibility can break when a CLI or credential format changes; unsupported or ambiguous states must stop rather than guess.
 
-The current Linux, macOS, and Windows CI matrix covers the doctor-only scaffold. Credential management will be marked supported separately for each provider and OS only after filesystem permissions or ACLs, credential-store behavior, process supervision, and recovery paths are verified.
+The Linux, macOS, and Windows CI matrix still compiles and tests the portable surface. Managed registration is currently enabled only on Unix, where private directory/file modes are enforced. Windows registration fails closed until current-user-only ACL creation and recovery are verified.
 
 ## Security model
 
@@ -119,15 +154,17 @@ Core invariants for future implementation are:
 1. One process uses one immutable profile identity for its entire lifetime.
 2. Calcifer never copies managed credentials into global `~/.codex` or global Claude state.
 3. Only official CLI authentication and refresh mechanisms are used.
-4. Secrets never enter Calcifer logs, command arguments, diagnostics, telemetry, or real test fixtures.
+4. Secrets and opaque reset-credit identifiers never enter Calcifer logs, command arguments, diagnostics, telemetry, or real test fixtures.
 5. Unknown quota state and authentication errors never authorize a switch.
 6. State changes are permission-checked, atomic, bounded, and recoverable.
 7. Old rotated credentials are never restored over newer credentials.
 8. Credential-bearing environments are passed only to the selected adapter's validated executable, never to an arbitrary user-supplied command.
+9. A resumable thread remains bound to its source profile unless an explicit, reviewed same-trust-domain handoff is used.
+10. Resume restores persisted history but never replays an interrupted prompt or tool action.
 
 File-based Codex credentials remain readable by the current OS user and the official Codex CLI; Calcifer is not an encrypted vault. Calcifer also does not sandbox the wrapped CLI, its hooks, or commands executed from the current repository.
 
-See [Architecture](docs/architecture.md), [Security model](docs/security-model.md), and [Security policy](SECURITY.md) before contributing to authentication, storage, process execution, or failover behavior.
+See [Architecture](docs/architecture.md), [Provider compatibility](docs/provider-compatibility.md), [Security model](docs/security-model.md), and [Security policy](SECURITY.md) before contributing to authentication, storage, process execution, or failover behavior.
 
 ## Build from source
 
@@ -135,7 +172,7 @@ Prerequisites:
 
 - Rust 1.85 or newer
 - Git
-- The official provider CLI only if you want `doctor` to detect it
+- The official Codex CLI for profile registration, launch, resume, or status
 
 ```console
 git clone https://github.com/kazu-42/calcifer.git
@@ -168,14 +205,15 @@ The CI contract covers formatting and Clippy on Rust 1.96, tests on Linux/macOS/
 
 ## Roadmap
 
-The first useful slice is Codex-only profile isolation with no shared runtime home:
+The current and next slices keep Codex profile isolation with no shared runtime home:
 
-1. Secure local registry and profile-name validation.
-2. `calcifer auth add codex <name>` using a profile-specific `CODEX_HOME` and the official login command.
-3. `calcifer run codex@<name> -- <codex arguments>` with a validated Codex executable, exact exit-code behavior, and signal forwarding.
-4. Profile leases, identity verification, safe remove/re-auth flows, and redaction tests.
-5. Version-gated usage observations, then explicit failover pools.
-6. Claude support only through provider-supported authentication surfaces.
+1. **Implemented:** private Unix registry, profile-name validation, ownership markers, and atomic metadata writes.
+2. **Implemented:** `auth add/list`, `run`, same-profile `resume`, profile leases, and structured on-demand status.
+3. Add exact thread-ID capture for automatic cold restore, provider identity verification, safe remove/reauth flows, and crash recovery.
+4. Add observation caching, supported-version/schema gates, and adaptive refresh without aggressive polling.
+5. Add explicit same-trust-domain pools and fail-closed automatic selection.
+6. Evaluate cross-profile resume behind an experimental gate; do not use it as the default failover path.
+7. Add Claude only through provider-supported authentication and usage-observation surfaces.
 
 Detailed gates and non-goals are tracked in [docs/roadmap.md](docs/roadmap.md).
 

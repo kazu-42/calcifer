@@ -1,14 +1,19 @@
 mod cli;
 mod commands;
+mod error;
+mod executable;
 mod output;
+mod profiles;
+mod providers;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::process::ExitCode;
+use std::process::{ExitCode, ExitStatus};
 
 use clap::{CommandFactory, Parser, error::ErrorKind};
 
-use crate::cli::{Cli, Commands};
+use crate::cli::{AuthCommand, Cli, Commands, ProviderArgument};
+use crate::error::AppError;
 use crate::output::ErrorReport;
 
 const HUMAN_USAGE_ERROR: &str =
@@ -26,7 +31,10 @@ where
     T: Into<OsString> + Clone,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    let json_requested = args.iter().any(|arg| arg == "--json");
+    let json_requested = args
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--json");
 
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -92,7 +100,198 @@ where
             }
             ExitCode::from(report.exit_code())
         }
+        Commands::Auth { command } => match command {
+            AuthCommand::Add {
+                provider: ProviderArgument::Codex,
+                alias,
+            } => {
+                if cli.json {
+                    return render_app_error("auth", &AppError::InteractiveJsonUnsupported, true);
+                }
+                match commands::auth::add_codex(&alias) {
+                    Ok(report) => render_auth_report(&report, false),
+                    Err(error) => render_app_error("auth", &error, false),
+                }
+            }
+            AuthCommand::List => match commands::auth::list() {
+                Ok(report) => render_auth_report(&report, cli.json),
+                Err(error) => render_app_error("auth", &error, cli.json),
+            },
+        },
+        Commands::Run {
+            profile,
+            provider_args,
+        } => {
+            if cli.json {
+                return render_app_error("run", &AppError::InteractiveJsonUnsupported, true);
+            }
+            match profile.provider {
+                ProviderArgument::Codex => {
+                    match commands::process::run_codex(&profile.alias, &provider_args) {
+                        Ok(status) => exit_code_from_status(status),
+                        Err(error) => render_app_error("run", &error, false),
+                    }
+                }
+            }
+        }
+        Commands::Resume {
+            profile,
+            session_id,
+            provider_args,
+        } => {
+            if cli.json {
+                return render_app_error("resume", &AppError::InteractiveJsonUnsupported, true);
+            }
+            match profile.provider {
+                ProviderArgument::Codex => {
+                    match commands::process::resume_codex(
+                        &profile.alias,
+                        session_id.as_deref(),
+                        &provider_args,
+                    ) {
+                        Ok(status) => exit_code_from_status(status),
+                        Err(error) => render_app_error("resume", &error, false),
+                    }
+                }
+            }
+        }
+        Commands::Status { profile } => match commands::status::StatusReport::inspect(
+            profile.as_ref().map(|profile| profile.alias.as_str()),
+        ) {
+            Ok(report) => render_status_report(&report, cli.json),
+            Err(error) => render_app_error("status", &error, cli.json),
+        },
+        Commands::InternalCodex {
+            profile,
+            mode,
+            session_id,
+            provider_args,
+        } => {
+            if cli.json {
+                return render_app_error(
+                    "__internal-codex",
+                    &AppError::InteractiveJsonUnsupported,
+                    true,
+                );
+            }
+            match profile.provider {
+                ProviderArgument::Codex => {
+                    let notice = match mode {
+                        cli::InternalProcessMode::Run => format!(
+                            "Calcifer: launching codex@{} (explicit profile).",
+                            profile.alias
+                        ),
+                        cli::InternalProcessMode::ResumeLast => format!(
+                            "Calcifer: resuming latest session in codex@{} (same profile; no prompt replay).",
+                            profile.alias
+                        ),
+                        cli::InternalProcessMode::ResumeExact => format!(
+                            "Calcifer: resuming requested thread in codex@{} (same profile; no prompt replay).",
+                            profile.alias
+                        ),
+                    };
+                    if write_stderr(&notice).is_err() {
+                        return ExitCode::FAILURE;
+                    }
+                    match commands::process::supervise_codex(
+                        &profile.alias,
+                        mode,
+                        session_id.as_deref(),
+                        &provider_args,
+                    ) {
+                        Ok(status) => exit_code_from_status(status),
+                        Err(error) => render_app_error("__internal-codex", &error, false),
+                    }
+                }
+            }
+        }
+        Commands::InternalCodexProvider {
+            profile,
+            run_id,
+            mode,
+            session_id,
+            provider_args,
+        } => {
+            if cli.json {
+                return render_app_error(
+                    "__internal-codex-provider",
+                    &AppError::InteractiveJsonUnsupported,
+                    true,
+                );
+            }
+            match profile.provider {
+                ProviderArgument::Codex => match commands::process::guard_codex(
+                    &profile.alias,
+                    &run_id,
+                    mode,
+                    session_id.as_deref(),
+                    &provider_args,
+                ) {
+                    Ok(status) => exit_code_from_status(status),
+                    Err(error) => render_app_error("__internal-codex-provider", &error, false),
+                },
+            }
+        }
     }
+}
+
+fn render_auth_report(report: &commands::auth::AuthReport, json: bool) -> ExitCode {
+    let rendered = if json {
+        report.to_json()
+    } else {
+        Ok(report.to_human())
+    };
+    match rendered {
+        Ok(rendered) if write_stdout(&rendered).is_ok() => ExitCode::SUCCESS,
+        _ => {
+            let _ = write_stderr(if json {
+                JSON_INTERNAL_ERROR
+            } else {
+                HUMAN_INTERNAL_ERROR
+            });
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn render_status_report(report: &commands::status::StatusReport, json: bool) -> ExitCode {
+    let rendered = if json {
+        report.to_json()
+    } else {
+        Ok(report.to_human())
+    };
+    match rendered {
+        Ok(rendered) if write_stdout(&rendered).is_ok() => ExitCode::from(report.exit_code()),
+        _ => {
+            let _ = write_stderr(if json {
+                JSON_INTERNAL_ERROR
+            } else {
+                HUMAN_INTERNAL_ERROR
+            });
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn render_app_error(command: &str, error: &AppError, json: bool) -> ExitCode {
+    let rendered = if json {
+        ErrorReport::command(command, error.code(), error.safe_message())
+            .to_json()
+            .unwrap_or_else(|_| JSON_INTERNAL_ERROR.to_owned())
+    } else {
+        format!("error: {}", error.safe_message())
+    };
+    if write_stderr(&rendered).is_err() {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::FAILURE
+}
+
+fn exit_code_from_status(status: ExitStatus) -> ExitCode {
+    status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
 /// Verifies clap's command definition during unit tests and CI.
@@ -134,7 +333,7 @@ mod tests {
 
     #[test]
     fn unimplemented_commands_fail_closed() {
-        for command in ["auth", "run", "switch", "use"] {
+        for command in ["switch", "use"] {
             let result = Cli::try_parse_from(["calcifer", command]);
             assert!(result.is_err(), "{command} must remain unavailable");
         }

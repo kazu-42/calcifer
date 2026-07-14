@@ -12,30 +12,39 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 
 ## Phase 1: secure local registry
 
-- [ ] Cross-platform data-directory selection with explicit override
-- [ ] Opaque profile IDs and normalized display-name validation
-- [ ] Managed-root ownership marker and safe deletion boundary
-- [ ] Unix `0700`/`0600`, Windows current-user-only ACLs, symlink/owner checks, and atomic metadata writes
-- [ ] OS advisory locks and deterministic lock ordering
+- [x] Platform data-directory selection with absolute `CALCIFER_HOME` override
+- [x] Opaque profile IDs and normalized display-name validation
+- [x] Per-profile ownership marker and staging cleanup boundary
+- [x] Unix `0700`/`0600`, symlink/type checks, and atomic registry writes
+- [ ] Windows current-user-only ACL creation and validation
+- [ ] Owner-UID checks and hardened directory-relative filesystem operations
+- [x] OS advisory locks for the current single-profile operations
+- [ ] Deterministic multi-profile/session lock ordering
 - [ ] Redaction and crash-injection test harnesses
 
 ## Phase 2: Codex profile isolation
 
-- [ ] `auth add/list/show/remove/reauth codex`
-- [ ] Official `codex login` in a profile-specific `CODEX_HOME`
+- [ ] Complete `auth add/list/show/remove/reauth codex` (`add` and `list` are implemented)
+- [x] Official `codex login` in a profile-specific `CODEX_HOME`
 - [ ] Provider identity verification before profile publication
-- [ ] File-backed credential-store configuration scoped to the managed home
-- [ ] Adapter-selected, validated official executable with exact argv, arbitrary-command rejection, signal, PTY, and exit-code behavior
-- [ ] No writes to the user's global `~/.codex`
-- [ ] Same-profile lifetime lease; different profiles may run concurrently
+- [x] File-backed credential-store configuration scoped to the managed home
+- [x] Revalidate managed auth/config and reject account/provider-routing argument overrides
+- [ ] Complete adapter-selected executable hardening and process supervision (direct argv, owner/parent-mode checks, crash-tolerant split launch leases, and ordinary exit codes are implemented; complete signal semantics remain)
+- [x] No writes to the user's global `~/.codex`
+- [x] Same-profile lifetime lease; different profiles may run concurrently
+- [x] Same-profile `resume` by exact thread ID or official `--last`
+- [ ] Automatic `{profile_id, cwd, thread_id}` capture and cold restore
 
 ## Phase 3: usage observations
 
-- [ ] Identify a documented or official structured Codex usage signal
-- [ ] Version-gated parser with `available | exhausted | unknown` classification
-- [ ] Timestamped source and reset metadata
-- [ ] Staleness, provider failure, auth failure, and unknown-format tests
-- [ ] Human and stable JSON status commands
+- [x] Use official structured `account/rateLimits/read`; do not scrape TUI text
+- [ ] Explicit supported-version/schema gate (unknown methods and malformed payloads already fail closed)
+- [x] `available | exhausted | unknown` classification without treating rounded 100% as exhaustion
+- [x] Timestamped source, window reset metadata, spend control, and reset-credit count/expiry
+- [x] Provider failure, auth failure, timeout, missing-field, and unknown-format handling
+- [x] Human and stable JSON status commands for one or all idle profiles
+- [ ] Profile-owned supervisor or safe observation cache for active-session monitoring
+- [ ] Snapshot cache, staleness state, TTL/backoff, and notification merge
 
 Calcifer will not ship automatic failover by scraping an unstable human string and treating parse failures as zero.
 
@@ -49,6 +58,15 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [ ] No mid-session credential swap
 - [ ] No automatic command or prompt replay
 - [ ] Audit events containing no secret or stable account identifier
+
+## Phase 4.5: optional session handoff
+
+- [ ] Decide whether cross-profile resume belongs in Calcifer's supported surface
+- [ ] Bind every captured thread to source profile, canonical cwd, trust domain, and exact rollout path
+- [ ] Version-gate Codex's experimental external-rollout resume field
+- [ ] Canonical containment, symlink/owner/mode validation, and a single-writer session lease
+- [ ] Stop and reap the old child before reopening history under a target profile
+- [ ] Restore transcript only; never replay an interrupted turn
 
 ## Phase 5: Claude support
 
