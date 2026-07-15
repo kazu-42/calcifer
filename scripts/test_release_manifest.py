@@ -285,6 +285,77 @@ class ReleaseManifestTests(unittest.TestCase):
                 source_commit="0123456789abcdef0123456789abcdef01234567",
             )
 
+    def test_rejects_zip_leading_bytes_outside_the_local_header_stream(self) -> None:
+        archive = next(self.dist.glob("*x86_64-pc-windows-msvc.zip"))
+        prefix = b"synthetic-self-extracting-stub"
+        encoded = bytearray(prefix + archive.read_bytes())
+        end_record_offset = len(encoded) - 22
+        (
+            signature,
+            _,
+            _,
+            _,
+            total_entries,
+            directory_size,
+            original_directory_offset,
+            _,
+        ) = struct.unpack_from("<4s4H2LH", encoded, end_record_offset)
+        self.assertEqual(signature, b"PK\x05\x06")
+
+        directory_offset = original_directory_offset + len(prefix)
+        struct.pack_into("<L", encoded, end_record_offset + 16, directory_offset)
+        cursor = directory_offset
+        for _ in range(total_entries):
+            self.assertEqual(encoded[cursor : cursor + 4], b"PK\x01\x02")
+            filename_size, extra_size, comment_size = struct.unpack_from(
+                "<HHH", encoded, cursor + 28
+            )
+            local_header_offset = struct.unpack_from("<L", encoded, cursor + 42)[0]
+            struct.pack_into(
+                "<L",
+                encoded,
+                cursor + 42,
+                local_header_offset + len(prefix),
+            )
+            cursor += 46 + filename_size + extra_size + comment_size
+        self.assertEqual(cursor, directory_offset + directory_size)
+        archive.write_bytes(encoded)
+        with zipfile.ZipFile(archive) as readable:
+            self.assertIsNone(readable.testzip())
+
+        with self.assertRaisesRegex(ValueError, "release zip archive is invalid"):
+            release_manifest.build_manifest(
+                dist=self.dist,
+                version="0.1.0-alpha.4",
+                source_commit="0123456789abcdef0123456789abcdef01234567",
+            )
+
+    def test_rejects_zip_gap_before_the_central_directory(self) -> None:
+        archive = next(self.dist.glob("*x86_64-pc-windows-msvc.zip"))
+        original = archive.read_bytes()
+        end_record_offset = len(original) - 22
+        directory_offset = struct.unpack_from("<L", original, end_record_offset + 16)[0]
+        gap = b"unowned-zip-bytes"
+        encoded = bytearray(
+            original[:directory_offset] + gap + original[directory_offset:]
+        )
+        struct.pack_into(
+            "<L",
+            encoded,
+            len(encoded) - 22 + 16,
+            directory_offset + len(gap),
+        )
+        archive.write_bytes(encoded)
+        with zipfile.ZipFile(archive) as readable:
+            self.assertIsNone(readable.testzip())
+
+        with self.assertRaisesRegex(ValueError, "release zip archive is invalid"):
+            release_manifest.build_manifest(
+                dist=self.dist,
+                version="0.1.0-alpha.4",
+                source_commit="0123456789abcdef0123456789abcdef01234567",
+            )
+
     @unittest.skipIf(os.name == "nt", "Tar symlink construction is not portable on Windows")
     def test_rejects_symlink_entries(self) -> None:
         archive = next(self.dist.glob("*aarch64-unknown-linux-gnu.tar.gz"))

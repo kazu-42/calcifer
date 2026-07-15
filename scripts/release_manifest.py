@@ -275,7 +275,7 @@ def _inspect_tar(path: Path, version: str, target: str) -> tuple[str, str]:
     return binary_path, binary_sha256
 
 
-def _validate_zip_container(path: Path) -> int:
+def _validate_zip_container(path: Path) -> tuple[int, int]:
     archive_size = path.stat().st_size
     end_record_size = 22
     if archive_size < end_record_size:
@@ -308,13 +308,72 @@ def _validate_zip_container(path: Path) -> int:
         or directory_offset + directory_size != archive_size - end_record_size
     ):
         raise ValueError("release zip archive is invalid")
-    return total_entries
+    return total_entries, directory_offset
+
+
+def _validate_zip_local_layout(
+    path: Path,
+    members: list[zipfile.ZipInfo],
+    directory_offset: int,
+) -> None:
+    """Reject bytes that are not owned by a contiguous local-file stream."""
+
+    cursor = 0
+    try:
+        with path.open("rb") as source:
+            for member in sorted(members, key=lambda candidate: candidate.header_offset):
+                if member.header_offset != cursor:
+                    raise ValueError("release zip archive is invalid")
+                source.seek(cursor)
+                header = source.read(30)
+                if len(header) != 30:
+                    raise ValueError("release zip archive is invalid")
+                (
+                    signature,
+                    _,
+                    flags,
+                    compression,
+                    _,
+                    _,
+                    crc32,
+                    compressed_size,
+                    uncompressed_size,
+                    filename_size,
+                    extra_size,
+                ) = struct.unpack("<4s5H3L2H", header)
+                if (
+                    signature != b"PK\x03\x04"
+                    or flags != member.flag_bits
+                    or flags & 0x08
+                    or compression != member.compress_type
+                    or crc32 != member.CRC
+                    or compressed_size != member.compress_size
+                    or uncompressed_size != member.file_size
+                ):
+                    raise ValueError("release zip archive is invalid")
+
+                filename = source.read(filename_size)
+                extra = source.read(extra_size)
+                if len(filename) != filename_size or len(extra) != extra_size:
+                    raise ValueError("release zip archive is invalid")
+                encoding = "utf-8" if flags & 0x800 else "cp437"
+                if filename != member.filename.encode(encoding):
+                    raise ValueError("release zip archive is invalid")
+
+                cursor = source.tell() + member.compress_size
+                if cursor > directory_offset:
+                    raise ValueError("release zip archive is invalid")
+
+            if cursor != directory_offset:
+                raise ValueError("release zip archive is invalid")
+    except (struct.error, UnicodeEncodeError) as error:
+        raise ValueError("release zip archive is invalid") from error
 
 
 def _inspect_zip(path: Path, version: str, target: str) -> tuple[str, str]:
     binary_path, expected = _expected_archive_entries(version, target)
     expected_directory = binary_path.split("/", maxsplit=1)[0]
-    expected_member_count = _validate_zip_container(path)
+    expected_member_count, directory_offset = _validate_zip_container(path)
     try:
         with zipfile.ZipFile(path) as archive:
             members = archive.infolist()
@@ -322,6 +381,7 @@ def _inspect_zip(path: Path, version: str, target: str) -> tuple[str, str]:
                 raise ValueError("release zip archive is invalid")
             if len(members) > MAX_ARCHIVE_ENTRIES:
                 raise ValueError("release archive contains too many entries")
+            _validate_zip_local_layout(path, members, directory_offset)
             names: list[str] = []
             content_bytes = 0
             actual_content_bytes = 0
