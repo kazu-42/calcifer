@@ -1,9 +1,107 @@
 //! Fail-closed compatibility gate for cross-profile Codex thread handoff.
 
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use serde_json::Value;
+
+#[cfg(unix)]
+mod proxy;
+#[cfg(unix)]
+mod runtime;
+
+/// Capability proving that an exact Codex build passed schema, fork, and
+/// remote-TUI runtime probes in an isolated credential-free workspace.
+///
+/// Its constructor is private. Future handoff code can consume this value but
+/// cannot mint it from a version string or schema inspection alone.
+#[allow(dead_code)] // Consumed by the handoff transaction introduced in issue #33.
+pub(crate) struct CodexHandoffCapability {
+    executable: CodexExecutableIdentity,
+}
+
+#[derive(Eq, PartialEq)]
+struct CodexExecutableIdentity {
+    canonical_path: PathBuf,
+    device: u64,
+    inode: u64,
+    length: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    links: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    digest: [u8; 32],
+}
+
+#[allow(dead_code)] // Consumed by the handoff transaction introduced in issue #33.
+impl CodexHandoffCapability {
+    pub(crate) const fn id(&self) -> &'static str {
+        "codex-handoff/0.144.4/v1"
+    }
+
+    pub(crate) const fn version(&self) -> &'static str {
+        "0.144.4"
+    }
+}
+
+/// Redacted compatibility failure returned before handoff is authorized.
+#[allow(dead_code)] // Surfaced by the handoff transaction introduced in issue #33.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexHandoffError {
+    Unsupported,
+    Protocol,
+    Timeout,
+    Transport,
+    Spawn,
+}
+
+impl fmt::Display for CodexHandoffError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unsupported => "the installed Codex does not support guarded thread handoff",
+            Self::Protocol => "the Codex handoff compatibility response was invalid",
+            Self::Timeout => "the Codex handoff compatibility probe timed out",
+            Self::Transport => "the Codex handoff compatibility transport failed",
+            Self::Spawn => "the Codex handoff compatibility probe could not be started",
+        })
+    }
+}
+
+impl std::error::Error for CodexHandoffError {}
+
+/// Runs the complete private compatibility gate without reading or mutating a
+/// Calcifer profile, conversation binding, credential, or user rollout.
+#[cfg(unix)]
+#[allow(dead_code)] // Consumed by the handoff transaction introduced in issue #33.
+pub(crate) fn verify_codex_handoff_compatibility(
+    codex_executable: &Path,
+    timeout: Duration,
+) -> Result<CodexHandoffCapability, CodexHandoffError> {
+    runtime::verify(codex_executable, timeout)
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)] // Windows support remains explicitly gated off in issue #28.
+pub(crate) fn verify_codex_handoff_compatibility(
+    _codex_executable: &Path,
+    _timeout: Duration,
+) -> Result<CodexHandoffCapability, CodexHandoffError> {
+    Err(CodexHandoffError::Unsupported)
+}
 
 const JSON_SCHEMA_DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 const PROTOCOL_SCHEMA_TITLE: &str = "CodexAppServerProtocolV2";
+const JSONRPC_ERROR_TITLE: &str = "JSONRPCError";
+const JSONRPC_ERROR_BODY_TITLE: &str = "JSONRPCErrorError";
+const JSONRPC_ERROR_DESCRIPTION: &str = "A response to a request that indicates an error occurred.";
+const APPROVALS_REVIEWER_DESCRIPTION: &str =
+    "Reviewer currently used for approval requests on this thread.";
+const SANDBOX_RESPONSE_DESCRIPTION: &str = "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance.";
 const FORK_PATH_DESCRIPTION: &str = "[UNSTABLE] Specify the rollout path to fork from. If specified, the thread_id param will be ignored.";
 const RESUME_PATH_DESCRIPTION: &str = "[UNSTABLE] Specify the rollout path to resume from. If specified for a non-running thread, the thread_id param will be ignored. If thread_id identifies a running thread, the path must match the active rollout path.";
 const RESPONSE_REQUIRED: &[&str] = &[
@@ -40,10 +138,13 @@ enum HandoffSchemaError {
     Malformed,
 }
 
-#[allow(dead_code)] // The runtime gate consumes this projection later in issue #28.
 fn validate_handoff_schema_pair(
     default_schema: &Value,
     experimental_schema: &Value,
+    default_error_schema: &Value,
+    default_error_body_schema: &Value,
+    experimental_error_schema: &Value,
+    experimental_error_body_schema: &Value,
 ) -> Result<HandoffSchemaContract, HandoffSchemaError> {
     validate_schema_header(default_schema)?;
     validate_schema_header(experimental_schema)?;
@@ -66,8 +167,72 @@ fn validate_handoff_schema_pair(
         validate_thread_response(schema, "ThreadResumeResponse")?;
         validate_thread(schema)?;
     }
+    for (error_schema, error_body_schema) in [
+        (default_error_schema, default_error_body_schema),
+        (experimental_error_schema, experimental_error_body_schema),
+    ] {
+        validate_jsonrpc_error_schema(error_schema)?;
+        validate_jsonrpc_error_body_schema(error_body_schema)?;
+    }
 
     Ok(HandoffSchemaContract { _private: () })
+}
+
+fn validate_jsonrpc_error_schema(schema: &Value) -> Result<(), HandoffSchemaError> {
+    let error_body = jsonrpc_error_body_projection();
+    let expected = serde_json::json!({
+        "$schema": JSON_SCHEMA_DRAFT_07,
+        "title": JSONRPC_ERROR_TITLE,
+        "description": JSONRPC_ERROR_DESCRIPTION,
+        "type": "object",
+        "required": ["error", "id"],
+        "properties": {
+            "error": { "$ref": "#/definitions/JSONRPCErrorError" },
+            "id": { "$ref": "#/definitions/RequestId" }
+        },
+        "definitions": {
+            "JSONRPCErrorError": error_body,
+            "RequestId": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "integer", "format": "int64" }
+                ]
+            }
+        }
+    });
+    if schema == &expected {
+        Ok(())
+    } else {
+        Err(HandoffSchemaError::Malformed)
+    }
+}
+
+fn validate_jsonrpc_error_body_schema(schema: &Value) -> Result<(), HandoffSchemaError> {
+    let expected_body = jsonrpc_error_body_projection();
+    let expected = serde_json::json!({
+        "$schema": JSON_SCHEMA_DRAFT_07,
+        "title": JSONRPC_ERROR_BODY_TITLE,
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": expected_body["properties"].clone()
+    });
+    if schema == &expected {
+        Ok(())
+    } else {
+        Err(HandoffSchemaError::Malformed)
+    }
+}
+
+fn jsonrpc_error_body_projection() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+            "code": { "type": "integer", "format": "int64" },
+            "data": true,
+            "message": { "type": "string" }
+        }
+    })
 }
 
 fn validate_schema_header(schema: &Value) -> Result<(), HandoffSchemaError> {
@@ -119,6 +284,22 @@ fn validate_thread_response(schema: &Value, name: &str) -> Result<(), HandoffSch
     if definition.get("title").and_then(Value::as_str) != Some(name)
         || definition.get("type").and_then(Value::as_str) != Some("object")
         || !required_matches(definition, RESPONSE_REQUIRED)
+        || property(definition, "approvalPolicy")
+            != Some(&serde_json::json!({ "$ref": "#/definitions/AskForApproval" }))
+        || property(definition, "approvalsReviewer")
+            != Some(&serde_json::json!({
+                "description": APPROVALS_REVIEWER_DESCRIPTION,
+                "allOf": [{ "$ref": "#/definitions/ApprovalsReviewer" }]
+            }))
+        || property(definition, "cwd")
+            != Some(&serde_json::json!({ "$ref": "#/definitions/AbsolutePathBuf" }))
+        || property(definition, "model") != Some(&serde_json::json!({ "type": "string" }))
+        || property(definition, "modelProvider") != Some(&serde_json::json!({ "type": "string" }))
+        || property(definition, "sandbox")
+            != Some(&serde_json::json!({
+                "description": SANDBOX_RESPONSE_DESCRIPTION,
+                "allOf": [{ "$ref": "#/definitions/SandboxPolicy" }]
+            }))
         || property(definition, "thread")
             != Some(&serde_json::json!({ "$ref": "#/definitions/Thread" }))
     {
@@ -129,8 +310,7 @@ fn validate_thread_response(schema: &Value, name: &str) -> Result<(), HandoffSch
 
 fn validate_thread(schema: &Value) -> Result<(), HandoffSchemaError> {
     let definition = definition(schema, "Thread")?;
-    if definition.get("title").and_then(Value::as_str) != Some("Thread")
-        || definition.get("type").and_then(Value::as_str) != Some("object")
+    if definition.get("type").and_then(Value::as_str) != Some("object")
         || !required_matches(definition, THREAD_REQUIRED)
         || !property_has_type(definition, "id", &Value::String("string".to_owned()))
         || !property_has_type(definition, "sessionId", &Value::String("string".to_owned()))
@@ -180,13 +360,14 @@ fn required_matches(definition: &Value, expected: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use serde_json::{Value, json};
 
     use super::*;
 
     fn schema_pair() -> (Value, Value) {
         let thread = json!({
-            "title": "Thread",
             "type": "object",
             "required": [
                 "cliVersion", "createdAt", "cwd", "ephemeral", "id",
@@ -209,6 +390,18 @@ mod tests {
                     "modelProvider", "sandbox", "thread"
                 ],
                 "properties": {
+                    "approvalPolicy": { "$ref": "#/definitions/AskForApproval" },
+                    "approvalsReviewer": {
+                        "description": APPROVALS_REVIEWER_DESCRIPTION,
+                        "allOf": [{ "$ref": "#/definitions/ApprovalsReviewer" }]
+                    },
+                    "cwd": { "$ref": "#/definitions/AbsolutePathBuf" },
+                    "model": { "type": "string" },
+                    "modelProvider": { "type": "string" },
+                    "sandbox": {
+                        "description": SANDBOX_RESPONSE_DESCRIPTION,
+                        "allOf": [{ "$ref": "#/definitions/SandboxPolicy" }]
+                    },
                     "thread": { "$ref": "#/definitions/Thread" }
                 }
             })
@@ -249,12 +442,77 @@ mod tests {
         (default_schema, experimental_schema)
     }
 
+    fn error_schema_pair() -> (Value, Value, Value, Value) {
+        let error_body = json!({
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+                "code": { "type": "integer", "format": "int64" },
+                "data": true,
+                "message": { "type": "string" }
+            }
+        });
+        let error_schema = json!({
+            "$schema": JSON_SCHEMA_DRAFT_07,
+            "title": JSONRPC_ERROR_TITLE,
+            "description": JSONRPC_ERROR_DESCRIPTION,
+            "type": "object",
+            "required": ["error", "id"],
+            "properties": {
+                "error": { "$ref": "#/definitions/JSONRPCErrorError" },
+                "id": { "$ref": "#/definitions/RequestId" }
+            },
+            "definitions": {
+                "JSONRPCErrorError": error_body.clone(),
+                "RequestId": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "integer", "format": "int64" }
+                    ]
+                }
+            }
+        });
+        let error_body_schema = json!({
+            "$schema": JSON_SCHEMA_DRAFT_07,
+            "title": JSONRPC_ERROR_BODY_TITLE,
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": error_body["properties"].clone()
+        });
+        (
+            error_schema.clone(),
+            error_body_schema.clone(),
+            error_schema,
+            error_body_schema,
+        )
+    }
+
+    fn validate_protocol_pair(
+        default_schema: &Value,
+        experimental_schema: &Value,
+    ) -> Result<HandoffSchemaContract, HandoffSchemaError> {
+        let (
+            default_error_schema,
+            default_error_body_schema,
+            experimental_error_schema,
+            experimental_error_body_schema,
+        ) = error_schema_pair();
+        validate_handoff_schema_pair(
+            default_schema,
+            experimental_schema,
+            &default_error_schema,
+            &default_error_body_schema,
+            &experimental_error_schema,
+            &experimental_error_body_schema,
+        )
+    }
+
     #[test]
     fn accepts_the_exact_v0_144_4_handoff_projection() {
         let (default_schema, experimental_schema) = schema_pair();
 
         assert_eq!(
-            validate_handoff_schema_pair(&default_schema, &experimental_schema),
+            validate_protocol_pair(&default_schema, &experimental_schema),
             Ok(HandoffSchemaContract { _private: () })
         );
     }
@@ -266,7 +524,7 @@ mod tests {
             experimental_schema["definitions"]["ThreadForkParams"]["properties"]["path"].clone();
 
         assert_eq!(
-            validate_handoff_schema_pair(&default_schema, &experimental_schema),
+            validate_protocol_pair(&default_schema, &experimental_schema),
             Err(HandoffSchemaError::Malformed)
         );
     }
@@ -296,7 +554,7 @@ mod tests {
                 replacement;
 
             assert_eq!(
-                validate_handoff_schema_pair(&default_schema, &experimental_schema),
+                validate_protocol_pair(&default_schema, &experimental_schema),
                 Err(HandoffSchemaError::Malformed)
             );
         }
@@ -305,7 +563,19 @@ mod tests {
     #[test]
     fn rejects_malformed_fork_resume_and_thread_response_projections() {
         for pointer in [
+            "/definitions/ThreadForkResponse/properties/approvalPolicy",
+            "/definitions/ThreadForkResponse/properties/approvalsReviewer",
+            "/definitions/ThreadForkResponse/properties/cwd",
+            "/definitions/ThreadForkResponse/properties/model",
+            "/definitions/ThreadForkResponse/properties/modelProvider",
+            "/definitions/ThreadForkResponse/properties/sandbox",
             "/definitions/ThreadForkResponse/properties/thread",
+            "/definitions/ThreadResumeResponse/properties/approvalPolicy",
+            "/definitions/ThreadResumeResponse/properties/approvalsReviewer",
+            "/definitions/ThreadResumeResponse/properties/cwd",
+            "/definitions/ThreadResumeResponse/properties/model",
+            "/definitions/ThreadResumeResponse/properties/modelProvider",
+            "/definitions/ThreadResumeResponse/properties/sandbox",
             "/definitions/ThreadResumeResponse/properties/thread",
             "/definitions/Thread/properties/id",
             "/definitions/Thread/properties/sessionId",
@@ -319,10 +589,72 @@ mod tests {
             *slot = Value::Null;
 
             assert_eq!(
-                validate_handoff_schema_pair(&default_schema, &experimental_schema),
+                validate_protocol_pair(&default_schema, &experimental_schema),
                 Err(HandoffSchemaError::Malformed),
                 "mutation at {pointer} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn rejects_mutated_jsonrpc_error_envelopes_and_bodies() {
+        for (document, pointer, replacement) in [
+            (
+                0,
+                "/definitions/JSONRPCErrorError/properties/code/format",
+                json!("int32"),
+            ),
+            (0, "/definitions/RequestId/anyOf/1/type", json!("number")),
+            (1, "/properties/data", json!({ "type": "object" })),
+            (2, "/required", json!(["error"])),
+            (3, "/properties/message/type", json!("number")),
+        ] {
+            let (default_schema, experimental_schema) = schema_pair();
+            let (
+                mut default_error,
+                mut default_error_body,
+                mut experimental_error,
+                mut experimental_error_body,
+            ) = error_schema_pair();
+            let target = match document {
+                0 => &mut default_error,
+                1 => &mut default_error_body,
+                2 => &mut experimental_error,
+                3 => &mut experimental_error_body,
+                _ => unreachable!(),
+            };
+            *target
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("fixture pointer must exist: {pointer}")) = replacement;
+
+            assert_eq!(
+                validate_handoff_schema_pair(
+                    &default_schema,
+                    &experimental_schema,
+                    &default_error,
+                    &default_error_body,
+                    &experimental_error,
+                    &experimental_error_body,
+                ),
+                Err(HandoffSchemaError::Malformed),
+                "error schema mutation {document}:{pointer} must fail closed"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires the pinned official Codex 0.144.4 package"]
+    fn packaged_codex_0_144_4_passes_the_complete_handoff_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let executable = std::env::var_os("CALCIFER_CODEX_COMPAT_BINARY")
+            .map(PathBuf::from)
+            .ok_or("CALCIFER_CODEX_COMPAT_BINARY must name the pinned Codex binary")?;
+
+        let capability =
+            verify_codex_handoff_compatibility(&executable, std::time::Duration::from_secs(180))?;
+        assert_eq!(capability.id(), "codex-handoff/0.144.4/v1");
+        assert_eq!(capability.version(), "0.144.4");
+        Ok(())
     }
 }

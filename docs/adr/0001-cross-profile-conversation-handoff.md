@@ -1,6 +1,6 @@
 # ADR 0001: Treat conversation lineage as independent from credential profiles
 
-- Status: Accepted for the failover design; implementation pending
+- Status: Accepted for the failover design; private compatibility gate implemented, production handoff transaction pending
 - Date: 2026-07-15
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 
@@ -154,14 +154,60 @@ This loses the interaction continuity the product is meant to provide. A fresh t
 
 ## Compatibility gate
 
-The handoff adapter must:
+The private Unix compatibility gate is implemented for exactly Codex `0.144.4`.
+It operates only on synthetic homes and rollouts and does not yet implement the
+production transaction described above. The gate:
 
-- allow only tested Codex release versions;
-- generate and diff the installed App Server schema with `codex app-server generate-json-schema --experimental --out <dir>` in CI, because the default schema intentionally omits `thread/fork.path`;
-- run a version-pinned protocol smoke test that initializes with `experimentalApi: true`, forks a synthetic Calcifer-owned rollout by `path`, and verifies the new ID, `forkedFromId`, target containment, and unchanged source; schema presence alone does not prove runtime behavior;
-- require the expected `thread/fork.path`, remote TUI, thread response, and error shapes;
-- use a private local transport and never expose the App Server remotely;
-- fail closed without modifying source or target state when compatibility cannot be proven.
+- accepts only an absolute canonical executable with executable bits, no
+  setuid/setgid or group/other-write bits, stable device/inode/size/mode/owner,
+  link and nanosecond timestamp metadata, and a SHA-256 digest;
+- creates one byte-identical mode-`0500` staged copy below the retained private
+  mode-`0700` scratch root and executes every probe phase from that copy;
+  immediately before capability minting, it fully rehashes both the stage and
+  the original binary to fail closed across an installer path replacement while
+  keeping the capability bound to the original identity;
+- starts every command from `env_clear` and allowlists only fixed process values
+  plus synthetic `CODEX_HOME`, home, XDG, and temporary paths;
+- generates both default and experimental App Server schemas because the
+  default intentionally omits `thread/fork.path`, then requires reviewed
+  fork/resume/thread-response projections; only the separate `JSONRPCError` and
+  `JSONRPCErrorError` documents require complete equality with pinned schemas;
+- retains private directory descriptors and accesses config, model catalog,
+  schema, source rollout, and target rollout through a normal-component-only,
+  descriptor-relative `O_NOFOLLOW` walk;
+- initializes with `experimentalApi: true`, forks a synthetic rollout by path,
+  and verifies the new ID, `forkedFromId`, target containment, effective
+  model/provider/cwd/approval/reviewer/sandbox settings, and unchanged source;
+  schema presence alone does not prove runtime behavior;
+- retains exact device/inode/length/mode/owner/link/mtime/ctime/SHA-256
+  fingerprints for both source and target rollouts through the remote phase;
+- attaches the official TUI over a private local proxy and requires successful
+  target `thread/read`, then target `thread/resume` with unchanged effective
+  settings, then exact source-parent `thread/read` with `includeTurns` absent;
+  the source exists only in the source home, so the expected target-App-Server
+  error response proves the TUI parsed and followed the resumed fork lineage,
+  and readiness is emitted only after that response is forwarded to the TUI;
+- keeps the bind-created App Server and proxy sockets below the retained
+  owner-only mode-`0700` scratch directory rather than applying an unsafe
+  path-based `chmod` or claiming mode `0600`, while requiring the App Server
+  socket to remain current-user-owned;
+- models relay state atomically as `RUNNING`, unexpected `DISCONNECTED`, or
+  intentional `STOPPING`, performs active poll-hangup and non-consuming `PEEK`
+  checks on both streams, and requires checked shutdown;
+- observes every process-group leader with non-reaping `WNOWAIT`, kills the
+  group before waiting for the direct child, and joins bounded pipe, PTY, and
+  proxy readers; explicit cleanup errors propagate, and macOS group-kill
+  `EPERM` is tolerated only for an already-observed zombie leader, never a live
+  tree;
+- fails closed without modifying any Calcifer profile, credential,
+  conversation registry, or user rollout when compatibility cannot be proven.
+
+Socket cleanup records device/inode and performs an identity-conditioned
+`lstat` before pathname unlink. The operations are not atomic: a hostile
+same-user process with access to the private scratch namespace can race them and
+cause a replacement directory entry to be unlinked, although a replacement
+symlink target is not followed. The gate explicitly treats arbitrary same-UID
+malware and a compromised executable as outside its sandbox guarantee.
 
 The baseline source contracts are:
 
@@ -177,4 +223,7 @@ The baseline source contracts are:
 - A Calcifer logical conversation ID remains stable while the provider thread ID changes at each handoff.
 - The lineage registry and conversation lease become first-class state alongside credential profiles.
 - The supervised path must use App Server plus remote TUI; the current direct `run` and same-profile `resume` commands remain available and unchanged.
-- The feature stays disabled until the version gate, transition recovery, pool policy, and adversarial path/lock tests are implemented.
+- Production handoff stays disabled until this synthetic gate is wired into a
+  reviewed capability-owned launch path and transition recovery, pool policy,
+  authoritative exhaustion selection, leases, and adversarial user-state
+  path/lock tests are implemented.

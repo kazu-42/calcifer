@@ -576,7 +576,17 @@ pub(crate) fn probe_codex_version(
     timeout: Duration,
 ) -> Result<String, CodexThreadError> {
     let deadline = thread_deadline(codex_executable, timeout)?;
-    let mut child = managed_command(codex_executable, codex_home)
+    let command = managed_command(codex_executable, codex_home);
+    probe_codex_version_command(command, working_directory, deadline)
+}
+
+fn probe_codex_version_command(
+    mut command: Command,
+    working_directory: &Path,
+    deadline: Instant,
+) -> Result<String, CodexThreadError> {
+    configure_own_process_group(&mut command);
+    let mut child = command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -587,7 +597,7 @@ pub(crate) fn probe_codex_version(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            terminate(&mut child);
+            force_terminate_process_tree(&mut child).map_err(|_| CodexThreadError::Transport)?;
             return Err(CodexThreadError::Spawn);
         }
     };
@@ -604,24 +614,33 @@ pub(crate) fn probe_codex_version(
         }) {
         Ok(reader) => reader,
         Err(_) => {
-            terminate(&mut child);
+            force_terminate_process_tree(&mut child).map_err(|_| CodexThreadError::Transport)?;
             return Err(CodexThreadError::Spawn);
         }
     };
 
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        match child_exit_observed_without_reaping(&mut child) {
+            Ok(true) => {
+                let status = reap_exited_process_tree(&mut child)
+                    .map_err(|_| CodexThreadError::Transport)?;
                 let remaining = match deadline.checked_duration_since(Instant::now()) {
                     Some(remaining) => remaining,
-                    None => return Err(CodexThreadError::Timeout),
+                    None => {
+                        let _ = reader.join();
+                        return Err(CodexThreadError::Timeout);
+                    }
                 };
                 let bytes = match output_receiver.recv_timeout(remaining) {
                     Ok(Ok(bytes)) => bytes,
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
+                        let _ = reader.join();
                         return Err(CodexThreadError::Transport);
                     }
-                    Err(RecvTimeoutError::Timeout) => return Err(CodexThreadError::Timeout),
+                    Err(RecvTimeoutError::Timeout) => {
+                        let _ = reader.join();
+                        return Err(CodexThreadError::Timeout);
+                    }
                 };
                 reader.join().map_err(|_| CodexThreadError::Transport)?;
                 if !status.success() {
@@ -629,17 +648,19 @@ pub(crate) fn probe_codex_version(
                 }
                 return parse_codex_version_output(&bytes);
             }
-            Ok(None) if Instant::now() < deadline => {
+            Ok(false) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) => {
-                terminate(&mut child);
-                drop(reader);
+            Ok(false) => {
+                force_terminate_process_tree(&mut child)
+                    .map_err(|_| CodexThreadError::Transport)?;
+                let _ = reader.join();
                 return Err(CodexThreadError::Timeout);
             }
             Err(_) => {
-                terminate(&mut child);
-                drop(reader);
+                force_terminate_process_tree(&mut child)
+                    .map_err(|_| CodexThreadError::Transport)?;
+                let _ = reader.join();
                 return Err(CodexThreadError::Transport);
             }
         }
@@ -1608,6 +1629,7 @@ fn parse_version_component(component: &str) -> Option<u32> {
 
 struct AppServerProcess {
     child: Child,
+    reaped: bool,
     stdin: Option<ChildStdin>,
     stdout_events: Option<Receiver<StdoutEvent>>,
     stdout_reader: Option<JoinHandle<()>>,
@@ -1620,8 +1642,17 @@ impl AppServerProcess {
         codex_home: &Path,
         working_directory: &Path,
     ) -> Result<Self, CodexUsageError> {
-        let mut child = managed_command(codex_executable, codex_home)
-            .args(["app-server", "--stdio"])
+        let mut command = managed_command(codex_executable, codex_home);
+        command.args(["app-server", "--stdio"]);
+        Self::spawn_command(command, working_directory)
+    }
+
+    fn spawn_command(
+        mut command: Command,
+        working_directory: &Path,
+    ) -> Result<Self, CodexUsageError> {
+        configure_own_process_group(&mut command);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1632,21 +1663,21 @@ impl AppServerProcess {
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                terminate(&mut child);
+                force_terminate_process_tree(&mut child).map_err(|_| CodexUsageError::Transport)?;
                 return Err(CodexUsageError::Spawn);
             }
         };
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                terminate(&mut child);
+                force_terminate_process_tree(&mut child).map_err(|_| CodexUsageError::Transport)?;
                 return Err(CodexUsageError::Spawn);
             }
         };
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                terminate(&mut child);
+                force_terminate_process_tree(&mut child).map_err(|_| CodexUsageError::Transport)?;
                 return Err(CodexUsageError::Spawn);
             }
         };
@@ -1658,7 +1689,7 @@ impl AppServerProcess {
         {
             Ok(reader) => reader,
             Err(_) => {
-                terminate(&mut child);
+                force_terminate_process_tree(&mut child).map_err(|_| CodexUsageError::Transport)?;
                 return Err(CodexUsageError::Spawn);
             }
         };
@@ -1668,13 +1699,14 @@ impl AppServerProcess {
         {
             Ok(drainer) => drainer,
             Err(_) => {
-                terminate(&mut child);
+                force_terminate_process_tree(&mut child).map_err(|_| CodexUsageError::Transport)?;
                 return Err(CodexUsageError::Spawn);
             }
         };
 
         Ok(Self {
             child,
+            reaped: false,
             stdin: Some(stdin),
             stdout_events: Some(stdout_events),
             stdout_reader: Some(stdout_reader),
@@ -1709,6 +1741,33 @@ impl AppServerProcess {
             .as_ref()
             .ok_or(CodexThreadError::Transport)?;
         receive_thread_result_from(events, expected_id, deadline)
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
+        self.stdin.take();
+        if !self.reaped {
+            let termination = graceful_terminate(&mut self.child, GRACEFUL_SHUTDOWN_TIMEOUT);
+            self.reaped = child_reap_confirmed(&mut self.child);
+            let status = termination?;
+            if !self.reaped {
+                return Err(io::Error::other("Codex child was not reaped"));
+            }
+            if !status.success() {
+                return Err(io::Error::other("Codex app-server did not exit cleanly"));
+            }
+        }
+        self.stdout_events.take();
+        if let Some(reader) = self.stdout_reader.take() {
+            reader
+                .join()
+                .map_err(|_| io::Error::other("Codex stdout reader panicked"))?;
+        }
+        if let Some(drainer) = self.stderr_drainer.take() {
+            drainer
+                .join()
+                .map_err(|_| io::Error::other("Codex stderr drainer panicked"))?;
+        }
+        Ok(())
     }
 }
 
@@ -1776,15 +1835,7 @@ fn receive_thread_result_from(
 
 impl Drop for AppServerProcess {
     fn drop(&mut self) {
-        self.stdin.take();
-        graceful_terminate(&mut self.child, GRACEFUL_SHUTDOWN_TIMEOUT);
-        self.stdout_events.take();
-        if let Some(reader) = self.stdout_reader.take() {
-            let _ = reader.join();
-        }
-        if let Some(drainer) = self.stderr_drainer.take() {
-            let _ = drainer.join();
-        }
+        let _ = self.shutdown();
     }
 }
 
@@ -1867,9 +1918,136 @@ fn drain_stderr(mut stderr: impl io::Read) {
     let _ = io::copy(&mut stderr, &mut io::sink());
 }
 
-fn terminate(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn wait_for_child(child: &mut Child) -> io::Result<std::process::ExitStatus> {
+    loop {
+        match child.wait() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+fn configure_own_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+pub(super) fn force_terminate_process_tree(
+    child: &mut Child,
+) -> io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    let group_result = {
+        let process_group = rustix::process::Pid::from_child(child);
+        match rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            #[cfg(target_os = "macos")]
+            Err(rustix::io::Errno::PERM)
+                if child_exit_observed_without_reaping(child).unwrap_or(false) =>
+            {
+                // macOS can report EPERM when the child exited between the
+                // liveness decision and killpg and only its zombie remains.
+                Ok(())
+            }
+            Err(error) => Err(io::Error::from(error)),
+        }
+    };
+    #[cfg(not(unix))]
+    let group_result: io::Result<()> = Ok(());
+
+    let kill_result = child.kill();
+    let wait_result = wait_for_child(child);
+    group_result?;
+    if let Err(error) = kill_result {
+        let already_gone = matches!(
+            error.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+        );
+        #[cfg(unix)]
+        let already_gone =
+            already_gone || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error());
+        if !already_gone {
+            return Err(error);
+        }
+    }
+    wait_result
+}
+
+#[cfg(unix)]
+pub(super) fn child_exit_observed_without_reaping(child: &mut Child) -> io::Result<bool> {
+    let pid = rustix::process::Pid::from_child(child);
+    retry_rustix_intr(|| {
+        rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        )
+    })
+    .map(|status| status.is_some())
+    .map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn retry_rustix_intr<T>(
+    mut operation: impl FnMut() -> Result<T, rustix::io::Errno>,
+) -> Result<T, rustix::io::Errno> {
+    loop {
+        match operation() {
+            Err(rustix::io::Errno::INTR) => {}
+            result => return result,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(super) fn child_exit_observed_without_reaping(child: &mut Child) -> io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+pub(super) fn child_reap_confirmed(child: &mut Child) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => true,
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) => true,
+        Ok(None) | Err(_) => false,
+    }
+}
+
+pub(super) fn reap_exited_process_tree(child: &mut Child) -> io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    let group_result = {
+        let process_group = rustix::process::Pid::from_child(&*child);
+        exited_group_kill_result(rustix::process::kill_process_group(
+            process_group,
+            rustix::process::Signal::KILL,
+        ))
+    };
+    #[cfg(not(unix))]
+    let group_result: io::Result<()> = Ok(());
+
+    let wait_result = wait_for_child(child);
+    group_result?;
+    wait_result
+}
+
+#[cfg(unix)]
+fn exited_group_kill_result(result: Result<(), rustix::io::Errno>) -> Result<(), io::Error> {
+    match result {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        // macOS reports EPERM when the WNOWAIT-observed group contains only
+        // the zombie leader. The direct wait still proves that leader was
+        // reaped. Other Unix platforms keep EPERM fatal because it can mean
+        // live descendants were not signalled.
+        #[cfg(target_os = "macos")]
+        Err(rustix::io::Errno::PERM) => Ok(()),
+        Err(error) => Err(io::Error::from(error)),
+    }
 }
 
 fn decode_response(line: &str, expected_id: u64) -> Result<Option<Value>, CodexUsageError> {
@@ -1975,20 +2153,21 @@ fn classify_rpc_error(error: &Value) -> CodexUsageError {
     }
 }
 
-fn graceful_terminate(child: &mut Child, timeout: Duration) {
+fn graceful_terminate(
+    child: &mut Child,
+    timeout: Duration,
+) -> io::Result<std::process::ExitStatus> {
     let deadline = Instant::now().checked_add(timeout);
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let _ = child.wait();
-                return;
+        match child_exit_observed_without_reaping(child) {
+            Ok(true) => {
+                return reap_exited_process_tree(child);
             }
-            Ok(None) if deadline.is_some_and(|deadline| Instant::now() < deadline) => {
+            Ok(false) if deadline.is_some_and(|deadline| Instant::now() < deadline) => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) | Err(_) => {
-                terminate(child);
-                return;
+            Ok(false) | Err(_) => {
+                return force_terminate_process_tree(child);
             }
         }
     }
@@ -2193,6 +2372,153 @@ mod tests {
             parse_codex_version_output(&vec![b'x'; MAX_VERSION_OUTPUT_BYTES + 1]),
             Err(CodexThreadError::Protocol)
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exit_observation_keeps_group_leader_waitable_until_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("sh");
+        configure_own_process_group(&mut command);
+        let mut child = command
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let process_group = rustix::process::Pid::from_child(&child);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        while !child_exit_observed_without_reaping(&mut child)? {
+            if Instant::now() >= deadline {
+                let _ = force_terminate_process_tree(&mut child);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "synthetic child did not exit",
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let still_waitable = rustix::process::waitid(
+            rustix::process::WaitId::Pid(process_group),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        )?;
+        assert!(still_waitable.is_some());
+
+        let status = reap_exited_process_tree(&mut child)?;
+        assert!(status.success());
+        assert!(matches!(
+            rustix::process::waitid(
+                rustix::process::WaitId::Pid(process_group),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ),
+            Err(error) if error == rustix::io::Errno::CHILD
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_observation_retries_interrupted_waitid() {
+        let mut attempts = 0_u8;
+        let observed = retry_rustix_intr(|| {
+            attempts = attempts.saturating_add(1);
+            if attempts < 3 {
+                Err(rustix::io::Errno::INTR)
+            } else {
+                Ok(true)
+            }
+        });
+
+        assert_eq!(observed, Ok(true));
+        assert_eq!(attempts, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_group_cleanup_accepts_only_platform_proven_kill_results() {
+        assert!(exited_group_kill_result(Ok(())).is_ok());
+        assert!(exited_group_kill_result(Err(rustix::io::Errno::SRCH)).is_ok());
+
+        let permission = exited_group_kill_result(Err(rustix::io::Errno::PERM));
+        #[cfg(target_os = "macos")]
+        assert!(permission.is_ok());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            permission.err().and_then(|error| error.raw_os_error()),
+            Some(rustix::io::Errno::PERM.raw_os_error())
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn forced_cleanup_accepts_a_child_exit_racing_with_group_kill()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("sh");
+        configure_own_process_group(&mut command);
+        let mut child = command
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !child_exit_observed_without_reaping(&mut child)? {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "child did not exit").into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let status = force_terminate_process_tree(&mut child)?;
+        assert!(status.success());
+        assert!(child_reap_confirmed(&mut child));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_app_server_shutdown_rejects_a_nonzero_exit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 7"]);
+        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        assert!(process.shutdown().is_err());
+        assert!(process.reaped);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_kills_a_descendant_that_keeps_stdout_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "(trap '' HUP TERM; sleep 30) & printf 'codex-cli 0.144.4\\n'; exit 0",
+        ]);
+        let started = Instant::now();
+
+        let version = probe_codex_version_command(
+            command,
+            Path::new("/tmp"),
+            Instant::now() + Duration::from_secs(2),
+        )?;
+
+        assert_eq!(version, "0.144.4");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the inherited stdout descriptor must not stall the reader join"
+        );
+        Ok(())
     }
 
     #[test]

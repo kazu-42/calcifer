@@ -2,7 +2,7 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. Automatic failover and cross-profile conversation handoff are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
+This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. A private, credential-free compatibility gate now proves the pinned Codex `0.144.4` fork-by-path and remote-TUI behavior against synthetic state. Automatic failover and the production cross-profile conversation handoff transaction are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
 
 ## Assets
 
@@ -28,6 +28,7 @@ This document covers both implemented and intended guarantees. The current Unix 
 - incorrect quota classification causing failover loops
 - automatic replay duplicating file, Git, deployment, billing, or messaging side effects
 - one conversation lineage being written concurrently, handed to an account outside its configured trust domain, or imported from an attacker-selected path
+- a compatibility probe reading a real profile or rollout, inheriting ambient credentials or routing, declaring a remote TUI ready from socket liveness alone, or deleting a replaced cleanup path
 - mutable, redirected, oversized, partial, or digest-mismatched release metadata causing installation of the wrong target
 
 ## Threats outside the guarantee
@@ -35,6 +36,10 @@ This document covers both implemented and intended guarantees. The current Unix 
 Calcifer cannot protect credentials from:
 
 - root, administrator, or malware running as the same OS user;
+- a same-user process racing the handoff probe's identity-checking `lstat` and
+  subsequent socket-path `unlink`; the private `0700` parent prevents other
+  unprivileged users from entering that namespace, but the two operations are
+  not an atomic descriptor-relative unlink;
 - a compromised official provider CLI, plugin, hook, or child tool;
 - a malicious repository executed by the wrapped agent;
 - provider compromise or provider-side account recovery;
@@ -246,6 +251,149 @@ directory blocks subsequent registration before provider login. Readers ignore
 stale temporary names. Deliberate re-key and stale temporary cleanup remain
 future recovery commands and must validate every selected binding as one
 transaction.
+
+### Codex handoff compatibility probe
+
+The implemented compatibility probe is deliberately separate from profiles and
+the future handoff transaction. Its API accepts only an absolute Codex
+executable and a timeout. It cannot receive a Calcifer profile, conversation
+binding, credential, or user rollout, so an unsupported version, malformed
+schema, protocol error, timeout, transport failure, or spawn failure returns a
+redacted error without committing Calcifer state.
+
+The probe supports exactly Codex `0.144.4` on Unix. A private handoff capability
+is constructed only from three typed proofs: the pinned schema projection, a
+successful synthetic fork-by-path, and a successful official remote-TUI
+rejoin. The default generated schema must not authorize `thread/fork.path` or
+`thread/resume.path`; only the `--experimental` schema may contain their
+reviewed unstable `0.144.4` path fields. Calcifer validates reviewed fork,
+resume, and thread-response projections rather than claiming equality with the
+entire generated protocol document. The generated default and experimental
+`JSONRPCError` and `JSONRPCErrorError` files must also equal the pinned complete
+error schemas, including required fields, request-ID union, code/message/data
+properties, titles, and description. This prevents a version label, permissive
+schema match, socket file, or live process from becoming authorization by
+itself.
+
+The absolute executable is canonicalized and opened with `O_NOFOLLOW` before
+the first subprocess. It must be a non-empty executable regular file no larger
+than 512 MiB; group/other write bits and setuid/setgid bits are rejected. The
+capability is bound to device, inode, length, mode, UID/GID, link count,
+nanosecond mtime/ctime, and SHA-256. Before any subprocess starts, Calcifer
+copies those verified bytes to a mode-`0500` executable inside a retained
+mode-`0700` scratch directory and confirms equal length and digest. Every probe
+phase executes only that staged copy, whose metadata is revalidated throughout,
+so a legitimate updater cannot replace the installation path halfway through
+and produce a mixed-build proof. Immediately before minting, Calcifer fully
+rehashes both the staged copy and the original executable under the overall
+deadline. Replacement of the original path therefore fails closed. The
+capability remains bound to the original executable identity and does not expose
+a raw executable-path accessor; arbitrary same-UID tampering remains outside
+the threat guarantee.
+
+Every subprocess runs below a new mode-`0700`, current-user-owned scratch root
+with separate synthetic source home, target `CODEX_HOME`, workspace, and
+environment home. Each command starts from `env_clear` and adds only a fixed
+`PATH`, `LANG`, `LC_ALL`, `SHELL`, and `TERM`, plus synthetic `CODEX_HOME`,
+`HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`,
+`XDG_RUNTIME_DIR`, `TMPDIR`, `TMP`, and `TEMP`. This allowlist excludes ambient
+provider credentials, endpoint and proxy overrides, `CALCIFER_HOME`, and test
+hooks by construction. The probe invokes no login command, supplies no
+credential or refresh token, creates no credential file, and rejects a bounded
+scratch tree containing `auth.json` or `.credentials.json`. A private static
+model catalog avoids online model discovery; the configured no-auth provider
+points only to a loopback sentinel, and any connection to that sentinel rejects
+the proof.
+
+Each private source, target, workspace, environment, and schema directory is
+kept open and bound to its visible device/inode, owner, and safe mode. Reads and
+writes accept only normal relative path components. Every intermediate
+component is opened relative to the retained descriptor with
+`O_DIRECTORY | O_NOFOLLOW`, and the final regular file is opened with
+`O_NOFOLLOW`; descriptor metadata is checked before and after bounded reads.
+This prevents a provider-created intermediate or final symlink from redirecting
+schema, config/catalog, source-rollout, or target-rollout readback.
+
+The synthetic source rollout is bounded to 1 MiB and fingerprinted by device,
+inode, length, mode, owner, link count, nanosecond mtime/ctime, and SHA-256
+before the experimental `thread/fork.path` request. The response must name a
+distinct UUID with the expected `forkedFromId`, CLI version, model provider,
+cwd, preview, and turns. It must also return the requested model/provider/cwd,
+`never` approval policy, and read-only/no-network sandbox plus the expected
+`user` reviewer. Its target rollout must be canonically below the synthetic
+target `sessions` root, contain the known history sentinel, and be a
+current-user-owned, single-link regular file that is not writable by group or
+other. Both source and target
+directory descriptors and exact fingerprints are retained and revalidated
+before remote attach, before the TUI launch, and after remote shutdown. These
+checks prove the pinned provider's materialization behavior; they do not
+validate or authorize a real handoff path.
+
+The remote half starts a real private Unix App Server and the official
+`codex resume --no-alt-screen --remote unix://... <target-thread-id>` TUI under
+a PTY. The bind-created App Server and WebSocket proxy sockets are not
+post-`chmod`ed and are not claimed to have mode `0600`; both remain inside the
+retained, current-user-owned mode-`0700` scratch root, whose directory search
+permission is the privacy boundary. Calcifer still requires the App Server
+socket to be owned by the current user. The proxy records its own socket's
+device/inode and checks that identity before unlink. Because the final `lstat`
+and pathname `unlink` are separate, a malicious process with the same UID can
+race them and cause a replacement entry to be unlinked; a replacement symlink
+target is never followed, but this same-user race is outside the guarantee.
+
+The proxy transparently forwards traffic while inspecting only enough of the
+startup protocol to prove readiness. It first requires a successful
+`thread/read` for the exact synthetic target, then a successful `thread/resume`
+for that target whose model, provider, cwd, approval/reviewer, and
+sandbox/network settings equal the fork proof. The official TUI must next issue
+`thread/read` for the exact synthetic source-parent ID with `includeTurns`
+absent. Because that source exists only in the isolated source home, the target
+App Server's expected error response completes the round trip. Readiness is
+signalled only after that error has been forwarded to the TUI; observing the
+request proves the TUI parsed `forkedFromId` from the resumed thread rather than
+merely opening a socket.
+
+The two forwarding directions serialize each inspected forward/observe
+operation so a request caused by a server response cannot overtake observation
+of that response. An atomic three-state relay lifecycle records `RUNNING`,
+unexpected `DISCONNECTED`, and intentional `STOPPING`. Before checked shutdown,
+the final health probe actively polls the retained client and upstream streams
+for error/hangup/invalid state and performs non-consuming non-blocking `PEEK`
+reads to detect EOF. A disconnect cannot be relabelled as intentional shutdown;
+it fails the proof even if readiness had already been emitted. Handshakes are
+capped at 16 KiB, messages and captured TUI output at 1 MiB, target IDs at 256
+bytes, and readiness events use a bounded channel and deadline. After readiness
+the proxy stops parsing and becomes an opaque relay; message contents are not
+logged.
+
+Failure closes the gate and mints no capability. Every subprocess starts as its
+own process-group leader. Calcifer uses non-reaping
+`waitid(EXITED | NOHANG | WNOWAIT)` to observe a leader exit, sends `SIGKILL` to
+that process group so descendants cannot keep stdout or PTY descriptors open,
+and then waits for the direct child leader. Explicit shutdown propagates
+process-group kill, direct wait/reap confirmation, stdout/stderr or PTY reader
+join, and proxy pump/cleanup errors; an otherwise successful probe cannot mint a
+capability after uncertain cleanup. macOS `EPERM` from process-group kill is
+tolerated only after `WNOWAIT` already proved the group leader exited, covering
+the zombie-only group behavior. Live-tree termination continues to treat
+`EPERM` as failure. Calcifer does not claim to reap non-child descendants.
+Cleanup unlinks a socket or recursively removes a scratch root only while its
+recorded filesystem identity matches at the check. An identity mismatch is
+preserved rather than risking deletion of an already-replaced node, subject to
+the documented same-user `lstat`/`unlink` race. An interrupted or failed
+best-effort scratch cleanup can therefore leave private synthetic files for
+manual removal, but never rolls back by touching a user profile, credential,
+rollout, or Calcifer registry.
+
+Linux and macOS CI run the full ignored-by-default probe using the official
+`0.144.4` release archive for the runner architecture after verifying a pinned
+SHA-256 digest and the archive's single expected executable. The complete probe
+has a 180-second budget; the ignored schema/fork-only diagnostic has 120
+seconds. Windows and every unreviewed release fail closed. This is a
+compatibility test for a trusted, checksum-pinned official executable, not an
+OS sandbox: the loopback sentinel
+proves that the expected flow performs no configured model request, but it
+cannot constrain arbitrary egress from a malicious or compromised executable.
 
 ## Failover requirements
 
