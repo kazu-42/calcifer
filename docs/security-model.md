@@ -2,7 +2,7 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. A private, credential-free compatibility gate proves the pinned Codex `0.144.4` fork-by-path and remote-TUI behavior against synthetic state, and issue #48 extracts its bounded readiness relay without exposing a production session. Automatic failover and the production cross-profile conversation handoff transaction are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines handoff semantics and [ADR 0003](adr/0003-supervised-codex-session.md) defines the staged supervisor.
+This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. A private, credential-free compatibility gate proves the pinned Codex `0.144.4` fork-by-path and remote-TUI behavior against synthetic state; issue #48 extracts its bounded readiness relay, and issue #50 adds a default-unused coordinator/guardian authority foundation with fake children and real-exec fault injection. Automatic failover, real supervised Codex integration, PTY bridging, and the production cross-profile conversation handoff transaction are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines handoff semantics and [ADR 0003](adr/0003-supervised-codex-session.md) defines the staged supervisor.
 
 ## Assets
 
@@ -132,13 +132,18 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   state. The ACK is one-shot, strictly parsed, and bound to the same socket; the
   sender releases its provider descriptor only by close, never explicit
   unlock. Descriptor-held flock state is the authority; a PID is not.
-- In the future supervised-session path, provider PIDs and process groups are
-  containment handles, not lease or reap authority. Normal release requires a
-  trusted `CHILDREN_REAPED` terminal frame from the live guardian followed by
-  an exact wait for that guardian. If the guardian disappears without that
-  proof, including after reporting provider PIDs, the coordinator parks with
-  lease A held rather than inferring safety from PID disappearance; see
-  [ADR 0003](adr/0003-supervised-codex-session.md).
+- In the internal #50 supervised-session foundation, provider PIDs and process
+  groups are containment handles, not lease or reap authority. Normal release
+  requires a trusted `CHILDREN_REAPED` terminal frame from the live guardian
+  followed by an exact wait for that guardian and terminal-stream EOF. If the
+  guardian disappears without that proof, including after reporting provider
+  PIDs, the coordinator parks with lease A held rather than inferring safety
+  from PID disappearance; see
+  [ADR 0003](adr/0003-supervised-codex-session.md). This foundation launches
+  fixed synthetic children only and is unavailable to the public CLI. Reported
+  numeric PID/PGID values are never reused by the coordinator as delayed signal
+  authority; the fake children instead receive a dedicated guardian-liveness
+  pipe whose EOF lets them exit after abrupt guardian death.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
 - Bounded metadata-only App Servers for status and thread capture inherit only
   the provider-side lease. On Unix the multithreaded parent never clears

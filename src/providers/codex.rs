@@ -17,6 +17,15 @@ use serde_json::{Value, json};
 mod handoff_compat;
 #[cfg(unix)]
 mod remote;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // Staged behind issue #50 until the public supervisor is complete.
+mod supervisor;
+
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) use supervisor::run_internal_fixture;
 
 /// Capability proving that the installed Codex process passed the exact
 /// identity-adapter initialize/home/version gate.

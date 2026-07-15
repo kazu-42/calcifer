@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, and an internal Linux/macOS no-gap target-reservation and guardian provider-lease transfer primitive are implemented. The production cross-profile handoff supervisor, transaction, and automatic failover remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target-reservation primitive, and a default-unused fake-child supervisor authority foundation are implemented. Real supervised Codex integration, PTY/monitor wiring, the production cross-profile handoff transaction, and automatic failover remain future work.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -410,9 +410,12 @@ The current process launcher:
 - retain the provider-side lease if the coordinator is selectively killed, and
   retain the coordinator-side lease if the guardian is selectively killed;
 - treat provider PIDs and process groups only as containment handles: the
-  supervised path releases after the live guardian reports trusted terminal
-  child dispositions and is exactly waited, while unexpected guardian loss
-  parks with the coordinator lease held;
+  internal fake-child supervisor foundation releases after the live guardian
+  reports trusted terminal child dispositions, is exactly waited, and closes
+  its selected lifecycle stream; unexpected guardian loss parks with the
+  coordinator lease held; the coordinator never turns previously reported
+  numeric PIDs into delayed signal authority, while the fixed fake children
+  use a guardian-liveness pipe to avoid orphaning on abrupt guardian death;
 - let every Calcifer wrapper layer catch terminal termination signals while the official provider receives its normal process-group delivery, so a provider that handles `SIGINT` remains attached to the foreground wrapper and cannot outlive every lease owner;
 - preserve ordinary child exit codes; polished cross-platform signal forwarding and job-control semantics remain release gates;
 - avoid persisting child stdout or stderr by default;

@@ -1,6 +1,6 @@
 # ADR 0003: Supervise a profile-owned Codex App Server and official remote TUI
 
-- Status: Accepted for staged implementation in issues #33 and #48
+- Status: Accepted; internal slices #48 and #50 implemented
 - Date: 2026-07-15
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 - Related decisions: [ADR 0001](0001-cross-profile-conversation-handoff.md), [ADR 0002](0002-private-provider-identity-binding.md)
@@ -30,6 +30,16 @@ Issue #32 added a no-gap type-state lease-transfer primitive using
 `SCM_RIGHTS`. It remains internal until the receiving guardian and ambiguous
 ACK outcomes have a complete process supervisor.
 
+Issue #50 adds the default-unused process-authority foundation with synthetic
+children only. It proves the dedicated lifecycle channel, coordinator A and
+guardian B ownership, guardian-direct process groups, exact child waits,
+bounded worker shutdown, identity-conditioned runtime cleanup, and retained-A
+guardian-loss behavior through real `exec` fault injection. It does not launch
+Codex, bridge a PTY, query usage, read credentials, or expose a command.
+The one-reader `SCM_RIGHTS` transfer and ACK proof remains the issue #32
+primitive; issue #50 proves that its reserved transport is physically distinct
+from lifecycle traffic, close-on-exec, and absent after child `exec`.
+
 ## Decision and initial scope
 
 Calcifer will add a Linux/macOS-only, explicit, default-off supervised session
@@ -37,10 +47,11 @@ path. The first public form will resume one canonical existing thread in one
 explicit profile. Existing direct `run`, exact `resume`, workspace-head
 `resume`, and `status` remain independent and unchanged.
 
-Implementation is divided into four slices. Issue #48 implements only the
-first: a bounded readiness-relay transport kernel extracted from #28. It does
-not start an App Server, open a second monitor connection, spawn a child, own a
-lease, bridge a terminal, query usage, or expose a CLI option.
+Implementation is divided into four slices. Issue #48 implements the first: a
+bounded readiness-relay transport kernel extracted from #28. Issue #50
+implements the second slice's process-authority kernel with fake children.
+Neither starts a real App Server, opens a persistent monitor connection,
+bridges a terminal, queries usage, reads credentials, or exposes a CLI option.
 
 The production supervisor will reuse the reviewed transport mechanics, but not
 the synthetic readiness policy or probe PTY. The provider guardian will own
@@ -118,9 +129,11 @@ different single-reader authorities.
   endpoint survives guardian `exec`.
 - Is absent from App Server, TUI, tools, and unrelated concurrent execs.
 
-The coordinator accepts child PID/PGID reports only for best-effort containment.
-Exact wait authority for App Server and TUI remains in the guardian's direct
-`Child` handles.
+The coordinator accepts child PID/PGID reports as bounded observation metadata,
+not durable signal authority. Exact containment and wait authority for App
+Server and TUI remains in the guardian's direct `Child` handles. Once the
+guardian is untrusted, a coordinator without a process-birth handle must not
+signal a previously reported numeric identity because that PID may be reused.
 
 ### Optional lease-transfer socketpair
 
@@ -262,10 +275,12 @@ When the guardian remains alive, it is the exact direct-child reaper. If the
 guardian dies unexpectedly, the coordinator can exactly wait only for its
 direct guardian child. On macOS it cannot `wait(2)` for reparented App
 Server/TUI grandchildren. Reported process groups may be signalled for
-containment, but EOF, `killpg` success, PID disappearance, and `ESRCH` are not
-reap or identity proofs. Without a previously received `CHILDREN_REAPED`
-terminal frame, the coordinator parks with A held and requires explicit
-process-level recovery. It must not exit and accidentally release A.
+containment only while an exact, non-reusable process identity is still held;
+the #50 coordinator deliberately has no such cross-process handle and does not
+signal them. EOF, `killpg` success, PID disappearance, and `ESRCH` are not reap
+or identity proofs. Without a previously received `CHILDREN_REAPED` terminal
+frame, the coordinator parks with A held and requires explicit process-level
+recovery. It must not exit and accidentally release A.
 
 ## Invariants
 
@@ -349,7 +364,7 @@ replacement, and overlong path fail closed. Cleanup never blindly unlinks.
 | TUI normal/nonzero exit | Preserve its code only after verified cleanup |
 | TUI terminating signal | Preserve structured signal; restore terminal and reproduce shell disposition after cleanup |
 | Coordinator death | Live guardian B closes input, stops/waits direct children, then releases B |
-| Guardian death before trusted terminal frame | Coordinator exactly waits guardian, best-effort contains reported groups, parks with A held |
+| Guardian death before trusted terminal frame | Coordinator exactly waits guardian, never signals stale reported groups, and parks with A held; fixed fake children use guardian-liveness EOF |
 | Missing/invalid transfer ACK | Retain A+B; terminate and exactly wait pre-spawn guardian before release |
 | Socket identity mismatch at cleanup | Preserve replacement and report cleanup failure |
 
@@ -374,6 +389,11 @@ failure, never a reconstructed TUI success.
 | Compatibility | Existing #28 packaged 0.144.4 proof, exact build revalidation at spawn, and schema/sequence drift rejection |
 | Regression/platform | Direct run/resume/status unchanged; Linux/macOS green; Windows and unreviewed Unix explicit unsupported |
 
+Process-death tests executed inside a container require a functioning PID 1
+reaper (for example Docker `--init` or `tini`). A container runtime that leaves
+orphan zombies unreaped is an invalid environment for disappearance assertions,
+not evidence that exact child wait authority can be reconstructed from PIDs.
+
 ## Staged implementation
 
 ### Slice 1: bounded readiness-relay kernel (#48)
@@ -388,20 +408,32 @@ failure, never a reconstructed TUI success.
 - Add no App Server ownership, persistent connection, subscription, usage
   loop, child spawn, lease, terminal bridge, cache, schema, or CLI behavior.
 
-### Slice 2: guardian-owned fake process foundation
+### Slice 2: guardian-owned fake process foundation (#50, implemented internally)
 
-- Add lifecycle and separate optional transfer socketpairs.
-- Add guardian-owned fake App Server/TUI process groups, private runtime,
-  socket verification, PTY bridge, input gate, signals, structured disposition,
-  and bounded shutdown.
-- Exercise phase-barrier fault injection without a live provider or public CLI.
+- Add a bounded lifecycle socketpair and a distinct default-unused optional
+  transfer socketpair with no lifecycle ancillary-data receive path.
+- Add guardian-owned fake App Server/TUI process groups, a private runtime,
+  structured dispositions, exact waits, bounded worker join, and fail-closed
+  cleanup/guardian-loss states.
+- Require a post-`START` capability at every runtime/worker/child creation
+  callsite and synchronously record spawn requests in the guardian parent, so
+  the pre-B phase-barrier fault cannot hide behind scheduler timing.
+- Exercise phase barriers, real-exec descriptor scans, early exits, timeouts,
+  malformed control, stuck descendants, selective process death, and cleanup
+  mismatch without a live provider or public CLI. After guardian trust is
+  lost, the coordinator never signals lifecycle-reported numeric PIDs; fixed
+  fake children instead observe a guardian-owned liveness pipe and exit on
+  guardian death while A remains retained.
+- Defer the PTY bridge, input gate, signal/job-control policy, monitor, and real
+  Codex adapter to later slices.
 
 ### Slice 3: pinned same-profile provider integration
 
 - Introduce a sealed capability that retains or launch-time revalidates the
   exact executable; App Server and TUI use the same build identity.
 - Add the separate typed monitor, reviewed initialization/subscription, usage
-  reads, and official TUI through the readiness relay.
+  reads, official TUI through the readiness relay, PTY input gate, and terminal
+  restoration/disposition handling.
 - Exercise through an internal test entrypoint only.
 
 ### Slice 4: explicit public exact resume
