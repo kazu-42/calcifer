@@ -4,3 +4,4 @@ mod codex_conversation;
 pub(crate) mod doctor;
 pub(crate) mod process;
 pub(crate) mod status;
+pub(crate) mod update;

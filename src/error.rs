@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io;
 
+use crate::commands::update::UpdateError;
 use crate::conversations::ConversationError;
 use crate::executable::ExecutableError;
 use crate::profiles::ProfileError;
@@ -16,6 +17,7 @@ pub(crate) enum AppError {
     ProjectConfig(ProjectConfigError),
     ProviderArgumentRejected,
     ProviderLoginFailed,
+    Update(UpdateError),
 }
 
 impl AppError {
@@ -29,6 +31,7 @@ impl AppError {
             Self::ProjectConfig(error) => error.code(),
             Self::ProviderArgumentRejected => "provider_argument_rejected",
             Self::ProviderLoginFailed => "provider_login_failed",
+            Self::Update(error) => error.code(),
         }
     }
 
@@ -45,6 +48,7 @@ impl AppError {
             Self::ProjectConfig(error) => error.safe_message().to_owned(),
             Self::ProviderArgumentRejected => "Calcifer rejected a provider argument that could bypass the selected managed account or provider.".to_owned(),
             Self::ProviderLoginFailed => "The official Codex login command did not complete successfully. No profile was registered.".to_owned(),
+            Self::Update(error) => error.safe_message().to_owned(),
         }
     }
 }
@@ -78,6 +82,12 @@ impl From<ProfileError> for AppError {
 impl From<ProjectConfigError> for AppError {
     fn from(error: ProjectConfigError) -> Self {
         Self::ProjectConfig(error)
+    }
+}
+
+impl From<UpdateError> for AppError {
+    fn from(error: UpdateError) -> Self {
+        Self::Update(error)
     }
 }
 

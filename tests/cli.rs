@@ -104,7 +104,7 @@ fn help_lists_only_implemented_commands() -> Result<(), Box<dyn std::error::Erro
 
     assert!(output.status.success());
     assert!(stdout.contains("doctor"));
-    for command in ["auth", "run", "resume", "status"] {
+    for command in ["auth", "run", "resume", "status", "update"] {
         assert!(
             stdout.contains(&format!("  {command}")),
             "{command} must be advertised after implementation"

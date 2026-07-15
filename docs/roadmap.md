@@ -9,6 +9,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Linux, macOS, Windows, formatting, Clippy, and MSRV CI
 - [x] Architecture, security, contribution, and disclosure documentation
 - [ ] First checksummed and provenance-attested pre-release binary
+- [x] Credential-free strict-channel update check for immutable manifest-v1 releases
 
 ## Phase 1: secure local registry
 

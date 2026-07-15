@@ -40,6 +40,12 @@ pub(crate) enum Commands {
         profile: Option<ProfileReference>,
     },
 
+    /// Check an immutable Calcifer release without reading credentials.
+    Update {
+        #[command(subcommand)]
+        command: UpdateCommand,
+    },
+
     /// Launch an official provider CLI with one immutable profile.
     Run {
         /// Skip conversation capture and require explicit exact recovery later.
@@ -115,6 +121,22 @@ impl FromStr for ProfileId {
         }
         Ok(Self(value.to_owned()))
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum UpdateCommand {
+    /// Check one strict release channel for this exact compile target.
+    Check {
+        /// Release channel; defaults to the current binary's channel.
+        #[arg(long, value_enum)]
+        channel: Option<ReleaseChannelArgument>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ReleaseChannelArgument {
+    Stable,
+    Preview,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

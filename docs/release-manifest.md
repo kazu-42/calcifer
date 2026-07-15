@@ -131,3 +131,34 @@ published, whether the downloaded manifest bytes matched their digest, and
 whether an archive was actually downloaded and verified. The update checker
 does not download an archive and therefore cannot claim to have locally
 verified that archive.
+
+## Credential-free update checking
+
+`calcifer update check` defaults to the current binary's channel; `--channel
+stable` and `--channel preview` select one explicitly. The command lists public
+releases anonymously, parses every inspected tag as canonical SemVer, requires
+the GitHub prerelease flag to agree with the selected channel, and chooses the
+highest version only after completing a bounded release inventory. A missing
+channel and an unsupported compile target are successful, explicit states. The
+checker never falls back to a different architecture, libc, or Windows ABI.
+
+For a selected release, the checker requires `immutable: true`, exactly the five
+canonical archives plus this manifest and `SHA256SUMS`, uploaded state, bounded
+sizes, canonical release/download URLs, and SHA-256 release-asset digests. It
+downloads only the manifest and checksum assets. Their response bytes must
+match the release-asset size/digest, the manifest must be canonical single-line
+JSON in the exact v1 schema, and `SHA256SUMS` must be canonical, complete, and
+agree with every manifest archive descriptor. The selected archive remains
+metadata-only until a separate installer downloads and hashes it.
+
+The anonymous HTTP client uses a fixed repository, fixed GitHub API version,
+no authorization/cookie/proxy-authorization header, no token or profile lookup,
+no endpoint override, no background polling, a ten-second per-request timeout,
+four release pages of 100 entries, three redirects, a sixteen-asset preflight
+cap, 1 MiB release pages, a 64 KiB manifest, and a 4 KiB checksum file.
+Redirects remain HTTPS and may target only `api.github.com`, `github.com`,
+`release-assets.githubusercontent.com`, or `objects.githubusercontent.com`;
+compressed response bodies are rejected rather than expanded. An incomplete
+inventory, network/rate-limit failure, unexpected redirect, schema drift,
+mutable release, or digest mismatch is non-zero and never produces an update
+recommendation.

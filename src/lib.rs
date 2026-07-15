@@ -15,7 +15,7 @@ use std::process::{ExitCode, ExitStatus};
 
 use clap::{CommandFactory, Parser, error::ErrorKind};
 
-use crate::cli::{AuthCommand, Cli, Commands, ProviderArgument};
+use crate::cli::{AuthCommand, Cli, Commands, ProviderArgument, UpdateCommand};
 use crate::error::AppError;
 use crate::output::ErrorReport;
 
@@ -186,6 +186,12 @@ where
             Ok(report) => render_status_report(&report, cli.json),
             Err(error) => render_app_error("status", &error, cli.json),
         },
+        Commands::Update {
+            command: UpdateCommand::Check { channel },
+        } => match commands::update::check(channel) {
+            Ok(report) => render_update_report(&report, cli.json),
+            Err(error) => render_app_error("update", &error.into(), cli.json),
+        },
         Commands::InternalCodex {
             profile_id,
             expected_profile,
@@ -327,6 +333,25 @@ fn render_status_report(report: &commands::status::StatusReport, json: bool) -> 
     }
 }
 
+fn render_update_report(report: &commands::update::UpdateReport, json: bool) -> ExitCode {
+    let rendered = if json {
+        report.to_json()
+    } else {
+        Ok(report.to_human())
+    };
+    match rendered {
+        Ok(rendered) if write_stdout(&rendered).is_ok() => ExitCode::SUCCESS,
+        _ => {
+            let _ = write_stderr(if json {
+                JSON_INTERNAL_ERROR
+            } else {
+                HUMAN_INTERNAL_ERROR
+            });
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn render_app_error(command: &str, error: &AppError, json: bool) -> ExitCode {
     let rendered = if json {
         ErrorReport::command(command, error.code(), error.safe_message())
@@ -391,6 +416,20 @@ mod tests {
             let result = Cli::try_parse_from(["calcifer", command]);
             assert!(result.is_err(), "{command} must remain unavailable");
         }
+    }
+
+    #[test]
+    fn update_check_has_strict_optional_channels() {
+        assert!(Cli::try_parse_from(["calcifer", "update", "check"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["calcifer", "update", "check", "--channel", "stable",]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["calcifer", "update", "check", "--channel", "preview",]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["calcifer", "update", "check", "--channel", "nightly",]).is_err()
+        );
     }
 
     #[test]

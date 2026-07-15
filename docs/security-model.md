@@ -12,6 +12,7 @@ This document covers both implemented and intended guarantees. The current Unix 
 - source code, prompts, conversation context, and child process output
 - Calcifer registry integrity
 - installation-local provider-identity HMAC key and private profile bindings
+- public release metadata, manifests, checksums, and update recommendations
 
 ## Threats in scope
 
@@ -27,6 +28,7 @@ This document covers both implemented and intended guarantees. The current Unix 
 - incorrect quota classification causing failover loops
 - automatic replay duplicating file, Git, deployment, billing, or messaging side effects
 - one conversation lineage being written concurrently, handed to an account outside its configured trust domain, or imported from an attacker-selected path
+- mutable, redirected, oversized, partial, or digest-mismatched release metadata causing installation of the wrong target
 
 ## Threats outside the guarantee
 
@@ -54,6 +56,10 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   markers, managed homes, sessions, and conversation records untouched.
 - Claude token storage fails closed when a supported OS credential store is unavailable. Plaintext fallback is a non-goal unless a later ADR and security review define it.
 - Export, backup, telemetry, and crash-report features exclude credentials by design.
+- Update checks do not open profiles, provider state, configuration, credential
+  stores, or token sources. Ambient proxy configuration is explicitly disabled;
+  requests send only fixed public GitHub media-type, API-version, and user-agent
+  headers.
 - Credential-bearing environments are passed only to a provider adapter's validated executable, never to an arbitrary command supplied after `--`.
 - Every managed Codex login, run, resume, and App Server process is built by one
   environment policy. It removes ambient API/access tokens, authentication and

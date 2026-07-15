@@ -53,6 +53,11 @@ calcifer status
 calcifer status codex@work
 calcifer --json status
 
+# Check this binary's release channel, or select one explicitly.
+calcifer update check
+calcifer update check --channel stable
+calcifer --json update check --channel preview
+
 # Start Codex in one immutable profile.
 calcifer run codex@work
 calcifer run codex@personal -- --no-alt-screen
@@ -118,6 +123,18 @@ The remaining percentage is explicitly display-only. Codex rounds the upstream u
 
 `doctor` remains credential-free. It checks the host and whether executables named `codex` and `claude` are discoverable on `PATH`; it does not execute them or read provider state.
 
+`update check` is also credential-free and never opens the profile registry,
+provider configuration, or an authentication store. It reads only the public
+`kazu-42/calcifer` GitHub Releases API through fixed HTTPS hosts, selects the
+highest strict SemVer in exactly one `stable` or `preview` channel, and requires
+an immutable release. The command selects only the archive for the binary's
+exact Rust compile target; an unsupported target succeeds as
+`target_unsupported` instead of substituting a different ABI. It downloads only
+the bounded v1 manifest and `SHA256SUMS`, verifies their local bytes against the
+release-asset digests and each other, and does not download or claim to verify
+the archive itself. Network, schema, redirect, pagination, and integrity
+failures are non-zero; an absent channel succeeds as `no_release_in_channel`.
+
 Example JSON envelope:
 
 ```json
@@ -131,18 +148,21 @@ Example JSON envelope:
 }
 ```
 
-For structured `doctor`, `auth list`, `auth verify`, `auth rename`, and `status` results,
-`--json` emits one JSON document on stdout. Rename reports `action: "rename"`,
-whether the alias changed, the old and new local references, and the existing
-non-secret profile record. Interactive `auth add`, `run`, and `resume` reject
-`--json` because the official provider owns the terminal and mixing its stream
-with a Calcifer JSON document would break the contract. Identity JSON contains
-only Calcifer-local profile metadata and never the private fingerprint,
-identity-key ID, or provider account scope. Usage failures emit one redacted
-JSON document on stderr with exit code `2`. Clap's standard `--help` and
-`--version` output remains text even when `--json` is present. Within schema
-version 1, existing field names and meanings will remain stable; new fields may
-be added.
+For structured `doctor`, `auth list`, `auth verify`, `auth rename`, `status`,
+and `update check` results, `--json` emits one JSON document on stdout. Rename
+reports `action: "rename"`, whether the alias changed, the old and new local
+references, and the existing non-secret profile record. Interactive `auth add`,
+`run`, and `resume` reject `--json` because the official provider owns the
+terminal and mixing its stream with a Calcifer JSON document would break the
+contract. Identity JSON contains only Calcifer-local profile metadata and never
+the private fingerprint, identity-key ID, or provider account scope. Update
+JSON separates immutable-release and manifest-declared attestation publication
+evidence from locally verified manifest/checksum bytes, and always marks the
+un-downloaded archive `not_downloaded`. Usage and update failures emit one
+redacted JSON document on stderr with a non-zero exit code. Clap's standard
+`--help` and `--version` output remains text even when `--json` is present.
+Within schema version 1, existing field names and meanings will remain stable;
+new fields may be added.
 
 ## Planned interface
 
@@ -180,6 +200,7 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Capability | Status | Direction |
 | --- | --- | --- |
 | Read-only environment diagnostics | Implemented | No credential access |
+| Credential-free update check | Implemented | Strict stable/preview SemVer, exact compile target, immutable v1 manifest and checksum verification; no archive download |
 | Codex profile isolation | Implemented on Unix | One `CODEX_HOME` per profile; official Codex login and refresh |
 | Same-profile Codex resume | Implemented on Unix for Codex 0.144.4 | Tracked workspace head, explicit exact thread ID, or official `--last`; no prompt replay |
 | Private Codex identity binding | Implemented for 0.144.4 ChatGPT auth | HMAC equality only; duplicate aliases and credential drift fail closed |
@@ -261,6 +282,18 @@ Download only the archive for your operating system and architecture, verify it
 before installation, and keep in mind that Calcifer is still pre-alpha. See the
 [release and rollback runbook](docs/releasing.md) for exact checksum,
 attestation, install, uninstall, and recovery commands.
+
+After the first immutable manifest-v1 release is published, inspect the exact
+channel and compile-target result before downloading an archive:
+
+```console
+calcifer update check
+calcifer --json update check --channel preview
+```
+
+The checker validates release metadata plus the downloaded manifest and
+checksum bytes. It intentionally leaves archive download, archive-byte digest
+verification, and installation as separate explicit operations.
 
 ## Development
 

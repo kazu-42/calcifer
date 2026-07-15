@@ -26,6 +26,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   changing its immutable ID, managed home, authentication, provider identity,
   or conversation state, with stable human/JSON output and commit-uncertain
   read-back guidance.
+- Credential-free `calcifer update check` with strict stable/preview SemVer
+  channels, exact compile-target selection, stable JSON v1 output, and bounded
+  immutable manifest/checksum verification.
 
 ### Changed
 
@@ -57,6 +60,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Documented coordinated vulnerability disclosure, including patched-release
   ordering, urgent-notification exceptions, and audited emergency release
   removal under the no-bypass release-tag ruleset.
+- Update checks send no authorization or ambient token data, follow only bounded
+  allowlisted HTTPS redirects, reject mutable or malformed releases, and never
+  substitute another target ABI or claim an un-downloaded archive was verified.
 
 ## [0.1.0-alpha.3] - 2026-07-15
 
