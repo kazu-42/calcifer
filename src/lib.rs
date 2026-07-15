@@ -121,6 +121,7 @@ where
             },
         },
         Commands::Run {
+            untracked,
             profile,
             provider_args,
         } => {
@@ -129,7 +130,7 @@ where
             }
             match profile.provider {
                 ProviderArgument::Codex => {
-                    match commands::process::run_codex(&profile.alias, &provider_args) {
+                    match commands::process::run_codex(&profile.alias, untracked, &provider_args) {
                         Ok(status) => exit_code_from_status(status),
                         Err(error) => render_app_error("run", &error, false),
                     }
@@ -137,6 +138,7 @@ where
             }
         }
         Commands::Resume {
+            untracked,
             profile,
             session_id,
             provider_args,
@@ -149,10 +151,11 @@ where
                     ProviderArgument::Codex => commands::process::resume_codex(
                         &profile.alias,
                         session_id.as_deref(),
+                        untracked,
                         &provider_args,
                     ),
                 },
-                None if session_id.is_none() => {
+                None if !untracked && session_id.is_none() => {
                     commands::process::resume_workspace_codex(&provider_args)
                 }
                 None => Err(AppError::ProviderArgumentRejected),
@@ -188,8 +191,16 @@ where
                             "Calcifer: launching codex@{} (explicit profile).",
                             profile.alias
                         ),
+                        cli::InternalProcessMode::RunUntracked => format!(
+                            "Calcifer: launching codex@{} in explicit untracked mode.",
+                            profile.alias
+                        ),
                         cli::InternalProcessMode::ResumeLast => format!(
                             "Calcifer: resuming latest session in codex@{} (same profile; no prompt replay).",
+                            profile.alias
+                        ),
+                        cli::InternalProcessMode::ResumeLastUntracked => format!(
+                            "Calcifer: resuming the latest session in codex@{} in explicit untracked mode.",
                             profile.alias
                         ),
                         cli::InternalProcessMode::ResumeExact => format!(
@@ -347,6 +358,44 @@ mod tests {
         for command in ["switch", "use"] {
             let result = Cli::try_parse_from(["calcifer", command]);
             assert!(result.is_err(), "{command} must remain unavailable");
+        }
+    }
+
+    #[test]
+    fn untracked_mode_requires_an_explicit_profile_without_a_thread_id() {
+        assert!(Cli::try_parse_from(["calcifer", "run", "--untracked", "codex@work"]).is_ok());
+        assert!(Cli::try_parse_from(["calcifer", "resume", "--untracked", "codex@work"]).is_ok());
+        assert!(Cli::try_parse_from(["calcifer", "resume", "--untracked"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "calcifer",
+                "resume",
+                "--untracked",
+                "codex@work",
+                "01900000-0000-7000-8000-000000000001",
+            ])
+            .is_err()
+        );
+
+        let passthrough =
+            Cli::try_parse_from(["calcifer", "run", "codex@work", "--", "--untracked"]);
+        assert!(
+            passthrough.is_ok(),
+            "provider arguments after -- must remain opaque"
+        );
+        let Ok(passthrough) = passthrough else {
+            return;
+        };
+        match passthrough.command {
+            Commands::Run {
+                untracked,
+                provider_args,
+                ..
+            } => {
+                assert!(!untracked);
+                assert_eq!(provider_args, [OsString::from("--untracked")]);
+            }
+            _ => panic!("run command parsed as a different command"),
         }
     }
 }

@@ -13,6 +13,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   without replaying a prompt.
 - Conservative rollout-store completeness and change fingerprints for the
   hidden Codex 0.144.4 filesystem scan cap and same-second thread updates.
+- Explicit `run --untracked` and profile-specific `resume --untracked` modes
+  that durably disable automatic workspace resume before skipping capture and
+  retain cross-profile-safe in-flight ownership until the provider exits.
 
 ### Changed
 

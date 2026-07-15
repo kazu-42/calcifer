@@ -51,6 +51,10 @@ calcifer --json status
 calcifer run codex@work
 calcifer run codex@personal -- --no-alt-screen
 
+# Explicitly skip conversation capture when manual recovery is acceptable.
+calcifer run --untracked codex@work
+calcifer resume --untracked codex@work
+
 # Reopen the newest session in a profile, pin an exact thread, or restore this workspace head.
 calcifer resume codex@work
 calcifer resume codex@work 01900000-0000-7000-8000-000000000001
@@ -68,6 +72,8 @@ This remains isolated even when `CALCIFER_HOME` itself is stored inside a Git
 repository with local Codex configuration.
 
 For supported Codex 0.144.4 sessions, Calcifer captures the immutable `{profile ID, canonical cwd, thread ID}` binding in a separate private `conversations.json`. Bare `calcifer resume` validates that exact rollout under its source-profile lease and invokes `codex resume <exact-uuid>` without a prompt. A clean wrapper restart therefore restores the tracked history without an account selector or thread lookup. Interrupted and uncertain crash boundaries show a warning before reopening; missing, archived, incompatible, cross-profile, cross-cwd, corrupt, or ambiguous state stops before provider launch. Resume restores persisted history, not a dead process or in-flight tool call, and never resends the last prompt, approval answer, command, or tool call.
+
+Normal `run` and profile-specific `resume` remain fail-closed when Calcifer cannot prove a complete capture inventory. `--untracked` is the explicit manual escape hatch for `run` or profile-specific `resume --last`: it performs no App Server inventory, refuses an unresolved pending launch in the workspace, durably marks the workspace as requiring selection before spawning Codex, retains a metadata-only in-flight ownership record until the official child exits, and prints a warning. That ownership prevents a concurrent exact resume under another profile from restoring a stale automatic head; an exact process that started first also cannot refresh over a later untracked marker. Bare `calcifer resume` remains disabled afterward until `calcifer resume codex@<alias> <exact-thread-id>` validates and restores a tracked head. The flag cannot be combined with an exact thread ID or bare resume; a provider argument named `--untracked` must follow the `--` separator as usual.
 
 `status` starts the installed official `codex app-server` inside each idle profile and calls the structured `account/rateLimits/read` method. Before that read, it requires the tested Codex `0.144.4` initialize contract and verifies that the server reports the selected canonical `CODEX_HOME`. Untested versions, changed initialize data, a different home, or a changed usage schema fail closed as `unknown`; Calcifer does not send the usage request after an initialize-gate rejection. It displays all returned limit buckets, primary and secondary used/remaining percentages, reset times, workspace credit state, monthly spend control when present, and rate-limit reset-credit count and expirations. It does not scrape the interactive `/status` screen or read token values from `auth.json`.
 

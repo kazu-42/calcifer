@@ -41,6 +41,10 @@ pub(crate) enum Commands {
 
     /// Launch an official provider CLI with one immutable profile.
     Run {
+        /// Skip conversation capture and require explicit exact recovery later.
+        #[arg(long)]
+        untracked: bool,
+
         /// Provider and local profile alias, for example codex@work.
         profile: ProfileReference,
 
@@ -51,6 +55,10 @@ pub(crate) enum Commands {
 
     /// Resume a tracked workspace head or a session in an explicit profile.
     Resume {
+        /// Use official --last without capture; requires a profile and no exact ID.
+        #[arg(long, requires = "profile", conflicts_with = "session_id")]
+        untracked: bool,
+
         /// Provider and local profile alias; omit to resume this workspace's tracked head.
         profile: Option<ProfileReference>,
 
@@ -89,7 +97,9 @@ pub(crate) enum Commands {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum InternalProcessMode {
     Run,
+    RunUntracked,
     ResumeLast,
+    ResumeLastUntracked,
     ResumeExact,
     ResumeHead,
 }

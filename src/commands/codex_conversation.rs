@@ -30,15 +30,17 @@ pub(super) enum GuardianCapture {
     /// Derive the exact thread from a bounded before/after inventory.
     Tracked { launch_id: String },
     /// The exact thread was authoritative and adopted before provider start.
-    Bound { thread_id: String },
+    Bound { binding: HeadBinding },
     /// Keep stable exact resume available outside the pinned metadata adapter.
     UnsupportedExplicit,
+    /// The user explicitly disabled capture under durable in-flight ownership.
+    Untracked { launch_id: String },
 }
 
 impl GuardianCapture {
     pub(super) fn launch_id(&self) -> Option<&str> {
         match self {
-            Self::Tracked { launch_id } => Some(launch_id),
+            Self::Tracked { launch_id } | Self::Untracked { launch_id } => Some(launch_id),
             Self::Bound { .. } | Self::UnsupportedExplicit => None,
         }
     }
@@ -83,6 +85,22 @@ impl<'a> CaptureContext<'a> {
         session_id: Option<&str>,
     ) -> Result<GuardianCapture, AppError> {
         match mode {
+            InternalProcessMode::RunUntracked | InternalProcessMode::ResumeLastUntracked => {
+                let launch_mode = match mode {
+                    InternalProcessMode::RunUntracked => LaunchMode::RunUntracked,
+                    InternalProcessMode::ResumeLastUntracked => LaunchMode::ResumeLastUntracked,
+                    _ => unreachable!("tracked modes are handled separately"),
+                };
+                let launch_id = self.conversations.prepare_untracked(
+                    self.profile_id,
+                    self.working_directory,
+                    launch_mode,
+                )?;
+                eprintln!(
+                    "Calcifer: untracked mode is active; conversation capture and bare resume are disabled until explicit exact recovery."
+                );
+                Ok(GuardianCapture::Untracked { launch_id })
+            }
             InternalProcessMode::Run | InternalProcessMode::ResumeLast => {
                 self.reconcile_pending_launch()?;
                 let inventory = self.inventory()?;
@@ -94,7 +112,10 @@ impl<'a> CaptureContext<'a> {
                 let launch_mode = match mode {
                     InternalProcessMode::Run => LaunchMode::Run,
                     InternalProcessMode::ResumeLast => LaunchMode::ResumeLast,
-                    InternalProcessMode::ResumeExact | InternalProcessMode::ResumeHead => {
+                    InternalProcessMode::RunUntracked
+                    | InternalProcessMode::ResumeLastUntracked
+                    | InternalProcessMode::ResumeExact
+                    | InternalProcessMode::ResumeHead => {
                         unreachable!("exact modes are handled separately")
                     }
                 };
@@ -145,6 +166,17 @@ impl<'a> CaptureContext<'a> {
         session_id: Option<&str>,
     ) -> Result<GuardianCapture, AppError> {
         let thread_id = session_id.ok_or(AppError::ProviderArgumentRejected)?;
+        if let Some(untracked) = self
+            .conversations
+            .untracked_for_workspace(self.working_directory)?
+        {
+            if untracked.profile_id != self.profile_id {
+                return Err(ConversationError::Ambiguous.into());
+            }
+            let _ = self
+                .conversations
+                .finish_launch(&untracked.launch_id, LaunchResolution::Ambiguous)?;
+        }
         if mode == InternalProcessMode::ResumeHead {
             let head = self.conversations.resolve_head(self.working_directory)?;
             validate_head_target(&head, self.profile_id, thread_id, self.working_directory)?;
@@ -173,7 +205,10 @@ impl<'a> CaptureContext<'a> {
                 thread_id,
                 self.working_directory,
             )?,
-            InternalProcessMode::Run | InternalProcessMode::ResumeLast => None,
+            InternalProcessMode::Run
+            | InternalProcessMode::RunUntracked
+            | InternalProcessMode::ResumeLast
+            | InternalProcessMode::ResumeLastUntracked => None,
         };
         if persisted_binding
             .as_ref()
@@ -194,9 +229,7 @@ impl<'a> CaptureContext<'a> {
             binding,
         )?;
         warn_if_unclean_resume(adopted.lifecycle);
-        Ok(GuardianCapture::Bound {
-            thread_id: thread_id.to_owned(),
-        })
+        Ok(GuardianCapture::Bound { binding: adopted })
     }
 
     /// Capture never changes the official provider status and never retries a
@@ -206,9 +239,14 @@ impl<'a> CaptureContext<'a> {
             GuardianCapture::Tracked { launch_id } => {
                 self.complete_tracked(launch_id, provider_succeeded)
             }
-            GuardianCapture::Bound { thread_id } => {
-                self.refresh_bound_lifecycle(thread_id, provider_succeeded)
+            GuardianCapture::Bound { binding } => {
+                self.refresh_bound_lifecycle(binding, provider_succeeded)
             }
+            GuardianCapture::Untracked { launch_id } => self
+                .conversations
+                .finish_launch(launch_id, LaunchResolution::Ambiguous)
+                .map(|_| ())
+                .map_err(AppError::from),
             GuardianCapture::UnsupportedExplicit => Ok(()),
         };
 
@@ -235,6 +273,14 @@ impl<'a> CaptureContext<'a> {
         if pending.launch_id != launch_id {
             return Err(ConversationError::Ambiguous.into());
         }
+        if pending.mode.is_untracked() {
+            return Err(ConversationError::Ambiguous.into());
+        }
+        let pending_codex_version = pending.codex_version.as_deref().ok_or_else(|| {
+            ConversationError::RegistryInvalid(
+                "tracked pending launch has no Codex version".to_owned(),
+            )
+        })?;
         let inventory = match self.inventory() {
             Ok(inventory) => inventory,
             Err(error) => {
@@ -247,7 +293,7 @@ impl<'a> CaptureContext<'a> {
                 .finish_launch(launch_id, LaunchResolution::Ambiguous)?;
             return Err(ConversationError::Ambiguous.into());
         }
-        if inventory.codex_version != pending.codex_version {
+        if inventory.codex_version != pending_codex_version {
             return finish_reconciliation_failure(
                 self.conversations,
                 launch_id,
@@ -269,7 +315,7 @@ impl<'a> CaptureContext<'a> {
                         return finish_reconciliation_failure(self.conversations, launch_id, error);
                     }
                 };
-                if read.codex_version != pending.codex_version {
+                if read.codex_version != pending_codex_version {
                     return finish_reconciliation_failure(
                         self.conversations,
                         launch_id,
@@ -302,15 +348,15 @@ impl<'a> CaptureContext<'a> {
 
     fn refresh_bound_lifecycle(
         &self,
-        thread_id: &str,
+        expected: &HeadBinding,
         provider_succeeded: bool,
     ) -> Result<(), AppError> {
-        let read = self.read_thread(thread_id)?;
+        let read = self.read_thread(&expected.thread_id)?;
         let mut binding = self.binding_from_read(read)?;
         if !provider_succeeded && binding.lifecycle == ConversationLifecycle::Clean {
             binding.lifecycle = ConversationLifecycle::UnknownCrash;
         }
-        self.conversations.adopt(binding)?;
+        self.conversations.refresh_adopted(expected, binding)?;
         Ok(())
     }
 
@@ -321,6 +367,17 @@ impl<'a> CaptureContext<'a> {
         else {
             return Ok(());
         };
+        if pending.mode.is_untracked() {
+            let _ = self
+                .conversations
+                .finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
+            return Err(ConversationError::Ambiguous.into());
+        }
+        let pending_codex_version = pending.codex_version.as_deref().ok_or_else(|| {
+            ConversationError::RegistryInvalid(
+                "tracked pending launch has no Codex version".to_owned(),
+            )
+        })?;
         let inventory = match self.inventory() {
             Ok(inventory) => inventory,
             Err(error) => {
@@ -337,7 +394,7 @@ impl<'a> CaptureContext<'a> {
                 .finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
             return Err(ConversationError::Ambiguous.into());
         }
-        if inventory.codex_version != pending.codex_version {
+        if inventory.codex_version != pending_codex_version {
             return finish_reconciliation_failure(
                 self.conversations,
                 &pending.launch_id,
@@ -372,7 +429,7 @@ impl<'a> CaptureContext<'a> {
                         );
                     }
                 };
-                if read.codex_version != pending.codex_version {
+                if read.codex_version != pending_codex_version {
                     return finish_reconciliation_failure(
                         self.conversations,
                         &pending.launch_id,
@@ -527,6 +584,9 @@ fn adopt_exact_binding(
     binding: BindingInput,
 ) -> Result<HeadBinding, AppError> {
     if let Some(pending) = conversations.pending_for(profile_id, working_directory)? {
+        if pending.mode.is_untracked() {
+            return Err(ConversationError::Ambiguous.into());
+        }
         // Explicit selection is authoritative recovery. A false result means
         // the pending launch was resolved beneath an older needs-selection
         // marker; adoption below replaces that marker with the exact binding.

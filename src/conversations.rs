@@ -39,6 +39,14 @@ pub(crate) enum ConversationLifecycle {
 pub(crate) enum LaunchMode {
     Run,
     ResumeLast,
+    RunUntracked,
+    ResumeLastUntracked,
+}
+
+impl LaunchMode {
+    pub(crate) const fn is_untracked(self) -> bool {
+        matches!(self, Self::RunUntracked | Self::ResumeLastUntracked)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,7 +80,8 @@ pub(crate) struct PendingLaunch {
     pub(crate) profile_id: String,
     pub(crate) canonical_cwd: String,
     pub(crate) mode: LaunchMode,
-    pub(crate) codex_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_version: Option<String>,
     pub(crate) adapter_version: String,
     pub(crate) pre_inventory: Vec<InventoryThread>,
     pub(crate) phase: PendingPhase,
@@ -199,6 +208,11 @@ impl ConversationRegistry {
         mut pre_inventory: Vec<InventoryThread>,
     ) -> Result<String, ConversationError> {
         validate_uuid(profile_id, "profile id")?;
+        if mode.is_untracked() {
+            return Err(ConversationError::RegistryInvalid(
+                "tracked launch preparation requires a capture mode".to_owned(),
+            ));
+        }
         let canonical_cwd = canonical_path_string(canonical_cwd)?;
         validate_codex_version(codex_version)?;
         normalize_inventory(&mut pre_inventory)?;
@@ -209,7 +223,7 @@ impl ConversationRegistry {
             profile_id: profile_id.to_owned(),
             canonical_cwd: canonical_cwd.clone(),
             mode,
-            codex_version: codex_version.to_owned(),
+            codex_version: Some(codex_version.to_owned()),
             adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
             pre_inventory,
             phase: PendingPhase::Prepared,
@@ -272,9 +286,9 @@ impl ConversationRegistry {
 
     /// Returns only the immutable profile owner needed to reconcile a crashed
     /// launch. This never selects a provider thread: the caller must release
-    /// the conversation lock, acquire that profile's coordinator/provider
-    /// lease, and compare a fresh inventory before resolving the workspace
-    /// head.
+    /// the conversation lock and acquire that profile's coordinator/provider
+    /// lease. Tracked ownership then requires a fresh inventory; untracked
+    /// ownership can only be removed while preserving `NeedsSelection`.
     pub(crate) fn pending_profile_for_workspace(
         &self,
         canonical_cwd: &Path,
@@ -293,6 +307,26 @@ impl ConversationRegistry {
         })
     }
 
+    /// Returns a durable no-capture owner without treating tracked launches as
+    /// equivalent. A caller may clear a matching owner only while holding both
+    /// halves of that profile's process lease; a different owner remains live
+    /// or crash-uncertain and must block exact adoption.
+    pub(crate) fn untracked_for_workspace(
+        &self,
+        canonical_cwd: &Path,
+    ) -> Result<Option<PendingLaunch>, ConversationError> {
+        let canonical_cwd = canonical_path_string(canonical_cwd)?;
+        self.read(|document| {
+            Ok(document
+                .pending_launches
+                .iter()
+                .find(|pending| {
+                    pending.canonical_cwd == canonical_cwd && pending.mode.is_untracked()
+                })
+                .cloned())
+        })
+    }
+
     pub(crate) fn finish_launch(
         &self,
         launch_id: &str,
@@ -306,6 +340,10 @@ impl ConversationRegistry {
                 .position(|pending| pending.launch_id == launch_id)
                 .ok_or(ConversationError::NotFound)?;
             let pending = document.pending_launches.remove(index);
+            if pending.mode.is_untracked() {
+                mark_head_needs_selection(document, &pending.canonical_cwd);
+                return Ok(None);
+            }
             if document.workspace_heads.iter().any(|head| {
                 head.canonical_cwd == pending.canonical_cwd
                     && head.state == HeadState::NeedsSelection
@@ -317,7 +355,7 @@ impl ConversationRegistry {
                 LaunchResolution::Bind(binding) => {
                     if binding.profile_id != pending.profile_id
                         || binding.canonical_cwd != pending.canonical_cwd
-                        || binding.codex_version != pending.codex_version
+                        || pending.codex_version.as_deref() != Some(binding.codex_version.as_str())
                     {
                         mark_head_needs_selection(document, &pending.canonical_cwd);
                         return Ok(None);
@@ -335,7 +373,46 @@ impl ConversationRegistry {
 
     pub(crate) fn adopt(&self, binding: BindingInput) -> Result<HeadBinding, ConversationError> {
         validate_binding_input(&binding)?;
-        self.transact(|document| bind_document(document, binding))
+        self.transact(|document| {
+            if document.pending_launches.iter().any(|pending| {
+                pending.mode.is_untracked() && pending.canonical_cwd == binding.canonical_cwd
+            }) {
+                return Err(ConversationError::Ambiguous);
+            }
+            bind_document(document, binding)
+        })
+    }
+
+    /// Refreshes lifecycle metadata only while the exact head adopted before
+    /// provider spawn is still authoritative. A concurrent tracked or
+    /// untracked launch may make the workspace ambiguous and then finish
+    /// before this provider exits; checking the durable head prevents that
+    /// older exact process from restoring `Ready` afterward.
+    pub(crate) fn refresh_adopted(
+        &self,
+        expected: &HeadBinding,
+        binding: BindingInput,
+    ) -> Result<HeadBinding, ConversationError> {
+        validate_binding_input(&binding)?;
+        if expected.profile_id != binding.profile_id
+            || expected.thread_id != binding.thread_id
+            || expected.canonical_cwd != binding.canonical_cwd
+            || expected.codex_version != binding.codex_version
+        {
+            return Err(ConversationError::Ambiguous);
+        }
+        self.transact(|document| {
+            let current = resolve_head_document(document, &binding.canonical_cwd)?;
+            if current.conversation_id != expected.conversation_id
+                || current.generation != expected.generation
+                || current.profile_id != expected.profile_id
+                || current.thread_id != expected.thread_id
+                || current.codex_version != expected.codex_version
+            {
+                return Err(ConversationError::Ambiguous);
+            }
+            bind_document(document, binding)
+        })
     }
 
     pub(crate) fn resolve_head(
@@ -388,6 +465,51 @@ impl ConversationRegistry {
         self.transact(|document| {
             mark_head_needs_selection(document, &canonical_cwd);
             Ok(())
+        })
+    }
+
+    /// Durably opts one workspace out of automatic conversation capture.
+    ///
+    /// The selected profile is validated at the boundary, while pending
+    /// ownership is intentionally checked by canonical workspace regardless
+    /// of profile. An unresolved launch must be reconciled before another
+    /// provider can make that workspace's thread history more ambiguous.
+    pub(crate) fn prepare_untracked(
+        &self,
+        profile_id: &str,
+        canonical_cwd: &Path,
+        mode: LaunchMode,
+    ) -> Result<String, ConversationError> {
+        validate_uuid(profile_id, "profile id")?;
+        if !mode.is_untracked() {
+            return Err(ConversationError::RegistryInvalid(
+                "untracked preparation requires an untracked mode".to_owned(),
+            ));
+        }
+        let canonical_cwd = canonical_path_string(canonical_cwd)?;
+        let launch_id = Uuid::new_v4().to_string();
+        let pending = PendingLaunch {
+            launch_id: launch_id.clone(),
+            profile_id: profile_id.to_owned(),
+            canonical_cwd: canonical_cwd.clone(),
+            mode,
+            codex_version: None,
+            adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+            pre_inventory: Vec::new(),
+            phase: PendingPhase::Prepared,
+            started_at: unix_timestamp()?,
+        };
+        self.transact(|document| {
+            if document
+                .pending_launches
+                .iter()
+                .any(|pending| pending.canonical_cwd == canonical_cwd)
+            {
+                return Err(ConversationError::Ambiguous);
+            }
+            mark_head_needs_selection(document, &canonical_cwd);
+            document.pending_launches.push(pending);
+            Ok(launch_id)
         })
     }
 
@@ -824,12 +946,24 @@ fn validate_document(document: &ConversationDocument) -> Result<(), Conversation
         validate_uuid(&pending.launch_id, "launch id")?;
         validate_uuid(&pending.profile_id, "profile id")?;
         validate_stored_path(&pending.canonical_cwd)?;
-        validate_codex_version(&pending.codex_version)?;
         validate_adapter_version(&pending.adapter_version)?;
         if pending.started_at < 0 || pending.pre_inventory.len() > MAX_INVENTORY_THREADS {
             return Err(ConversationError::RegistryInvalid(
                 "pending launch metadata is out of bounds".to_owned(),
             ));
+        }
+        if pending.mode.is_untracked() {
+            if pending.codex_version.is_some() || !pending.pre_inventory.is_empty() {
+                return Err(ConversationError::RegistryInvalid(
+                    "untracked ownership contains capture metadata".to_owned(),
+                ));
+            }
+        } else {
+            validate_codex_version(pending.codex_version.as_deref().ok_or_else(|| {
+                ConversationError::RegistryInvalid(
+                    "tracked pending launch has no Codex version".to_owned(),
+                )
+            })?)?;
         }
         let mut inventory = pending.pre_inventory.clone();
         normalize_inventory(&mut inventory)?;
@@ -1333,6 +1467,222 @@ mod tests {
             .ok_or_else(|| io::Error::other("cwd ownership change was accepted"))?;
         assert_eq!(cwd_error.code(), "conversation_cwd_mismatch");
         assert_eq!(registry.resolve_head(&workspace)?, original);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_transition_marks_new_and_existing_heads_for_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("untracked-heads")?;
+        let new_workspace = root.join("new-workspace");
+        let existing_workspace = root.join("existing-workspace");
+        fs::DirBuilder::new().mode(0o700).create(&new_workspace)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&existing_workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let profile = Uuid::new_v4();
+        let thread = Uuid::new_v4();
+        registry.adopt(binding(&existing_workspace, profile, thread))?;
+
+        registry.prepare_untracked(
+            &profile.to_string(),
+            &new_workspace,
+            LaunchMode::RunUntracked,
+        )?;
+        registry.prepare_untracked(
+            &profile.to_string(),
+            &existing_workspace,
+            LaunchMode::ResumeLastUntracked,
+        )?;
+
+        for workspace in [&new_workspace, &existing_workspace] {
+            assert_eq!(
+                registry
+                    .resolve_head(workspace)
+                    .err()
+                    .map(|error| error.code()),
+                Some("conversation_ambiguous")
+            );
+        }
+        assert!(
+            registry
+                .find_bound_thread(
+                    &profile.to_string(),
+                    &thread.to_string(),
+                    &existing_workspace
+                )?
+                .is_some(),
+            "untracked mode must retain immutable recovery metadata"
+        );
+        assert!(
+            registry
+                .find_bound_thread(
+                    &profile.to_string(),
+                    &Uuid::new_v4().to_string(),
+                    &new_workspace
+                )?
+                .is_none(),
+            "a new untracked workspace must not invent a binding"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn active_untracked_transition_blocks_exact_head_adoption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("untracked-blocks-adoption")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let untracked_profile = Uuid::new_v4();
+        let exact_profile = Uuid::new_v4();
+
+        let launch_id = registry.prepare_untracked(
+            &untracked_profile.to_string(),
+            &workspace,
+            LaunchMode::RunUntracked,
+        )?;
+        let pending = registry
+            .untracked_for_workspace(&workspace)?
+            .ok_or_else(|| io::Error::other("untracked ownership was not durable"))?;
+        assert_eq!(pending.launch_id, launch_id);
+        assert_eq!(pending.mode, LaunchMode::RunUntracked);
+        assert!(pending.codex_version.is_none());
+        assert!(pending.pre_inventory.is_empty());
+
+        let error = registry
+            .adopt(binding(&workspace, exact_profile, Uuid::new_v4()))
+            .err()
+            .ok_or_else(|| io::Error::other("active untracked launch allowed exact adoption"))?;
+
+        assert_eq!(error.code(), "conversation_ambiguous");
+        assert_eq!(
+            registry
+                .resolve_head(&workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_ambiguous")
+        );
+
+        let _ = registry.finish_launch(&launch_id, LaunchResolution::Ambiguous)?;
+        assert!(registry.untracked_for_workspace(&workspace)?.is_none());
+        let exact_thread = Uuid::new_v4();
+        registry.adopt(binding(&workspace, exact_profile, exact_thread))?;
+        assert_eq!(
+            registry.resolve_head(&workspace)?.thread_id,
+            exact_thread.to_string()
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn completed_untracked_transition_blocks_stale_exact_refresh()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("untracked-blocks-stale-refresh")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let exact_profile = Uuid::new_v4();
+        let exact_thread = Uuid::new_v4();
+        let exact_binding = binding(&workspace, exact_profile, exact_thread);
+        let expected = registry.adopt(exact_binding.clone())?;
+
+        let launch_id = registry.prepare_untracked(
+            &Uuid::new_v4().to_string(),
+            &workspace,
+            LaunchMode::RunUntracked,
+        )?;
+        let _ = registry.finish_launch(&launch_id, LaunchResolution::Ambiguous)?;
+        let error = registry
+            .refresh_adopted(&expected, exact_binding)
+            .err()
+            .ok_or_else(|| io::Error::other("stale exact refresh restored a ready head"))?;
+
+        assert_eq!(error.code(), "conversation_ambiguous");
+        assert_eq!(
+            registry
+                .resolve_head(&workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_ambiguous")
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_transition_refuses_any_pending_launch_in_the_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("untracked-pending")?;
+        let requested_workspace = root.join("requested-workspace");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&requested_workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let pending_profile = Uuid::new_v4();
+        let selected_profile = Uuid::new_v4();
+        let launch_id = registry.begin_launch(
+            &pending_profile.to_string(),
+            &requested_workspace,
+            LaunchMode::Run,
+            "0.144.4",
+            Vec::new(),
+        )?;
+
+        let error = registry
+            .prepare_untracked(
+                &selected_profile.to_string(),
+                &requested_workspace,
+                LaunchMode::RunUntracked,
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("untracked mode ignored a prior pending launch"))?;
+        assert_eq!(error.code(), "conversation_ambiguous");
+        assert!(
+            registry
+                .pending_for(&pending_profile.to_string(), &requested_workspace)?
+                .is_some_and(|pending| pending.launch_id == launch_id)
+        );
+        assert!(
+            registry.load()?.workspace_heads.is_empty(),
+            "refusal must not add a workspace-head mutation"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn uncertain_untracked_transition_never_authorizes_spawn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("untracked-uncertain")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let profile = Uuid::new_v4();
+
+        let error = registry
+            .with_fault(WriteFault::AfterRename)
+            .prepare_untracked(&profile.to_string(), &workspace, LaunchMode::RunUntracked)
+            .err()
+            .ok_or_else(|| io::Error::other("uncertain commit was reported as durable"))?;
+        assert_eq!(error.code(), "conversation_commit_uncertain");
+        assert_eq!(
+            registry
+                .resolve_head(&workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_ambiguous"),
+            "the visible marker must remain fail-closed after uncertain durability"
+        );
 
         fs::remove_dir_all(root)?;
         Ok(())

@@ -39,21 +39,32 @@ const GUARDIAN_START_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const CONTROL_LINE_LIMIT: usize = 128;
 
-pub(crate) fn run_codex(alias: &str, provider_args: &[OsString]) -> Result<ExitStatus, AppError> {
+pub(crate) fn run_codex(
+    alias: &str,
+    untracked: bool,
+    provider_args: &[OsString],
+) -> Result<ExitStatus, AppError> {
     validate_provider_arguments(provider_args)?;
-    spawn_supervisor(alias, InternalProcessMode::Run, None, provider_args)
+    let mode = if untracked {
+        InternalProcessMode::RunUntracked
+    } else {
+        InternalProcessMode::Run
+    };
+    spawn_supervisor(alias, mode, None, provider_args)
 }
 
 pub(crate) fn resume_codex(
     alias: &str,
     session_id: Option<&str>,
+    untracked: bool,
     provider_args: &[OsString],
 ) -> Result<ExitStatus, AppError> {
     validate_provider_arguments(provider_args)?;
-    let mode = if session_id.is_some() {
-        InternalProcessMode::ResumeExact
-    } else {
-        InternalProcessMode::ResumeLast
+    let mode = match (session_id, untracked) {
+        (Some(_), false) => InternalProcessMode::ResumeExact,
+        (None, false) => InternalProcessMode::ResumeLast,
+        (None, true) => InternalProcessMode::ResumeLastUntracked,
+        (Some(_), true) => return Err(AppError::ProviderArgumentRejected),
     };
     spawn_supervisor(alias, mode, session_id, provider_args)
 }
@@ -122,7 +133,9 @@ fn spawn_supervisor(
         .arg(format!("codex@{alias}"))
         .arg(match mode {
             InternalProcessMode::Run => "run",
+            InternalProcessMode::RunUntracked => "run-untracked",
             InternalProcessMode::ResumeLast => "resume-last",
+            InternalProcessMode::ResumeLastUntracked => "resume-last-untracked",
             InternalProcessMode::ResumeExact => "resume-exact",
             InternalProcessMode::ResumeHead => "resume-head",
         });
@@ -207,6 +220,12 @@ pub(crate) fn supervise_codex(
 
     #[cfg(not(unix))]
     {
+        if matches!(
+            mode,
+            InternalProcessMode::RunUntracked | InternalProcessMode::ResumeLastUntracked
+        ) {
+            return Err(crate::profiles::ProfileError::UnsupportedPlatform.into());
+        }
         let executable = resolve_codex()?;
         let registry = Registry::discover()?;
         let profile = registry.find(Provider::Codex, alias)?;
@@ -355,8 +374,10 @@ fn provider_arguments(
 ) -> Result<Vec<OsString>, AppError> {
     let mut arguments = Vec::new();
     match (mode, session_id) {
-        (InternalProcessMode::Run, None) => arguments.extend(provider_args.iter().cloned()),
-        (InternalProcessMode::ResumeLast, None) => {
+        (InternalProcessMode::Run | InternalProcessMode::RunUntracked, None) => {
+            arguments.extend(provider_args.iter().cloned());
+        }
+        (InternalProcessMode::ResumeLast | InternalProcessMode::ResumeLastUntracked, None) => {
             arguments.push(OsString::from("resume"));
             arguments.push(OsString::from("--last"));
             arguments.extend(provider_args.iter().cloned());
@@ -398,7 +419,9 @@ fn spawn_provider_guardian(
         .arg(run_id.to_string())
         .arg(match mode {
             InternalProcessMode::Run => "run",
+            InternalProcessMode::RunUntracked => "run-untracked",
             InternalProcessMode::ResumeLast => "resume-last",
+            InternalProcessMode::ResumeLastUntracked => "resume-last-untracked",
             InternalProcessMode::ResumeExact => "resume-exact",
             InternalProcessMode::ResumeHead => "resume-head",
         });
@@ -821,6 +844,7 @@ mod tests {
     fn permits_arguments_that_do_not_select_an_account_or_provider() {
         let arguments = [
             OsString::from("--no-alt-screen"),
+            OsString::from("--untracked"),
             OsString::from("--sandbox"),
             OsString::from("workspace-write"),
         ];

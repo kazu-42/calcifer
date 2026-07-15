@@ -34,6 +34,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Same-profile lifetime lease; different profiles may run concurrently
 - [x] Same-profile `resume` by exact thread ID or official `--last`
 - [x] Automatic same-profile `{profile_id, cwd, thread_id}` capture, crash reconciliation, and exact cold restore
+- [x] Explicit fail-closed `--untracked` escape hatch with durable manual-recovery state
 
 ## Phase 3: usage observations
 
