@@ -454,7 +454,7 @@ class Publisher:
             raise ValueError("tag ref object is invalid")
         raw_digest = ref_object.get("sha")
         ref_type = ref_object.get("type")
-        if raw_digest != bundle.tag_ref_digest or ref_type not in ("tag", "commit"):
+        if raw_digest != bundle.tag_ref_digest or ref_type != "tag":
             raise ValueError("live raw tag ref does not match the attested manifest")
         tagged_commit = self.client.tagged_commit(bundle.tag)
         if tagged_commit != bundle.source_commit:
