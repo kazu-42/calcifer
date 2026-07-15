@@ -42,6 +42,11 @@ ZIP_CREATE_SYSTEM = 3
 ZIP_CREATE_VERSION = 20
 ZIP_EXTRACT_VERSION = 20
 ZIP_FLAGS = 0
+USTAR_NAME_BYTES = 100
+USTAR_PREFIX_BYTES = 155
+USTAR_HEADER_BYTES = 512
+USTAR_CHECKSUM_OFFSET = 148
+USTAR_CHECKSUM_BYTES = 8
 
 SEMVER_PATTERN = re.compile(
     r"^(0|[1-9][0-9]*)\."
@@ -208,6 +213,91 @@ def _expected_zip_external_attr(
     return (stat.S_IFREG | mode) << 16
 
 
+def _ustar_string(value: str, width: int) -> bytes:
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("release tar archive has a noncanonical USTAR header") from error
+    if len(encoded) > width:
+        raise ValueError("release tar archive has a noncanonical USTAR header")
+    return encoded.ljust(width, b"\0")
+
+
+def _ustar_octal(value: int, width: int) -> bytes:
+    if value < 0 or value >= 8 ** (width - 1):
+        raise ValueError("release tar archive has a noncanonical USTAR header")
+    return f"{value:0{width - 1}o}\0".encode("ascii")
+
+
+def _split_ustar_name(name: str) -> tuple[str, str]:
+    try:
+        encoded = name.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("release tar archive has a noncanonical USTAR header") from error
+    if len(encoded) <= USTAR_NAME_BYTES:
+        return name, ""
+
+    components = name.split("/")
+    for index in range(1, len(components)):
+        prefix = "/".join(components[:index])
+        suffix = "/".join(components[index:])
+        if (
+            len(prefix.encode("ascii")) <= USTAR_PREFIX_BYTES
+            and len(suffix.encode("ascii")) <= USTAR_NAME_BYTES
+        ):
+            return suffix, prefix
+    raise ValueError("release tar archive has a noncanonical USTAR header")
+
+
+def _canonical_ustar_header(
+    *,
+    name: str,
+    size: int,
+    mode: int,
+    entry_type: bytes,
+) -> bytes:
+    """Build the byte-level USTAR contract without using tarfile's writer."""
+
+    name_field, prefix_field = _split_ustar_name(name)
+    header = bytearray(USTAR_HEADER_BYTES)
+    header[0:100] = _ustar_string(name_field, 100)
+    header[100:108] = _ustar_octal(mode, 8)
+    header[108:116] = _ustar_octal(0, 8)
+    header[116:124] = _ustar_octal(0, 8)
+    header[124:136] = _ustar_octal(size, 12)
+    header[136:148] = _ustar_octal(0, 12)
+    header[USTAR_CHECKSUM_OFFSET : USTAR_CHECKSUM_OFFSET + USTAR_CHECKSUM_BYTES] = (
+        b" " * USTAR_CHECKSUM_BYTES
+    )
+    header[156:157] = entry_type
+    header[157:257] = b"\0" * 100
+    header[257:265] = b"ustar\x0000"
+    header[265:297] = b"\0" * 32
+    header[297:329] = b"\0" * 32
+    header[329:337] = b"\0" * 8
+    header[337:345] = b"\0" * 8
+    header[345:500] = _ustar_string(prefix_field, 155)
+    header[500:512] = b"\0" * 12
+
+    checksum = sum(header)
+    header[USTAR_CHECKSUM_OFFSET : USTAR_CHECKSUM_OFFSET + USTAR_CHECKSUM_BYTES] = (
+        f"{checksum:06o}\0 ".encode("ascii")
+    )
+    return bytes(header)
+
+
+def _read_exact_at(stream: BinaryIO, offset: int, length: int) -> bytes:
+    previous_offset = stream.tell()
+    try:
+        stream.seek(offset)
+        value = stream.read(length)
+    finally:
+        stream.seek(previous_offset)
+    if len(value) != length:
+        raise ValueError("release tar archive is invalid")
+    return value
+
+
 def _expand_canonical_gzip(path: Path, expanded: BinaryIO) -> int:
     """Expand exactly one packager-format gzip member under the tar size bound."""
 
@@ -329,9 +419,46 @@ def _inspect_tar(path: Path, version: str, target: str) -> tuple[str, str]:
                         raise ValueError(
                             "release tar archive has noncanonical tar metadata"
                         )
+                    if member.size < 0:
+                        raise ValueError("release archive entry has an invalid size")
+
+                    expected_header = _canonical_ustar_header(
+                        name=(
+                            f"{expected_order[index]}/"
+                            if expected_type == tarfile.DIRTYPE
+                            else expected_order[index]
+                        ),
+                        size=member.size,
+                        mode=expected_mode,
+                        entry_type=expected_type,
+                    )
+                    actual_header = _read_exact_at(
+                        expanded,
+                        member.offset,
+                        USTAR_HEADER_BYTES,
+                    )
+                    if actual_header != expected_header:
+                        raise ValueError(
+                            "release tar archive has a noncanonical USTAR header"
+                        )
+
+                    padding_start = member.offset_data + member.size
+                    padding_end = member.offset_data + (
+                        (member.size + tarfile.BLOCKSIZE - 1)
+                        // tarfile.BLOCKSIZE
+                        * tarfile.BLOCKSIZE
+                    )
+                    if any(
+                        _read_exact_at(
+                            expanded,
+                            padding_start,
+                            padding_end - padding_start,
+                        )
+                    ):
+                        raise ValueError(
+                            "release tar archive has noncanonical tar padding"
+                        )
                     if member.isreg():
-                        if member.size < 0:
-                            raise ValueError("release archive entry has an invalid size")
                         content_bytes += member.size
                         if content_bytes > MAX_ARCHIVE_CONTENT_BYTES:
                             raise ValueError("release archive expands beyond the size limit")

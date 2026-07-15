@@ -234,19 +234,17 @@ class ReleaseManifestTests(unittest.TestCase):
                         else:
                             destination.addfile(member, io.BytesIO(contents))
 
-    def _patch_tar_binary_numeric_field(self, offset: int, value: int) -> None:
+    def _rewrite_linux_tar_expanded(
+        self,
+        mutate: Callable[[bytearray, tarfile.TarInfo], None],
+    ) -> None:
         archive_path = self._linux_archive()
         expanded = bytearray(gzip.decompress(archive_path.read_bytes()))
-        header_offset = tarfile.BLOCKSIZE
-        expanded[header_offset + offset : header_offset + offset + 8] = (
-            f"{value:07o}\0".encode("ascii")
-        )
-        checksum_offset = header_offset + 148
-        expanded[checksum_offset : checksum_offset + 8] = b"        "
-        checksum = sum(expanded[header_offset : header_offset + tarfile.BLOCKSIZE])
-        expanded[checksum_offset : checksum_offset + 8] = (
-            f"{checksum:06o}\0 ".encode("ascii")
-        )
+        with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as archive:
+            binary = next(
+                member for member in archive if member.name.endswith("/calcifer")
+            )
+        mutate(expanded, binary)
 
         encoded = io.BytesIO()
         with gzip.GzipFile(
@@ -257,6 +255,39 @@ class ReleaseManifestTests(unittest.TestCase):
         ) as compressed:
             compressed.write(expanded)
         archive_path.write_bytes(encoded.getvalue())
+
+    @staticmethod
+    def _recalculate_tar_header_checksum(
+        expanded: bytearray,
+        header_offset: int,
+    ) -> None:
+        checksum_offset = header_offset + 148
+        expanded[checksum_offset : checksum_offset + 8] = b"        "
+        checksum = sum(expanded[header_offset : header_offset + tarfile.BLOCKSIZE])
+        expanded[checksum_offset : checksum_offset + 8] = (
+            f"{checksum:06o}\0 ".encode("ascii")
+        )
+
+    def _patch_tar_binary_header_field(
+        self,
+        offset: int,
+        contents: bytes,
+        *,
+        recalculate_checksum: bool = True,
+    ) -> None:
+        def mutate(expanded: bytearray, binary: tarfile.TarInfo) -> None:
+            start = binary.offset + offset
+            expanded[start : start + len(contents)] = contents
+            if recalculate_checksum:
+                self._recalculate_tar_header_checksum(expanded, binary.offset)
+
+        self._rewrite_linux_tar_expanded(mutate)
+
+    def _patch_tar_binary_numeric_field(self, offset: int, value: int) -> None:
+        self._patch_tar_binary_header_field(
+            offset,
+            f"{value:07o}\0".encode("ascii"),
+        )
 
     def test_builds_canonical_manifest_for_all_supported_targets(self) -> None:
         first = self.build_manifest(
@@ -361,6 +392,32 @@ class ReleaseManifestTests(unittest.TestCase):
         )
 
         self.assertEqual(document["release_channel"], "stable")
+
+    def test_accepts_canonical_ustar_prefix_splitting(self) -> None:
+        version = f"1.2.3-{'a' * 56}"
+        prefixed_dist = self.root / "prefixed-dist"
+        prefixed_dist.mkdir()
+        for target in TARGETS:
+            binary = self.root / f"prefixed-{target}"
+            binary.write_bytes(target.encode())
+            binary.chmod(0o755)
+            package_release.build_archive(
+                project_root=self.project,
+                binary=binary,
+                output_dir=prefixed_dist,
+                target=target,
+                version=version,
+            )
+
+        document = json.loads(
+            self.build_manifest(
+                dist=prefixed_dist,
+                version=version,
+                source_commit=self.source_commit,
+            )
+        )
+
+        self.assertEqual(document["version"], version)
 
     def test_rejects_missing_or_unexpected_bundle_entries(self) -> None:
         next(self.dist.glob("*aarch64-apple-darwin.tar.gz")).unlink()
@@ -735,6 +792,131 @@ class ReleaseManifestTests(unittest.TestCase):
                 self._linux_archive().write_bytes(original)
                 self._patch_tar_binary_numeric_field(offset, 1)
                 self._assert_bundle_rejected("canonical tar metadata")
+
+    def test_rejects_equivalent_noncanonical_ustar_header_encodings(self) -> None:
+        archive = self._linux_archive()
+        original = archive.read_bytes()
+        expanded = gzip.decompress(original)
+        with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as release_tar:
+            binary = next(
+                member
+                for member in release_tar
+                if member.name.endswith("/calcifer")
+            )
+        checksum = int(
+            expanded[binary.offset + 148 : binary.offset + 154].decode("ascii"),
+            8,
+        )
+        cases = (
+            ("leading-space octal mode", 100, b"   0755\0", True),
+            ("space-terminated octal mode", 100, b"0000755 ", True),
+            (
+                "GNU base-256 mode",
+                100,
+                b"\x80" + (0o755).to_bytes(7, "big"),
+                True,
+            ),
+            (
+                "space-leading checksum",
+                148,
+                f"{checksum:6o}\0 ".encode("ascii"),
+                False,
+            ),
+        )
+        for label, offset, contents, recalculate_checksum in cases:
+            with self.subTest(label=label):
+                archive.write_bytes(original)
+                self._patch_tar_binary_header_field(
+                    offset,
+                    contents,
+                    recalculate_checksum=recalculate_checksum,
+                )
+                with tarfile.open(archive, "r:gz") as readable:
+                    self.assertEqual(readable.getmember(binary.name).mode, 0o755)
+                self._assert_bundle_rejected("canonical USTAR header")
+
+    def test_rejects_nonzero_ustar_header_padding(self) -> None:
+        archive = self._linux_archive()
+        original = archive.read_bytes()
+        expanded = gzip.decompress(original)
+        with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as release_tar:
+            binary = next(
+                member
+                for member in release_tar
+                if member.name.endswith("/calcifer")
+            )
+        cases = (
+            ("name field after NUL", len(binary.name) + 1),
+            ("empty prefix field after NUL", 346),
+            ("USTAR reserved padding", 500),
+        )
+        for label, offset in cases:
+            with self.subTest(label=label):
+                archive.write_bytes(original)
+                self._patch_tar_binary_header_field(offset, b"x")
+                with tarfile.open(archive, "r:gz") as readable:
+                    self.assertEqual(readable.getmember(binary.name).name, binary.name)
+                self._assert_bundle_rejected("canonical USTAR header")
+
+    def test_rejects_nonzero_tar_payload_padding(self) -> None:
+        archive = self._linux_archive()
+        original_payload: bytes | None = None
+
+        def mutate(expanded: bytearray, binary: tarfile.TarInfo) -> None:
+            nonlocal original_payload
+            original_payload = bytes(
+                expanded[binary.offset_data : binary.offset_data + binary.size]
+            )
+            padding_offset = binary.offset_data + binary.size
+            self.assertLess(
+                padding_offset,
+                binary.offset_data
+                + (
+                    (binary.size + tarfile.BLOCKSIZE - 1)
+                    // tarfile.BLOCKSIZE
+                    * tarfile.BLOCKSIZE
+                ),
+            )
+            expanded[padding_offset] = 1
+
+        self._rewrite_linux_tar_expanded(mutate)
+        with tarfile.open(archive, "r:gz") as readable:
+            binary = next(
+                member for member in readable if member.name.endswith("/calcifer")
+            )
+            extracted = readable.extractfile(binary)
+            self.assertIsNotNone(extracted)
+            self.assertEqual(extracted.read(), original_payload)
+
+        self._assert_bundle_rejected("canonical tar padding")
+
+    def test_rejects_nonzero_tar_end_blocks_and_record_padding(self) -> None:
+        archive = self._linux_archive()
+        original = archive.read_bytes()
+        expanded = gzip.decompress(original)
+        with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as release_tar:
+            for _ in release_tar:
+                pass
+            logical_end = release_tar.offset
+        cases = (
+            ("end block", logical_end),
+            ("record padding", logical_end + (2 * tarfile.BLOCKSIZE)),
+        )
+        for label, offset in cases:
+            with self.subTest(label=label):
+                archive.write_bytes(original)
+
+                def mutate(
+                    payload: bytearray,
+                    _: tarfile.TarInfo,
+                    *,
+                    mutation_offset: int = offset,
+                ) -> None:
+                    self.assertLess(mutation_offset, len(payload))
+                    payload[mutation_offset] = 1
+
+                self._rewrite_linux_tar_expanded(mutate)
+                self._assert_bundle_rejected("invalid trailing data")
 
     def test_rejects_noncanonical_gzip_header(self) -> None:
         archive = self._linux_archive()
