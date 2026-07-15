@@ -48,10 +48,11 @@ user mitigation, maintainers use this order:
    disclosure plan.
 2. Reproduce and validate the impact, identify affected versions, implement the
    smallest complete fix, and test both the exploit boundary and regressions.
-3. Add the intended patched version to the draft advisory and publish that
+3. Add the intended patched version to the draft advisory and stage that
    patched release through the normal reviewed, tag-driven release workflow.
-   Confirm its checksums, artifact attestations, immutable release attestation,
-   and install smoke test.
+   Use the documented maintainer-local preflight and explicit publish command,
+   then confirm its checksums, artifact attestations, immutable release
+   attestation, and install smoke test.
 4. Publish the advisory immediately after the patched release is verified so
    users receive the impact, affected range, fixed version, and mitigations
    together. Requesting a CVE can be coordinated in the advisory but must not

@@ -47,6 +47,7 @@ class VerifyReleaseTests(unittest.TestCase):
             output=self.dist / release_manifest.MANIFEST_NAME,
             version=self.version,
             source_commit=self.source_commit,
+            tag_ref_digest=self.tag_ref_digest,
         )
         self.write_checksums()
 
@@ -117,6 +118,7 @@ class VerifyReleaseTests(unittest.TestCase):
             dist=self.dist,
             version=self.version,
             source_commit=self.source_commit,
+            tag_ref_digest=self.tag_ref_digest,
             expected_prerelease=True,
             stage=stage,
         )
@@ -128,6 +130,7 @@ class VerifyReleaseTests(unittest.TestCase):
             dist=self.dist,
             version=self.version,
             source_commit=self.source_commit,
+            tag_ref_digest=self.tag_ref_digest,
         )
 
     def test_rejects_semantically_invalid_manifest_with_matching_checksums(self) -> None:
@@ -162,6 +165,7 @@ class VerifyReleaseTests(unittest.TestCase):
                 dist=self.dist,
                 version=self.version,
                 source_commit="f" * 40,
+                tag_ref_digest=self.tag_ref_digest,
                 expected_prerelease=True,
                 stage="draft",
             )
@@ -189,6 +193,7 @@ class VerifyReleaseTests(unittest.TestCase):
                 dist=self.dist,
                 version=self.version,
                 source_commit=self.source_commit,
+                tag_ref_digest=self.tag_ref_digest,
             )
 
     def test_accepts_exact_release_attestation_subjects(self) -> None:

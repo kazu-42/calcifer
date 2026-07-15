@@ -485,11 +485,14 @@ def _build_manifest(
     dist: Path,
     version: str,
     source_commit: str,
+    tag_ref_digest: str,
     metadata_names: frozenset[str],
 ) -> bytes:
     channel = release_channel(version)
     if SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise ValueError("source commit must be a lowercase 40-character Git SHA")
+    if SOURCE_COMMIT_PATTERN.fullmatch(tag_ref_digest) is None:
+        raise ValueError("tag ref digest must be a lowercase 40-character Git SHA")
     if dist.is_symlink() or not dist.is_dir():
         raise ValueError("release bundle directory must be a regular directory")
     dist = dist.resolve(strict=True)
@@ -521,6 +524,7 @@ def _build_manifest(
         "version": version,
         "tag": f"v{version}",
         "source_commit": source_commit,
+        "tag_ref_digest": tag_ref_digest,
         "release_channel": channel,
         "targets": [
             _target_descriptor(dist, version, target) for target in SUPPORTED_TARGETS
@@ -556,18 +560,31 @@ def _build_manifest(
     return encoded
 
 
-def build_manifest(*, dist: Path, version: str, source_commit: str) -> bytes:
+def build_manifest(
+    *,
+    dist: Path,
+    version: str,
+    source_commit: str,
+    tag_ref_digest: str,
+) -> bytes:
     """Return the canonical manifest after strictly validating every archive."""
 
     return _build_manifest(
         dist=dist,
         version=version,
         source_commit=source_commit,
+        tag_ref_digest=tag_ref_digest,
         metadata_names=frozenset({MANIFEST_NAME}),
     )
 
 
-def validate_manifest(*, dist: Path, version: str, source_commit: str) -> bytes:
+def validate_manifest(
+    *,
+    dist: Path,
+    version: str,
+    source_commit: str,
+    tag_ref_digest: str,
+) -> bytes:
     """Rebuild and compare a published bundle manifest byte for byte."""
 
     if dist.is_symlink() or not dist.is_dir():
@@ -585,6 +602,7 @@ def validate_manifest(*, dist: Path, version: str, source_commit: str) -> bytes:
         dist=dist,
         version=version,
         source_commit=source_commit,
+        tag_ref_digest=tag_ref_digest,
         metadata_names=frozenset({MANIFEST_NAME, CHECKSUM_NAME}),
     )
     if actual != expected:
@@ -600,6 +618,7 @@ def write_manifest(
     output: Path,
     version: str,
     source_commit: str,
+    tag_ref_digest: str,
 ) -> Path:
     """Atomically write the canonical manifest inside the validated bundle."""
 
@@ -614,6 +633,7 @@ def write_manifest(
         dist=dist,
         version=version,
         source_commit=source_commit,
+        tag_ref_digest=tag_ref_digest,
     )
 
     descriptor, temporary_name = tempfile.mkstemp(
@@ -646,6 +666,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--tag-ref-digest", required=True)
     arguments = parser.parse_args()
 
     try:
@@ -654,6 +675,7 @@ def main() -> int:
             output=arguments.output,
             version=arguments.version,
             source_commit=arguments.source_commit,
+            tag_ref_digest=arguments.tag_ref_digest,
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))

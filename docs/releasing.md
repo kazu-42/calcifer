@@ -1,19 +1,23 @@
 # Releasing Calcifer
 
-Calcifer publishes pre-alpha binaries through a tag-driven GitHub Actions
-workflow. A manual workflow run is always a dry run: only a matching version
-tag **push event** can enter the publish job, even when manual dispatch selects a
-tag ref.
+Calcifer builds and stages pre-alpha binaries through a tag-driven GitHub
+Actions workflow. The tag workflow deliberately stops at a verified draft. A
+maintainer publishes that exact draft with a local, read-first command after
+checking repository administration controls with the maintainer's existing
+`gh` login. No administration token is stored in Actions.
+
+A manual workflow run is always a build-only dry run. Only a matching version
+tag **push event** can enter the draft-staging job, even when manual dispatch
+selects a tag ref.
 
 ## Release guarantees
 
 The release workflow enforces these boundaries:
 
 - The tag must exactly match the Calcifer version in `Cargo.toml`.
-- Tag-triggered publication is restricted to the canonical
+- Tag-triggered draft staging is restricted to the canonical
   `kazu-42/calcifer` repository; a fork or repository transfer fails before
-  building a public release until the manifest contract is deliberately
-  updated.
+  writing a GitHub Release until the manifest contract is deliberately updated.
 - The tagged commit must be reachable from `main`.
 - The five branch-protection checks must have completed successfully for the
   tagged commit.
@@ -25,24 +29,31 @@ The release workflow enforces these boundaries:
 - Archive names and archive metadata are deterministic. A canonical versioned
   manifest records the archive and in-archive binary SHA-256 for every target,
   and `SHA256SUMS` covers all five archives plus that manifest.
-- Before any write to a GitHub Release, the privileged job independently
+- Before any write to a GitHub Release draft, the privileged job independently
   rebuilds the canonical manifest, validates every archive body and checksum,
-  and verifies its expected `source_commit`.
-- The publish job mints and verifies GitHub artifact attestations over the exact
-  assembled release assets. These are release-workflow attestations, not
+  and verifies its expected peeled `source_commit` and raw `tag_ref_digest`.
+- The draft-staging job mints and verifies GitHub artifact attestations over the
+  exact assembled release assets. These are release-workflow attestations, not
   separate statements emitted by each native build job.
 - The workflow creates a draft, uploads every asset, and compares the GitHub
-  API name, size, upload state, and SHA-256 readback with the local bundle.
-- Only an exact draft is published. The workflow then requires an immutable
-  repository-setting preflight before publication, requires an immutable API
-  readback afterward, and verifies that the release attestation binds the exact
-  asset set, tag, and pinned raw tag-ref digest before verifying every local
-  asset. For the documented annotated tags, the raw tag-object SHA is distinct
-  from the peeled source commit; the workflow pins and rechecks both.
+  List releases API name, size, upload state, and SHA-256 readback with the
+  local bundle. A green tag workflow means "draft ready", not "published".
+- `scripts/publish_release.py` is read-only by default. It rejects environment
+  token or host redirection, requires public GitHub and the canonical repo,
+  checks immutable releases and ruleset 18956764 with admin read access,
+  completely and boundedly lists push-visible releases, and re-verifies the
+  pinned tag, exact draft bytes, and every assembled-artifact attestation.
+- Explicit `--publish` repeats those checks immediately before issuing one
+  numeric release-ID `PATCH`. It never retries that write. Read-only
+  reconciliation then requires an immutable API readback, exact release
+  attestation, and every asset attestation.
+- For documented annotated tags, the raw tag-object SHA is distinct from the
+  peeled source commit. Both values are pinned in the artifact-attested
+  manifest and rechecked immediately before publication.
 - The active [Immutable release tags ruleset](https://github.com/kazu-42/calcifer/rules/18956764)
   has no bypass actors and blocks updates and deletions for every `v*` tag. The
-  workflow also verifies both the raw tag ref and peeled commit immediately
-  before draft creation and again immediately before publication.
+  workflow verifies both values before draft creation; the local publisher
+  repeats them before publication.
 - A workflow rerun refuses to replace an existing GitHub Release.
 
 This is a reproducible release *process*. Calcifer does not yet claim that Rust
@@ -106,36 +117,55 @@ Makefile also run the release matrix without any write or OIDC permissions.
    git push origin "refs/tags/v${version}"
    ```
 
-5. Watch the tag-triggered workflow and inspect the published pre-release:
+5. Watch the tag-triggered workflow. Its final job must be
+   **Stage draft GitHub Release**; no public release exists yet:
 
    ```console
-   gh run list --repo kazu-42/calcifer --workflow release.yml --limit 5
-   gh release view "v${version}" --repo kazu-42/calcifer
+   run_id="$(gh run list --repo kazu-42/calcifer --workflow release.yml \
+     --event push --limit 1 --json databaseId --jq '.[0].databaseId')"
+   gh run watch "$run_id" --repo kazu-42/calcifer --exit-status
    ```
 
-6. Download the assets into a clean directory and verify the release
-   attestation, every checksum, and every asset attestation:
+6. From the reviewed repository checkout, download that run's attested bundle
+   into a new directory. Ensure `GH_TOKEN` and `GITHUB_TOKEN` are unset so `gh`
+   uses the maintainer's keyring login. Run the read-only preflight first, review
+   its repo/tag/commit/release-ID/asset-count summary, then explicitly publish:
 
    ```console
-   gh release download "v${version}" --repo kazu-42/calcifer
-   sha256sum --check SHA256SUMS
-   gh release verify "v${version}" --repo kazu-42/calcifer
-   source_commit="$(gh api \
-     "repos/kazu-42/calcifer/commits/v${version}" --jq .sha)"
-   for asset in calcifer-* SHA256SUMS; do
-     gh attestation verify "$asset" \
-       --repo kazu-42/calcifer \
-       --signer-workflow kazu-42/calcifer/.github/workflows/release.yml \
-       --source-ref "refs/tags/v${version}" \
-       --source-digest "$source_commit" \
-       --deny-self-hosted-runners
-     gh release verify-asset "v${version}" "$asset" --repo kazu-42/calcifer
-   done
+   release_dir="$(mktemp -d)"
+   gh run download "$run_id" --repo kazu-42/calcifer \
+     --name release-bundle --dir "$release_dir"
+   unset GH_TOKEN GITHUB_TOKEN
+   gh auth status --hostname github.com
+   python3 scripts/publish_release.py \
+     --dist "$release_dir" --tag "v${version}"
+   python3 scripts/publish_release.py \
+     --dist "$release_dir" --tag "v${version}" --publish
    ```
 
-   On macOS, use `shasum -a 256 -c SHA256SUMS` for the checksum step.
+   The second command performs exactly one draft-to-published write and returns
+   success only after immutable release and per-asset attestations verify. For a
+   stable version it marks the release latest; prereleases are never latest.
 
-7. Install one artifact on a clean supported host and run:
+7. As an independent readback, download the now-public assets into another
+   clean directory and check `SHA256SUMS`. On macOS use
+   `shasum -a 256 -c SHA256SUMS`; elsewhere use
+   `sha256sum --check SHA256SUMS`.
+
+   ```console
+   verify_dir="$(mktemp -d)"
+   gh release download "v${version}" --repo github.com/kazu-42/calcifer \
+     --dir "$verify_dir"
+   (cd "$verify_dir" && \
+     if command -v sha256sum >/dev/null; then \
+       sha256sum --check SHA256SUMS; \
+     else \
+       shasum -a 256 -c SHA256SUMS; \
+     fi)
+   gh release verify "v${version}" --repo github.com/kazu-42/calcifer
+   ```
+
+8. Install one artifact on a clean supported host and run:
 
    ```console
    calcifer --version
@@ -143,25 +173,45 @@ Makefile also run the release matrix without any write or OIDC permissions.
    calcifer --json doctor
    ```
 
-8. Only after a fixed release exists, update any corresponding draft security
+9. Only after a fixed release exists, update any corresponding draft security
    advisory with the patched version. Publishing an advisory remains a separate
    deliberate action.
 
 ## Failure and recovery boundaries
 
-The draft is intentionally the only mutable phase. If upload, draft readback,
-or the live immutable-release setting preflight fails, the workflow stops
-without publishing. It also refuses to reuse that existing draft on a rerun. A
-maintainer must inspect the failure, delete only the unpublished draft after
-confirming that no valid release exists, and then rerun from the unchanged
-reviewed tag.
+The draft is intentionally the only mutable phase. If upload or draft readback
+fails, the workflow stops without publishing. It also refuses to reuse an
+existing draft on rerun. A maintainer must inspect the failed run and the
+push-visible release list, delete only the unpublished draft after confirming
+its exact numeric ID and that no public release exists, then rerun from the
+unchanged reviewed tag.
+
+A failed local preflight performs no write. Correct the repository setting,
+ruleset, authentication, bundle, or tag problem and run the read-only command
+again. Do not work around a failure with `GH_TOKEN`, `GITHUB_TOKEN`, a PAT
+stored in Actions, or a different GitHub host.
+
+The publication `PATCH` is never retried, including after a timeout. The command
+uses read-only List releases reconciliation against the same tag and numeric
+release ID:
+
+- If the exact draft remains unpublished through the deadline, inspect it and
+  then the full preflight may be run again.
+- If the exact release is immutable, the command verifies release and asset
+  attestations and succeeds even when the original write returned an error.
+- A transient public-but-not-yet-immutable readback is polled read-only. If it
+  persists through the deadline, treat it as a critical release incident; do
+  not publish, edit, delete, or rerun blindly.
+- If GitHub cannot provide a conclusive readback, the state is unknown. Inspect
+  the exact release ID manually before any retry.
 
 After publication, the release and tag are immutable. A failed post-publication
-readback can be retried manually with `gh release verify` and
-`gh release verify-asset`; it never authorizes changing an asset. If the
-published bytes are wrong, ship a higher version. If the release is part of a
-security incident, remove the release through the documented incident process,
-record why, and never reuse its tag name or version.
+attestation check can be retried by running the default publisher command: an
+already immutable release enters verification-only mode and issues no `PATCH`.
+It never authorizes changing an asset. If the published bytes are wrong, ship a
+higher version. If the release is part of a security incident, remove it
+through the documented incident process, record why, and never reuse its tag
+name or version.
 
 ## Release-tag protection and emergency removal
 

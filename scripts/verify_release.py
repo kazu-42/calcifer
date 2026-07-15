@@ -50,6 +50,7 @@ def verify_local_bundle(
     dist: Path,
     version: str,
     source_commit: str,
+    tag_ref_digest: str,
 ) -> dict[str, tuple[int, str]]:
     """Validate every local release byte and the canonical manifest semantics."""
 
@@ -89,6 +90,7 @@ def verify_local_bundle(
         dist=dist,
         version=version,
         source_commit=source_commit,
+        tag_ref_digest=tag_ref_digest,
     )
     return local
 
@@ -168,42 +170,28 @@ def _required_boolean(release: dict[str, object], field: str) -> bool:
     return value
 
 
-def verify_release(
+def verify_release_assets(
     *,
     release: dict[str, object],
     dist: Path,
     version: str,
     source_commit: str,
+    tag_ref_digest: str,
     expected_prerelease: bool,
-    stage: str,
 ) -> None:
-    """Validate lifecycle state and every uploaded asset against local bytes."""
+    """Validate release identity and every uploaded asset against local bytes."""
 
-    if stage not in STAGES:
-        raise ValueError("release verification stage must be draft or published")
     local = verify_local_bundle(
         dist=dist,
         version=version,
         source_commit=source_commit,
+        tag_ref_digest=tag_ref_digest,
     )
     expected_tag = f"v{version}"
     if release.get("tag_name") != expected_tag:
         raise ValueError("release tag does not match the package version")
     if _required_boolean(release, "prerelease") is not expected_prerelease:
         raise ValueError("release prerelease state does not match the version channel")
-
-    expected_draft = stage == "draft"
-    expected_immutable = stage == "published"
-    if _required_boolean(release, "draft") is not expected_draft:
-        raise ValueError(f"release draft state does not match the {stage} stage")
-    if _required_boolean(release, "immutable") is not expected_immutable:
-        raise ValueError(f"release immutable state does not match the {stage} stage")
-
-    published_at = release.get("published_at")
-    if expected_draft and published_at is not None:
-        raise ValueError("draft release must not have a publication timestamp")
-    if not expected_draft and (not isinstance(published_at, str) or not published_at):
-        raise ValueError("published release must have a publication timestamp")
 
     assets = release.get("assets")
     if not isinstance(assets, list):
@@ -237,6 +225,42 @@ def verify_release(
             raise ValueError(f"release asset digest does not match local bytes: {name}")
 
 
+def verify_release(
+    *,
+    release: dict[str, object],
+    dist: Path,
+    version: str,
+    source_commit: str,
+    tag_ref_digest: str,
+    expected_prerelease: bool,
+    stage: str,
+) -> None:
+    """Validate lifecycle state and every uploaded asset against local bytes."""
+
+    if stage not in STAGES:
+        raise ValueError("release verification stage must be draft or published")
+    verify_release_assets(
+        release=release,
+        dist=dist,
+        version=version,
+        source_commit=source_commit,
+        tag_ref_digest=tag_ref_digest,
+        expected_prerelease=expected_prerelease,
+    )
+    expected_draft = stage == "draft"
+    expected_immutable = stage == "published"
+    if _required_boolean(release, "draft") is not expected_draft:
+        raise ValueError(f"release draft state does not match the {stage} stage")
+    if _required_boolean(release, "immutable") is not expected_immutable:
+        raise ValueError(f"release immutable state does not match the {stage} stage")
+
+    published_at = release.get("published_at")
+    if expected_draft and published_at is not None:
+        raise ValueError("draft release must not have a publication timestamp")
+    if not expected_draft and (not isinstance(published_at, str) or not published_at):
+        raise ValueError("published release must have a publication timestamp")
+
+
 def verify_release_attestation(
     *,
     attestation: dict[str, object],
@@ -253,6 +277,7 @@ def verify_release_attestation(
         dist=dist,
         version=version,
         source_commit=source_commit,
+        tag_ref_digest=tag_ref_digest,
     )
     verification = attestation.get("verificationResult")
     if not isinstance(verification, dict):
@@ -379,16 +404,18 @@ def main() -> int:
                     arguments.release_json,
                     arguments.expected_prerelease,
                     arguments.stage,
-                    arguments.tag_ref_digest,
                 )
             ):
                 parser.error(
                     "--local-only cannot be combined with remote release arguments"
                 )
+            if arguments.tag_ref_digest is None:
+                parser.error("--local-only requires --tag-ref-digest")
             verify_local_bundle(
                 dist=arguments.dist,
                 version=arguments.version,
                 source_commit=arguments.source_commit,
+                tag_ref_digest=arguments.tag_ref_digest,
             )
             return 0
         if (
@@ -400,13 +427,14 @@ def main() -> int:
                 "remote verification requires --release-json, "
                 "--expected-prerelease, and --stage"
             )
-        if arguments.tag_ref_digest is not None:
-            parser.error("--tag-ref-digest is only valid for release attestations")
+        if arguments.tag_ref_digest is None:
+            parser.error("remote verification requires --tag-ref-digest")
         verify_release(
             release=load_release(arguments.release_json),
             dist=arguments.dist,
             version=arguments.version,
             source_commit=arguments.source_commit,
+            tag_ref_digest=arguments.tag_ref_digest,
             expected_prerelease=arguments.expected_prerelease,
             stage=arguments.stage,
         )

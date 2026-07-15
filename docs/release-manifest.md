@@ -33,6 +33,7 @@ top-level shape is:
   "schema": "calcifer-release-manifest-v1",
   "source_commit": "40-character-lowercase-git-sha",
   "tag": "v0.1.0-alpha.4",
+  "tag_ref_digest": "40-character-lowercase-raw-tag-object-sha",
   "targets": [],
   "version": "0.1.0-alpha.4"
 }
@@ -89,10 +90,15 @@ name only within the already selected GitHub Release.
 - The GitHub Release prerelease flag must agree with that channel.
 - `source_commit` is the exact tagged commit already required to be reachable
   from `main` and to have every protected check green.
+- `tag_ref_digest` is the exact raw Git ref object SHA observed by the workflow.
+  It equals `source_commit` for a lightweight tag and is the distinct tag-object
+  SHA for an annotated tag. It is inside the checksummed and artifact-attested
+  manifest so the local publisher cannot establish a newer baseline.
 - The active no-bypass release-tag ruleset rejects updates and deletions of
   every `v*` tag. The workflow pins both the raw tag-ref digest and the peeled
-  `source_commit`, then rechecks both values before creating the draft and
-  immediately before publishing it.
+  `source_commit`, then rechecks both values before creating the draft. The
+  maintainer-local publisher rechecks those same pinned values immediately
+  before publishing it.
 - A consumer that does not implement `calcifer-release-manifest-v1` must stop;
   it must not reinterpret a different schema as v1.
 
@@ -100,21 +106,24 @@ name only within the already selected GitHub Release.
 
 The assembled-artifact attestation and immutable-release attestation are
 separate claims. After the unprivileged native build outputs are assembled, the
-privileged `publish` job first rebuilds and byte-compares this canonical
-manifest, validates `SHA256SUMS`, and then mints an artifact attestation over
+privileged `publish` job (displayed as **Stage draft GitHub Release**) first
+rebuilds and byte-compares this canonical manifest, validates `SHA256SUMS`, and
+then mints an artifact attestation over
 those exact downloaded bytes. This attests the assembled release assets and
 release-workflow identity; it is not a distinct statement emitted by each
 native build job. Publishing with immutable releases enabled then locks the tag
 and assets and creates a second release attestation over the published set.
 
 Before the draft exists, the workflow verifies every artifact attestation
-against the repository, release workflow, tag ref, and `source_commit`. After
-publication, it verifies that the release attestation names exactly the local
-asset set and binds the package subject to the pinned raw tag-ref digest. For an
-annotated tag, that digest is the tag-object SHA and intentionally differs from
-the peeled `source_commit`; for a lightweight tag, the two values are equal.
-The pre-publication checks prove that the pinned ref still peels to the manifest
-commit.
+against the repository, release workflow, tag ref, and `source_commit`. The tag
+workflow then stops. The maintainer-local publisher downloads the attested
+bundle, repeats every artifact-attestation verification, checks repository
+immutability controls with admin-read access, and publishes the exact numeric
+draft release ID once. After publication it verifies that the release
+attestation names exactly the local asset set and binds the package subject to
+the manifest's `tag_ref_digest`. For an annotated tag, that digest is the tag
+object SHA and intentionally differs from the peeled `source_commit`; for a
+lightweight tag, the two values are equal.
 
 Seeing attestation descriptors in the manifest is not local cryptographic
 verification. A consumer must report separately whether attestations are

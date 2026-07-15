@@ -31,6 +31,9 @@ class ReleaseManifestTests(unittest.TestCase):
         self.project.mkdir()
         self.dist = self.root / "dist"
         self.dist.mkdir()
+        self.version = "0.1.0-alpha.4"
+        self.source_commit = "0123456789abcdef0123456789abcdef01234567"
+        self.tag_ref_digest = "89abcdef0123456789abcdef0123456789abcdef"
 
         for name, contents in (
             ("README.md", "read me\n"),
@@ -51,13 +54,28 @@ class ReleaseManifestTests(unittest.TestCase):
                 version="0.1.0-alpha.4",
             )
 
+    def build_manifest(
+        self,
+        *,
+        dist: Path,
+        version: str,
+        source_commit: str,
+        tag_ref_digest: str | None = None,
+    ) -> bytes:
+        return release_manifest.build_manifest(
+            dist=dist,
+            version=version,
+            source_commit=source_commit,
+            tag_ref_digest=tag_ref_digest or self.tag_ref_digest,
+        )
+
     def test_builds_canonical_manifest_for_all_supported_targets(self) -> None:
-        first = release_manifest.build_manifest(
+        first = self.build_manifest(
             dist=self.dist,
             version="0.1.0-alpha.4",
             source_commit="0123456789abcdef0123456789abcdef01234567",
         )
-        second = release_manifest.build_manifest(
+        second = self.build_manifest(
             dist=self.dist,
             version="0.1.0-alpha.4",
             source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -73,6 +91,7 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(document["repository"], "kazu-42/calcifer")
         self.assertEqual(document["version"], "0.1.0-alpha.4")
         self.assertEqual(document["tag"], "v0.1.0-alpha.4")
+        self.assertEqual(document["tag_ref_digest"], self.tag_ref_digest)
         self.assertEqual(document["release_channel"], "preview")
         self.assertEqual(
             [target["target"] for target in document["targets"]],
@@ -112,12 +131,13 @@ class ReleaseManifestTests(unittest.TestCase):
             output=destination,
             version="0.1.0-alpha.4",
             source_commit="0123456789abcdef0123456789abcdef01234567",
+            tag_ref_digest=self.tag_ref_digest,
         )
 
         self.assertEqual(written, destination)
         self.assertEqual(
             destination.read_bytes(),
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -144,7 +164,7 @@ class ReleaseManifestTests(unittest.TestCase):
             )
 
         document = json.loads(
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=stable_dist,
                 version="1.2.3",
                 source_commit="abcdef0123456789abcdef0123456789abcdef01",
@@ -156,7 +176,7 @@ class ReleaseManifestTests(unittest.TestCase):
     def test_rejects_missing_or_unexpected_bundle_entries(self) -> None:
         next(self.dist.glob("*aarch64-apple-darwin.tar.gz")).unlink()
         with self.assertRaisesRegex(ValueError, "release bundle does not match"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -164,7 +184,7 @@ class ReleaseManifestTests(unittest.TestCase):
 
         (self.dist / "unexpected.txt").write_text("unexpected", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "release bundle does not match"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -178,7 +198,7 @@ class ReleaseManifestTests(unittest.TestCase):
             malformed.addfile(info)
 
         with self.assertRaisesRegex(ValueError, "unsafe archive path"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -215,7 +235,7 @@ class ReleaseManifestTests(unittest.TestCase):
         archive.write_bytes(encoded)
 
         with self.assertRaisesRegex(ValueError, "release zip archive is invalid"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -226,7 +246,7 @@ class ReleaseManifestTests(unittest.TestCase):
         archive.write_bytes(archive.read_bytes() + b"not-a-valid-gzip-member")
 
         with self.assertRaisesRegex(ValueError, "release tar archive is invalid"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -247,7 +267,7 @@ class ReleaseManifestTests(unittest.TestCase):
                 malformed.addfile(member, io.BytesIO(contents))
 
         with self.assertRaisesRegex(ValueError, "directory entry must be empty"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -268,7 +288,7 @@ class ReleaseManifestTests(unittest.TestCase):
                 malformed.writestr(member, name.encode("ascii"))
 
         with self.assertRaisesRegex(ValueError, "directory entry must be empty"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -279,7 +299,7 @@ class ReleaseManifestTests(unittest.TestCase):
         archive.write_bytes(archive.read_bytes() + b"trailing")
 
         with self.assertRaisesRegex(ValueError, "release zip archive is invalid"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -324,7 +344,7 @@ class ReleaseManifestTests(unittest.TestCase):
             self.assertIsNone(readable.testzip())
 
         with self.assertRaisesRegex(ValueError, "release zip archive is invalid"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -350,7 +370,7 @@ class ReleaseManifestTests(unittest.TestCase):
             self.assertIsNone(readable.testzip())
 
         with self.assertRaisesRegex(ValueError, "release zip archive is invalid"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -370,7 +390,7 @@ class ReleaseManifestTests(unittest.TestCase):
             malformed.addfile(link)
 
         with self.assertRaisesRegex(ValueError, "regular files and directories"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
@@ -378,17 +398,25 @@ class ReleaseManifestTests(unittest.TestCase):
 
     def test_rejects_invalid_version_and_source_commit(self) -> None:
         with self.assertRaisesRegex(ValueError, "invalid semantic version"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="01.0.0",
                 source_commit="0123456789abcdef0123456789abcdef01234567",
             )
 
         with self.assertRaisesRegex(ValueError, "source commit"):
-            release_manifest.build_manifest(
+            self.build_manifest(
                 dist=self.dist,
                 version="0.1.0-alpha.4",
                 source_commit="main",
+            )
+
+        with self.assertRaisesRegex(ValueError, "tag ref digest"):
+            self.build_manifest(
+                dist=self.dist,
+                version="0.1.0-alpha.4",
+                source_commit=self.source_commit,
+                tag_ref_digest="main",
             )
 
 
