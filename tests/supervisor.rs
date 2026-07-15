@@ -201,6 +201,7 @@ struct OuterPtyChild {
     reaped: bool,
     kill_marker: PathBuf,
     retained_resolution_marker: Option<PathBuf>,
+    failure_quiescence_release_marker: Option<PathBuf>,
     master: File,
     master_closed: bool,
     capture: FixedPtyCapture,
@@ -273,6 +274,8 @@ impl OuterPtyChild {
             kill_marker: fixture.markers.join("test.kill-coordinator"),
             retained_resolution_marker: (scenario == "pty-foreground-reclaim")
                 .then(|| fixture.markers.join("test.resolve-foreground-reclaim")),
+            failure_quiescence_release_marker: (scenario == "pty-tui-exit-before-gate")
+                .then(|| fixture.markers.join("test.release-quiescence")),
             master,
             master_closed: false,
             capture: FixedPtyCapture::new(),
@@ -603,6 +606,12 @@ impl OuterPtyChild {
         // restoration and prevents a failed test from orphaning a retained
         // coordinator. The direct anchor is force-killed only if bounded
         // cooperative cleanup cannot finish.
+        if let Some(release) = &self.failure_quiescence_release_marker {
+            // The guardian must leave its synthetic failure barrier while the
+            // anchor still owns the outer terminal. Killing the coordinator
+            // first would make fail-closed restoration retain the guardian.
+            let _ = write_private_release_marker_idempotent(release);
+        }
         if let Some(resolution) = &self.retained_resolution_marker {
             let _ = write_private_release_marker_idempotent(resolution);
         }
@@ -984,6 +993,7 @@ esac
             name,
             "test.release-ready"
                 | "test.release-fault"
+                | "test.release-quiescence"
                 | "test.release-output"
                 | "test.resolve-cleanup"
                 | "test.resolve-foreground-reclaim"
@@ -1766,6 +1776,151 @@ fn gated_pty_tui_early_exit_before_readiness_stays_closed_and_reaps_exactly() ->
         return Err(io::Error::other("pre-readiness input reached the early-exit TUI").into());
     }
     fixture.assert_marker_payloads_exclude(&[PRE_READY_SENTINEL, POST_READY_SENTINEL])?;
+    fixture.assert_no_runtime()?;
+    fixture.wait_for_provider_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn gated_pty_tui_exit_after_ready_but_before_gate_is_a_clean_failure() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("pty-tui-exit-before-gate")?;
+    let mut coordinator = OuterPtyChild::spawn(&fixture, "pty-tui-exit-before-gate")?;
+
+    coordinator.write_bytes(PRE_READY_SENTINEL, CONTENDER_TIMEOUT)?;
+    fixture.release_test_capability("test.release-ready")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "tui.pre-gate-exit-armed",
+        b"armed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "coordinator.pre-gate-held",
+        b"held\n",
+        PROCESS_TIMEOUT,
+    )?;
+    let guardian = fixture.read_pid_marker("guardian.pid")?;
+    let app = fixture.read_pid_marker("app.pid")?;
+    let tui = fixture.read_pid_marker("tui.pid")?;
+    fixture.wait_for_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+
+    fixture.release_test_capability("test.release-fault")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "coordinator.pre-gate-failed",
+        b"failed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.failure-announced-held",
+        b"held\n",
+        PROCESS_TIMEOUT,
+    )?;
+    fixture.release_test_capability("test.signal-winch-storm")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.winch-storm-sent",
+        b"sent\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "coordinator.failed-controls-suppressed",
+        b"suppressed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    fixture.release_test_capability("test.release-quiescence")?;
+    let status = coordinator.wait(PROCESS_TIMEOUT)?;
+    assert_status_code(status, Some(EXIT_FAILURE))?;
+    coordinator.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+    coordinator.wait_until_restored(CONTENDER_TIMEOUT)?;
+    coordinator.assert_restored()?;
+    wait_pid_gone(guardian, guardian, CONTENDER_TIMEOUT)?;
+    wait_pid_gone(app, app, CONTENDER_TIMEOUT)?;
+    wait_pid_gone(tui, tui, CONTENDER_TIMEOUT)?;
+
+    fixture.assert_marker("tui.pre-gate-exit", b"exiting\n")?;
+    fixture.assert_marker("terminal.restored", b"restored\n")?;
+    fixture.assert_marker("guardian.cleaned", b"complete\n")?;
+    fixture.assert_marker("coordinator.failed", b"clean\n")?;
+    for absent in [
+        "terminal.raw",
+        "gate.open",
+        "guardian.input-started",
+        "coordinator.input-started",
+        "coordinator.completed",
+        "coordinator.retained",
+    ] {
+        fixture.assert_marker_absent(absent)?;
+    }
+    if coordinator.capture().occurrences(PRE_READY_SENTINEL) != 0 {
+        return Err(
+            io::Error::other("pre-gate input reached a TUI that had already exited").into(),
+        );
+    }
+    fixture.assert_marker_payloads_exclude(&[PRE_READY_SENTINEL, POST_READY_SENTINEL])?;
+    fixture.assert_no_runtime()?;
+    fixture.wait_for_provider_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn gated_pty_failure_unwind_releases_quiescence_before_coordinator_kill() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("pty-tui-exit-before-gate")?;
+    let mut coordinator = OuterPtyChild::spawn(&fixture, "pty-tui-exit-before-gate")?;
+
+    fixture.release_test_capability("test.release-ready")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "tui.pre-gate-exit-armed",
+        b"armed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "coordinator.pre-gate-held",
+        b"held\n",
+        PROCESS_TIMEOUT,
+    )?;
+    let guardian = fixture.read_pid_marker("guardian.pid")?;
+    let app = fixture.read_pid_marker("app.pid")?;
+    let tui = fixture.read_pid_marker("tui.pid")?;
+
+    fixture.release_test_capability("test.release-fault")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "coordinator.pre-gate-failed",
+        b"failed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.failure-announced-held",
+        b"held\n",
+        PROCESS_TIMEOUT,
+    )?;
+
+    // Model a test assertion unwinding while both sides are held at the
+    // synthetic failure barrier. `Drop` must release that barrier before it
+    // asks the anchor to terminate the coordinator.
+    drop(coordinator);
+
+    fixture.assert_marker("test.release-quiescence", b"release\n")?;
+    fixture.assert_marker("test.kill-coordinator", b"release\n")?;
+    wait_pid_gone(guardian, guardian, PROCESS_TIMEOUT)?;
+    wait_pid_gone(app, app, PROCESS_TIMEOUT)?;
+    wait_pid_gone(tui, tui, PROCESS_TIMEOUT)?;
+    fixture.assert_marker("terminal.restored", b"restored\n")?;
+    fixture.assert_marker("guardian.cleaned", b"complete\n")?;
     fixture.assert_no_runtime()?;
     fixture.wait_for_provider_contender(0, CONTENDER_TIMEOUT)?;
     fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
@@ -2671,6 +2826,94 @@ fn gated_pty_suspend_restores_and_resume_requires_a_fresh_gate() -> TestResult {
     fixture.assert_marker("guardian.cleaned", b"complete\n")?;
     fixture.assert_marker_payloads_exclude(&[SUSPENDED_SENTINEL, POST_READY_SENTINEL])?;
     fixture.assert_no_runtime()?;
+    fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn gated_pty_tui_exit_after_resume_before_fresh_gate_is_a_clean_failure() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("pty-tui-exit-before-resume-gate")?;
+    let mut coordinator = OuterPtyChild::spawn(&fixture, "pty-tui-exit-before-resume-gate")?;
+    fixture.release_test_capability("test.release-ready")?;
+    coordinator.wait_for_marker(&fixture, "gate.open", b"open\n", PROCESS_TIMEOUT)?;
+    let guardian = fixture.read_pid_marker("guardian.pid")?;
+    let app = fixture.read_pid_marker("app.pid")?;
+    let tui = fixture.read_pid_marker("tui.pid")?;
+    fixture.wait_for_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+
+    fixture.release_test_capability("test.signal-tstp")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "tui.leader-self-stop",
+        b"stopping\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.coordinator-stopped",
+        b"stopped\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "terminal.suspended-restored",
+        b"restored\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.assert_restored()?;
+    coordinator.write_bytes(SUSPENDED_SENTINEL, CONTENDER_TIMEOUT)?;
+    coordinator.resize(43, 125)?;
+
+    fixture.release_test_capability("test.signal-cont")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "coordinator.resume-gate-held",
+        b"held\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "tui.pre-resume-gate-exit",
+        b"exiting\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.pre-resume-gate-failure",
+        b"observed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    let status = coordinator.wait(PROCESS_TIMEOUT)?;
+    assert_status_code(status, Some(EXIT_FAILURE))?;
+    coordinator.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+    coordinator.wait_until_restored(CONTENDER_TIMEOUT)?;
+    coordinator.assert_restored()?;
+    wait_pid_gone(guardian, guardian, CONTENDER_TIMEOUT)?;
+    wait_pid_gone(app, app, CONTENDER_TIMEOUT)?;
+    wait_pid_gone(tui, tui, CONTENDER_TIMEOUT)?;
+
+    fixture.assert_marker("tui.resumed", b"43x125\n")?;
+    fixture.assert_marker("terminal.restored", b"restored\n")?;
+    fixture.assert_marker("guardian.cleaned", b"complete\n")?;
+    fixture.assert_marker("coordinator.failed", b"clean\n")?;
+    for absent in [
+        "gate.reopened",
+        "coordinator.completed",
+        "coordinator.retained",
+    ] {
+        fixture.assert_marker_absent(absent)?;
+    }
+    if coordinator.capture().occurrences(SUSPENDED_SENTINEL) != 0 {
+        return Err(
+            io::Error::other("input typed while suspended crossed the failed fresh gate").into(),
+        );
+    }
+    fixture.assert_marker_payloads_exclude(&[SUSPENDED_SENTINEL, POST_READY_SENTINEL])?;
+    fixture.assert_no_runtime()?;
+    fixture.wait_for_provider_contender(0, CONTENDER_TIMEOUT)?;
     fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
     fixture.assert_provider_untouched()?;
     Ok(())

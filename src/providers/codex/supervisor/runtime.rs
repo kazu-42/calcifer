@@ -16,7 +16,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, Stat, fstat, mkdirat, open, openat,
+    AtFlags, Dir, FileType, Mode, OFlags, RawMode, RenameFlags, Stat, fstat, mkdirat, open, openat,
     renameat_with, statat, unlinkat,
 };
 use uuid::Uuid;
@@ -24,6 +24,16 @@ use uuid::Uuid;
 const RUNTIME_CREATE_ATTEMPTS: usize = 8;
 const RUNTIME_QUARANTINE_ATTEMPTS: usize = 8;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+
+#[cfg(target_os = "linux")]
+fn stat_permission_mode(mode: RawMode) -> u32 {
+    mode & 0o7777
+}
+
+#[cfg(target_os = "macos")]
+fn stat_permission_mode(mode: RawMode) -> u32 {
+    u32::from(mode & 0o7777)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NodeIdentity {
@@ -59,13 +69,13 @@ impl NodeIdentity {
         #[cfg(target_os = "macos")]
         let device = u64::from(stat.st_dev as u32);
         #[cfg(target_os = "linux")]
-        let device = stat.st_dev as u64;
+        let device = stat.st_dev;
 
         Self {
             device,
             inode: stat.st_ino,
             uid: stat.st_uid,
-            mode: u32::from(stat.st_mode & 0o7777),
+            mode: stat_permission_mode(stat.st_mode),
         }
     }
 
@@ -706,7 +716,7 @@ fn remove_fixture_synthetic_unknown_entry(runtime: &PrivateRuntime) -> Result<()
     let stat = fstat(&descriptor).map_err(|_| RuntimeError::IdentityMismatch)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_uid != rustix::process::geteuid().as_raw()
-        || u32::from(stat.st_mode & 0o7777) != 0o600
+        || stat_permission_mode(stat.st_mode) != 0o600
         || stat.st_nlink != 1
         || stat.st_size != i64::try_from(PAYLOAD.len()).map_err(|_| RuntimeError::Cleanup)?
     {
@@ -800,6 +810,12 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn stat_permission_projection_is_platform_stable() {
+        assert_eq!(stat_permission_mode(0o100600), 0o600);
+        assert_eq!(stat_permission_mode(0o107777), 0o7777);
     }
 
     #[test]

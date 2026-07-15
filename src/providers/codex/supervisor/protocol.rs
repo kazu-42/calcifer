@@ -317,6 +317,10 @@ struct TerminalLifecycleValidator {
     app_started: bool,
     tui_started: bool,
     gate_ever_opened: bool,
+    // A failure observed in `ReadyForGate` can race exactly one gate command
+    // already written by the peer. It may be consumed after quiescence, but it
+    // can never mint an input acknowledgement or survive terminal restore.
+    superseded_gate_may_be_pending: bool,
     failure: Option<(Phase, FailureCode)>,
 }
 
@@ -362,6 +366,7 @@ impl TerminalLifecycleValidator {
             app_started: false,
             tui_started: false,
             gate_ever_opened: false,
+            superseded_gate_may_be_pending: false,
             failure: None,
         }
     }
@@ -410,7 +415,17 @@ impl TerminalLifecycleValidator {
                 validate_terminal_size(rows, cols)?;
                 State::Quiesced
             }
-            (State::Quiesced, Command::TerminalRestored) => State::AwaitRecoveryDisarmed,
+            // The guardian may announce a pre-gate failure immediately while
+            // the coordinator's ordered gate frame is already in flight. Drain
+            // that one typed command so it cannot be mistaken for RESTORED.
+            (State::Quiesced, Command::OpenInputGate) if self.superseded_gate_may_be_pending => {
+                self.superseded_gate_may_be_pending = false;
+                State::Quiesced
+            }
+            (State::Quiesced, Command::TerminalRestored) => {
+                self.superseded_gate_may_be_pending = false;
+                State::AwaitRecoveryDisarmed
+            }
             _ => return Err(ProtocolError::UnexpectedState),
         };
         Ok(())
@@ -548,6 +563,7 @@ impl TerminalLifecycleValidator {
         {
             return Err(ProtocolError::UnexpectedState);
         }
+        self.superseded_gate_may_be_pending = self.state == State::ReadyForGate;
         self.failure = Some((phase, code));
         self.state = match self.state {
             State::Quiesced | State::AwaitRecoveryDisarmed | State::RecoveryDisarmed => self.state,
@@ -3379,6 +3395,39 @@ mod tests {
             receiver.record_command(CoordinatorCommand::TerminalRestored),
             Err(ProtocolError::UnexpectedState)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_pre_gate_exit_consumes_one_in_flight_gate_before_terminal_restore()
+    -> Result<(), Box<dyn Error>> {
+        let mut commands = encode_coordinator(CoordinatorCommand::Start)?;
+        commands.extend_from_slice(&encode_coordinator(
+            CoordinatorCommand::TerminalArmAccepted,
+        )?);
+        commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
+        commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::TerminalRestored)?);
+        let mut receiver = GuardianCommandReceiver::new_terminal(Cursor::new(commands));
+        receiver.record_event(GuardianEvent::LeaseCommitted)?;
+        assert_eq!(receiver.receive(deadline())?, CoordinatorCommand::Start);
+        record_guardian_terminal_ready(&mut receiver)?;
+
+        receiver.record_event(GuardianEvent::Failed {
+            phase: Phase::Readiness,
+            code: FailureCode::EarlyExit,
+        })?;
+        receiver.record_event(GuardianEvent::TerminalQuiesced)?;
+        assert_eq!(
+            receiver.receive(deadline())?,
+            CoordinatorCommand::OpenInputGate
+        );
+        assert_eq!(
+            receiver.receive(deadline())?,
+            CoordinatorCommand::TerminalRestored
+        );
+        receiver.record_event(GuardianEvent::TerminalRecoveryDisarmed)?;
+        receiver.record_event(failed_terminal(true, true))?;
+        assert!(receiver.terminal_received());
         Ok(())
     }
 

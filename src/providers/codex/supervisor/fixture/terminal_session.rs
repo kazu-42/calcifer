@@ -369,6 +369,7 @@ fn dispatch_anchor_controls(
             signal_direct_child_group(coordinator, coordinator_group, Signal::WINCH)?;
         }
         controls.winch_storm = true;
+        write_marker("anchor.winch-storm-sent", b"sent\n")?;
     }
 
     if controls.tstp && !controls.suspended && !controls.cont {
@@ -587,6 +588,13 @@ pub(super) fn run_fake_tui(scenario: Scenario) -> Result<ExitCode, FixtureError>
         .map_err(|_| FixtureError::Process)?;
     drop(readiness);
 
+    if scenario == Scenario::PtyTuiExitBeforeGate {
+        write_marker("tui.pre-gate-exit-armed", b"armed\n")?;
+        wait_for_exact_marker("test.release-fault", b"release\n")?;
+        write_marker("tui.pre-gate-exit", b"exiting\n")?;
+        return Ok(ExitCode::from(23));
+    }
+
     let mut signal_state = TuiSignalState::default();
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -594,6 +602,10 @@ pub(super) fn run_fake_tui(scenario: Scenario) -> Result<ExitCode, FixtureError>
     let mut byte = [0_u8; 1];
     loop {
         signal_flags.observe(&mut signal_state)?;
+        if scenario == Scenario::PtyTuiExitBeforeResumeGate && signal_state.continue_seen {
+            write_marker("tui.pre-resume-gate-exit", b"exiting\n")?;
+            return Ok(ExitCode::from(23));
+        }
         if scenario == Scenario::PtySlaveCloseWhileLive && marker_exists("test.release-fault")? {
             write_marker("tui.slave-close", b"closed-while-live\n")?;
             return exec_detached_tui_without_slave();
@@ -812,7 +824,10 @@ impl TuiSignalFlags {
         };
 
         let handles_interactive = scenario == Scenario::PtySignals;
-        let handles_job_control = scenario == Scenario::PtySuspendResume;
+        let handles_job_control = matches!(
+            scenario,
+            Scenario::PtySuspendResume | Scenario::PtyTuiExitBeforeResumeGate
+        );
         let ignores_terminate = scenario == Scenario::PtyOutputBackpressure;
         let flags = Self {
             interrupt: handles_interactive
@@ -1525,6 +1540,10 @@ struct GuardianOutputPump(PumpCore<PtyMaster, TerminalEndpoint>);
 struct GuardianReadyPump(PumpCore<PtyMaster, TerminalEndpoint>);
 struct GuardianDuplexPump(PumpCore<PtyMaster, TerminalEndpoint>);
 
+trait GuardianGateWaitPump {
+    fn gate_wait_finished(&self) -> bool;
+}
+
 enum GuardianPumpState {
     Output(GuardianOutputPump),
     Ready(GuardianReadyPump),
@@ -1567,6 +1586,12 @@ impl GuardianReadyPump {
 
     fn stop(self) -> Result<PumpExit, Self> {
         self.0.stop().map_err(Self)
+    }
+}
+
+impl GuardianGateWaitPump for GuardianReadyPump {
+    fn gate_wait_finished(&self) -> bool {
+        self.0.is_finished()
     }
 }
 
@@ -1627,6 +1652,12 @@ impl GuardianDuplexPump {
             .right
             .shutdown(TerminalShutdown::Both)
             .map_err(|_| FixtureError::Channel)
+    }
+}
+
+impl GuardianGateWaitPump for GuardianDuplexPump {
+    fn gate_wait_finished(&self) -> bool {
+        self.0.is_finished()
     }
 }
 
@@ -1994,7 +2025,8 @@ fn suspend_and_resume_coordinator(
     snapshot: &TerminalSnapshot,
     receiver: &mut CoordinatorReceiver<&LifecycleEndpoint>,
     lifecycle: &LifecycleEndpoint,
-) -> Result<(), FixtureError> {
+    scenario: Scenario,
+) -> Result<CoordinatorControlOutcome, FixtureError> {
     pump.pause_input()?;
 
     receiver
@@ -2061,6 +2093,34 @@ fn suspend_and_resume_coordinator(
         .map_err(|_| FixtureError::Protocol)?;
     let gate = InputGate::closed().mark_ready(readiness);
 
+    if scenario == Scenario::PtyTuiExitBeforeResumeGate {
+        write_marker("coordinator.resume-gate-held", b"held\n")?;
+        wait_for_exact_marker("guardian.pre-resume-gate-failure", b"observed\n")?;
+        receiver
+            .record_command(CoordinatorCommand::OpenInputGate)
+            .map_err(|_| FixtureError::Protocol)?;
+        send_coordinator_command(
+            &mut &*lifecycle,
+            CoordinatorCommand::OpenInputGate,
+            phase_deadline(),
+        )
+        .map_err(|_| FixtureError::Channel)?;
+        let event = receiver
+            .receive(bounded_deadline(PHASE_TIMEOUT.saturating_mul(2)))
+            .map_err(|_| FixtureError::Protocol)?;
+        if event
+            != (GuardianEvent::Failed {
+                phase: Phase::Readiness,
+                code: FailureCode::EarlyExit,
+            })
+        {
+            return Err(FixtureError::Protocol);
+        }
+        drop(gate);
+        drop(raw);
+        return Ok(CoordinatorControlOutcome::FailedAwaitQuiescence);
+    }
+
     receiver
         .record_command(CoordinatorCommand::OpenInputGate)
         .map_err(|_| FixtureError::Protocol)?;
@@ -2082,7 +2142,8 @@ fn suspend_and_resume_coordinator(
         .map_err(|_| FixtureError::Protocol)?;
     let gate = gate.acknowledge_open(raw, acknowledgement);
     pump.restart_input(gate)?;
-    write_marker("gate.reopened", b"open\n")
+    write_marker("gate.reopened", b"open\n")?;
+    Ok(CoordinatorControlOutcome::Continue)
 }
 
 fn write_terminal_size_marker(name: &str, size: TerminalSize) -> Result<(), FixtureError> {
@@ -2825,6 +2886,111 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
 
     let mut pump = None;
     let mut signal_flags = None;
+    let ready = match (scenario, ready) {
+        (Scenario::PtyTuiExitBeforeGate, Some(readiness)) => {
+            signal_flags = match TerminalSignalFlags::install() {
+                Ok(flags) => Some(flags),
+                Err(_) => {
+                    drop(receiver);
+                    drop(terminal_coordinator);
+                    restore_and_retain(
+                        coordinator_lease,
+                        guardian,
+                        lifecycle,
+                        transfer,
+                        snapshot,
+                        None,
+                        RetentionReason::InvariantUnconfirmed,
+                    )
+                }
+            };
+            if write_marker("coordinator.pre-gate-held", b"held\n").is_err() {
+                drop(receiver);
+                drop(terminal_coordinator);
+                restore_and_retain(
+                    coordinator_lease,
+                    guardian,
+                    lifecycle,
+                    transfer,
+                    snapshot,
+                    None,
+                    RetentionReason::InvariantUnconfirmed,
+                )
+            }
+            let gate = CoordinatorCommand::OpenInputGate;
+            if wait_for_exact_marker("guardian.pre-gate-failure", b"observed\n").is_err()
+                || receiver.record_command(gate).is_err()
+                || send_coordinator_command(&mut &lifecycle, gate, phase_deadline()).is_err()
+            {
+                drop(receiver);
+                drop(terminal_coordinator);
+                restore_and_retain(
+                    coordinator_lease,
+                    guardian,
+                    lifecycle,
+                    transfer,
+                    snapshot,
+                    None,
+                    RetentionReason::InvariantUnconfirmed,
+                )
+            }
+            match receiver.receive(bounded_deadline(PHASE_TIMEOUT.saturating_mul(2))) {
+                Ok(GuardianEvent::Failed {
+                    phase: Phase::Readiness,
+                    code: FailureCode::EarlyExit,
+                }) => {
+                    session_failed = true;
+                    if write_marker("coordinator.pre-gate-failed", b"failed\n").is_err()
+                        || wait_for_exact_marker("anchor.winch-storm-sent", b"sent\n").is_err()
+                    {
+                        drop(signal_flags.take());
+                        drop(receiver);
+                        drop(terminal_coordinator);
+                        restore_and_retain(
+                            coordinator_lease,
+                            guardian,
+                            lifecycle,
+                            transfer,
+                            snapshot,
+                            None,
+                            RetentionReason::InvariantUnconfirmed,
+                        )
+                    }
+                    drop(readiness);
+                    None
+                }
+                Ok(_) => {
+                    drop(receiver);
+                    drop(terminal_coordinator);
+                    restore_and_retain(
+                        coordinator_lease,
+                        guardian,
+                        lifecycle,
+                        transfer,
+                        snapshot,
+                        None,
+                        RetentionReason::ProtocolInvalid,
+                    )
+                }
+                Err(error) => {
+                    let reason = retention_reason_for_receive_failure(&guardian, error);
+                    drop(receiver);
+                    drop(terminal_coordinator);
+                    restore_and_retain(
+                        coordinator_lease,
+                        guardian,
+                        lifecycle,
+                        transfer,
+                        snapshot,
+                        None,
+                        reason,
+                    )
+                }
+            }
+        }
+        (_, ready) => ready,
+    };
+
     if let Some(readiness) = ready {
         if write_marker("coordinator.ready", b"ready\n").is_err() {
             drop(receiver);
@@ -2912,7 +3078,7 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
         }
         let acknowledgement = match receiver.receive(phase_deadline()) {
             Ok(GuardianEvent::InputGateOpened) => match receiver.take_verified_open_gate_ack() {
-                Ok(acknowledgement) => acknowledgement,
+                Ok(acknowledgement) => Some(acknowledgement),
                 Err(_) => {
                     drop(signal_flags.take());
                     drop(receiver);
@@ -2928,6 +3094,10 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
                     )
                 }
             },
+            Ok(GuardianEvent::Failed { .. }) => {
+                session_failed = true;
+                None
+            }
             Ok(_) => {
                 drop(signal_flags.take());
                 drop(receiver);
@@ -2958,26 +3128,12 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
                 )
             }
         };
-        let gate = gate.acknowledge_open(raw, acknowledgement);
-        if write_marker("gate.open", b"open\n").is_err() {
-            drop(signal_flags.take());
-            drop(receiver);
-            drop(terminal_coordinator);
-            restore_and_retain(
-                coordinator_lease,
-                guardian,
-                lifecycle,
-                transfer,
-                snapshot,
-                None,
-                RetentionReason::InvariantUnconfirmed,
-            )
-        }
-        pump = match CoordinatorPump::start(gate, terminal_coordinator, scenario) {
-            Ok(pump) => Some(pump),
-            Err(_) => {
+        if let Some(acknowledgement) = acknowledgement {
+            let gate = gate.acknowledge_open(raw, acknowledgement);
+            if write_marker("gate.open", b"open\n").is_err() {
                 drop(signal_flags.take());
                 drop(receiver);
+                drop(terminal_coordinator);
                 restore_and_retain(
                     coordinator_lease,
                     guardian,
@@ -2988,26 +3144,49 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
                     RetentionReason::InvariantUnconfirmed,
                 )
             }
-        };
-        if write_marker("coordinator.input-started", b"started\n").is_err() {
-            drop(signal_flags.take());
-            drop(receiver);
-            restore_and_retain(
-                coordinator_lease,
-                guardian,
-                lifecycle,
-                transfer,
-                snapshot,
-                pump,
-                RetentionReason::InvariantUnconfirmed,
-            )
+            pump = match CoordinatorPump::start(gate, terminal_coordinator, scenario) {
+                Ok(pump) => Some(pump),
+                Err(_) => {
+                    drop(signal_flags.take());
+                    drop(receiver);
+                    restore_and_retain(
+                        coordinator_lease,
+                        guardian,
+                        lifecycle,
+                        transfer,
+                        snapshot,
+                        None,
+                        RetentionReason::InvariantUnconfirmed,
+                    )
+                }
+            };
+            if write_marker("coordinator.input-started", b"started\n").is_err() {
+                drop(signal_flags.take());
+                drop(receiver);
+                restore_and_retain(
+                    coordinator_lease,
+                    guardian,
+                    lifecycle,
+                    transfer,
+                    snapshot,
+                    pump,
+                    RetentionReason::InvariantUnconfirmed,
+                )
+            }
+        } else {
+            drop(gate);
+            drop(raw);
+            drop(terminal_coordinator);
         }
     } else {
         drop(terminal_coordinator);
     }
 
-    let mut signal_shutdown = false;
+    // Once the guardian has failed, no new foreground control may race its
+    // terminal-quiescence proof. Pending signals stay latched until teardown.
+    let mut signal_shutdown = session_failed;
     let mut pump_failure_deadline = None;
+    let mut failure_controls_suppressed = false;
     loop {
         match lifecycle_readable(&lifecycle, EVENT_POLL) {
             Ok(false) => {
@@ -3034,17 +3213,17 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
                     {
                         let handled = match action {
                             TerminalSignalAction::Suspend => {
-                                let result = match (signal_flags.as_ref(), pump.as_mut()) {
+                                match (signal_flags.as_ref(), pump.as_mut()) {
                                     (Some(flags), Some(pump)) => suspend_and_resume_coordinator(
                                         flags,
                                         pump,
                                         &snapshot,
                                         &mut receiver,
                                         &lifecycle,
+                                        scenario,
                                     ),
                                     _ => Err(FixtureError::Invariant),
-                                };
-                                result.map(|()| CoordinatorControlOutcome::Continue)
+                                }
                             }
                             action => handle_coordinator_control(action, &mut receiver, &lifecycle),
                         };
@@ -3073,6 +3252,27 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
                             }
                         }
                     }
+                } else if scenario == Scenario::PtyTuiExitBeforeGate
+                    && session_failed
+                    && !failure_controls_suppressed
+                {
+                    if write_marker("coordinator.failed-controls-suppressed", b"suppressed\n")
+                        .is_err()
+                        || wait_for_exact_marker("test.release-quiescence", b"release\n").is_err()
+                    {
+                        drop(signal_flags.take());
+                        drop(receiver);
+                        restore_and_retain(
+                            coordinator_lease,
+                            guardian,
+                            lifecycle,
+                            transfer,
+                            snapshot,
+                            pump,
+                            RetentionReason::InvariantUnconfirmed,
+                        )
+                    }
+                    failure_controls_suppressed = true;
                 }
                 continue;
             }
@@ -3109,7 +3309,10 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
             }
         };
         match event {
-            GuardianEvent::Failed { .. } if !session_failed => session_failed = true,
+            GuardianEvent::Failed { .. } if !session_failed => {
+                session_failed = true;
+                signal_shutdown = true;
+            }
             GuardianEvent::TerminalQuiesced => break,
             _ => {
                 drop(signal_flags.take());
@@ -3922,23 +4125,66 @@ fn run_terminal_guardian(_scenario: Scenario) -> Result<ExitCode, FixtureError> 
         }
     }
 
-    let open_gate = commands.receive(phase_deadline());
-    if !matches!(open_gate, Ok(CoordinatorCommand::OpenInputGate)) {
-        return finish_terminal_guardian(
-            &endpoint,
-            &mut commands,
-            provider_lease,
-            recovery,
-            snapshot,
-            runtime,
-            worker,
-            Some(app),
-            Some(tui),
-            Some(GuardianPumpState::Ready(ready_pump)),
-            Some((Phase::Protocol, FailureCode::InvalidControl)),
-            open_gate.is_ok(),
-        );
-    }
+    let open_gate = match await_guardian_open_input_gate(
+        &endpoint,
+        &mut commands,
+        &mut app,
+        &mut tui,
+        &ready_pump,
+    ) {
+        Ok(gate) => gate,
+        Err(failure) => {
+            if scenario == Scenario::PtyTuiExitBeforeGate
+                && write_marker("guardian.pre-gate-failure", b"observed\n").is_err()
+            {
+                return finish_terminal_guardian(
+                    &endpoint,
+                    &mut commands,
+                    provider_lease,
+                    recovery,
+                    snapshot,
+                    runtime,
+                    worker,
+                    Some(app),
+                    Some(tui),
+                    Some(GuardianPumpState::Ready(ready_pump)),
+                    Some((Phase::Readiness, FailureCode::Internal)),
+                    failure.channel_live,
+                );
+            }
+            return if scenario == Scenario::PtyTuiExitBeforeGate {
+                finish_terminal_guardian_with_failure_quiescence_barrier(
+                    &endpoint,
+                    &mut commands,
+                    provider_lease,
+                    recovery,
+                    snapshot,
+                    runtime,
+                    worker,
+                    Some(app),
+                    Some(tui),
+                    Some(GuardianPumpState::Ready(ready_pump)),
+                    Some((failure.phase, failure.code)),
+                    failure.channel_live,
+                )
+            } else {
+                finish_terminal_guardian(
+                    &endpoint,
+                    &mut commands,
+                    provider_lease,
+                    recovery,
+                    snapshot,
+                    runtime,
+                    worker,
+                    Some(app),
+                    Some(tui),
+                    Some(GuardianPumpState::Ready(ready_pump)),
+                    Some((failure.phase, failure.code)),
+                    failure.channel_live,
+                )
+            };
+        }
+    };
     if scenario == Scenario::PtyReadyNoAck {
         if write_marker("guardian.no-ack-armed", b"armed\n").is_err()
             || wait_for_exact_marker("test.release-fault", b"release\n").is_err()
@@ -3973,7 +4219,7 @@ fn run_terminal_guardian(_scenario: Scenario) -> Result<ExitCode, FixtureError> 
             false,
         );
     }
-    let duplex_pump = match ready_pump.open_input(GuardianOpenGate { _private: () }) {
+    let duplex_pump = match ready_pump.open_input(open_gate) {
         Ok(pump) => pump,
         Err(pump) => {
             return finish_terminal_guardian(
@@ -4146,6 +4392,30 @@ struct GuardianControlFailure {
 }
 
 impl GuardianControlFailure {
+    const fn app_early_exit() -> Self {
+        Self {
+            phase: Phase::AppServer,
+            code: FailureCode::EarlyExit,
+            channel_live: true,
+        }
+    }
+
+    const fn readiness(code: FailureCode, channel_live: bool) -> Self {
+        Self {
+            phase: Phase::Readiness,
+            code,
+            channel_live,
+        }
+    }
+
+    const fn containment() -> Self {
+        Self {
+            phase: Phase::Reap,
+            code: FailureCode::Containment,
+            channel_live: true,
+        }
+    }
+
     const fn pump() -> Self {
         Self {
             phase: Phase::Pump,
@@ -4168,6 +4438,71 @@ impl GuardianControlFailure {
             code: FailureCode::InvalidControl,
             channel_live,
         }
+    }
+}
+
+fn verify_guardian_gate_liveness<P: GuardianGateWaitPump>(
+    app: &mut ManagedGroupChild,
+    tui: &mut ManagedGroupChild,
+    pump: &P,
+) -> Result<(), GuardianControlFailure> {
+    match app.poll_liveness(phase_deadline()) {
+        Ok(ChildLiveness::Running) => {}
+        Ok(ChildLiveness::Exited) => return Err(GuardianControlFailure::app_early_exit()),
+        Err(_) => return Err(GuardianControlFailure::containment()),
+    }
+    match tui.poll_liveness(phase_deadline()) {
+        Ok(ChildLiveness::Running) => {}
+        Ok(ChildLiveness::Exited) => {
+            return Err(GuardianControlFailure::readiness(
+                FailureCode::EarlyExit,
+                true,
+            ));
+        }
+        Err(_) => return Err(GuardianControlFailure::containment()),
+    }
+    if pump.gate_wait_finished() {
+        return Err(GuardianControlFailure::readiness(
+            FailureCode::EarlyExit,
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn await_guardian_open_input_gate<P: GuardianGateWaitPump>(
+    endpoint: &LifecycleEndpoint,
+    commands: &mut GuardianCommandReceiver<&LifecycleEndpoint>,
+    app: &mut ManagedGroupChild,
+    tui: &mut ManagedGroupChild,
+    pump: &P,
+) -> Result<GuardianOpenGate, GuardianControlFailure> {
+    let deadline = phase_deadline();
+    loop {
+        verify_guardian_gate_liveness(app, tui, pump)?;
+        match lifecycle_readable(endpoint, Duration::ZERO) {
+            Ok(true) => {
+                match commands.receive(phase_deadline()) {
+                    Ok(CoordinatorCommand::OpenInputGate) => {}
+                    Ok(_) => return Err(GuardianControlFailure::protocol(true)),
+                    Err(_) => return Err(GuardianControlFailure::protocol(false)),
+                }
+                // Receiving the command is not the gate linearization point.
+                // Recheck exact child and pump liveness immediately before
+                // minting the sole capability that can start terminal input.
+                verify_guardian_gate_liveness(app, tui, pump)?;
+                return Ok(GuardianOpenGate { _private: () });
+            }
+            Ok(false) => {}
+            Err(_) => return Err(GuardianControlFailure::protocol(false)),
+        }
+        if Instant::now() >= deadline {
+            return Err(GuardianControlFailure::readiness(
+                FailureCode::Timeout,
+                true,
+            ));
+        }
+        thread::sleep(EVENT_POLL);
     }
 }
 
@@ -4200,6 +4535,7 @@ fn suspend_active_guardian(
 fn resume_active_guardian(
     endpoint: &LifecycleEndpoint,
     commands: &mut GuardianCommandReceiver<&LifecycleEndpoint>,
+    app: &mut ManagedGroupChild,
     tui: &mut ManagedGroupChild,
     pump: &mut GuardianDuplexPump,
     rows: u16,
@@ -4216,12 +4552,8 @@ fn resume_active_guardian(
     if !emit_guardian_event(commands, endpoint, GuardianEvent::Resumed { rows, cols }) {
         return Err(GuardianControlFailure::signal(false));
     }
-    match commands.receive(phase_deadline()) {
-        Ok(CoordinatorCommand::OpenInputGate) => {}
-        Ok(_) => return Err(GuardianControlFailure::protocol(true)),
-        Err(_) => return Err(GuardianControlFailure::protocol(false)),
-    }
-    pump.restart_input(GuardianOpenGate { _private: () })
+    let gate = await_guardian_open_input_gate(endpoint, commands, app, tui, pump)?;
+    pump.restart_input(gate)
         .map_err(|_| GuardianControlFailure::pump())?;
     if !emit_guardian_event(commands, endpoint, GuardianEvent::InputGateOpened) {
         return Err(GuardianControlFailure::protocol(false));
@@ -4615,12 +4947,19 @@ fn run_active_guardian(
             }
             Ok(CoordinatorCommand::Resume { rows, cols }) if suspended => {
                 let outcome = match pump.as_mut() {
-                    Some(pump) => {
-                        resume_active_guardian(endpoint, commands, &mut tui, pump, rows, cols)
-                    }
+                    Some(pump) => resume_active_guardian(
+                        endpoint, commands, &mut app, &mut tui, pump, rows, cols,
+                    ),
                     None => Err(GuardianControlFailure::pump()),
                 };
-                if let Err(control_failure) = outcome {
+                if let Err(mut control_failure) = outcome {
+                    if scenario == Scenario::PtyTuiExitBeforeResumeGate
+                        && control_failure.phase == Phase::Readiness
+                        && control_failure.code == FailureCode::EarlyExit
+                        && write_marker("guardian.pre-resume-gate-failure", b"observed\n").is_err()
+                    {
+                        control_failure.code = FailureCode::Internal;
+                    }
                     return finish_terminal_guardian(
                         endpoint,
                         commands,
@@ -5087,6 +5426,39 @@ fn finish_terminal_guardian(
         pump,
         failure,
         channel_live,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_terminal_guardian_with_failure_quiescence_barrier(
+    endpoint: &LifecycleEndpoint,
+    commands: &mut GuardianCommandReceiver<&LifecycleEndpoint>,
+    provider_lease: ProfileLease,
+    recovery: RecoveryTty,
+    snapshot: TerminalSnapshot,
+    runtime: PrivateRuntime,
+    worker: FixtureWorker,
+    app: Option<ManagedGroupChild>,
+    tui: Option<ManagedGroupChild>,
+    pump: Option<GuardianPumpState>,
+    failure: Option<(Phase, FailureCode)>,
+    channel_live: bool,
+) -> Result<ExitCode, FixtureError> {
+    finish_terminal_guardian_inner(
+        endpoint,
+        commands,
+        provider_lease,
+        recovery,
+        snapshot,
+        runtime,
+        worker,
+        app,
+        GuardianTuiShutdown::Standard(tui),
+        pump,
+        failure,
+        channel_live,
+        true,
     )
 }
 
@@ -5119,6 +5491,7 @@ fn finish_terminal_guardian_after_forwarded_signal(
         pump,
         failure,
         channel_live,
+        false,
     )
 }
 
@@ -5136,6 +5509,7 @@ fn finish_terminal_guardian_inner(
     pump: Option<GuardianPumpState>,
     mut failure: Option<(Phase, FailureCode)>,
     mut channel_live: bool,
+    hold_after_announced_failure: bool,
 ) -> Result<ExitCode, FixtureError> {
     let mut failure_announced = false;
     if channel_live {
@@ -5146,6 +5520,14 @@ fn finish_terminal_guardian_inner(
                 channel_live = false;
             }
         }
+    }
+    if channel_live
+        && failure_announced
+        && hold_after_announced_failure
+        && (write_marker("guardian.failure-announced-held", b"held\n").is_err()
+            || wait_for_exact_marker("test.release-quiescence", b"release\n").is_err())
+    {
+        channel_live = false;
     }
 
     let pumps_stopped = match pump {
@@ -5465,8 +5847,12 @@ fn receive_terminal_restored(
             signal: UnixSignal::Int | UnixSignal::Quit,
         } | CoordinatorCommand::Resize { .. })
     );
-    natural_tui_exit
-        && superseded_interactive_control
+    // The validator accepts `OpenInputGate` here only when a failure left the
+    // pre-gate state before a concurrently written command was consumed.
+    // Unlike best-effort interactive controls, this drain does not depend on
+    // which child triggered the failure.
+    let superseded_pre_gate_control = matches!(first, Ok(CoordinatorCommand::OpenInputGate));
+    (superseded_pre_gate_control || natural_tui_exit && superseded_interactive_control)
         && matches!(
             commands.receive(phase_deadline()),
             Ok(CoordinatorCommand::TerminalRestored)

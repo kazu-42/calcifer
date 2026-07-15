@@ -92,6 +92,8 @@ enum Scenario {
     PtyMalformedFrame,
     PtyTrailingFrame,
     PtyTuiEarlyExit,
+    PtyTuiExitBeforeGate,
+    PtyTuiExitBeforeResumeGate,
     PtyReadyNoAck,
     PtyWorkerFailure,
     PtyTerminalChannelEof,
@@ -133,6 +135,8 @@ impl Scenario {
             "pty-malformed-frame" => Ok(Self::PtyMalformedFrame),
             "pty-trailing-frame" => Ok(Self::PtyTrailingFrame),
             "pty-tui-early-exit" => Ok(Self::PtyTuiEarlyExit),
+            "pty-tui-exit-before-gate" => Ok(Self::PtyTuiExitBeforeGate),
+            "pty-tui-exit-before-resume-gate" => Ok(Self::PtyTuiExitBeforeResumeGate),
             "pty-ready-no-ack" => Ok(Self::PtyReadyNoAck),
             "pty-worker-failure" => Ok(Self::PtyWorkerFailure),
             "pty-terminal-channel-eof" => Ok(Self::PtyTerminalChannelEof),
@@ -175,6 +179,8 @@ impl Scenario {
             Self::PtyMalformedFrame => "pty-malformed-frame",
             Self::PtyTrailingFrame => "pty-trailing-frame",
             Self::PtyTuiEarlyExit => "pty-tui-early-exit",
+            Self::PtyTuiExitBeforeGate => "pty-tui-exit-before-gate",
+            Self::PtyTuiExitBeforeResumeGate => "pty-tui-exit-before-resume-gate",
             Self::PtyReadyNoAck => "pty-ready-no-ack",
             Self::PtyWorkerFailure => "pty-worker-failure",
             Self::PtyTerminalChannelEof => "pty-terminal-channel-eof",
@@ -205,6 +211,8 @@ impl Scenario {
                 | Self::PtyMalformedFrame
                 | Self::PtyTrailingFrame
                 | Self::PtyTuiEarlyExit
+                | Self::PtyTuiExitBeforeGate
+                | Self::PtyTuiExitBeforeResumeGate
                 | Self::PtyReadyNoAck
                 | Self::PtyWorkerFailure
                 | Self::PtyTerminalChannelEof
