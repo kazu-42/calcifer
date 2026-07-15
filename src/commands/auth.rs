@@ -182,16 +182,15 @@ pub(crate) fn rename_codex(old_alias: &str, new_alias: &str) -> Result<RenameRep
     })
 }
 
-pub(crate) fn preview_remove_codex(alias: &str) -> Result<Profile, AppError> {
-    let registry = Registry::discover()?;
+pub(crate) fn preview_remove_codex(registry: &Registry, alias: &str) -> Result<Profile, AppError> {
     Ok(registry.preview_remove(Provider::Codex, alias)?)
 }
 
 pub(crate) fn remove_codex(
+    registry: &Registry,
     alias: &str,
     confirmed_profile_id: Option<&str>,
 ) -> Result<RemoveReport, AppError> {
-    let registry = Registry::discover()?;
     let profile = registry.remove(Provider::Codex, alias, confirmed_profile_id)?;
     Ok(RemoveReport {
         schema_version: 1,

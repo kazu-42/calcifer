@@ -229,6 +229,32 @@ fn snapshot_profile_remove_test_tree(
 }
 
 #[cfg(unix)]
+fn clone_profile_remove_test_tree(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            clone_profile_remove_test_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else if metadata.is_file() {
+        std::fs::copy(source, destination)?;
+    } else {
+        return Err(std::io::Error::other("unexpected non-file profile fixture entry").into());
+    }
+    std::fs::set_permissions(
+        destination,
+        std::fs::Permissions::from_mode(metadata.permissions().mode()),
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
 #[derive(Debug)]
 struct ProfileRemovePtyResult {
     status: i32,
@@ -1150,6 +1176,67 @@ fn profile_remove_tty_requires_exact_yes_and_pins_the_prompted_immutable_id()
         replacement_id
     );
 
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_remove_tty_pins_the_physical_root_across_confirmation()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-profile-remove-root-pin-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&sandbox)?;
+    let root_a = sandbox.join("state-a");
+    let root_b = sandbox.join("state-b");
+    let root_alias = sandbox.join("state-current");
+    let (path, provider_log) = install_profile_remove_test_codex(&sandbox)?;
+    let profile_id = add_profile_remove_test_profile(&root_a, &path, &provider_log, "work")?;
+    clone_profile_remove_test_tree(&root_a, &root_b)?;
+    assert_eq!(profile_remove_test_profile_id(&root_b, "work")?, profile_id);
+    symlink(&root_a, &root_alias)?;
+
+    let fixture = ProfileRemovePtyFixture {
+        sandbox: &sandbox,
+        root: &root_alias,
+        path: &path,
+        log: &provider_log,
+    };
+    let result = run_profile_remove_in_pty(
+        &fixture,
+        "work",
+        Some(b"yes\n"),
+        "physical-root-swap",
+        || {
+            std::fs::remove_file(&root_alias)?;
+            symlink(&root_b, &root_alias)?;
+            Ok(())
+        },
+    )?;
+
+    assert_eq!(
+        result.status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(profile_remove_test_profile_id(&root_a, "work").is_err());
+    assert_eq!(
+        profile_remove_test_profile_id(&root_b, "work")?,
+        profile_id,
+        "confirmation for root A must never remove the cloned profile in root B"
+    );
+    assert_eq!(
+        std::fs::canonicalize(&root_alias)?,
+        std::fs::canonicalize(&root_b)?
+    );
+
+    std::fs::remove_file(root_alias)?;
     std::fs::remove_dir_all(sandbox)?;
     Ok(())
 }

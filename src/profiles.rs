@@ -3501,7 +3501,94 @@ fn private_directory_metadata_is_safe(metadata: &fs::Metadata, expected_uid: u32
         && metadata.mode() & 0o077 == 0
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+struct MacosOpenedNode {
+    metadata: fs::Metadata,
+    stat: rustix::fs::Stat,
+    acl: calcifer_macos_acl::Acl,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_for_open_file(file: &File) -> io::Result<calcifer_macos_acl::Acl> {
+    use std::os::fd::AsFd;
+
+    calcifer_macos_acl::read_acl(file.as_fd())
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_opened_macos_node(
+    file: &File,
+    path: &Path,
+    expected_directory: bool,
+) -> Result<MacosOpenedNode, ProfileError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let first_metadata = file.metadata()?;
+    let expected_type = if expected_directory {
+        first_metadata.file_type().is_dir()
+    } else {
+        first_metadata.file_type().is_file()
+    };
+    if !expected_type || first_metadata.file_type().is_symlink() {
+        return Err(ProfileError::UnsafeState(
+            "managed path has an unexpected filesystem type".to_owned(),
+        ));
+    }
+
+    let acl = macos_acl_for_open_file(file).map_err(|_| {
+        ProfileError::UnsafeState("managed path ACL could not be read safely".to_owned())
+    })?;
+    let stat = rustix::fs::fstat(file)
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+    let metadata = file.metadata()?;
+    let visible = fs::symlink_metadata(path)?;
+    let opened_identity = FileSystemIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    let visible_identity = FileSystemIdentity {
+        device: visible.dev(),
+        inode: visible.ino(),
+    };
+    if opened_identity != visible_identity
+        || opened_identity != stat_identity(&stat)?
+        || first_metadata.dev() != metadata.dev()
+        || first_metadata.ino() != metadata.ino()
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed path changed while its permissions were inspected".to_owned(),
+        ));
+    }
+
+    Ok(MacosOpenedNode {
+        metadata,
+        stat,
+        acl,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn open_verified_macos_node(
+    path: &Path,
+    expected_directory: bool,
+) -> Result<MacosOpenedNode, ProfileError> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if expected_directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let descriptor = open(path, flags, Mode::empty()).map_err(|_| {
+        ProfileError::UnsafeState(
+            "managed path could not be opened without following links".to_owned(),
+        )
+    })?;
+    let file = File::from(descriptor);
+    inspect_opened_macos_node(&file, path, expected_directory)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
     if !private_directory_metadata_is_safe(&metadata, rustix::process::getuid().as_raw()) {
@@ -3509,8 +3596,24 @@ fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
             "managed directory type, owner, or mode is unsafe".to_owned(),
         ));
     }
-    verify_no_extended_macos_acl(path)?;
-    verify_deletable_macos_flags_path(path)?;
+    verify_safe_creation_parent(path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
+    let node = open_verified_macos_node(path, true)?;
+    if !private_directory_metadata_is_safe(&node.metadata, rustix::process::getuid().as_raw()) {
+        return Err(ProfileError::UnsafeState(
+            "managed directory type, owner, or mode is unsafe".to_owned(),
+        ));
+    }
+    if !node.acl.is_empty() {
+        return Err(ProfileError::UnsafeState(
+            "managed path has unsupported extended permissions".to_owned(),
+        ));
+    }
+    verify_deletable_macos_flags_stat(&node.stat)?;
     verify_safe_creation_parent(path)?;
     Ok(())
 }
@@ -3522,10 +3625,32 @@ fn macos_acl_options() -> Option<exacl::AclOption> {
 
 #[cfg(target_os = "macos")]
 fn clear_inherited_macos_acl(path: &Path) -> Result<(), ProfileError> {
-    exacl::setfacl(&[path], &[], macos_acl_options()).map_err(|_| {
+    use std::os::fd::AsFd;
+
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|_| {
+        ProfileError::UnsafeState(
+            "managed directory could not be opened without following links".to_owned(),
+        )
+    })?;
+    let file = File::from(descriptor);
+    calcifer_macos_acl::clear_acl(file.as_fd()).map_err(|_| {
         ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
     })?;
-    verify_no_extended_macos_acl(path)
+    let node = inspect_opened_macos_node(&file, path, true)?;
+    if node.acl.is_empty() {
+        Ok(())
+    } else {
+        Err(ProfileError::UnsafeState(
+            "managed path has unsupported extended permissions".to_owned(),
+        ))
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3549,40 +3674,13 @@ fn verify_no_extended_macos_acl(_path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_parent_acl_entry_is_safe(entry: &exacl::AclEntry) -> bool {
-    !entry.allow
-        && entry.flags.difference(exacl::Flag::INHERITED).is_empty()
-        && entry.perms.difference(exacl::Perm::DELETE).is_empty()
+fn macos_parent_acl_entry_is_safe(entry: &calcifer_macos_acl::Entry) -> bool {
+    entry.tag == calcifer_macos_acl::TAG_DENY
+        && entry.flags & !calcifer_macos_acl::FLAG_INHERITED == 0
+        && entry.permissions & !calcifer_macos_acl::PERMISSION_DELETE == 0
 }
 
-#[cfg(target_os = "macos")]
-fn verify_safe_macos_parent_directory(parent: &Path) -> Result<(), ProfileError> {
-    let parent_stat = rustix::fs::statat(rustix::fs::CWD, parent, rustix::fs::AtFlags::empty())
-        .map_err(io::Error::from)
-        .map_err(ProfileError::Io)?;
-    verify_safe_macos_creation_parent_flags(&parent_stat)?;
-    let entries = exacl::getfacl(parent, None).map_err(|_| {
-        ProfileError::UnsafeState(
-            "managed path creation parent has unsupported extended permissions".to_owned(),
-        )
-    })?;
-    if entries
-        .iter()
-        .any(|entry| !macos_parent_acl_entry_is_safe(entry))
-    {
-        return Err(ProfileError::UnsafeState(
-            "managed path creation parent has unsafe extended permissions".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn verify_safe_macos_parent_directory(_parent: &Path) -> Result<(), ProfileError> {
-    Ok(())
-}
-
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn verify_safe_creation_ancestor(directory: &Path, current_uid: u32) -> Result<(), ProfileError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -3605,7 +3703,34 @@ fn verify_safe_creation_ancestor(directory: &Path, current_uid: u32) -> Result<(
             "managed path has a replaceable creation ancestor".to_owned(),
         ));
     }
-    verify_safe_macos_parent_directory(directory)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_safe_creation_ancestor(directory: &Path, current_uid: u32) -> Result<(), ProfileError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let node = open_verified_macos_node(directory, true)?;
+    let owner_is_trusted = node.metadata.uid() == 0 || node.metadata.uid() == current_uid;
+    let writable_by_others = node.metadata.mode() & 0o022 != 0;
+    let sticky = node.metadata.mode() & 0o1000 != 0;
+    if !owner_is_trusted || (writable_by_others && !sticky) {
+        return Err(ProfileError::UnsafeState(
+            "managed path has a replaceable creation ancestor".to_owned(),
+        ));
+    }
+    verify_safe_macos_creation_parent_flags(&node.stat)?;
+    if node.acl.flags != 0
+        || node
+            .acl
+            .entries
+            .iter()
+            .any(|entry| !macos_parent_acl_entry_is_safe(entry))
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed path creation parent has unsafe extended permissions".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -3720,22 +3845,35 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ProfileError> {
     let mut file = create_new_private_file(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    verify_private_regular_file(path)
+    verify_private_regular_file_handle(path, &file)
 }
 
 fn create_new_private_file(path: &Path) -> Result<File, ProfileError> {
     verify_safe_creation_parent(path)?;
     let mut options = private_open_options();
     let file = options.write(true).create_new(true).open(path)?;
-    let verification = clear_inherited_macos_acl(path)
-        .and_then(|()| verify_deletable_macos_flags_path(path))
-        .and_then(|()| verify_private_regular_file(path));
+    let verification = prepare_new_private_file(path, &file);
     if let Err(error) = verification {
         drop(file);
         let _ = fs::remove_file(path);
         return Err(error);
     }
     Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_new_private_file(path: &Path, file: &File) -> Result<(), ProfileError> {
+    use std::os::fd::AsFd;
+
+    calcifer_macos_acl::clear_acl(file.as_fd()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })?;
+    verify_private_regular_file_handle(path, file)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prepare_new_private_file(path: &Path, _file: &File) -> Result<(), ProfileError> {
+    verify_private_regular_file(path)
 }
 
 #[cfg(unix)]
@@ -3950,7 +4088,7 @@ fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, Prof
     Ok(file)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -3965,8 +4103,45 @@ fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
             "managed file is accessible by another OS user".to_owned(),
         ));
     }
-    verify_no_extended_macos_acl(path)?;
-    verify_deletable_macos_flags_path(path)?;
+    verify_safe_creation_parent(path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_private_macos_regular_node(node: &MacosOpenedNode) -> Result<(), ProfileError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if node.metadata.mode() & 0o077 != 0 {
+        return Err(ProfileError::UnsafeState(
+            "managed file is accessible by another OS user".to_owned(),
+        ));
+    }
+    if !node.acl.is_empty() {
+        return Err(ProfileError::UnsafeState(
+            "managed path has unsupported extended permissions".to_owned(),
+        ));
+    }
+    verify_deletable_macos_flags_stat(&node.stat)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_private_regular_file_handle(path: &Path, file: &File) -> Result<(), ProfileError> {
+    let node = inspect_opened_macos_node(file, path, false)?;
+    verify_private_macos_regular_node(&node)?;
+    verify_safe_creation_parent(path)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_private_regular_file_handle(path: &Path, _file: &File) -> Result<(), ProfileError> {
+    verify_private_regular_file(path)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
+    let node = open_verified_macos_node(path, false)?;
+    verify_private_macos_regular_node(&node)?;
     verify_safe_creation_parent(path)?;
     Ok(())
 }
@@ -7035,19 +7210,29 @@ config_file = "{sensitive_path}"
         let mut acl_cleanup = MacosAclCleanup::new(vec![parent.clone(), raw_child.clone()]);
         let current_uid = rustix::process::getuid().as_raw();
         let other_uid = if current_uid == 89 { "1" } else { "89" };
-        let mut unknown_flag = AclEntry::deny_user(other_uid, Perm::DELETE, None);
-        unknown_flag.flags = Flag::from_bits_retain(1_u32 << 31);
+        let unknown_flag = calcifer_macos_acl::Entry {
+            tag: calcifer_macos_acl::TAG_DENY,
+            flags: 1_u32 << 31,
+            permissions: calcifer_macos_acl::PERMISSION_DELETE,
+        };
         assert!(
             !macos_parent_acl_entry_is_safe(&unknown_flag),
             "unknown ACL flags must fail closed"
         );
-        let mut unknown_permission = AclEntry::deny_user(other_uid, Perm::DELETE, None);
-        unknown_permission.perms |= Perm::from_bits_retain(1_u32 << 31);
+        let unknown_permission = calcifer_macos_acl::Entry {
+            tag: calcifer_macos_acl::TAG_DENY,
+            flags: 0,
+            permissions: calcifer_macos_acl::PERMISSION_DELETE | (1_u32 << 31),
+        };
         assert!(
             !macos_parent_acl_entry_is_safe(&unknown_permission),
             "unknown ACL permissions must fail closed"
         );
-        let inherited_delete = AclEntry::deny_user(other_uid, Perm::DELETE, Flag::INHERITED);
+        let inherited_delete = calcifer_macos_acl::Entry {
+            tag: calcifer_macos_acl::TAG_DENY,
+            flags: calcifer_macos_acl::FLAG_INHERITED,
+            permissions: calcifer_macos_acl::PERMISSION_DELETE,
+        };
         assert!(
             macos_parent_acl_entry_is_safe(&inherited_delete),
             "an inherited, non-propagating DELETE-only deny remains safe"
@@ -7169,6 +7354,57 @@ config_file = "{sensitive_path}"
 
         acl_cleanup.clear()?;
         fs::remove_dir_all(parent)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_acl_reads_stay_bound_to_an_open_inode_after_path_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsFd;
+
+        use exacl::{AclEntry, Perm};
+
+        let root = temporary_root("opened-macos-acl");
+        secure_create_dir_all(&root)?;
+        let original = root.join("original");
+        secure_create_dir(&original)?;
+        let current_uid = rustix::process::getuid().as_raw();
+        let other_uid = if current_uid == 89 { "1" } else { "89" };
+        let allow_delete = [AclEntry::allow_user(other_uid, Perm::DELETE, None)];
+        exacl::setfacl(&[&original], &allow_delete, macos_test_acl_options())?;
+        let mut acl_cleanup = MacosAclCleanup::new(vec![original.clone()]);
+        let opened = File::open(&original)?;
+
+        let parked = root.join("parked");
+        fs::rename(&original, &parked)?;
+        acl_cleanup.candidates = vec![parked.clone()];
+        secure_create_dir(&original)?;
+        assert!(
+            exacl::getfacl(&original, macos_test_acl_options())?.is_empty(),
+            "the replacement pathname must be ACL-free"
+        );
+        let opened_acl = macos_acl_for_open_file(&opened)?;
+        assert_eq!(opened_acl.entries.len(), 1);
+        assert_eq!(opened_acl.entries[0].tag, calcifer_macos_acl::TAG_ALLOW);
+        assert_eq!(
+            opened_acl.entries[0].permissions,
+            calcifer_macos_acl::PERMISSION_DELETE
+        );
+        calcifer_macos_acl::clear_acl(opened.as_fd())?;
+        assert!(
+            macos_acl_for_open_file(&opened)?.is_empty(),
+            "descriptor-bound clearing must remove the parked inode's ACL"
+        );
+        assert!(
+            exacl::getfacl(&parked, macos_test_acl_options())?.is_empty(),
+            "descriptor-bound clearing must affect the parked inode, not its replacement"
+        );
+
+        acl_cleanup.clear()?;
+        fs::remove_dir(original)?;
+        fs::remove_dir(parked)?;
+        fs::remove_dir(root)?;
         Ok(())
     }
 

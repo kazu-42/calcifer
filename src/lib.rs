@@ -132,18 +132,21 @@ where
             },
             AuthCommand::Remove { profile, yes } => match profile.provider {
                 ProviderArgument::Codex => {
+                    if !yes
+                        && (cli.json || !io::stdin().is_terminal() || !io::stderr().is_terminal())
+                    {
+                        return render_app_error("auth", &AppError::ConfirmationRequired, cli.json);
+                    }
+                    let registry = match profiles::Registry::discover().map_err(AppError::from) {
+                        Ok(registry) => registry,
+                        Err(error) => return render_app_error("auth", &error, cli.json),
+                    };
                     let confirmed_profile_id = if !yes {
-                        if cli.json || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-                            return render_app_error(
-                                "auth",
-                                &AppError::ConfirmationRequired,
-                                cli.json,
-                            );
-                        }
-                        let preview = match commands::auth::preview_remove_codex(&profile.alias) {
-                            Ok(preview) => preview,
-                            Err(error) => return render_app_error("auth", &error, false),
-                        };
+                        let preview =
+                            match commands::auth::preview_remove_codex(&registry, &profile.alias) {
+                                Ok(preview) => preview,
+                                Err(error) => return render_app_error("auth", &error, false),
+                            };
                         let prompt = format!(
                             "Remove {} (local profile {}, created {})?\nThis deletes only Calcifer-managed local credentials and sessions; it does not revoke provider tokens or guarantee secure erasure.\nType 'yes' to continue:",
                             preview.reference(),
@@ -168,6 +171,7 @@ where
                         None
                     };
                     match commands::auth::remove_codex(
+                        &registry,
                         &profile.alias,
                         confirmed_profile_id.as_deref(),
                     ) {

@@ -122,12 +122,16 @@ also have supported file flags. Calcifer resolves the deepest existing prefix
 of its configured Unix storage root to a physical path once, stores that path,
 and passes it unchanged to coordinator and guardian helpers. Later managed
 operations reject every symlink ancestor and require each real ancestor to be
-root/current-user-owned and non-replaceable. This avoids path-based ACL checks
-on mutable symlink objects while keeping symlinked home-directory aliases
-usable. Calcifer rejects a parent ACL that could grant, inherit, or block child
-deletion, and rejects append, immutable, XNU-inherited, and unknown parent
-flags. The new path must then read back
-ACL-free and safely flagged before credential bytes are written. On
+root/current-user-owned and non-replaceable by ordinary mode checks. On macOS,
+Calcifer binds type, owner, mode, flags, ACL, and inode identity for each
+acceptance decision to one no-follow descriptor and compares it with the
+visible pathname. It rejects a parent ACL that could grant, inherit, or block
+child deletion, and rejects append, immutable, XNU-inherited, and unknown
+parent flags. A new private file is cleared and read back through the same open
+descriptor as ACL-free and safely flagged before credential bytes are written.
+An already ACL-authorized different OS principal that actively mutates the
+namespace during or after validation remains outside the guarantee because the
+official Codex CLI accepts `CODEX_HOME` only as a pathname. On
 Linux, removal and its recovery require kernel 5.8 or newer
 so `statx` mount IDs and `openat2` constraints are both available; Calcifer never
 falls back to `st_dev` or an unconstrained `openat`. macOS compares

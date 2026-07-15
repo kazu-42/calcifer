@@ -38,6 +38,13 @@ Calcifer cannot protect credentials from:
 - a compromised official provider CLI, plugin, hook, or child tool;
 - a malicious repository executed by the wrapped agent;
 - provider compromise or provider-side account recovery;
+- on macOS, a different OS principal that already has mode- or ACL-granted
+  authority to alter a managed node, its security metadata, or its namespace
+  and races validation or mutates the pathname after the final check. This
+  includes node `DELETE`, parent `DELETE_CHILD`/`ADD_FILE`/`ADD_SUBDIRECTORY`,
+  `WRITE_SECURITY`, and ownership-change authority. The official Codex CLI
+  accepts `CODEX_HOME` only as a pathname and exposes no supported
+  descriptor-based handoff;
 - all exposure through OS swap, crash dumps, or debugging facilities.
 
 Calcifer is not a sandbox and does not make an untrusted repository safe.
@@ -157,17 +164,25 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   coordinator and guardian self-execs. Operational paths must remain canonical;
   every symlink ancestor is rejected, and every real directory ancestor must
   be owned by root/current user and must not be group/other replaceable unless
-  sticky. This removes mutable symlink objects from path-based ACL validation.
-  On macOS, every
-  ALLOW entry, every inheritable ACL entry, DENY permissions other than a
+  sticky. On macOS, each existing managed regular file or directory and each
+  creation ancestor is opened with no-follow semantics. Type, owner, mode, file
+  flags, extended ACL, and device/inode identity used by one acceptance
+  decision are read from that same descriptor with `fstat` and
+  `acl_get_fd_np(ACL_TYPE_EXTENDED)`; the descriptor identity must also match a
+  no-follow lookup of the visible pathname. Any open, ACL, metadata, identity,
+  unsupported tag/bit, or malformed native representation fails closed. No
+  pathname ACL result is combined with metadata from a different vnode. This
+  binds one validation decision, but it is not a globally atomic snapshot and
+  does not permanently pin the pathname against an already-authorized active
+  mutator described above. Every ALLOW entry, every inheritable ACL entry, DENY permissions other than a
   non-inheritable DELETE-only entry, and append, immutable,
   DATAVAULT/RESTRICTED, or unknown parent flags fail before an inode exists. The
   DELETE-only exception keeps the standard macOS home `everyone deny delete`
   ACL compatible without admitting `deny delete_child`; parent-only
   `SF_NOUNLINK` remains compatible with standard temp ancestry. Each new managed
-  directory or private file must then read back with an empty extended ACL and
-  supported flags before credential bytes are written. Existing extended ACL
-  state is never silently normalized.
+  directory or private file must then read back through its open descriptor
+  with an empty extended ACL and supported flags before credential bytes are
+  written. Existing extended ACL state is never silently normalized.
 - Removal-sidecar reads use a no-follow descriptor and match its inode, owner,
   private mode, and single-link state to the visible path before bounded JSON
   parsing.
