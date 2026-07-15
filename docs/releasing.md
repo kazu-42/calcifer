@@ -107,8 +107,12 @@ run_id="$(jq -r '.[0].databaseId' <<<"$run_json")"
 gh run watch "$run_id" --repo kazu-42/calcifer --exit-status
 ```
 
-Pull requests that change the workflow, packaging code, Cargo metadata, or the
-Makefile also run the release matrix without any write or OIDC permissions.
+The normal CI `Quality` job downloads a versioned actionlint archive, verifies
+its pinned SHA-256, and lints every workflow. Pull requests that change the CI
+or release workflow, packaging code, Cargo/build metadata, or the Makefile also
+run this release workflow's complete validation and native build matrix without
+any write or OIDC permissions. A release-path change therefore requires both
+the normal CI checks and the separate `Release` PR run to be green.
 
 ## Maintainer checklist
 

@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target-reservation primitive, and a default-unused fake-child supervisor authority foundation are implemented. Real supervised Codex integration, PTY/monitor wiring, the production cross-profile handoff transaction, and automatic failover remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target-reservation primitive, and default-unused fake-child process plus readiness-gated terminal supervisor foundations are implemented. Real supervised Codex/App Server/TUI integration, persistent monitor wiring, the production cross-profile handoff transaction, and automatic failover remain future work.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -71,6 +71,13 @@ Future code that violates one of these invariants requires an architecture decis
 16. **Provider identity stays private.** A bounded provider-owned scope is immediately reduced to an installation-local HMAC fingerprint; raw scopes, fingerprints, and identity-key IDs never enter public DTOs or diagnostics.
 17. **Update evidence stays precise.** An update recommendation requires an immutable release and canonical v1 manifest/checksum agreement for the exact compile target. Published attestation evidence and locally verified bytes are reported separately; an un-downloaded archive is never called verified.
 18. **Transferred leases are close-only and non-inheritable.** After a lease descriptor is shared, ownership is released only by closing the exact descriptor, never by explicitly unlocking it. A received descriptor must be marked and read back as close-on-exec before the guardian may acknowledge it or start a child.
+19. **Terminal authority is gated and recoverable.** Lifecycle control,
+    optional lease transfer, and terminal bytes use distinct close-on-exec
+    channels. The guardian creates no runtime, worker, PTY, or child before the
+    coordinator accepts an exact semantic pre-raw snapshot fingerprint. Outer
+    input has no worker before typed readiness, raw-mode readback, and
+    `OPEN_GATE` ACK, and no final child disposition is trusted before exact
+    waits and terminal restoration.
 
 ## Codex profile model
 
@@ -196,6 +203,87 @@ compatibility proofs only: production leases, transition journaling and
 recovery, pool policy, authoritative exhaustion selection, and user-state
 handoff remain unimplemented.
 
+## Implemented default-unused Unix terminal kernel
+
+The `internal-supervisor-fixture` path now composes the fake-child process
+authority with a real PTY and outer terminal on Linux and macOS. This is an
+internal failure-injection kernel, not a public supervised command and not a
+real Codex launch. It reads no profile credentials, starts no persistent usage
+monitor, and changes no registry or conversation schema.
+
+The coordinator/guardian exec boundary keeps three channel classes physically
+separate:
+
+```text
+lifecycle socketpair       -> bounded typed state, failure, signal, and cleanup frames
+optional transfer socket   -> one lease descriptor plus one ACK
+terminal socketpair        -> fixed-buffer full-duplex bytes only
+```
+
+The still-single-threaded guardian exec entry moves lifecycle fd 0, terminal fd
+1, and recovery fd 2 into separate owned close-on-exec duplicates. For each
+class it first requires exactly the inherited standard fd plus the new
+duplicate, atomically replaces the standard fd with access-appropriate
+`/dev/null`, and reads back `/dev/null` type/access/close-on-exec, changed
+identity, and exactly one surviving reference to the original identity. The
+owned duplicate is therefore the sole authority; dropping recovery must reduce
+its original identity count from one to zero. Marking the inherited fd
+close-on-exec without replacing it is not a recovery-disarm boundary.
+
+The guardian then advertises a fixed, domain-separated SHA-256 fingerprint of
+its full semantic pre-raw target state in `TERMINAL_ARMED`. The fingerprint
+covers the platform and format version, terminal identity, PENDIN-masked
+termios fields, initial character and pixel size, and foreground process group.
+The coordinator compares it in constant time with its immutable snapshot and
+sends `TERMINAL_ARM_ACCEPTED` only on an exact match; descriptor identity or
+foreground process group alone is not enough. The guardian creates no private
+runtime, fixture worker, PTY, or child before that ACK. The fingerprint remains
+wire-only and redacted in debug output and failures.
+
+The fake TUI later receives a one-shot typed readiness descriptor. All
+provider-style children lack the lease, lifecycle, transfer, terminal,
+recovery, unrelated PTY-master, and outer-tty descriptors after exec.
+
+The terminal gate is ordered and linear:
+
+```text
+TERMINAL_ARMED { redacted semantic fingerprint }
+  -> constant-time coordinator match
+  -> TERMINAL_ARM_ACCEPTED; runtime/worker/child creation now authorized
+  -> fake TUI on controlling PTY; output-only pump
+  -> exact READY capability; input workers still absent
+  -> outer tty identity and foreground revalidation
+  -> discard queued input; enter raw mode and read it back
+  -> OPEN_GATE / INPUT_GATE_OPENED
+  -> create outer-input worker
+```
+
+Every pump moves only one fixed 8 KiB fragment at a time and relies on kernel
+backpressure. There is no terminal transcript, unbounded payload queue, or
+payload-bearing diagnostic. Pre-ready and suspended input is discarded instead
+of replayed.
+
+Only the live guardian direct-child handle may signal the TUI process group.
+INT/QUIT may be handled without ending the session; HUP/TERM are forwarded once
+before bounded shutdown; WINCH retains only the latest size. TSTP first
+quiesces ingress and restores the user's tty before the coordinator stops.
+CONT requires foreground and identity revalidation, a fresh size, raw-mode
+readback, TUI continuation, and a new gate ACK.
+
+Normal completion stops pumps, exactly waits children, restores the outer tty,
+disarms guardian recovery, emits one terminal `CHILDREN_REAPED` frame, exactly
+waits the guardian, and only then reproduces the TUI's zero, nonzero, or signal
+disposition. Infrastructure, PTY EOF/EIO, signal, identity, restoration, and
+cleanup failures cannot be rewritten as a successful TUI exit.
+
+If the coordinator dies while raw mode may be active, the guardian restores
+through its recovery tty before releasing B. If the guardian dies, the
+coordinator restores before retained-A parking and never promotes a reported
+PID/PGID into stale authority. If both are killed with uncatchable `SIGKILL`,
+in-process restoration is impossible and the shell or terminal emulator is the
+external recovery boundary. The complete state machine and release gates are
+normative in [ADR 0003](adr/0003-supervised-codex-session.md).
+
 ## Implemented Codex usage observation
 
 For every selected idle profile, Calcifer holds the exclusive profile lease and
@@ -225,6 +313,8 @@ The verified upstream versions, exact fields, and source links are recorded in [
 The staged process topology, separate lifecycle/lease-transfer channels,
 readiness contract, macOS guardian-loss constraint, and public release gates
 are specified in [ADR 0003](adr/0003-supervised-codex-session.md).
+Its fake-child process and readiness-gated PTY foundations are implemented and
+default-unused; the following real-provider transaction remains planned.
 
 ```text
 resolve pinned profile or explicit pool
@@ -416,8 +506,14 @@ The current process launcher:
   coordinator lease held; the coordinator never turns previously reported
   numeric PIDs into delayed signal authority, while the fixed fake children
   use a guardian-liveness pipe to avoid orphaning on abrupt guardian death;
-- let every Calcifer wrapper layer catch terminal termination signals while the official provider receives its normal process-group delivery, so a provider that handles `SIGINT` remains attached to the foreground wrapper and cannot outlive every lease owner;
-- preserve ordinary child exit codes; polished cross-platform signal forwarding and job-control semantics remain release gates;
+- prove in the default-unused Unix terminal fixture that only the live guardian
+  signals the TUI group, HUP/TERM are forwarded once, INT/QUIT can remain
+  attached, WINCH is coalesced, and TSTP/CONT uses restore-before-stop plus a
+  fresh gate; wiring that policy to the official provider remains a public
+  release gate;
+- preserve ordinary child exit codes; the terminal fixture additionally
+  preserves nonzero and terminating-signal disposition only after exact waits,
+  restoration, recovery disarm, and final guardian proof;
 - avoid persisting child stdout or stderr by default;
 - force profile-local file storage for CLI and MCP OAuth credentials on every
   operation and reject provider arguments that can override the account,
@@ -502,9 +598,10 @@ Before the first stable release, the project still needs reviewed decisions or
 completed implementations for:
 
 - deliberate all-profile re-key recovery after identity-key loss;
-- the Linux/macOS process/PTY supervision staged in
+- real Codex/App Server/TUI and persistent-monitor integration on top of the
+  default-unused Linux/macOS process/PTY foundations in
   [ADR 0003](adr/0003-supervised-codex-session.md), plus a separate Windows
-  design;
+  terminal and process-authority design;
 - additional Codex version/schema gates and observation cache TTL/backoff;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);

@@ -28,7 +28,7 @@ pub(super) enum RetentionReason {
 }
 
 impl RetentionReason {
-    const fn code(self) -> &'static str {
+    pub(super) const fn code(self) -> &'static str {
         match self {
             Self::LifecycleLost => "lifecycle_lost",
             Self::ProtocolInvalid => "protocol_invalid",
@@ -39,6 +39,14 @@ impl RetentionReason {
             Self::CleanupUnconfirmed => "cleanup_unconfirmed",
             Self::InvariantUnconfirmed => "invariant_unconfirmed",
         }
+    }
+
+    /// Losing proof that outer-terminal ingress is quiescent invalidates any
+    /// more specific retention classification. Terminal restoration is still
+    /// attempted, but its result cannot recover the missing quiescence proof.
+    pub(super) const fn after_unconfirmed_input_quiescence(self) -> Self {
+        let _ = self;
+        Self::InvariantUnconfirmed
     }
 }
 
@@ -144,6 +152,27 @@ mod tests {
             assert!(!rendered.contains('/'));
             assert!(!rendered.contains('@'));
             assert!(!rendered.contains("codex"));
+        }
+    }
+
+    #[test]
+    fn unconfirmed_input_quiescence_overrides_every_prior_retention_reason() {
+        let reasons = [
+            RetentionReason::LifecycleLost,
+            RetentionReason::ProtocolInvalid,
+            RetentionReason::GuardianExited,
+            RetentionReason::ShutdownDeadline,
+            RetentionReason::ChildrenNotReaped,
+            RetentionReason::WorkerNotJoined,
+            RetentionReason::CleanupUnconfirmed,
+            RetentionReason::InvariantUnconfirmed,
+        ];
+
+        for reason in reasons {
+            assert_eq!(
+                reason.after_unconfirmed_input_quiescence(),
+                RetentionReason::InvariantUnconfirmed
+            );
         }
     }
 }

@@ -2,7 +2,24 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. A private, credential-free compatibility gate proves the pinned Codex `0.144.4` fork-by-path and remote-TUI behavior against synthetic state; issue #48 extracts its bounded readiness relay, and issue #50 adds a default-unused coordinator/guardian authority foundation with fake children and real-exec fault injection. Automatic failover, real supervised Codex integration, PTY bridging, and the production cross-profile conversation handoff transaction are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines handoff semantics and [ADR 0003](adr/0003-supervised-codex-session.md) defines the staged supervisor.
+This document covers both implemented and intended guarantees. The current
+Unix Codex slice creates isolated file-backed credentials through the official
+login flow, may let the official CLI refresh them during run, resume, or status,
+captures an exact same-profile thread key for crash-safe cold restore, and can
+remove one owned local profile through a confirmed crash-safe tombstone
+transaction. A private, credential-free compatibility gate proves the pinned
+Codex `0.144.4` fork-by-path and remote-TUI behavior against synthetic state;
+issue #48 extracts its bounded readiness relay, issue #50 adds default-unused
+coordinator/guardian process authority with fake children, and issue #52 adds a
+default-unused synthetic Unix terminal kernel with a real PTY, typed input gate,
+fixed-buffer streaming, signal/job-control policy, and redundant restoration.
+That kernel launches no real Codex process, reads no profile credential,
+persists no terminal data, and exposes no public command. Automatic failover,
+real supervised Codex/App Server/TUI and monitor integration, and the production
+cross-profile conversation handoff transaction remain unimplemented;
+[ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines handoff
+semantics and [ADR 0003](adr/0003-supervised-codex-session.md) defines the
+staged supervisor.
 
 ## Assets
 
@@ -10,6 +27,8 @@ This document covers both implemented and intended guarantees. The current Unix 
 - account, workspace, and organization identity
 - profile selection and trust-domain policy
 - source code, prompts, conversation context, and child process output
+- outer-terminal identity, modes, foreground ownership, and interactive stream
+  privacy
 - Calcifer registry integrity
 - installation-local provider-identity HMAC key and private profile bindings
 - public release metadata, manifests, checksums, and update recommendations
@@ -29,6 +48,9 @@ This document covers both implemented and intended guarantees. The current Unix 
 - automatic replay duplicating file, Git, deployment, billing, or messaging side effects
 - one conversation lineage being written concurrently, handed to an account outside its configured trust domain, or imported from an attacker-selected path
 - a compatibility probe reading a real profile or rollout, inheriting ambient credentials or routing, declaring a remote TUI ready from socket liveness alone, or deleting a replaced cleanup path
+- a terminal supervisor forwarding or replaying input before exact readiness,
+  retaining a transcript, growing an unbounded payload queue, signaling through
+  a stale numeric PID/PGID, or leaving the outer tty raw after one authority dies
 - mutable, redirected, oversized, partial, or digest-mismatched release metadata causing installation of the wrong target
 
 ## Threats outside the guarantee
@@ -52,6 +74,12 @@ Calcifer cannot protect credentials from:
   descriptor-based handoff;
 - all exposure through OS swap, crash dumps, or debugging facilities.
 
+If both coordinator and guardian receive uncatchable `SIGKILL` while the outer
+tty is raw, no in-process authority survives to restore it. The invoking shell
+or terminal emulator is the external recovery boundary and may require an
+explicit terminal reset. Calcifer must never turn that limitation into a false
+restoration claim.
+
 Calcifer is not a sandbox and does not make an untrusted repository safe.
 
 ## Secret-handling requirements
@@ -60,6 +88,11 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Tokens and reset-credit IDs are never accepted as ordinary command-line flags because process listings and shell history can expose them.
 - Raw arguments, child environments, credential files, account email, and stable provider IDs are not logged.
 - Conversation metadata stores only Calcifer/profile/thread UUIDs, canonical cwd, tested adapter versions, bounded inventory timestamps, path-free file identity/size/mtime/ctime fingerprints, and lifecycle state. It excludes aliases, rollout paths, App Server previews, transcript bodies, prompts, responses, approvals, tool arguments, terminal streams, credentials, and provider identity.
+- The internal terminal kernel moves bytes only through one fixed 8 KiB buffer
+  per active direction, retains no transcript or payload queue, zeroes reported
+  and otherwise unreported bytes before reuse, and emits only fixed redacted
+  diagnostics. Its pre-raw SHA-256 snapshot fingerprint is ephemeral lifecycle
+  evidence and is never rendered or persisted.
 - Diagnostics report capability and redacted status, not secret values or credential paths.
 - Test credentials are synthetic and contain obvious non-production markers.
 - Profile aliases are mutable display metadata, never filesystem ownership
@@ -132,18 +165,49 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   state. The ACK is one-shot, strictly parsed, and bound to the same socket; the
   sender releases its provider descriptor only by close, never explicit
   unlock. Descriptor-held flock state is the authority; a PID is not.
-- In the internal #50 supervised-session foundation, provider PIDs and process
-  groups are containment handles, not lease or reap authority. Normal release
-  requires a trusted `CHILDREN_REAPED` terminal frame from the live guardian
-  followed by an exact wait for that guardian and terminal-stream EOF. If the
+- In the internal #50/#52 supervised-session foundations, provider PIDs and
+  process groups are observation and live-guardian containment metadata, not
+  lease or reap authority. Normal release requires stopped terminal pumps,
+  exact direct-child waits, `TERMINAL_QUIESCED`, coordinator restoration with
+  semantic readback, `TERMINAL_RESTORED`, guardian recovery disarm, a trusted
+  `CHILDREN_REAPED` frame, exact guardian wait, and lifecycle EOF. If the
   guardian disappears without that proof, including after reporting provider
-  PIDs, the coordinator parks with lease A held rather than inferring safety
-  from PID disappearance; see
-  [ADR 0003](adr/0003-supervised-codex-session.md). This foundation launches
-  fixed synthetic children only and is unavailable to the public CLI. Reported
-  numeric PID/PGID values are never reused by the coordinator as delayed signal
-  authority; the fake children instead receive a dedicated guardian-liveness
-  pipe whose EOF lets them exit after abrupt guardian death.
+  PIDs, the coordinator restores the tty and parks with lease A held rather
+  than inferring safety from PID disappearance; see
+  [ADR 0003](adr/0003-supervised-codex-session.md). These foundations launch
+  fixed synthetic children only and are unavailable to the public CLI.
+  Reported numeric PID/PGID values are never reused by the coordinator as
+  delayed signal authority; the fake children instead receive a dedicated
+  guardian-liveness pipe whose EOF lets them exit after abrupt guardian death.
+- At guardian exec entry, lifecycle fd 0, terminal fd 1, and recovery fd 2 are
+  each moved into one owned close-on-exec duplicate while the guardian is still
+  single-threaded. The boundary requires exactly two references to the original
+  identity before replacement, atomically replaces the inherited standard fd
+  with access-appropriate `/dev/null`, validates type/access/close-on-exec and
+  changed identity, and requires exactly the owned duplicate afterward.
+  Dropping recovery must reduce that identity count from one to zero. Merely
+  setting `FD_CLOEXEC` on an inherited second recovery fd is not disarm proof.
+- Before the #52 guardian can create a private runtime, worker, PTY, or child,
+  it sends a fixed, domain-separated SHA-256 fingerprint of its full semantic
+  pre-raw terminal snapshot. The coordinator compares it in constant time with
+  its own immutable snapshot and returns `TERMINAL_ARM_ACCEPTED` only on an
+  exact match. A mismatch starts nothing, keeps input closed, restores and reads
+  back the tty, exactly waits the guardian, and fails cleanly. A missing or
+  ambiguous ACK also starts nothing but retains coordinator authority and
+  evidence after restoration and guardian containment.
+- The #52 outer-input worker is physically absent until exact fake-TUI
+  readiness, foreground and terminal-identity revalidation, input flush,
+  raw-mode semantic readback, and `OPEN_GATE` acknowledgement all succeed.
+  `TSTP` restores before stopping and `CONT` requires a fresh gate; HUP/TERM are
+  forwarded once, WINCH retains only the latest size, and only the guardian's
+  live direct-child handle may signal the synthetic TUI group. Normal and
+  fallback restoration re-read foreground ownership immediately before
+  changing termios; a mismatch means another owner may have reclaimed the tty,
+  so Calcifer performs no restore, emits no restored proof, and retains its
+  lease/evidence. The internal fallback assumes its living test anchor does not
+  reclaim the tty in that interval. Public use requires a wrapper/anchor-owned
+  handoff or an equivalently strong generation binding rather than trusting a
+  reusable numeric process-group value.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
 - Bounded metadata-only App Servers for status and thread capture inherit only
   the provider-side lease. On Unix the multithreaded parent never clears
@@ -415,6 +479,16 @@ capability after uncertain cleanup. macOS `EPERM` from process-group kill is
 tolerated only after `WNOWAIT` already proved the group leader exited, covering
 the zombie-only group behavior. Live-tree termination continues to treat
 `EPERM` as failure. Calcifer does not claim to reap non-child descendants.
+That exception currently relies on the default-unused synthetic children
+remaining in the guardian's credential and MAC domain. `WNOWAIT` proves only
+the leader's terminal state, not the absence of an unsignalable live group
+member. Before any real Codex process uses this kernel, platform review must
+provide a stronger absence proof or make every macOS group-kill `EPERM` fatal;
+the synthetic exception is not production containment evidence.
+The job-control fixture likewise escalates an ignored `SIGTSTP` with
+process-group `SIGSTOP` only for a synthetic same-credential tree. Real Codex
+integration must revalidate descendant credentials, sessions, process groups,
+and signal permissions before treating that escalation as containment proof.
 Cleanup unlinks a socket or recursively removes a scratch root only while its
 recorded filesystem identity matches at the check. An identity mismatch is
 preserved rather than risking deletion of an already-replaced node, subject to
@@ -469,7 +543,9 @@ Immediately before launch, Calcifer reports the local profile alias, provider, t
 
 Changes to authentication, storage, profile deletion, identity verification, environment sanitation, process spawning, output parsing, locking, usage classification, or failover require focused tests and explicit review of the invariants in [architecture.md](architecture.md).
 
-Minimum future test classes include:
+Minimum security-sensitive test classes include. Implemented slices keep their
+applicable classes in CI; future slices must add the remaining evidence before
+public exposure:
 
 1. Property tests proving non-exhaustion never switches, pools never loop, and trust domains never cross.
 2. Multi-process tests for profile leases, mutation races, crashes, and lock release.
@@ -495,3 +571,10 @@ Minimum future test classes include:
     descriptor survives an actual provider-child `exec`. A deterministic
     pre-exec barrier additionally proves the parent remains close-on-exec and a
     concurrent unrelated child receives no matching device/inode.
+15. Real-PTY terminal tests proving semantic snapshot-arm equality, no spawn or
+    input before the respective ACKs, wrong-order/malformed/trailing/disconnected
+    failure, early TUI exit, PTY EOF/EIO, bounded backpressure and worker
+    failure, signal/job-control behavior including a `SIGTSTP`-ignoring
+    descendant, foreground reclaim without stale restoration, restore and
+    cleanup mismatch, selective coordinator/guardian death, exact disposition,
+    and transcript absence on Linux and macOS.

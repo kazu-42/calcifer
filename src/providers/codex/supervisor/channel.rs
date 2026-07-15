@@ -135,12 +135,30 @@ impl LifecycleEndpoint {
             .set_write_timeout(timeout)
             .map_err(|_| ChannelError::TimeoutConfiguration)
     }
+
+    /// Closes both lifecycle directions without releasing endpoint ownership.
+    ///
+    /// Terminal recovery uses this only after a guardian can no longer
+    /// publish a trustworthy quiescence frame. The retained endpoint remains
+    /// an owned capability, while the peer receives deterministic EOF instead
+    /// of waiting forever in raw mode.
+    pub(super) fn shutdown(&self) -> Result<(), ChannelError> {
+        self.stream
+            .shutdown(std::net::Shutdown::Both)
+            .map_err(|_| ChannelError::Shutdown)
+    }
 }
 
 impl fmt::Debug for LifecycleEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let _ = &self.stream;
         formatter.write_str("LifecycleEndpoint(<redacted>)")
+    }
+}
+
+impl AsFd for LifecycleEndpoint {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
     }
 }
 
@@ -287,26 +305,31 @@ pub(super) fn spawn_guardian_with_lifecycle_stdin(
     Ok(SpawnedGuardian { child, coordinator })
 }
 
-/// Adopts the guardian's inherited stdin without ever taking ownership of fd 0.
+/// Moves the guardian's inherited lifecycle stdin into one owned duplicate.
 ///
-/// The inherited descriptor is duplicated atomically with close-on-exec. The
-/// borrowed stdin descriptor is then restored to close-on-exec before any
-/// guardian worker or child may start. Only the duplicate is converted into an
-/// owned `UnixStream`, avoiding a second owner for fd 0.
+/// Before any worker or child may start, fd 0 is atomically replaced by a
+/// close-on-exec `/dev/null`. The audited helper requires the original socket
+/// identity to have exactly two references before replacement and one after,
+/// so the returned endpoint is the guardian's only lifecycle read authority.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn bootstrap_guardian_from_stdin() -> Result<LifecycleEndpoint, ChannelError> {
     let stdin = io::stdin();
-    bootstrap_guardian_from_descriptor(stdin.as_fd())
-}
-
-fn bootstrap_guardian_from_descriptor(
-    inherited: BorrowedFd<'_>,
-) -> Result<LifecycleEndpoint, ChannelError> {
-    let duplicate = fcntl_dupfd_cloexec(inherited, 3).map_err(|_| ChannelError::Duplicate)?;
-    set_and_verify_close_on_exec(inherited)?;
+    let (duplicate, expected_identity) = {
+        let inherited = stdin.as_fd();
+        let expected_identity = DescriptorIdentity::read(inherited)?;
+        let duplicate = fcntl_dupfd_cloexec(inherited, 3).map_err(|_| ChannelError::Duplicate)?;
+        (duplicate, expected_identity)
+    };
     verify_close_on_exec(&duplicate)?;
+    calcifer_unix_child_fd::replace_inherited_stdin_with_dev_null(expected_identity.for_scan())
+        .map_err(|_| ChannelError::Duplicate)?;
 
     let stream = UnixStream::from(duplicate);
-    LifecycleEndpoint::adopt(stream)
+    let endpoint = LifecycleEndpoint::adopt(stream)?;
+    if endpoint.descriptor_identity()? != expected_identity {
+        return Err(ChannelError::DescriptorIdentity);
+    }
+    Ok(endpoint)
 }
 
 /// Returns the per-send flags/configuration that prevents lifecycle writes
@@ -425,6 +448,7 @@ pub(super) enum ChannelError {
     InvalidPeerDomain,
     MissingPeer,
     SignalSafety,
+    Shutdown,
     TimeoutConfiguration,
     Spawn,
     UnsupportedPlatform,
@@ -444,6 +468,7 @@ impl ChannelError {
             Self::InvalidPeerDomain => "invalid_peer_domain",
             Self::MissingPeer => "missing_peer",
             Self::SignalSafety => "signal_safety",
+            Self::Shutdown => "shutdown",
             Self::TimeoutConfiguration => "timeout_configuration",
             Self::Spawn => "spawn",
             Self::UnsupportedPlatform => "unsupported_platform",
@@ -474,6 +499,7 @@ impl fmt::Display for ChannelError {
             Self::InvalidPeerDomain => "the lifecycle peer domain was invalid",
             Self::MissingPeer => "the lifecycle socket had no connected peer",
             Self::SignalSafety => "the lifecycle channel could not suppress SIGPIPE",
+            Self::Shutdown => "the lifecycle channel could not be shut down",
             Self::TimeoutConfiguration => "the lifecycle channel timeout could not be configured",
             Self::Spawn => "the guardian process could not be spawned",
             Self::UnsupportedPlatform => "the lifecycle channel is unsupported on this platform",
@@ -558,31 +584,59 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_duplicates_the_inherited_endpoint_and_restores_cloexec()
+    fn bootstrap_replaces_inherited_stdin_with_dev_null_and_owns_only_endpoint()
     -> Result<(), Box<dyn Error>> {
+        const CHILD_ENV: &str = "CALCIFER_TEST_LIFECYCLE_STDIN_BOOTSTRAP";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let inherited_identity = DescriptorIdentity::read(io::stdin().as_fd())?;
+            assert_eq!(
+                calcifer_unix_child_fd::count_open_descriptors_with_identity(
+                    inherited_identity.for_scan()
+                )?,
+                1
+            );
+
+            let adopted = bootstrap_guardian_from_stdin()?;
+            verify_close_on_exec(&adopted.stream)?;
+            assert_eq!(adopted.descriptor_identity()?, inherited_identity);
+            assert_eq!(
+                calcifer_unix_child_fd::count_open_descriptors_with_identity(
+                    inherited_identity.for_scan()
+                )?,
+                1
+            );
+            assert_ne!(
+                DescriptorIdentity::read(io::stdin().as_fd())?,
+                inherited_identity
+            );
+            assert!(fcntl_getfd(io::stdin())?.contains(FdFlags::CLOEXEC));
+            assert!(!rustix::termios::isatty(io::stdin()));
+
+            drop(adopted);
+            assert_eq!(
+                calcifer_unix_child_fd::count_open_descriptors_with_identity(
+                    inherited_identity.for_scan()
+                )?,
+                0
+            );
+            return Ok(());
+        }
+
         let LifecyclePair {
-            mut coordinator,
+            coordinator,
             guardian,
         } = LifecyclePair::new()?;
-        let inherited_flags = fcntl_getfd(&guardian.stream)?;
-        fcntl_setfd(&guardian.stream, inherited_flags & !FdFlags::CLOEXEC)?;
-        assert!(!fcntl_getfd(&guardian.stream)?.contains(FdFlags::CLOEXEC));
-
-        let mut adopted = bootstrap_guardian_from_descriptor(guardian.stream.as_fd())?;
-        assert!(fcntl_getfd(&guardian.stream)?.contains(FdFlags::CLOEXEC));
-        verify_close_on_exec(&adopted.stream)?;
-        drop(guardian);
-
-        adopted.set_read_timeout(Some(Duration::from_secs(2)))?;
-        coordinator.set_read_timeout(Some(Duration::from_secs(2)))?;
-        coordinator.write_all(b"a")?;
-        let mut from_coordinator = [0_u8; 1];
-        adopted.read_exact(&mut from_coordinator)?;
-        assert_eq!(from_coordinator, *b"a");
-        adopted.write_all(b"b")?;
-        let mut from_guardian = [0_u8; 1];
-        coordinator.read_exact(&mut from_guardian)?;
-        assert_eq!(from_guardian, *b"b");
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("bootstrap_replaces_inherited_stdin_with_dev_null_and_owns_only_endpoint")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .stdin(Stdio::from(OwnedFd::from(guardian.stream)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        assert!(child.wait()?.success());
+        drop(coordinator);
         Ok(())
     }
 

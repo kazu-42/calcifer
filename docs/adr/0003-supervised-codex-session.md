@@ -1,7 +1,8 @@
 # ADR 0003: Supervise a profile-owned Codex App Server and official remote TUI
 
-- Status: Accepted; internal slices #48 and #50 implemented
+- Status: Accepted; internal foundations #48, #50, and #52 implemented and default-unused
 - Date: 2026-07-15
+- Last updated: 2026-07-15
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 - Related decisions: [ADR 0001](0001-cross-profile-conversation-handoff.md), [ADR 0002](0002-private-provider-identity-binding.md)
 
@@ -40,6 +41,14 @@ The one-reader `SCM_RIGHTS` transfer and ACK proof remains the issue #32
 primitive; issue #50 proves that its reserved transport is physically distinct
 from lifecycle traffic, close-on-exec, and absent after child `exec`.
 
+Issue #52 adds the Linux/macOS terminal-authority foundation around those fake
+children. It proves a real controlling PTY, a physically absent input worker
+until a typed readiness/raw-mode/open-gate handshake completes, fixed-buffer
+full-duplex streaming, terminal restoration, signal and job-control semantics,
+and redundant coordinator/guardian recovery. It remains behind
+`internal-supervisor-fixture`; it does not launch real Codex, read credentials,
+monitor usage, persist terminal data, or add a public command.
+
 ## Decision and initial scope
 
 Calcifer will add a Linux/macOS-only, explicit, default-off supervised session
@@ -47,11 +56,14 @@ path. The first public form will resume one canonical existing thread in one
 explicit profile. Existing direct `run`, exact `resume`, workspace-head
 `resume`, and `status` remain independent and unchanged.
 
-Implementation is divided into four slices. Issue #48 implements the first: a
-bounded readiness-relay transport kernel extracted from #28. Issue #50
-implements the second slice's process-authority kernel with fake children.
-Neither starts a real App Server, opens a persistent monitor connection,
-bridges a terminal, queries usage, reads credentials, or exposes a CLI option.
+Implementation is divided into staged foundations and integrations. Issue #48
+implements the bounded readiness-relay transport kernel extracted from #28,
+issue #50 implements process authority with fake children, and issue #52
+implements the default-unused terminal kernel around those children. These
+foundations do not start a real profile App Server, open a persistent monitor
+connection, query usage, read credentials, or expose a CLI option. The #52
+fixture bridges a synthetic TUI through a real PTY only to prove terminal
+authority before real provider state enters the blast radius.
 
 The production supervisor will reuse the reviewed transport mechanics, but not
 the synthetic readiness policy or probe PTY. The provider guardian will own
@@ -69,6 +81,8 @@ flowchart TB
     GUARD[Provider guardian<br/>acquires or adopts lease B]
     LIFE[Lifecycle socketpair<br/>bounded frames only]
     XFER[Optional one-shot transfer socketpair<br/>SCM_RIGHTS plus ACK]
+    BYTES[Terminal byte socketpair<br/>fixed-buffer full duplex]
+    RECOVERY[Guardian recovery tty<br/>restore only]
     RUNTIME[Owner-private nonce runtime<br/>mode 0700]
     APP[Official Codex App Server<br/>guardian direct child]
     MON[Typed persistent monitor<br/>Slice 3]
@@ -83,6 +97,13 @@ flowchart TB
     LIFE <-->|inherited child endpoint| GUARD
     COORD -. dedicated optional channel .-> XFER
     XFER -. exactly one lease FD .-> GUARD
+    COORD <-->|outer terminal endpoint| BYTES
+    BYTES <-->|guardian terminal endpoint| GUARD
+    TERM -. pre-raw snapshot .-> COORD
+    TERM -. inherited restore descriptor .-> RECOVERY
+    GUARD --> RECOVERY
+    GUARD -. TERMINAL_ARMED fingerprint .-> COORD
+    COORD -. TERMINAL_ARM_ACCEPTED .-> GUARD
     GUARD --> RUNTIME
     GUARD --> APP
     GUARD --> MON
@@ -110,15 +131,15 @@ concurrent children inherit zero lease or coordinator-control descriptors.
 | App Server | Official selected-profile provider session | Inherit A, B, lifecycle, transfer, or PTY-control descriptors |
 | Readiness relay | Transparent TUI byte path and pre-readiness bounded observation | Manufacture provider responses or retain transcript payloads |
 | Typed monitor | A separate reviewed protocol connection introduced in Slice 3 | Expose generic `send(Value)`, `respond`, approval, or arbitrary-method APIs |
-| Terminal bridge | Fixed-size streaming and terminal state restoration | Forward user input before the guardian publishes exact readiness |
+| Terminal bridge | Fixed-size streaming and terminal state restoration | Forward input before readiness/raw/open-gate proof or retain a transcript |
 
 The #48 relay inspects only until readiness. It then becomes an opaque byte
 relay. It is not the future persistent monitor.
 
 ## Control-channel contract
 
-The lifecycle and lease-transfer channels are separate socketpairs with
-different single-reader authorities.
+Lifecycle control, optional lease transfer, and terminal bytes use separate
+socketpairs with different reader authorities.
 
 ### Lifecycle socketpair
 
@@ -128,6 +149,26 @@ different single-reader authorities.
 - Uses the audited child-only inheritance seam so only the selected guardian
   endpoint survives guardian `exec`.
 - Is absent from App Server, TUI, tools, and unrelated concurrent execs.
+
+The guardian's `TERMINAL_ARMED` frame carries a fixed, domain-separated SHA-256
+fingerprint of its complete semantic pre-raw snapshot. The fingerprint covers
+the platform and format version, terminal descriptor identity, PENDIN-masked
+termios modes, speeds, and platform-semantic special codes, plus the Linux line
+discipline, initial character and pixel size, and foreground process group. It
+exists only on the lifecycle wire; its debug representation and every failure
+are fixed and redacted.
+
+The coordinator compares that fingerprint in constant time with its own
+immutable snapshot and sends `TERMINAL_ARM_ACCEPTED` only on an exact match.
+Until that ACK, the guardian may create no private runtime, fixture worker, PTY,
+App Server, or TUI. A proven mismatch keeps the input gate closed, closes the
+lifecycle exchange, exactly waits the guardian, restores and reads back the
+outer terminal, and reports a clean infrastructure failure without
+provider-style child creation. A missing or ambiguous ACK also forbids spawn,
+but loss of the trusted lifecycle proof makes the coordinator restore and
+retain A plus evidence after containing and exactly waiting its guardian.
+Descriptor identity or foreground process group alone is not sufficient arm
+proof.
 
 The coordinator accepts child PID/PGID reports as bounded observation metadata,
 not durable signal authority. Exact containment and wait authority for App
@@ -152,6 +193,205 @@ ambiguous, the coordinator retains A+B, terminates and exactly waits for its
 direct guardian child, and releases only after the guardian copy is known
 closed. This proof is valid because no other process could inherit B before
 commit; it is not proof that later App Server/TUI grandchildren were reaped.
+
+### Dedicated terminal-byte socketpair
+
+The coordinator/guardian boundary has three physically distinct channel
+classes with different authorities:
+
+1. the bounded lifecycle socketpair carries typed commands, acknowledgements,
+   failures, and final dispositions;
+2. the optional one-shot transfer socketpair carries exactly one lease
+   descriptor and its ACK; and
+3. the full-duplex terminal socketpair carries terminal bytes only.
+
+At the still-single-threaded guardian exec entry, inherited standard streams
+are consumed rather than merely marked close-on-exec. The guardian creates one
+owned `F_DUPFD_CLOEXEC` duplicate of lifecycle fd 0, terminal fd 1, and recovery
+fd 2 in turn, requires the original identity to have exactly two open
+references, atomically replaces that standard fd with access-appropriate
+`/dev/null`, and reads back its type, access mode, close-on-exec flag, changed
+identity, and the original identity's post-count of one. The owned duplicate is
+then the sole authority of that class. Recovery disarm drops its duplicate and
+must prove the recovery identity count reached zero; `FD_CLOEXEC` on a still
+open second tty descriptor would not be disarm proof.
+
+The terminal endpoint has no lifecycle decoder and no ancillary-data receive
+path. One fixed-buffer worker owns each active direction, so a stalled consumer
+applies kernel backpressure rather than growing a queue. Both endpoints are
+close-on-exec and identity-checked; provider children inherit neither endpoint,
+the recovery tty, the outer-tty pump descriptor, nor an unrelated PTY master.
+
+The fake relay's typed readiness uses a separate inherited one-shot descriptor
+inside the guardian-owned TUI launch. It must deliver the exact readiness byte
+and EOF. That capability is not inferred from PTY creation, output, a PID, or a
+lifecycle marker, and it never shares a reader with any of the three
+coordinator/guardian channel classes.
+
+## Default-unused terminal state machine (#52)
+
+The #52 state machine is allocation-free and validates commands and events on
+both sides of the lifecycle channel. Every wrong-order, duplicate, malformed,
+trailing, timed-out, or disconnected frame poisons the exchange; a later
+terminal frame cannot repair it.
+
+```mermaid
+stateDiagram-v2
+    [*] --> AwaitLease
+    AwaitLease --> AwaitTerminalArmed: B committed, START
+    AwaitTerminalArmed --> AwaitTerminalArmAcceptance: TERMINAL_ARMED plus fingerprint
+    AwaitTerminalArmAcceptance --> AwaitChildren: exact match, TERMINAL_ARM_ACCEPTED
+    AwaitTerminalArmAcceptance --> ArmRejected: proven mismatch; no spawn
+    ArmRejected --> [*]: restore/readback, exact guardian wait, failure
+    AwaitTerminalArmAcceptance --> ArmAmbiguous: timeout, disconnect, or malformed frame
+    ArmAmbiguous --> Retained: restore, contain/wait guardian, retain A and evidence
+    AwaitChildren --> AwaitReadiness: fake App Server and TUI started
+    AwaitReadiness --> ReadyForGate: exact typed READY
+    ReadyForGate --> Active: flush, raw, OPEN_GATE, ACK, input worker created
+    Active --> Active: handled INT or QUIT; coalesced WINCH
+    Active --> AwaitSuspended: TSTP
+    AwaitSuspended --> Suspended: ingress quiesced, TUI stopped
+    Suspended --> ReadyForGate: foreground revalidated, TUI continued
+    Active --> AwaitQuiesced: TUI exit, HUP, TERM, STOP, or failure
+    Suspended --> AwaitQuiesced: STOP or failure
+    AwaitQuiesced --> Quiesced: pumps stopped, direct children waited
+    Quiesced --> AwaitRecoveryDisarmed: outer tty restored, TERMINAL_RESTORED
+    AwaitRecoveryDisarmed --> RecoveryDisarmed: fallback disarmed
+    RecoveryDisarmed --> Terminal: CHILDREN_REAPED
+    Terminal --> [*]: guardian exact wait and lifecycle EOF verified
+```
+
+### Readiness and input authority
+
+Input opens only in this order:
+
+1. Before raw mode, the coordinator captures the outer tty identity, termios,
+   foreground process group, and initial size. The guardian captures the same
+   target through an inherited close-on-exec recovery tty and sends
+   `TERMINAL_ARMED` with its redacted semantic SHA-256 fingerprint.
+2. The coordinator compares the complete fingerprint in constant time and
+   sends `TERMINAL_ARM_ACCEPTED` only on an exact match. Before that ACK the
+   guardian has no runtime, worker, PTY, or child. A mismatch fails cleanly with
+   the gate closed and no provider-style spawn.
+3. The guardian creates the private runtime and fixture worker, then creates the
+   PTY, attaches the fake TUI slave as controlling stdin/stdout/stderr, and
+   starts output-only forwarding. No outer-input or PTY-ingress worker exists.
+4. The fake relay writes the exact one-shot readiness capability. The guardian
+   validates it and reports `READY`; this still grants no input authority.
+5. The coordinator revalidates tty identity and foreground ownership, discards
+   queued pre-readiness input with `tcflush(TCIFLUSH)`, and applies raw mode
+   with semantic readback.
+6. The coordinator sends typed `OPEN_GATE`. The guardian creates PTY ingress
+   and acknowledges `INPUT_GATE_OPENED`.
+7. Only after that ACK does the coordinator consume its raw-mode proof and
+   create the outer-tty input worker.
+
+Terminal arming is a separate linear barrier:
+`Unarmed -> FingerprintAdvertised -> Accepted`. The input gate type-state is
+`Closed -> Ready -> Open`. Neither `TERMINAL_ARMED`, `READY`, nor a raw-mode
+proof can mint `Open` alone. Pre-readiness bytes are discarded, never replayed
+after readiness or resume. Any ambiguous arm exchange retains coordinator
+authority instead of reconstructing acceptance from guardian exit or EOF.
+
+### Signal and job-control authority
+
+Only the guardian's live direct-child handle may signal the TUI process group.
+The coordinator sends bounded typed intent; a reported numeric PID or PGID is
+observation metadata and never delayed signal authority.
+
+- `INT` and `QUIT` are forwarded once. If the TUI handles either signal, the
+  session remains active; Calcifer does not fabricate an exit.
+- `HUP` and `TERM` are forwarded once and transition immediately to bounded
+  shutdown. The forwarded-signal capability prevents the normal shutdown path
+  from sending a second `TERM`; a non-exiting child is forcibly contained with
+  `SIGKILL` after its grace deadline and is still exactly waited.
+- `WINCH` stores only the latest validated size. The guardian applies that size
+  to the PTY and notifies the TUI without creating an event-sized queue, so a
+  resize storm is coalesced and bounded.
+- `TSTP` first removes outer ingress, pauses guardian ingress, discards terminal
+  bytes that arrived after suspension began, stops the TUI under guardian
+  authority, and waits for `SUSPENDED`. The coordinator restores the outer tty
+  before stopping itself with the default job-control disposition.
+- After `CONT`, the coordinator must again own the foreground tty, revalidate
+  its identity, read the current window size, discard stale input, and re-enter
+  raw mode. The guardian applies the fresh size, continues the TUI, reports
+  `RESUMED`, and completes a new `OPEN_GATE`/ACK exchange before either input
+  worker is recreated. Bytes entered while stopped cannot leak through the new
+  gate.
+
+### Shutdown, restoration, and exact disposition
+
+The guardian quiesces both terminal directions, joins the terminal pump
+workers, closes the PTY, terminates or observes each direct child, and performs
+exact waits before reporting `TERMINAL_QUIESCED`. The coordinator then
+restores the captured termios state with immediate semantic readback and sends
+`TERMINAL_RESTORED`. Only after that proof may the guardian disarm fallback
+recovery. It then joins the remaining fixture worker, completes identity-checked
+runtime cleanup, and publishes the terminal `CHILDREN_REAPED` frame.
+Restoration does not overwrite the outer tty's live window size: Calcifer never
+mutates that size, and a user resize during the session must survive cleanup.
+
+`CHILDREN_REAPED` contains structured App Server and TUI dispositions, worker
+join status, complete cleanup, and session status. The coordinator reproduces
+the TUI's zero, nonzero, or terminating-signal shell disposition only after it
+has also exactly waited its guardian and verified lifecycle EOF. PTY EOF/EIO,
+pump or signal failure, a forced stop, restore failure, identity mismatch, and
+cleanup mismatch remain infrastructure failures; none can be flattened into a
+successful TUI exit.
+
+### Recovery and fail-closed authority
+
+The coordinator and guardian hold immutable copies of the same pre-raw target
+state. Reapplying that exact state is idempotent, but concurrent restoration is
+never a coordination protocol.
+
+The outer-PTY harness keeps a persistent terminal anchor as the controlling
+terminal's session leader and runs the coordinator in a separate foreground
+process group. This prevents Darwin from revoking the guardian's inherited
+recovery descriptor merely because the coordinator exits. The anchor can hand
+foreground ownership back to the coordinator group and retains a test-only
+emergency snapshot for harness failures. It owns no profile lease and cannot
+mint lifecycle restoration, child-reap, cleanup, or successful-disposition
+proof for the coordinator/guardian protocol.
+
+The internal fallback guarantee also depends on that living anchor not
+reclaiming foreground ownership or starting a new foreground job while either
+authority may restore. Immediately before `tcsetattr`, each restorer must read
+back the current foreground process group and require the captured group. A
+mismatch performs no restore, publishes no restored proof, and retains the
+remaining lease/evidence. That check detects an ownership handoff, but a
+numeric process-group value is not a reusable generation capability. Public
+integration therefore needs a wrapper/anchor that owns the terminal handoff or
+an equivalently strong generation-bound protocol; an ordinary invoking shell
+that may reclaim the tty is outside this internal fixture guarantee.
+
+- If the coordinator disappears before restoration, lifecycle EOF makes the
+  guardian close ingress, stop and exactly wait its direct children, close the
+  PTY, restore through its recovery tty, and only then release B. On macOS a
+  background guardian blocks `SIGTTOU` only for the scoped restoration call and
+  restores the original signal mask afterward.
+- If the guardian disappears while raw mode may be active, the coordinator
+  exactly waits its direct guardian child, restores the outer tty, and only
+  then enters retained-A parking. It does not signal a stale reported process
+  group or release A based on PID disappearance.
+- If restoration, terminal identity, exact wait, or cleanup proof is missing,
+  the surviving authority fails loudly and retains its lease/evidence. It does
+  not claim successful recovery or launch another writer.
+
+There is no in-process recovery after both authorities receive uncatchable
+`SIGKILL` while the tty is raw. The invoking shell or terminal emulator is the
+external recovery boundary and may require an explicit terminal reset. This
+limitation must remain explicit in public operational guidance before exposure;
+Calcifer must never print or persist a false “restored” claim.
+
+### Bounded privacy
+
+Every terminal transfer uses one fixed 8 KiB buffer and an in-buffer partial
+write offset. There is no transcript `Vec`, payload queue, terminal capture,
+or payload-bearing diagnostic. Successfully written and otherwise unreported
+bytes are zeroed before buffer reuse; debug representations expose only fixed
+redacted labels. Synthetic sentinel bytes are forbidden from marker files,
+stderr, logs, repository artifacts, and final lifecycle evidence.
 
 ## Readiness-relay protocol contract
 
@@ -207,9 +447,15 @@ sequenceDiagram
     participant T as Official TUI
 
     U->>C: explicit supervised resume(profile, UUID)
+    C->>C: capture immutable pre-raw terminal snapshot
     C->>C: validate and acquire A
     C->>G: spawn over lifecycle socketpair
     G->>G: acquire/adopt B and commit
+    G->>G: capture recovery snapshot and semantic fingerprint
+    G-->>C: TERMINAL_ARMED plus redacted fingerprint
+    C->>C: constant-time comparison with coordinator snapshot
+    Note over C,G: mismatch closes lifecycle; no runtime, worker, or child spawn
+    C->>G: TERMINAL_ARM_ACCEPTED
     G->>G: verify pinned build and create private runtime
     G->>A: spawn exact build with selected CODEX_HOME
     G->>M: initialize separate typed monitor
@@ -228,12 +474,22 @@ sequenceDiagram
     end
     R-->>G: typed readiness evidence
     G-->>C: READY plus containment-only PID/PGID reports
-    C->>U: open input gate
+    C->>C: verify foreground tty, flush input, enter raw mode
+    C->>G: OPEN_GATE
+    G->>G: create PTY-ingress worker
+    G-->>C: INPUT_GATE_OPENED
+    C->>C: create outer-input worker
     U->>T: interactive input
     T-->>G: exit code or terminating signal
-    G->>G: stop children; exact wait; join workers; clean sockets
+    G->>G: stop terminal pumps and children; exact direct-child waits
+    G-->>C: TERMINAL_QUIESCED
+    C->>C: restore outer tty plus semantic readback
+    C->>G: TERMINAL_RESTORED
+    G->>G: disarm fallback recovery
+    G-->>C: TERMINAL_RECOVERY_DISARMED
+    G->>G: join remaining worker; identity-checked runtime cleanup
     G-->>C: CHILDREN_REAPED plus structured disposition
-    C->>C: exact wait for guardian
+    C->>C: exact wait for guardian plus lifecycle EOF
     C-->>U: reproduce trusted TUI disposition
 ```
 
@@ -243,30 +499,44 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> Validating
     Validating --> Guarded: A and committed B held
-    Guarded --> AppServerStarting
+    Guarded --> TerminalArming
+    TerminalArming --> TerminalArmAcceptance: TERMINAL_ARMED fingerprint
+    TerminalArmAcceptance --> AppServerStarting: exact match plus ACK
     AppServerStarting --> MonitorStarting: socket verified
     MonitorStarting --> TuiStarting: monitor initialized
     TuiStarting --> AwaitingReadiness: input closed
-    AwaitingReadiness --> Running: exact readiness published
+    AwaitingReadiness --> GatePending: exact readiness published
+    GatePending --> Running: raw mode plus OPEN_GATE ACK
     Running --> Stopping: TUI exit or requested signal
     Validating --> Failed
+    TerminalArming --> Failed
+    TerminalArmAcceptance --> Failed: mismatch, timeout, or disconnect
     AppServerStarting --> Failed
     MonitorStarting --> Failed
     TuiStarting --> Failed
     AwaitingReadiness --> Failed
+    GatePending --> Failed
     Running --> Failed: child, monitor, or relay failure
     Failed --> Stopping: guardian remains alive
-    Stopping --> Reaped: direct children waited; workers joined
-    Reaped --> [*]: CHILDREN_REAPED trusted
+    Stopping --> Quiesced: terminal pumps stopped; direct children waited
+    Quiesced --> Restored: coordinator restores tty and sends proof
+    Restored --> RecoveryDisarmed: guardian drops fallback authority
+    RecoveryDisarmed --> Reaped: remaining worker joined; runtime cleaned
+    Reaped --> [*]: CHILDREN_REAPED, guardian wait, and EOF trusted
 
     Validating --> GuardianLost: guardian dies unexpectedly
     Guarded --> GuardianLost
+    TerminalArming --> GuardianLost
+    TerminalArmAcceptance --> GuardianLost
     AppServerStarting --> GuardianLost
     MonitorStarting --> GuardianLost
     TuiStarting --> GuardianLost
     AwaitingReadiness --> GuardianLost
     Running --> GuardianLost
     Stopping --> GuardianLost
+    Quiesced --> GuardianLost
+    Restored --> GuardianLost
+    RecoveryDisarmed --> GuardianLost
     GuardianLost --> CoordinatorFailClosed
     CoordinatorFailClosed --> CoordinatorFailClosed: retain A; no automatic release
 ```
@@ -296,7 +566,8 @@ recovery. It must not exit and accidentally release A.
 6. The guardian's live `Child` handles are the only exact App Server/TUI wait
    authority.
 7. User input reaches the PTY only after exact target readiness, downstream
-   response forwarding, and relay-health confirmation.
+   response forwarding, relay-health confirmation, outer-input flush, raw-mode
+   readback, and a typed `OPEN_GATE` acknowledgement.
 8. The official TUI is the only responder to provider-initiated requests.
 9. No prompt, turn, approval, command, tool argument, or terminal transcript is
    replayed, persisted, or included in diagnostics.
@@ -310,6 +581,10 @@ recovery. It must not exit and accidentally release A.
     into a successful TUI exit.
 14. Unsupported platforms/builds/contracts fail explicitly and never trigger a
     silent direct-mode fallback.
+15. Lifecycle frames, optional lease transfer, and terminal bytes use distinct
+    close-on-exec channel classes; no reader multiplexes their authorities.
+16. Raw mode always has an armed recovery owner. Restoration and exact wait
+    proof precede recovery disarm, lease release, and final shell disposition.
 
 ## Bounds and backpressure
 
@@ -327,7 +602,7 @@ recovery. It must not exit and accidentally release A.
 | Workspace writable roots | 64 entries | Reject typed evidence |
 | Observation queue | 32 events | Synchronous bounded backpressure |
 | Readiness result | 1 event | One-shot bounded delivery |
-| Terminal relay | Fixed streaming buffers | Never accumulate a transcript |
+| Terminal relay | One fixed 8 KiB fragment per active pump direction | Kernel backpressure; never accumulate a transcript |
 
 Connect, initialize, readiness, lease transfer, ACK, graceful shutdown,
 forced termination, and worker join each have explicit deadlines. A timeout
@@ -363,31 +638,39 @@ replacement, and overlong path fail closed. Cleanup never blindly unlinks.
 | Unexpected App Server/monitor/relay exit | Stop TUI and report infrastructure failure even if TUI exits zero |
 | TUI normal/nonzero exit | Preserve its code only after verified cleanup |
 | TUI terminating signal | Preserve structured signal; restore terminal and reproduce shell disposition after cleanup |
-| Coordinator death | Live guardian B closes input, stops/waits direct children, then releases B |
-| Guardian death before trusted terminal frame | Coordinator exactly waits guardian, never signals stale reported groups, and parks with A held; fixed fake children use guardian-liveness EOF |
+| Coordinator death | Live guardian B closes input, stops/waits direct children, restores through the recovery tty, then releases B |
+| Guardian death before trusted terminal frame | Coordinator exactly waits guardian, restores the tty, never signals stale reported groups, and parks with A held; fixed fake children use guardian-liveness EOF |
 | Missing/invalid transfer ACK | Retain A+B; terminate and exactly wait pre-spawn guardian before release |
+| Semantic terminal-snapshot fingerprint mismatch | Send no arm ACK; start no runtime, worker, PTY, or child; close the gate; exactly wait guardian; restore/read back the tty; report clean infrastructure failure |
+| Missing/ambiguous terminal-arm ACK | Start no runtime, worker, PTY, or child; restore and retain coordinator authority/evidence after guardian containment and exact wait |
 | Socket identity mismatch at cleanup | Preserve replacement and report cleanup failure |
+| Restore or tty-identity mismatch | Retain surviving lease authority and evidence; never publish a successful disposition |
+| Both terminal authorities receive `SIGKILL` | In-process restoration is impossible; require external terminal recovery and make no restored claim |
 
 The coordinator may trust a TUI exit code/signal only when the same lifecycle
-stream delivered `CHILDREN_REAPED { tui_disposition, app_server_disposition,
-workers_joined, cleanup_ok }` and the coordinator then exactly waited for its
-guardian child. Channel EOF or abnormal guardian exit yields an operational
-failure, never a reconstructed TUI success.
+stream delivered `CHILDREN_REAPED { app, tui, worker, cleanup, session }` with
+complete proof and the coordinator then exactly waited for its guardian child
+and verified lifecycle EOF. Channel EOF or abnormal guardian exit yields an
+operational failure, never a reconstructed TUI success.
 
 ## P0 gates
 
 | Gate | Required evidence before public exposure |
 | --- | --- |
+| Terminal arm | Canonical semantic fingerprint equality, constant-time comparison, arm-ACK ordering, and mismatch/timeout/disconnect proof that no runtime, worker, PTY, or child starts |
 | Input authority | Real PTY sentinel proves zero pre-ready input; every wrong-target/order/error/timeout/disconnect case keeps the gate closed |
 | Observe-only authority | Provider request is byte-for-byte forwarded; upstream silence window proves zero Calcifer response bytes; no generic response API exists |
 | Bounds/privacy | Exact-limit and limit-plus-one tests, duplicate-key rejection, deterministic queue backpressure, and sentinel absence from logs/files |
 | Socket integrity | Parent/symlink/collision/mode/replacement/timeout/disconnect/cleanup cases and mode-`0600` readback |
 | Lease integrity | Real exec FD scans, no-gap A/B tests, dedicated transfer/lifecycle reader tests, ambiguous ACK and concurrent-writer tests |
 | Live lifecycle | Every injected failure while guardian lives exactly waits children and joins workers; stuck descendants escalate within bounds |
+| Process containment | Revalidate the real Codex descendant/credential model; on macOS, leader-exit `WNOWAIT` alone must not turn `EPERM` into production containment proof unless a stronger reviewed absence proof excludes an unsignalable live group member, otherwise fail closed |
+| Terminal ownership | Both normal and fallback restore revalidate current foreground ownership immediately before mutation; a reclaim mismatch performs no restore and retains authority; production has a wrapper/anchor or generation-bound handoff that excludes shell/new-job races and numeric PGID reuse |
+| Job-control containment | The synthetic same-credential tree proves that a TUI descendant which ignores `SIGTSTP` is contained by process-group `SIGSTOP`; real Codex descendant credentials, sessions, groups, and signal permissions are revalidated before that escalation is trusted |
 | Guardian loss | Coordinator claims exact wait only for guardian, does not claim grandchild reap on macOS, and retains A indefinitely without `CHILDREN_REAPED` |
 | Exit/signals | 0/nonzero/signal semantics, HUP/INT/QUIT/TERM forwarding, WINCH, suspend/continue, and terminal restoration |
 | Compatibility | Existing #28 packaged 0.144.4 proof, exact build revalidation at spawn, and schema/sequence drift rejection |
-| Regression/platform | Direct run/resume/status unchanged; Linux/macOS green; Windows and unreviewed Unix explicit unsupported |
+| Regression/platform | Full supervisor fixture on Linux/macOS at Rust 1.85; stable all-feature Linux/macOS/Windows matrix; direct run/resume/status unchanged; supervised mode remains unsupported on Windows and unreviewed Unix |
 
 Process-death tests executed inside a container require a functioning PID 1
 reaper (for example Docker `--init` or `tini`). A container runtime that leaves
@@ -424,16 +707,46 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   lost, the coordinator never signals lifecycle-reported numeric PIDs; fixed
   fake children instead observe a guardian-owned liveness pipe and exit on
   guardian death while A remains retained.
-- Defer the PTY bridge, input gate, signal/job-control policy, monitor, and real
-  Codex adapter to later slices.
+- At the #50 boundary, defer the PTY bridge, input gate,
+  signal/job-control policy, monitor, and real Codex adapter. The terminal
+  items advance independently in #52 rather than widening #50 retroactively.
+
+### Slice 2b: readiness-gated terminal foundation (#52, implemented internally)
+
+- Add a dedicated close-on-exec full-duplex terminal socketpair, real
+  guardian-owned PTY, outer-tty snapshot, recovery tty, and fixed 8 KiB pumps.
+- Prove typed readiness, input flush, raw-mode readback, and `OPEN_GATE` ACK
+  before constructing input workers; repeat the complete gate after `CONT`.
+- Forward HUP/INT/QUIT/TERM exactly as typed policy requires, coalesce WINCH,
+  and implement restore-before-stop TSTP plus foreground-checked resume.
+- Preserve TUI zero/nonzero/signal disposition only after pump quiescence,
+  exact child waits, outer-terminal restoration, recovery disarm, final
+  lifecycle frame, guardian wait, and EOF verification.
+- Exercise normal exit, semantic snapshot mismatch, missing arm or input-gate
+  ACK, early exit, malformed/wrong-order/trailing/disconnected lifecycle,
+  PTY EOF/EIO and terminal-channel EOF, output backpressure, worker failure,
+  restore-identity and cleanup mismatch, signal/job control,
+  coordinator/guardian death, descriptor hygiene, and payload absence with fake
+  children only.
+- Keep the code behind `internal-supervisor-fixture`; add no credential access,
+  real App Server/TUI launch, persistent monitor, public command, or persisted
+  schema.
 
 ### Slice 3: pinned same-profile provider integration
 
 - Introduce a sealed capability that retains or launch-time revalidates the
   exact executable; App Server and TUI use the same build identity.
 - Add the separate typed monitor, reviewed initialization/subscription, usage
-  reads, official TUI through the readiness relay, PTY input gate, and terminal
-  restoration/disposition handling.
+  reads, and official TUI through the readiness relay and the already-proved
+  terminal kernel. Revalidate every #52 assumption against real Codex rather
+  than treating fake-child success as provider compatibility.
+- Revisit the synthetic same-credential process assumption: macOS `EPERM` plus
+  a non-reaping leader-exit observation is insufficient by itself to exclude
+  an unsignalable live descendant, so real-provider cleanup must obtain a
+  stronger reviewed proof or keep `EPERM` fatal.
+- Replace the test-only living-anchor assumption with a production terminal
+  ownership/generation handoff, and revalidate process-group `SIGSTOP` against
+  real Codex descendants before exposing suspend/resume.
 - Exercise through an internal test entrypoint only.
 
 ### Slice 4: explicit public exact resume
@@ -478,7 +791,7 @@ production spawn must use the verified build without a PATH lookup TOCTOU.
 | Reuse #28 proxy/PTY unchanged | Synthetic lineage and capture semantics are not a production terminal supervisor |
 | Coordinator directly parents App Server/TUI | Process wait authority would diverge from guardian-held lease B |
 | Pathname coordinator/guardian listener | First-connector and stale-path races are unnecessary; inherited socketpair binds the selected child |
-| Multiplex transfer and lifecycle frames | Ancillary FD ownership and lifecycle framing require independent single-reader channels |
+| Multiplex transfer, lifecycle frames, and terminal bytes | Ancillary FD ownership, typed control, and backpressured byte pumps require independent reader authorities |
 | Put a semantic monitor permanently in the TUI byte path | Expands authority and failure blast radius; readiness relay should become opaque |
 | Persist compatibility/usage cache now | Invalidation and ownership policy belong to later slices; live evidence is required first |
 
@@ -492,6 +805,12 @@ Before Slice 4, reverting removes only internal code and tests. After Slice 4,
 disabling the explicit supervised option leaves direct exact resume available
 for the same profile-local thread. A failed supervised attempt reports failure,
 preserves user data, and never silently retries through direct mode.
+
+Rollback is not terminal recovery. If both in-process restoration authorities
+are killed while raw mode is active, reverting a build cannot restore that live
+tty; the invoking shell or terminal emulator must reset it. The #52 slice
+remains default-unused, and any later public slice must preserve this external
+recovery boundary in its user-facing guidance.
 
 Private cleanup occurs only after identity checks. Replacements and ambiguous
 guardian-loss state are deliberately preserved for explicit recovery rather

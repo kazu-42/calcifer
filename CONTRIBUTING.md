@@ -25,6 +25,7 @@ Useful commands:
 make fmt
 make lint
 make test
+make supervisor-msrv
 cargo run -- doctor
 cargo run -- --json doctor
 ```
@@ -46,6 +47,13 @@ Changes to release metadata, packaging, or GitHub Actions must also follow the
 [release runbook](docs/releasing.md). Release actions stay pinned by full commit
 SHA, pull requests and manual runs cannot publish, and published assets are
 never replaced in place.
+
+The CI `Quality` check downloads a versioned actionlint archive, verifies its
+pinned SHA-256, and lints every GitHub Actions workflow. Pull requests that
+change `ci.yml`, `release.yml`, Cargo/build metadata, the `Makefile`, or release
+packaging scripts also trigger the permission-minimized release validation and
+native artifact matrix. Record both checks when handing off a workflow or
+release-path change.
 
 The JSON contract uses a numeric `schema_version`. Existing fields in schema version 1 cannot be removed, renamed, retyped, or assigned a different meaning. Additive fields are allowed.
 
