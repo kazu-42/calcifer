@@ -6,6 +6,17 @@ fn calcifer() -> Command {
 }
 
 #[cfg(unix)]
+fn signal_child_process_group(
+    child: &std::process::Child,
+    signal: rustix::process::Signal,
+) -> std::io::Result<()> {
+    // Avoid external `kill` option parsing: a negative process-group operand
+    // without `--` can be mistaken for another signal option.
+    let process_group = rustix::process::Pid::from_child(child);
+    rustix::process::kill_process_group(process_group, signal).map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
 const AMBIENT_CODEX_AUTH_OVERRIDES: &[(&str, &str)] = &[
     ("OPENAI_API_KEY", "synthetic-ambient-value"),
     ("CODEX_API_KEY", ""),
@@ -2520,10 +2531,8 @@ config_file = "{sensitive_role_path}"
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if !barrier_ready.is_file() {
-            let process_group = format!("-{}", untracked_spawn_parent.id());
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &process_group])
-                .status();
+            let _ =
+                signal_child_process_group(&untracked_spawn_parent, rustix::process::Signal::KILL);
             let _ = untracked_spawn_parent.wait();
             return Err(
                 std::io::Error::other("untracked guardian missed preflight barrier").into(),
@@ -3181,10 +3190,7 @@ config_file = "{sensitive_role_path}"
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if !final_preflight_ready.is_file() {
-        let process_group = format!("-{}", preflight_parent.id());
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &process_group])
-            .status();
+        let _ = signal_child_process_group(&preflight_parent, rustix::process::Signal::KILL);
         let _ = preflight_parent.wait();
         return Err(std::io::Error::other("guardian did not reach final preflight").into());
     }
@@ -3401,7 +3407,6 @@ config_file = "{sensitive_role_path}"
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    let coordinator_group = format!("-{}", coordinator_parent.id());
     for _ in 0..500 {
         if coordinator_child_pid_file.is_file()
             && coordinator_pid_file.is_file()
@@ -3415,9 +3420,7 @@ config_file = "{sensitive_role_path}"
         || !coordinator_pid_file.is_file()
         || !coordinator_tracked_file.is_file()
     {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &coordinator_group])
-            .status();
+        let _ = signal_child_process_group(&coordinator_parent, rustix::process::Signal::KILL);
         let _ = coordinator_parent.wait();
         let _ = std::fs::remove_file(&coordinator_pid_file);
         let _ = std::fs::remove_file(&coordinator_tracked_file);
@@ -3542,7 +3545,6 @@ config_file = "{sensitive_role_path}"
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    let guarded_group = format!("-{}", guarded_parent.id());
     for _ in 0..500 {
         if guarded_child_pid_file.is_file()
             && guardian_pid_file.is_file()
@@ -3556,9 +3558,7 @@ config_file = "{sensitive_role_path}"
         || !guardian_pid_file.is_file()
         || !guardian_tracked_file.is_file()
     {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &guarded_group])
-            .status();
+        let _ = signal_child_process_group(&guarded_parent, rustix::process::Signal::KILL);
         let _ = guarded_parent.wait();
         let _ = std::fs::remove_file(&guardian_coordinator_file);
         let _ = std::fs::remove_file(&guardian_tracked_file);
@@ -3606,9 +3606,7 @@ config_file = "{sensitive_role_path}"
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if guarded_parent.try_wait()?.is_none() {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &guarded_group])
-            .status();
+        let _ = signal_child_process_group(&guarded_parent, rustix::process::Signal::KILL);
         let _ = guarded_parent.wait();
         return Err(std::io::Error::other("coordinator did not recover").into());
     }
@@ -3749,13 +3747,7 @@ config_file = "{sensitive_role_path}"
         return Err(std::io::Error::other("interruptible provider did not start").into());
     }
     let interrupted_child_pid = std::fs::read_to_string(&interrupted_child_pid_file)?;
-    let process_group = format!("-{}", interrupted_parent.id());
-    assert!(
-        std::process::Command::new("kill")
-            .args(["-INT", &process_group])
-            .status()?
-            .success()
-    );
+    signal_child_process_group(&interrupted_parent, rustix::process::Signal::INT)?;
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert!(
         interrupted_parent.try_wait()?.is_none(),
@@ -3795,9 +3787,7 @@ config_file = "{sensitive_role_path}"
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if interrupted_parent.try_wait()?.is_none() {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &process_group])
-            .status();
+        let _ = signal_child_process_group(&interrupted_parent, rustix::process::Signal::KILL);
         let _ = interrupted_parent.wait();
         return Err(std::io::Error::other("interrupted wrapper did not exit").into());
     }
