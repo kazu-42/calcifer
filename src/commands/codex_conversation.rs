@@ -1,0 +1,1330 @@
+//! Same-profile Codex thread capture and crash reconciliation.
+//!
+//! Every App Server call in this module runs while the caller owns the
+//! profile's coordinator/provider lease. Registry transactions are deliberately
+//! short and never span provider I/O.
+
+#![cfg(unix)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::time::Duration;
+
+use crate::cli::InternalProcessMode;
+use crate::conversations::{
+    BindingInput, ConversationError, ConversationLifecycle, ConversationRegistry, HeadBinding,
+    InventoryThread, LaunchMode, LaunchResolution, PendingLaunch, PendingPhase,
+};
+use crate::error::AppError;
+use crate::profiles::ProfileLease;
+use crate::providers::codex::{
+    CodexThreadError, CodexThreadInventory, CodexThreadLifecycle, CodexThreadRead,
+    SUPPORTED_CODEX_STATUS_VERSIONS, probe_codex_version, read_thread_inventory,
+    read_thread_metadata,
+};
+
+const THREAD_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(super) enum GuardianCapture {
+    /// Derive the exact thread from a bounded before/after inventory.
+    Tracked { launch_id: String },
+    /// The exact thread was authoritative and adopted before provider start.
+    Bound { binding: HeadBinding },
+    /// Keep stable exact resume available outside the pinned metadata adapter.
+    UnsupportedExplicit,
+    /// The user explicitly disabled capture under durable in-flight ownership.
+    Untracked { launch_id: String },
+}
+
+impl GuardianCapture {
+    pub(super) fn launch_id(&self) -> Option<&str> {
+        match self {
+            Self::Tracked { launch_id } | Self::Untracked { launch_id } => Some(launch_id),
+            Self::Bound { .. } | Self::UnsupportedExplicit => None,
+        }
+    }
+}
+
+/// All resources required for a capture generation. Construction itself does
+/// no I/O; the caller controls the profile-lock lifetime.
+pub(super) struct CaptureContext<'a> {
+    conversations: &'a ConversationRegistry,
+    provider_lease: &'a ProfileLease,
+    executable: &'a Path,
+    home: &'a Path,
+    neutral_working_directory: &'a Path,
+    profile_id: &'a str,
+    working_directory: &'a Path,
+}
+
+impl<'a> CaptureContext<'a> {
+    pub(super) fn new(
+        conversations: &'a ConversationRegistry,
+        provider_lease: &'a ProfileLease,
+        executable: &'a Path,
+        home: &'a Path,
+        neutral_working_directory: &'a Path,
+        profile_id: &'a str,
+        working_directory: &'a Path,
+    ) -> Self {
+        Self {
+            conversations,
+            provider_lease,
+            executable,
+            home,
+            neutral_working_directory,
+            profile_id,
+            working_directory,
+        }
+    }
+
+    pub(super) fn prepare(
+        &self,
+        mode: InternalProcessMode,
+        session_id: Option<&str>,
+    ) -> Result<GuardianCapture, AppError> {
+        match mode {
+            InternalProcessMode::RunUntracked | InternalProcessMode::ResumeLastUntracked => {
+                let launch_mode = match mode {
+                    InternalProcessMode::RunUntracked => LaunchMode::RunUntracked,
+                    InternalProcessMode::ResumeLastUntracked => LaunchMode::ResumeLastUntracked,
+                    _ => unreachable!("tracked modes are handled separately"),
+                };
+                let launch_id = self.conversations.prepare_untracked(
+                    self.profile_id,
+                    self.working_directory,
+                    launch_mode,
+                )?;
+                eprintln!(
+                    "Calcifer: untracked mode is active; conversation capture and bare resume are disabled until explicit exact recovery."
+                );
+                Ok(GuardianCapture::Untracked { launch_id })
+            }
+            InternalProcessMode::Run | InternalProcessMode::ResumeLast => {
+                self.reconcile_pending_launch()?;
+                let inventory = self.inventory()?;
+                if !inventory.complete {
+                    self.conversations
+                        .mark_workspace_ambiguous(self.working_directory)?;
+                    return Err(ConversationError::Ambiguous.into());
+                }
+                let launch_mode = match mode {
+                    InternalProcessMode::Run => LaunchMode::Run,
+                    InternalProcessMode::ResumeLast => LaunchMode::ResumeLast,
+                    InternalProcessMode::RunUntracked
+                    | InternalProcessMode::ResumeLastUntracked
+                    | InternalProcessMode::ResumeExact
+                    | InternalProcessMode::ResumeHead => {
+                        unreachable!("exact modes are handled separately")
+                    }
+                };
+                let launch_id = self.conversations.begin_launch(
+                    self.profile_id,
+                    self.working_directory,
+                    launch_mode,
+                    &inventory.codex_version,
+                    inventory_projection(&inventory),
+                )?;
+                Ok(GuardianCapture::Tracked { launch_id })
+            }
+            InternalProcessMode::ResumeExact | InternalProcessMode::ResumeHead => {
+                self.prepare_exact(mode, session_id)
+            }
+        }
+    }
+
+    /// Durably crosses the non-idempotent spawn boundary. Once this returns,
+    /// crash recovery must assume that a provider may have existed even if no
+    /// thread was materialized. Keeping `Prepared` strictly pre-spawn makes a
+    /// zero-candidate prepared launch safe to discard.
+    pub(super) fn authorize_provider_spawn(
+        &self,
+        capture: &GuardianCapture,
+    ) -> Result<(), AppError> {
+        if let Some(launch_id) = capture.launch_id() {
+            self.conversations.mark_provider_started(launch_id)?;
+        }
+        Ok(())
+    }
+
+    /// `Command::spawn` returned an error, so no interactive child can be
+    /// waited on. Remove the conservative spawn marker without changing an
+    /// existing workspace head.
+    pub(super) fn provider_spawn_failed(&self, capture: &GuardianCapture) -> Result<(), AppError> {
+        if let Some(launch_id) = capture.launch_id() {
+            let _ = self
+                .conversations
+                .finish_launch(launch_id, LaunchResolution::NoThread)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_exact(
+        &self,
+        mode: InternalProcessMode,
+        session_id: Option<&str>,
+    ) -> Result<GuardianCapture, AppError> {
+        let thread_id = session_id.ok_or(AppError::ProviderArgumentRejected)?;
+        if let Some(untracked) = self
+            .conversations
+            .untracked_for_workspace(self.working_directory)?
+        {
+            if untracked.profile_id != self.profile_id {
+                return Err(ConversationError::Ambiguous.into());
+            }
+            let _ = self
+                .conversations
+                .finish_launch(&untracked.launch_id, LaunchResolution::Ambiguous)?;
+        }
+        if mode == InternalProcessMode::ResumeHead {
+            let head = self.conversations.resolve_head(self.working_directory)?;
+            validate_head_target(&head, self.profile_id, thread_id, self.working_directory)?;
+        }
+
+        if mode == InternalProcessMode::ResumeExact {
+            let codex_version = self.probe_version()?;
+            if !SUPPORTED_CODEX_STATUS_VERSIONS.contains(&codex_version.as_str()) {
+                eprintln!(
+                    "Calcifer: the installed Codex version is outside the tracked-session adapter; continuing with explicit exact resume without changing the conversation registry."
+                );
+                return Ok(GuardianCapture::UnsupportedExplicit);
+            }
+        }
+
+        let read = self.read_thread(thread_id)?;
+
+        let persisted_binding = match mode {
+            InternalProcessMode::ResumeHead => {
+                let head = self.conversations.resolve_head(self.working_directory)?;
+                validate_head_target(&head, self.profile_id, thread_id, self.working_directory)?;
+                Some(head)
+            }
+            InternalProcessMode::ResumeExact => self.conversations.find_bound_thread(
+                self.profile_id,
+                thread_id,
+                self.working_directory,
+            )?,
+            InternalProcessMode::Run
+            | InternalProcessMode::RunUntracked
+            | InternalProcessMode::ResumeLast
+            | InternalProcessMode::ResumeLastUntracked => None,
+        };
+        if persisted_binding
+            .as_ref()
+            .is_some_and(|binding| binding.codex_version != read.codex_version)
+        {
+            return Err(ConversationError::SessionSchemaUnsupported.into());
+        }
+
+        let mut binding = self.binding_from_read(read)?;
+        if let Some(persisted_binding) = persisted_binding {
+            binding.lifecycle =
+                preserve_resume_uncertainty(persisted_binding.lifecycle, binding.lifecycle);
+        }
+        let adopted = adopt_exact_binding(
+            self.conversations,
+            self.profile_id,
+            self.working_directory,
+            binding,
+        )?;
+        warn_if_unclean_resume(adopted.lifecycle);
+        Ok(GuardianCapture::Bound { binding: adopted })
+    }
+
+    /// Capture never changes the official provider status and never retries a
+    /// provider launch. Failure only marks later automatic selection unsafe.
+    pub(super) fn complete(&self, capture: &GuardianCapture, provider_succeeded: bool) {
+        let result = match capture {
+            GuardianCapture::Tracked { launch_id } => {
+                self.complete_tracked(launch_id, provider_succeeded)
+            }
+            GuardianCapture::Bound { binding } => {
+                self.refresh_bound_lifecycle(binding, provider_succeeded)
+            }
+            GuardianCapture::Untracked { launch_id } => self
+                .conversations
+                .finish_launch(launch_id, LaunchResolution::Ambiguous)
+                .map(|_| ())
+                .map_err(AppError::from),
+            GuardianCapture::UnsupportedExplicit => Ok(()),
+        };
+
+        if let Err(error) = result {
+            if let GuardianCapture::Tracked { launch_id } = capture {
+                let _ = self.conversations.mark_capture_failed(launch_id);
+            } else if matches!(capture, GuardianCapture::Bound { .. }) {
+                let _ = self
+                    .conversations
+                    .mark_workspace_ambiguous(self.working_directory);
+            }
+            eprintln!(
+                "Calcifer: the provider exited, but its conversation checkpoint could not be confirmed ({}). The provider was not launched again.",
+                error.code()
+            );
+        }
+    }
+
+    fn complete_tracked(&self, launch_id: &str, provider_succeeded: bool) -> Result<(), AppError> {
+        let pending = self
+            .conversations
+            .pending_for(self.profile_id, self.working_directory)?
+            .ok_or(ConversationError::NotFound)?;
+        if pending.launch_id != launch_id {
+            return Err(ConversationError::Ambiguous.into());
+        }
+        if pending.mode.is_untracked() {
+            return Err(ConversationError::Ambiguous.into());
+        }
+        let pending_codex_version = pending.codex_version.as_deref().ok_or_else(|| {
+            ConversationError::RegistryInvalid(
+                "tracked pending launch has no Codex version".to_owned(),
+            )
+        })?;
+        let inventory = match self.inventory() {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                return finish_reconciliation_failure(self.conversations, launch_id, error);
+            }
+        };
+        if !inventory.complete {
+            let _ = self
+                .conversations
+                .finish_launch(launch_id, LaunchResolution::Ambiguous)?;
+            return Err(ConversationError::Ambiguous.into());
+        }
+        if inventory.codex_version != pending_codex_version {
+            return finish_reconciliation_failure(
+                self.conversations,
+                launch_id,
+                ConversationError::SessionSchemaUnsupported.into(),
+            );
+        }
+
+        match inventory_candidate(&pending.pre_inventory, &inventory_projection(&inventory)) {
+            InventoryCandidate::None => {
+                let _ = self
+                    .conversations
+                    .finish_launch(launch_id, LaunchResolution::NoThread)?;
+                Ok(())
+            }
+            InventoryCandidate::One(thread_id) => {
+                let read = match self.read_thread(&thread_id) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        return finish_reconciliation_failure(self.conversations, launch_id, error);
+                    }
+                };
+                if read.codex_version != pending_codex_version {
+                    return finish_reconciliation_failure(
+                        self.conversations,
+                        launch_id,
+                        ConversationError::SessionSchemaUnsupported.into(),
+                    );
+                }
+                let mut binding = match self.binding_from_read(read) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        return finish_reconciliation_failure(self.conversations, launch_id, error);
+                    }
+                };
+                if !provider_succeeded && binding.lifecycle == ConversationLifecycle::Clean {
+                    binding.lifecycle = ConversationLifecycle::UnknownCrash;
+                }
+                if finish_candidate_binding(self.conversations, launch_id, binding)? {
+                    Ok(())
+                } else {
+                    Err(ConversationError::Ambiguous.into())
+                }
+            }
+            InventoryCandidate::Ambiguous => {
+                let _ = self
+                    .conversations
+                    .finish_launch(launch_id, LaunchResolution::Ambiguous)?;
+                Err(ConversationError::Ambiguous.into())
+            }
+        }
+    }
+
+    fn refresh_bound_lifecycle(
+        &self,
+        expected: &HeadBinding,
+        provider_succeeded: bool,
+    ) -> Result<(), AppError> {
+        let read = self.read_thread(&expected.thread_id)?;
+        let mut binding = self.binding_from_read(read)?;
+        if !provider_succeeded && binding.lifecycle == ConversationLifecycle::Clean {
+            binding.lifecycle = ConversationLifecycle::UnknownCrash;
+        }
+        self.conversations.refresh_adopted(expected, binding)?;
+        Ok(())
+    }
+
+    pub(super) fn reconcile_pending_launch(&self) -> Result<(), AppError> {
+        let Some(pending) = self
+            .conversations
+            .pending_for(self.profile_id, self.working_directory)?
+        else {
+            return Ok(());
+        };
+        if pending.mode.is_untracked() {
+            let _ = self
+                .conversations
+                .finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
+            return Err(ConversationError::Ambiguous.into());
+        }
+        let pending_codex_version = pending.codex_version.as_deref().ok_or_else(|| {
+            ConversationError::RegistryInvalid(
+                "tracked pending launch has no Codex version".to_owned(),
+            )
+        })?;
+        let inventory = match self.inventory() {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                return finish_reconciliation_failure(
+                    self.conversations,
+                    &pending.launch_id,
+                    error,
+                );
+            }
+        };
+        if !inventory.complete {
+            let _ = self
+                .conversations
+                .finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
+            return Err(ConversationError::Ambiguous.into());
+        }
+        if inventory.codex_version != pending_codex_version {
+            return finish_reconciliation_failure(
+                self.conversations,
+                &pending.launch_id,
+                ConversationError::SessionSchemaUnsupported.into(),
+            );
+        }
+
+        match inventory_candidate(&pending.pre_inventory, &inventory_projection(&inventory)) {
+            InventoryCandidate::None => match pending.phase {
+                PendingPhase::Prepared => {
+                    let _ = self
+                        .conversations
+                        .finish_launch(&pending.launch_id, LaunchResolution::NoThread)?;
+                    Ok(())
+                }
+                PendingPhase::ProviderStarted | PendingPhase::CaptureFailed => {
+                    let _ = self
+                        .conversations
+                        .finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
+                    Err(ConversationError::Ambiguous.into())
+                }
+            },
+            InventoryCandidate::One(thread_id) => {
+                require_started_candidate(self.conversations, &pending)?;
+                let read = match self.read_thread(&thread_id) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        return finish_reconciliation_failure(
+                            self.conversations,
+                            &pending.launch_id,
+                            error,
+                        );
+                    }
+                };
+                if read.codex_version != pending_codex_version {
+                    return finish_reconciliation_failure(
+                        self.conversations,
+                        &pending.launch_id,
+                        ConversationError::SessionSchemaUnsupported.into(),
+                    );
+                }
+                let mut binding = match self.binding_from_read(read) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        return finish_reconciliation_failure(
+                            self.conversations,
+                            &pending.launch_id,
+                            error,
+                        );
+                    }
+                };
+                binding.lifecycle = match binding.lifecycle {
+                    ConversationLifecycle::Interrupted => ConversationLifecycle::Interrupted,
+                    ConversationLifecycle::Clean | ConversationLifecycle::UnknownCrash => {
+                        ConversationLifecycle::UnknownCrash
+                    }
+                    ConversationLifecycle::Missing
+                    | ConversationLifecycle::Archived
+                    | ConversationLifecycle::Incompatible
+                    | ConversationLifecycle::Ambiguous => {
+                        return finish_reconciliation_failure(
+                            self.conversations,
+                            &pending.launch_id,
+                            ConversationError::SessionSchemaUnsupported.into(),
+                        );
+                    }
+                };
+                if finish_candidate_binding(self.conversations, &pending.launch_id, binding)? {
+                    Ok(())
+                } else {
+                    Err(ConversationError::Ambiguous.into())
+                }
+            }
+            InventoryCandidate::Ambiguous => {
+                let _ = self
+                    .conversations
+                    .finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
+                Err(ConversationError::Ambiguous.into())
+            }
+        }
+    }
+
+    fn inventory(&self) -> Result<CodexThreadInventory, AppError> {
+        let _inheritance = self.provider_lease.inherit_provider_lock()?;
+        read_thread_inventory(
+            self.executable,
+            self.home,
+            self.neutral_working_directory,
+            self.working_directory,
+            THREAD_METADATA_TIMEOUT,
+        )
+        .map_err(map_thread_error)
+        .map_err(AppError::from)
+    }
+
+    fn probe_version(&self) -> Result<String, AppError> {
+        let _inheritance = self.provider_lease.inherit_provider_lock()?;
+        probe_codex_version(
+            self.executable,
+            self.home,
+            self.neutral_working_directory,
+            VERSION_PROBE_TIMEOUT,
+        )
+        .map_err(map_thread_error)
+        .map_err(AppError::from)
+    }
+
+    fn read_thread(&self, thread_id: &str) -> Result<CodexThreadRead, AppError> {
+        let _inheritance = self.provider_lease.inherit_provider_lock()?;
+        read_thread_metadata(
+            self.executable,
+            self.home,
+            self.neutral_working_directory,
+            self.working_directory,
+            thread_id,
+            THREAD_METADATA_TIMEOUT,
+        )
+        .map_err(map_thread_error)
+        .map_err(AppError::from)
+    }
+
+    fn binding_from_read(&self, read: CodexThreadRead) -> Result<BindingInput, AppError> {
+        let canonical_cwd = std::fs::canonicalize(self.working_directory)
+            .map_err(|_| ConversationError::CwdMismatch)?;
+        if canonical_cwd != read.metadata.canonical_cwd {
+            return Err(ConversationError::CwdMismatch.into());
+        }
+        let canonical_cwd = canonical_cwd
+            .to_str()
+            .ok_or(ConversationError::CwdMismatch)?
+            .to_owned();
+        Ok(BindingInput {
+            profile_id: self.profile_id.to_owned(),
+            thread_id: read.metadata.thread_id,
+            canonical_cwd,
+            codex_version: read.codex_version,
+            lifecycle: map_thread_lifecycle(read.lifecycle),
+        })
+    }
+}
+
+fn require_started_candidate(
+    conversations: &ConversationRegistry,
+    pending: &PendingLaunch,
+) -> Result<(), AppError> {
+    if pending.phase != PendingPhase::Prepared {
+        return Ok(());
+    }
+    let _ = conversations.finish_launch(&pending.launch_id, LaunchResolution::Ambiguous)?;
+    Err(ConversationError::Ambiguous.into())
+}
+
+const fn preserve_resume_uncertainty(
+    persisted: ConversationLifecycle,
+    observed: ConversationLifecycle,
+) -> ConversationLifecycle {
+    match persisted {
+        ConversationLifecycle::Clean => observed,
+        ConversationLifecycle::Interrupted
+        | ConversationLifecycle::UnknownCrash
+        | ConversationLifecycle::Missing
+        | ConversationLifecycle::Archived
+        | ConversationLifecycle::Incompatible
+        | ConversationLifecycle::Ambiguous => persisted,
+    }
+}
+
+fn finish_candidate_binding(
+    conversations: &ConversationRegistry,
+    launch_id: &str,
+    binding: BindingInput,
+) -> Result<bool, AppError> {
+    match conversations.finish_launch(launch_id, LaunchResolution::Bind(binding)) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error @ (ConversationError::ProfileMismatch | ConversationError::CwdMismatch)) => {
+            finish_reconciliation_failure(conversations, launch_id, error.into()).map(|()| false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn adopt_exact_binding(
+    conversations: &ConversationRegistry,
+    profile_id: &str,
+    working_directory: &Path,
+    binding: BindingInput,
+) -> Result<HeadBinding, AppError> {
+    if let Some(pending) = conversations.pending_for(profile_id, working_directory)? {
+        if pending.mode.is_untracked() {
+            return Err(ConversationError::Ambiguous.into());
+        }
+        // Explicit selection is authoritative recovery. A false result means
+        // the pending launch was resolved beneath an older needs-selection
+        // marker; adoption below replaces that marker with the exact binding.
+        let _ = finish_candidate_binding(conversations, &pending.launch_id, binding.clone())?;
+    }
+    conversations.adopt(binding).map_err(AppError::from)
+}
+
+fn finish_reconciliation_failure(
+    conversations: &ConversationRegistry,
+    launch_id: &str,
+    error: AppError,
+) -> Result<(), AppError> {
+    let terminal = matches!(
+        &error,
+        AppError::Conversation(
+            ConversationError::RolloutMissing
+                | ConversationError::Archived
+                | ConversationError::SessionSchemaUnsupported
+                | ConversationError::CodexVersionUnsupported
+                | ConversationError::ProfileMismatch
+                | ConversationError::CwdMismatch
+                | ConversationError::ThreadProtocolInvalid
+        )
+    );
+    if terminal {
+        let _ = conversations.finish_launch(launch_id, LaunchResolution::Ambiguous)?;
+    } else {
+        conversations.mark_capture_failed(launch_id)?;
+    }
+    Err(error)
+}
+
+pub(super) fn validate_head_target(
+    head: &HeadBinding,
+    profile_id: &str,
+    thread_id: &str,
+    working_directory: &Path,
+) -> Result<(), AppError> {
+    if head.profile_id != profile_id {
+        return Err(ConversationError::ProfileMismatch.into());
+    }
+    if head.thread_id != thread_id {
+        return Err(ConversationError::Ambiguous.into());
+    }
+    let canonical_cwd =
+        std::fs::canonicalize(working_directory).map_err(|_| ConversationError::CwdMismatch)?;
+    if canonical_cwd.to_str() != Some(head.canonical_cwd.as_str()) {
+        return Err(ConversationError::CwdMismatch.into());
+    }
+    Ok(())
+}
+
+fn map_thread_error(error: CodexThreadError) -> ConversationError {
+    match error {
+        CodexThreadError::UnsupportedVersion => ConversationError::CodexVersionUnsupported,
+        CodexThreadError::SessionSchema => ConversationError::SessionSchemaUnsupported,
+        CodexThreadError::CwdMismatch => ConversationError::CwdMismatch,
+        CodexThreadError::Missing => ConversationError::RolloutMissing,
+        CodexThreadError::Archived => ConversationError::Archived,
+        CodexThreadError::Protocol => ConversationError::ThreadProtocolInvalid,
+        CodexThreadError::Authentication
+        | CodexThreadError::Timeout
+        | CodexThreadError::Transport
+        | CodexThreadError::Provider
+        | CodexThreadError::Spawn => ConversationError::ThreadMetadataUnavailable,
+    }
+}
+
+const fn map_thread_lifecycle(lifecycle: CodexThreadLifecycle) -> ConversationLifecycle {
+    match lifecycle {
+        CodexThreadLifecycle::Clean => ConversationLifecycle::Clean,
+        CodexThreadLifecycle::Interrupted => ConversationLifecycle::Interrupted,
+        CodexThreadLifecycle::UnknownCrash => ConversationLifecycle::UnknownCrash,
+    }
+}
+
+fn warn_if_unclean_resume(lifecycle: ConversationLifecycle) {
+    match lifecycle {
+        ConversationLifecycle::Interrupted => eprintln!(
+            "Calcifer: the tracked Codex conversation ended at an interrupted turn boundary; reopening its exact history without submitting a prompt."
+        ),
+        ConversationLifecycle::UnknownCrash => eprintln!(
+            "Calcifer: the tracked Codex conversation did not have a provably clean boundary; reopening its exact history without submitting a prompt."
+        ),
+        ConversationLifecycle::Clean
+        | ConversationLifecycle::Missing
+        | ConversationLifecycle::Archived
+        | ConversationLifecycle::Incompatible
+        | ConversationLifecycle::Ambiguous => {}
+    }
+}
+
+fn inventory_projection(inventory: &CodexThreadInventory) -> Vec<InventoryThread> {
+    inventory
+        .threads
+        .iter()
+        .map(|thread| InventoryThread {
+            thread_id: thread.thread_id.clone(),
+            updated_at: thread.updated_at,
+            recency_at: thread.recency_at,
+            archived: thread.archived,
+            rollout_device: thread.rollout_fingerprint.device,
+            rollout_inode: thread.rollout_fingerprint.inode,
+            rollout_length: thread.rollout_fingerprint.length,
+            rollout_modified_seconds: thread.rollout_fingerprint.modified_seconds,
+            rollout_modified_nanoseconds: thread.rollout_fingerprint.modified_nanoseconds,
+            rollout_changed_seconds: thread.rollout_fingerprint.changed_seconds,
+            rollout_changed_nanoseconds: thread.rollout_fingerprint.changed_nanoseconds,
+        })
+        .collect()
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum InventoryCandidate {
+    None,
+    One(String),
+    Ambiguous,
+}
+
+fn inventory_candidate(
+    baseline: &[InventoryThread],
+    current: &[InventoryThread],
+) -> InventoryCandidate {
+    let baseline: BTreeMap<&str, &InventoryThread> = baseline
+        .iter()
+        .map(|thread| (thread.thread_id.as_str(), thread))
+        .collect();
+    let current_ids: BTreeSet<&str> = current
+        .iter()
+        .map(|thread| thread.thread_id.as_str())
+        .collect();
+    if baseline
+        .keys()
+        .any(|thread_id| !current_ids.contains(thread_id))
+    {
+        return InventoryCandidate::Ambiguous;
+    }
+    let mut candidates = current.iter().filter(|thread| {
+        baseline
+            .get(thread.thread_id.as_str())
+            .is_none_or(|baseline| *baseline != *thread)
+    });
+    let first = candidates.next().map(|thread| thread.thread_id.clone());
+    match (first, candidates.next()) {
+        (None, _) => InventoryCandidate::None,
+        (Some(thread_id), None) => InventoryCandidate::One(thread_id),
+        (Some(_), Some(_)) => InventoryCandidate::Ambiguous,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::PathBuf;
+
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::profiles::Registry;
+
+    struct PendingFixture {
+        root: PathBuf,
+        workspace: PathBuf,
+        conversations: ConversationRegistry,
+        profile_id: String,
+        launch_id: String,
+    }
+
+    fn registry_fixture(
+        name: &str,
+        provider_started: bool,
+    ) -> Result<PendingFixture, Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "calcifer-reconcile-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let profiles = Registry::at(root.clone());
+        let conversations = ConversationRegistry::from_profiles(&profiles);
+        let profile_id = Uuid::new_v4().to_string();
+        let launch_id = conversations.begin_launch(
+            &profile_id,
+            &workspace,
+            LaunchMode::Run,
+            "0.144.4",
+            Vec::new(),
+        )?;
+        if provider_started {
+            conversations.mark_provider_started(&launch_id)?;
+        }
+        Ok(PendingFixture {
+            root,
+            workspace,
+            conversations,
+            profile_id,
+            launch_id,
+        })
+    }
+
+    fn pending_registry(name: &str) -> Result<PendingFixture, Box<dyn std::error::Error>> {
+        registry_fixture(name, true)
+    }
+
+    fn inventory_thread(thread_id: &str, updated_at: i64) -> InventoryThread {
+        InventoryThread {
+            thread_id: thread_id.to_owned(),
+            updated_at,
+            recency_at: Some(updated_at),
+            archived: false,
+            rollout_device: 1,
+            rollout_inode: 2,
+            rollout_length: 3,
+            rollout_modified_seconds: 4,
+            rollout_modified_nanoseconds: 5,
+            rollout_changed_seconds: 6,
+            rollout_changed_nanoseconds: 7,
+        }
+    }
+
+    fn binding_for(profile_id: &str, thread_id: &str, workspace: &Path) -> BindingInput {
+        BindingInput {
+            profile_id: profile_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            canonical_cwd: fs::canonicalize(workspace)
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned))
+                .unwrap_or_default(),
+            codex_version: "0.144.4".to_owned(),
+            lifecycle: ConversationLifecycle::Clean,
+        }
+    }
+
+    fn assert_terminal_binding_conflict(
+        name: &str,
+        profile_mismatch: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "calcifer-binding-conflict-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let existing_workspace = root.join("existing-workspace");
+        let pending_workspace = root.join("pending-workspace");
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&existing_workspace)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&pending_workspace)?;
+        let registry = Registry::at(root.clone());
+        let conversations = ConversationRegistry::from_profiles(&registry);
+        let existing_profile = Uuid::new_v4().to_string();
+        let pending_profile = if profile_mismatch {
+            Uuid::new_v4().to_string()
+        } else {
+            existing_profile.clone()
+        };
+        let thread_id = Uuid::new_v4().to_string();
+        conversations.adopt(binding_for(
+            &existing_profile,
+            &thread_id,
+            &existing_workspace,
+        ))?;
+        let launch_id = conversations.begin_launch(
+            &pending_profile,
+            &pending_workspace,
+            LaunchMode::Run,
+            "0.144.4",
+            Vec::new(),
+        )?;
+        conversations.mark_provider_started(&launch_id)?;
+
+        let error = adopt_exact_binding(
+            &conversations,
+            &pending_profile,
+            &pending_workspace,
+            binding_for(&pending_profile, &thread_id, &pending_workspace),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("immutable ownership conflict was accepted"))?;
+        assert_eq!(
+            error.code(),
+            if profile_mismatch {
+                "conversation_profile_mismatch"
+            } else {
+                "conversation_cwd_mismatch"
+            }
+        );
+        assert!(
+            conversations
+                .pending_for(&pending_profile, &pending_workspace)?
+                .is_none(),
+            "a permanent bind conflict must not leave a retry loop"
+        );
+        assert_eq!(
+            conversations
+                .resolve_head(&pending_workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_ambiguous")
+        );
+        assert_eq!(
+            conversations.resolve_head(&existing_workspace)?.thread_id,
+            thread_id,
+            "terminalizing the candidate must preserve the immutable owner"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_diff_never_guesses_between_new_changed_or_archived_threads() {
+        let first = inventory_thread("01900000-0000-7000-8000-000000000001", 10);
+        let second = inventory_thread("01900000-0000-7000-8000-000000000002", 20);
+
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&first), std::slice::from_ref(&first)),
+            InventoryCandidate::None
+        );
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&first), &[]),
+            InventoryCandidate::Ambiguous,
+            "a deleted baseline thread must never preserve a stale head"
+        );
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&first), std::slice::from_ref(&second)),
+            InventoryCandidate::Ambiguous,
+            "a deletion plus a new thread is not a unique launch candidate"
+        );
+        let mut changed = first.clone();
+        changed.updated_at += 1;
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&first), std::slice::from_ref(&changed)),
+            InventoryCandidate::One(first.thread_id.clone())
+        );
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&first), &[changed, second]),
+            InventoryCandidate::Ambiguous
+        );
+        let mut archived = first.clone();
+        archived.archived = true;
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&first), &[archived]),
+            InventoryCandidate::One(first.thread_id)
+        );
+    }
+
+    #[test]
+    fn inventory_diff_detects_same_second_rollout_changes() {
+        let original = inventory_thread("01900000-0000-7000-8000-000000000001", 10);
+
+        let mut length_changed = original.clone();
+        length_changed.rollout_length += 1;
+        assert_eq!(
+            inventory_candidate(
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&length_changed)
+            ),
+            InventoryCandidate::One(original.thread_id.clone())
+        );
+
+        let mut nanoseconds_changed = original.clone();
+        nanoseconds_changed.rollout_modified_nanoseconds += 1;
+        assert_eq!(
+            inventory_candidate(
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&nanoseconds_changed)
+            ),
+            InventoryCandidate::One(original.thread_id.clone())
+        );
+
+        let mut renamed = original.clone();
+        renamed.rollout_changed_nanoseconds += 1;
+        assert_eq!(
+            inventory_candidate(
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&renamed)
+            ),
+            InventoryCandidate::One(original.thread_id.clone()),
+            "a path-free ctime fingerprint must detect a same-inode rename"
+        );
+    }
+
+    #[test]
+    fn thread_error_mapping_separates_terminal_schema_from_retryable_availability() {
+        assert!(matches!(
+            map_thread_error(CodexThreadError::Protocol),
+            ConversationError::ThreadProtocolInvalid
+        ));
+        for retryable in [
+            CodexThreadError::Authentication,
+            CodexThreadError::Timeout,
+            CodexThreadError::Transport,
+            CodexThreadError::Provider,
+            CodexThreadError::Spawn,
+        ] {
+            assert!(matches!(
+                map_thread_error(retryable),
+                ConversationError::ThreadMetadataUnavailable
+            ));
+        }
+    }
+
+    #[test]
+    fn resume_preparation_preserves_persisted_uncertainty() {
+        for persisted in [
+            ConversationLifecycle::UnknownCrash,
+            ConversationLifecycle::Interrupted,
+        ] {
+            assert_eq!(
+                preserve_resume_uncertainty(persisted, ConversationLifecycle::Clean),
+                persisted
+            );
+        }
+        assert_eq!(
+            preserve_resume_uncertainty(
+                ConversationLifecycle::Clean,
+                ConversationLifecycle::Interrupted
+            ),
+            ConversationLifecycle::Interrupted
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_profile_conflict_terminalizes_pending_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_terminal_binding_conflict("profile", true)
+    }
+
+    #[test]
+    fn explicit_recovery_cwd_conflict_terminalizes_pending_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_terminal_binding_conflict("cwd", false)
+    }
+
+    #[test]
+    fn exact_binding_lookup_ignores_pending_and_selection_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = registry_fixture("exact-binding-lookup", false)?;
+        let _ = fixture
+            .conversations
+            .finish_launch(&fixture.launch_id, LaunchResolution::NoThread)?;
+        let thread_id = Uuid::new_v4().to_string();
+        let mut binding = binding_for(&fixture.profile_id, &thread_id, &fixture.workspace);
+        binding.lifecycle = ConversationLifecycle::UnknownCrash;
+        fixture.conversations.adopt(binding)?;
+        fixture.conversations.begin_launch(
+            &fixture.profile_id,
+            &fixture.workspace,
+            LaunchMode::Run,
+            "0.144.4",
+            Vec::new(),
+        )?;
+        fixture
+            .conversations
+            .mark_workspace_ambiguous(&fixture.workspace)?;
+
+        let found = fixture
+            .conversations
+            .find_bound_thread(&fixture.profile_id, &thread_id, &fixture.workspace)?
+            .ok_or_else(|| std::io::Error::other("immutable binding was hidden"))?;
+        assert_eq!(found.lifecycle, ConversationLifecycle::UnknownCrash);
+        assert_eq!(found.thread_id, thread_id);
+        assert!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .is_some(),
+            "the lookup must not resolve or mutate the pending launch"
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn new_explicit_binding_keeps_observed_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = registry_fixture("new-explicit-binding", false)?;
+        let _ = fixture
+            .conversations
+            .finish_launch(&fixture.launch_id, LaunchResolution::NoThread)?;
+        let thread_id = Uuid::new_v4().to_string();
+        assert!(
+            fixture
+                .conversations
+                .find_bound_thread(&fixture.profile_id, &thread_id, &fixture.workspace)?
+                .is_none()
+        );
+        let mut observed = binding_for(&fixture.profile_id, &thread_id, &fixture.workspace);
+        observed.lifecycle = ConversationLifecycle::Interrupted;
+
+        let adopted = adopt_exact_binding(
+            &fixture.conversations,
+            &fixture.profile_id,
+            &fixture.workspace,
+            observed,
+        )?;
+        assert_eq!(adopted.lifecycle, ConversationLifecycle::Interrupted);
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_recovery_refuses_cross_profile_tracked_pending_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = pending_registry("cross-profile-tracked-pending")?;
+        let selected_profile = Uuid::new_v4().to_string();
+        let selected_thread = Uuid::new_v4().to_string();
+
+        let error = adopt_exact_binding(
+            &fixture.conversations,
+            &selected_profile,
+            &fixture.workspace,
+            binding_for(&selected_profile, &selected_thread, &fixture.workspace),
+        )
+        .err()
+        .ok_or_else(|| {
+            std::io::Error::other("cross-profile tracked pending launch allowed exact adoption")
+        })?;
+
+        assert_eq!(error.code(), "conversation_ambiguous");
+        assert!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .is_some_and(|pending| pending.launch_id == fixture.launch_id),
+            "refusal must preserve the existing owner for reconciliation"
+        );
+        assert!(
+            fixture
+                .conversations
+                .find_bound_thread(&selected_profile, &selected_thread, &fixture.workspace)?
+                .is_none(),
+            "refusal must not persist the conflicting exact binding"
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_recovery_resolves_same_profile_tracked_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for provider_started in [false, true] {
+            let fixture = registry_fixture("same-profile-tracked-pending", provider_started)?;
+            let selected_thread = Uuid::new_v4().to_string();
+
+            let adopted = adopt_exact_binding(
+                &fixture.conversations,
+                &fixture.profile_id,
+                &fixture.workspace,
+                binding_for(&fixture.profile_id, &selected_thread, &fixture.workspace),
+            )?;
+
+            assert_eq!(adopted.profile_id, fixture.profile_id);
+            assert_eq!(adopted.thread_id, selected_thread);
+            assert!(
+                fixture
+                    .conversations
+                    .pending_for(&adopted.profile_id, &fixture.workspace)?
+                    .is_none(),
+                "same-profile recovery must resolve its tracked pending launch"
+            );
+            assert_eq!(
+                fixture.conversations.resolve_head(&fixture.workspace)?,
+                adopted
+            );
+
+            fs::remove_dir_all(fixture.root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn archive_transition_is_detected_but_cannot_be_bound_automatically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let active = inventory_thread("01900000-0000-7000-8000-000000000001", 10);
+        let mut archived = active.clone();
+        archived.archived = true;
+        assert_eq!(
+            inventory_candidate(std::slice::from_ref(&active), &[archived]),
+            InventoryCandidate::One(active.thread_id)
+        );
+
+        let fixture = pending_registry("archive-transition")?;
+        let error = finish_reconciliation_failure(
+            &fixture.conversations,
+            &fixture.launch_id,
+            ConversationError::Archived.into(),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("archived read unexpectedly succeeded"))?;
+        assert_eq!(error.code(), "conversation_archived");
+        assert!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .is_none()
+        );
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_candidate_failures_remove_pending_and_require_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for failure in [
+            ConversationError::RolloutMissing,
+            ConversationError::Archived,
+            ConversationError::SessionSchemaUnsupported,
+            ConversationError::CodexVersionUnsupported,
+            ConversationError::CwdMismatch,
+            ConversationError::ThreadProtocolInvalid,
+        ] {
+            let expected_code = failure.code();
+            let fixture = pending_registry(expected_code)?;
+
+            let error = finish_reconciliation_failure(
+                &fixture.conversations,
+                &fixture.launch_id,
+                failure.into(),
+            )
+            .err()
+            .ok_or_else(|| std::io::Error::other("terminal failure unexpectedly succeeded"))?;
+
+            assert_eq!(error.code(), expected_code);
+            assert!(
+                fixture
+                    .conversations
+                    .pending_for(&fixture.profile_id, &fixture.workspace)?
+                    .is_none(),
+                "terminal failure {expected_code} left a retry loop"
+            );
+            assert_eq!(
+                fixture
+                    .conversations
+                    .resolve_head(&fixture.workspace)
+                    .err()
+                    .map(|error| error.code()),
+                Some("conversation_ambiguous")
+            );
+            fs::remove_dir_all(fixture.root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transient_candidate_failure_remains_retryable() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = pending_registry("transient")?;
+
+        let error = finish_reconciliation_failure(
+            &fixture.conversations,
+            &fixture.launch_id,
+            ConversationError::ThreadMetadataUnavailable.into(),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("transient failure unexpectedly succeeded"))?;
+
+        assert_eq!(error.code(), "codex_thread_metadata_unavailable");
+        assert_eq!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .map(|pending| pending.phase),
+            Some(PendingPhase::CaptureFailed),
+            "a retryable metadata failure must retain its pending launch"
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn transient_candidate_registry_failure_is_not_hidden() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = pending_registry("registry-failure")?;
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o755))?;
+
+        let error = finish_reconciliation_failure(
+            &fixture.conversations,
+            &fixture.launch_id,
+            ConversationError::ThreadMetadataUnavailable.into(),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("unsafe registry unexpectedly succeeded"))?;
+
+        assert_eq!(error.code(), "conversation_registry_invalid");
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700))?;
+        assert_eq!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .map(|pending| pending.phase),
+            Some(PendingPhase::ProviderStarted),
+            "a failed registry mutation must not be reported as capture_failed"
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_launch_never_binds_a_later_candidate() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = registry_fixture("prepared-candidate", false)?;
+        let pending = fixture
+            .conversations
+            .pending_for(&fixture.profile_id, &fixture.workspace)?
+            .ok_or_else(|| std::io::Error::other("prepared launch is missing"))?;
+
+        let error = require_started_candidate(&fixture.conversations, &pending)
+            .err()
+            .ok_or_else(|| std::io::Error::other("prepared candidate was accepted"))?;
+
+        assert_eq!(error.code(), "conversation_ambiguous");
+        assert!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .conversations
+                .resolve_head(&fixture.workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_ambiguous")
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+}

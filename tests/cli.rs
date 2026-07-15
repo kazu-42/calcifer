@@ -301,6 +301,7 @@ fn non_normalized_home_is_rejected_before_staging() -> Result<(), Box<dyn std::e
 #[test]
 fn managed_codex_profile_supports_status_run_and_exact_resume()
 -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
 
@@ -323,6 +324,10 @@ fn managed_codex_profile_supports_status_run_and_exact_resume()
         &fake_codex,
         r#"#!/bin/sh
 set -eu
+case "$(umask)" in
+  0077|077) ;;
+  *) exit 98 ;;
+esac
 if env | grep -Eq '^(OPENAI_API_KEY|OPENAI_ORGANIZATION|OPENAI_PROJECT|CODEX_API_KEY|CODEX_ACCESS_TOKEN|CoDeX_AcCeSs_ToKeN|CODEX_REFRESH_TOKEN_URL_OVERRIDE|CODEX_REVOKE_TOKEN_URL_OVERRIDE|CODEX_APP_SERVER_LOGIN_CLIENT_ID|CODEX_AUTHAPI_BASE_URL|CODEX_APP_SERVER_LOGIN_ISSUER|CODEX_APP_SERVER_DEV_OPEN_APP_URL|CODEX_APP_SERVER_MANAGED_CONFIG_PATH|CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG|CODEX_APP_SERVER_TEST_USER_CONFIG_FILE|CODEX_SQLITE_HOME|CODEX_REMOTE_AUTH_TOKEN|CODEX_CONNECTORS_TOKEN|CODEX_CODE_MODE_HOST_PATH|CODEX_CLOUD_TASKS_BASE_URL|CODEX_CLOUD_TASKS_FORCE_INTERNAL|CODEX_STARTING_DIFF|CODEX_EXEC_SERVER_URL|CODEX_EXEC_SERVER_NOISE_REGISTRY_URL|CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID|CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN|CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID|CODEX_OSS_BASE_URL|CODEX_OSS_PORT|CODEX_INTERNAL_ORIGINATOR_OVERRIDE|CODEX_TUI_RECORD_SESSION|CODEX_TUI_SESSION_LOG_PATH|CODEX_ROLLOUT_TRACE_ROOT|CODEX_ANALYTICS_EVENTS_CAPTURE_FILE|CoDeX_TeSt_Future_Auth_Hook|CoDeX_FuTuRe_EnDpOiNt_OvErRiDe)='; then
   exit 97
 fi
@@ -354,21 +359,60 @@ if [ "${1:-}" = "-c" ]; then
   [ "${4:-}" = 'mcp_oauth_credentials_store="file"' ]
   shift 4
 fi
+thread_id=${FAKE_CODEX_THREAD_ID:-01900000-0000-7000-8000-000000000001}
+thread_state="$CODEX_HOME/.fake-thread-state"
+thread_counter="$CODEX_HOME/.fake-thread-counter"
+thread_rollout="$CODEX_HOME/sessions/rollout-synthetic-$thread_id.jsonl"
+if [ "${1:-}" != "login" ] && [ "${1:-}" != "app-server" ] && [ "${1:-}" != "--version" ] && [ "${FAKE_CODEX_NO_THREAD:-}" != "1" ]; then
+  mkdir -p "$CODEX_HOME/sessions"
+  counter=0
+  if [ -f "$thread_counter" ]; then
+    counter=$(cat "$thread_counter")
+  fi
+  counter=$((counter + 1))
+  printf '%s\n' "$counter" > "$thread_counter"
+  printf '%s\n' "$PWD" > "$thread_state"
+  if [ ! -f "$thread_rollout" ]; then
+    printf '{"timestamp":"2026-07-15T00:00:00Z","type":"session_meta","payload":{"id":"%s","cwd":"%s","cli_version":"0.144.4","source":"cli","parent_thread_id":null,"base_instructions":"prompt sentinel must not persist"}}\n' "$thread_id" "$PWD" > "$thread_rollout"
+    printf '%s\n' '{"timestamp":"2026-07-15T00:00:01Z","type":"response_item","payload":{"message":"response sentinel must not persist","tool_args":"tool arguments sentinel must not persist"}}' >> "$thread_rollout"
+  fi
+  printf '%s\n' '{"timestamp":"2026-07-15T00:00:02Z","type":"event_msg","payload":{"type":"task_started"}}' >> "$thread_rollout"
+  case "${1:-}" in
+    hold|hold-ignore-int)
+      ;;
+    *)
+      printf '%s\n' '{"timestamp":"2026-07-15T00:00:03Z","type":"event_msg","payload":{"type":"task_complete"}}' >> "$thread_rollout"
+      ;;
+  esac
+fi
 case "${1:-}" in
+  --version)
+    if [ "${FAKE_CODEX_VERSION_HOLD_STDOUT:-}" = "1" ]; then
+      (sleep 5) &
+    fi
+    printf 'codex-cli %s\n' "${FAKE_CODEX_VERSION:-0.144.4}"
+    ;;
   login)
     umask 077
     printf '%s\n' '{"fake":"synthetic-test-only"}' > "$CODEX_HOME/auth.json"
     ;;
   app-server)
+    if [ "${FAKE_CODEX_APP_SERVER_SHAPE:-}" = "unavailable" ]; then
+      exit 90
+    fi
     if [ -n "${FAKE_CODEX_APP_SERVER_HOLD_PID:-}" ]; then
       printf '%s\n' "$$" > "$FAKE_CODEX_APP_SERVER_HOLD_PID"
       exec sleep 30
     fi
     IFS= read -r initialize
+    case "$initialize" in
+      *'"method":"initialize"'*'"experimentalApi":false'*) ;;
+      *) exit 93 ;;
+    esac
     printf '%s\n' 'app-server-initialize' >> "$FAKE_CODEX_LOG"
     version=${FAKE_CODEX_VERSION:-0.144.4}
     reported_home=${FAKE_CODEX_REPORTED_HOME:-$CODEX_HOME}
-    if [ "${FAKE_CODEX_NULL_INITIALIZE:-}" = "1" ]; then
+    if [ "${FAKE_CODEX_NULL_INITIALIZE:-}" = "1" ] || [ "${FAKE_CODEX_APP_SERVER_SHAPE:-}" = "schema-drift" ]; then
       printf '%s\n' '{"id":0,"result":null}'
     else
       printf '{"id":0,"result":{"userAgent":"calcifer/%s (test)","platformFamily":"unix","platformOs":"test","codexHome":"%s"}}\n' "$version" "$reported_home"
@@ -377,24 +421,87 @@ case "${1:-}" in
       printf '%s\n' 'app-server-gate-closed' >> "$FAKE_CODEX_LOG"
       exit 0
     fi
-    IFS= read -r request
-    printf '%s\n' 'app-server-usage-request' >> "$FAKE_CODEX_LOG"
-    case "${FAKE_CODEX_USAGE_SHAPE:-complete}" in
-      missing-rate-limits)
-        printf '%s\n' '{"id":1,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
-        ;;
-      null-rate-limits)
-        printf '%s\n' '{"id":1,"result":{"rateLimits":null,"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
-        ;;
-      complete)
-        printf '%s\n' '{"id":1,"result":{"rateLimits":{"limitId":"codex","limitName":"Codex","planType":"pro","rateLimitReachedType":null,"primary":{"usedPercent":41,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":70,"windowDurationMins":10080,"resetsAt":1800500000},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"individualLimit":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":[{"id":"must-not-leak","resetType":"codexRateLimits","status":"available","grantedAt":1700000000,"expiresAt":1900000000,"title":"must-not-leak","description":"must-not-leak"}]}}}'
-        ;;
-      *)
-        exit 95
-        ;;
-    esac
-    while IFS= read -r trailing; do :; done
+    while IFS= read -r request; do
+      request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      case "$request" in
+        *'"method":"thread/list"'*)
+          case "$request" in
+            *'"sourceKinds":["cli"]'*'"useStateDbOnly":false'*) ;;
+            *) exit 92 ;;
+          esac
+          printf '%s\n' 'app-server-thread-list' >> "$FAKE_CODEX_LOG"
+          if [ "${FAKE_CODEX_PAGINATED_INVENTORY:-}" = "1" ]; then
+            printf '{"id":%s,"result":{"data":[],"nextCursor":"page-%s"}}\n' "$request_id" "$request_id"
+            continue
+          fi
+          case "$request" in
+            *'"archived":true'*)
+              printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$request_id"
+              ;;
+            *)
+              if [ -f "$thread_state" ] && [ -f "$thread_counter" ] && [ -f "$thread_rollout" ]; then
+                thread_cwd=$(cat "$thread_state")
+                updated_at=$(cat "$thread_counter")
+                if [ "${FAKE_CODEX_FIXED_THREAD_TIMESTAMP:-}" = "1" ]; then
+                  updated_at=1
+                fi
+                printf '{"id":%s,"result":{"data":[{"id":"%s","parentThreadId":null,"ephemeral":false,"updatedAt":%s,"recencyAt":%s,"cwd":"%s","cliVersion":"0.144.4","source":"cli","path":"%s","preview":"preview sentinel must not persist","turns":[{"prompt":"prompt sentinel must not persist"}]}],"nextCursor":null}}\n' "$request_id" "$thread_id" "$updated_at" "$updated_at" "$thread_cwd" "$thread_rollout"
+              else
+                printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$request_id"
+              fi
+              ;;
+          esac
+          ;;
+        *'"method":"thread/read"'*)
+          case "$request" in
+            *'"includeTurns":false'*) ;;
+            *) exit 91 ;;
+          esac
+          printf '%s\n' 'app-server-thread-read' >> "$FAKE_CODEX_LOG"
+          requested_thread=$(printf '%s\n' "$request" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
+          if [ "$requested_thread" != "$thread_id" ] || [ ! -f "$thread_state" ] || [ ! -f "$thread_rollout" ]; then
+            printf '{"id":%s,"error":{"code":-32001,"message":"thread not found: account-owner@example.invalid"}}\n' "$request_id"
+          else
+            thread_cwd=$(cat "$thread_state")
+            updated_at=$(cat "$thread_counter")
+            if [ "${FAKE_CODEX_FIXED_THREAD_TIMESTAMP:-}" = "1" ]; then
+              updated_at=1
+            fi
+            printf '{"id":%s,"result":{"thread":{"id":"%s","parentThreadId":null,"ephemeral":false,"updatedAt":%s,"recencyAt":%s,"cwd":"%s","cliVersion":"0.144.4","source":"cli","path":"%s","preview":"preview sentinel must not persist","turns":[{"response":"response sentinel must not persist"}]}}}\n' "$request_id" "$thread_id" "$updated_at" "$updated_at" "$thread_cwd" "$thread_rollout"
+          fi
+          ;;
+        *'"method":"account/rateLimits/read"'*)
+          printf '%s\n' 'app-server-usage-request' >> "$FAKE_CODEX_LOG"
+          case "${FAKE_CODEX_USAGE_SHAPE:-complete}" in
+            missing-rate-limits)
+              printf '%s\n' '{"id":1,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
+              ;;
+            null-rate-limits)
+              printf '%s\n' '{"id":1,"result":{"rateLimits":null,"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":41}}},"opaqueFuture":"must-not-leak-malformed"}}'
+              ;;
+            complete)
+              printf '%s\n' '{"id":1,"result":{"rateLimits":{"limitId":"codex","limitName":"Codex","planType":"pro","rateLimitReachedType":null,"primary":{"usedPercent":41,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":70,"windowDurationMins":10080,"resetsAt":1800500000},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"individualLimit":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":[{"id":"must-not-leak","resetType":"codexRateLimits","status":"available","grantedAt":1700000000,"expiresAt":1900000000,"title":"must-not-leak","description":"must-not-leak"}]}}}'
+              ;;
+            *)
+              exit 95
+              ;;
+          esac
+          ;;
+        *)
+          exit 94
+          ;;
+      esac
+    done
     printf '%s\n' 'app-server-eof' >> "$FAKE_CODEX_LOG"
+    if [ "${FAKE_CODEX_REMOVE_AFTER_APP_SERVER:-}" = "1" ]; then
+      rm -f "$0"
+    fi
+    ;;
+  resume)
+    if [ -n "${FAKE_CODEX_HOLD_RESUME_PID:-}" ]; then
+      printf '%s\n' "$$" > "$FAKE_CODEX_HOLD_RESUME_PID"
+      exec sleep 30
+    fi
     ;;
   hold)
     printf '%s\n' "$$" > "$FAKE_CODEX_CHILD_PID"
@@ -414,6 +521,9 @@ case "${1:-}" in
   background)
     nohup sleep 30 >/dev/null 2>&1 &
     printf '%s\n' "$!" > "$FAKE_CODEX_BACKGROUND_PID"
+    ;;
+  exit-seven)
+    exit 7
     ;;
   trust-project)
     cat >> "$CODEX_HOME/config.toml" <<'EOF'
@@ -446,6 +556,7 @@ esac
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_NO_THREAD", "1")
         .args(["run", "codex@work", "--", "trust-project"])
         .output()?;
     assert!(
@@ -762,6 +873,545 @@ config_file = "{sensitive_role_path}"
     assert_eq!(std::fs::read_to_string(&log)?, before_agents_node_rejection);
     std::fs::remove_dir(&agents)?;
 
+    let conversation_path = root.join("conversations.json");
+    let log_before_untracked_run = std::fs::read_to_string(&log)?;
+    let untracked_run = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["run", "--untracked", "codex@work", "--", "exit-seven"])
+        .output()?;
+    let untracked_run_stderr = String::from_utf8(untracked_run.stderr)?;
+    assert_eq!(
+        untracked_run.status.code(),
+        Some(7),
+        "untracked mode must preserve the official provider exit status: {untracked_run_stderr}"
+    );
+    assert!(
+        untracked_run_stderr.contains("conversation capture and bare resume are disabled"),
+        "untracked mode did not explain its recovery consequence"
+    );
+    let log_after_untracked_run = std::fs::read_to_string(&log)?;
+    let untracked_run_delta = log_after_untracked_run
+        .strip_prefix(&log_before_untracked_run)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+    assert_eq!(
+        untracked_run_delta
+            .lines()
+            .filter(|line| line.ends_with("exit-seven"))
+            .count(),
+        1,
+        "untracked mode must spawn the official provider exactly once"
+    );
+    assert!(
+        !untracked_run_delta.contains("app-server") && !untracked_run_delta.contains("--version"),
+        "untracked mode must not probe or capture provider inventory"
+    );
+    let untracked_new_head: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        untracked_new_head["workspace_heads"][0]["state"],
+        "needs_selection"
+    );
+    assert_eq!(
+        untracked_new_head["conversations"].as_array().map(Vec::len),
+        Some(0),
+        "untracked mode must not invent a conversation binding"
+    );
+    assert_eq!(
+        untracked_new_head["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "untracked mode must not create a capture baseline"
+    );
+
+    let log_before_ambiguous_resume = std::fs::read_to_string(&log)?;
+    let untracked_bare_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume"])
+        .output()?;
+    assert_eq!(untracked_bare_resume.status.code(), Some(1));
+    assert!(String::from_utf8(untracked_bare_resume.stderr)?.contains("ambiguous"));
+    assert_eq!(
+        std::fs::read_to_string(&log)?,
+        log_before_ambiguous_resume,
+        "bare resume after untracked mode must fail before provider spawn"
+    );
+
+    let untracked_exact_recovery = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert!(
+        untracked_exact_recovery.status.success(),
+        "{}",
+        String::from_utf8(untracked_exact_recovery.stderr)?
+    );
+    let recovered_untracked_head: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        recovered_untracked_head["workspace_heads"][0]["state"], "ready",
+        "explicit exact recovery must restore a tracked head"
+    );
+
+    // A different profile lease must not let exact recovery clear the marker
+    // while an untracked provider still owns this workspace. The durable
+    // ownership record spans provider execution and is removed only after the
+    // official child exits; exact recovery is then allowed to restore Ready.
+    const PERSONAL_THREAD_ID: &str = "01900000-0000-7000-8000-000000000002";
+    let add_personal = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_THREAD_ID", PERSONAL_THREAD_ID)
+        .args(["auth", "add", "codex", "personal"])
+        .output()?;
+    assert!(
+        add_personal.status.success(),
+        "{}",
+        String::from_utf8(add_personal.stderr)?
+    );
+    let seed_personal_thread = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_THREAD_ID", PERSONAL_THREAD_ID)
+        .args(["run", "codex@personal", "--", "--help"])
+        .output()?;
+    assert!(
+        seed_personal_thread.status.success(),
+        "{}",
+        String::from_utf8(seed_personal_thread.stderr)?
+    );
+
+    let active_untracked_pid_file = sandbox.join("active-untracked-provider.pid");
+    let mut active_untracked = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_CHILD_PID", &active_untracked_pid_file)
+        .args(["run", "--untracked", "codex@work", "--", "hold"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    for _ in 0..500 {
+        if active_untracked_pid_file.is_file() || active_untracked.try_wait()?.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !active_untracked_pid_file.is_file() {
+        let _ = active_untracked.kill();
+        let _ = active_untracked.wait();
+        return Err(std::io::Error::other("untracked concurrency provider did not start").into());
+    }
+
+    let log_before_concurrent_exact = std::fs::read_to_string(&log)?;
+    let concurrent_exact = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_THREAD_ID", PERSONAL_THREAD_ID)
+        .args(["resume", "codex@personal", PERSONAL_THREAD_ID])
+        .output()?;
+    assert_eq!(concurrent_exact.status.code(), Some(1));
+    assert!(String::from_utf8(concurrent_exact.stderr)?.contains("ambiguous"));
+    assert_eq!(
+        std::fs::read_to_string(&log)?,
+        log_before_concurrent_exact,
+        "cross-profile exact recovery reached the provider while untracked ownership was active"
+    );
+    let active_untracked_registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        active_untracked_registry["workspace_heads"][0]["state"],
+        "needs_selection"
+    );
+    assert_eq!(
+        active_untracked_registry["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        active_untracked_registry["pending_launches"][0]["mode"],
+        "run_untracked"
+    );
+    assert!(
+        active_untracked_registry["pending_launches"][0]
+            .get("codex_version")
+            .is_none(),
+        "untracked ownership must not claim a version that was never probed"
+    );
+    assert_eq!(
+        active_untracked_registry["pending_launches"][0]["pre_inventory"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "untracked ownership must not contain a capture baseline"
+    );
+
+    let active_untracked_pid = std::fs::read_to_string(&active_untracked_pid_file)?;
+    let terminated = std::process::Command::new("kill")
+        .args(["-TERM", active_untracked_pid.trim()])
+        .status()?;
+    assert!(terminated.success());
+    let _ = active_untracked.wait()?;
+    let completed_untracked_registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        completed_untracked_registry["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "untracked ownership must end with the official child"
+    );
+    assert_eq!(
+        completed_untracked_registry["workspace_heads"][0]["state"],
+        "needs_selection"
+    );
+
+    let exact_after_untracked_exit = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_THREAD_ID", PERSONAL_THREAD_ID)
+        .args(["resume", "codex@personal", PERSONAL_THREAD_ID])
+        .output()?;
+    assert!(
+        exact_after_untracked_exit.status.success(),
+        "{}",
+        String::from_utf8(exact_after_untracked_exit.stderr)?
+    );
+    let exact_after_untracked_registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        exact_after_untracked_registry["workspace_heads"][0]["state"],
+        "ready"
+    );
+
+    // The inverse ordering is also unsafe without a head epoch check: an
+    // exact provider can adopt Ready first, an untracked launch can invalidate
+    // it and finish, and then the older exact provider can exit last. Its
+    // lifecycle refresh must not resurrect the pre-untracked head.
+    let active_exact_pid_file = sandbox.join("active-exact-provider.pid");
+    let mut active_exact = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_THREAD_ID", PERSONAL_THREAD_ID)
+        .env("FAKE_CODEX_HOLD_RESUME_PID", &active_exact_pid_file)
+        .args(["resume", "codex@personal", PERSONAL_THREAD_ID])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    for _ in 0..500 {
+        if active_exact_pid_file.is_file() || active_exact.try_wait()?.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !active_exact_pid_file.is_file() {
+        let _ = active_exact.kill();
+        let _ = active_exact.wait();
+        return Err(std::io::Error::other("exact concurrency provider did not start").into());
+    }
+
+    let untracked_during_exact = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["run", "--untracked", "codex@work", "--", "--help"])
+        .output()?;
+    assert!(
+        untracked_during_exact.status.success(),
+        "{}",
+        String::from_utf8(untracked_during_exact.stderr)?
+    );
+    let invalidated_during_exact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        invalidated_during_exact["workspace_heads"][0]["state"],
+        "needs_selection"
+    );
+    assert_eq!(
+        invalidated_during_exact["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let active_exact_pid = std::fs::read_to_string(&active_exact_pid_file)?;
+    let terminated = std::process::Command::new("kill")
+        .args(["-TERM", active_exact_pid.trim()])
+        .status()?;
+    assert!(terminated.success());
+    let _ = active_exact.wait()?;
+    let after_stale_exact_refresh: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        after_stale_exact_refresh["workspace_heads"][0]["state"], "needs_selection",
+        "an exact process adopted before untracked mode must not restore Ready afterward"
+    );
+
+    let log_before_stale_exact_bare_resume = std::fs::read_to_string(&log)?;
+    let stale_exact_bare_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume"])
+        .output()?;
+    assert_eq!(stale_exact_bare_resume.status.code(), Some(1));
+    assert!(String::from_utf8(stale_exact_bare_resume.stderr)?.contains("ambiguous"));
+    assert_eq!(
+        std::fs::read_to_string(&log)?,
+        log_before_stale_exact_bare_resume,
+        "bare resume launched after a stale exact refresh"
+    );
+
+    let recover_after_stale_exact = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_THREAD_ID", PERSONAL_THREAD_ID)
+        .args(["resume", "codex@personal", PERSONAL_THREAD_ID])
+        .output()?;
+    assert!(
+        recover_after_stale_exact.status.success(),
+        "{}",
+        String::from_utf8(recover_after_stale_exact.stderr)?
+    );
+
+    // A final provider spawn failure happens after the untracked marker is
+    // durable. The marker must remain ambiguous; spawn failure is not evidence
+    // that an uncaptured provider could never have existed.
+    {
+        let marker_id = uuid::Uuid::new_v4();
+        let marker_runtime = std::path::PathBuf::from("/tmp")
+            .join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
+        let barrier_ready = marker_runtime.join(format!(".test-{marker_id}-final-preflight-ready"));
+        let barrier_release =
+            marker_runtime.join(format!(".test-{marker_id}-final-preflight-release"));
+        let barrier_coordinator = marker_runtime.join(format!(".test-{marker_id}-coordinator.pid"));
+        let fake_codex_backup = bin.join("codex-untracked-spawn-failure");
+        let log_before_untracked_spawn_failure = std::fs::read_to_string(&log)?;
+        let mut untracked_spawn_parent = calcifer()
+            .current_dir(&workspace)
+            .process_group(0)
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .env("CALCIFER_TEST_MARKER_ID", marker_id.to_string())
+            .env("CALCIFER_TEST_FINAL_PREFLIGHT_BARRIER", "1")
+            .args(["run", "--untracked", "codex@work", "--", "--help"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        for _ in 0..500 {
+            if barrier_ready.is_file() || untracked_spawn_parent.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !barrier_ready.is_file() {
+            let process_group = format!("-{}", untracked_spawn_parent.id());
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &process_group])
+                .status();
+            let _ = untracked_spawn_parent.wait();
+            return Err(
+                std::io::Error::other("untracked guardian missed preflight barrier").into(),
+            );
+        }
+        std::fs::rename(&fake_codex, &fake_codex_backup)?;
+        let release = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&barrier_release)?;
+        release.sync_all()?;
+        drop(release);
+        let untracked_spawn_failure = untracked_spawn_parent.wait_with_output();
+        std::fs::rename(&fake_codex_backup, &fake_codex)?;
+        let untracked_spawn_failure = untracked_spawn_failure?;
+        if barrier_coordinator.is_file() {
+            std::fs::remove_file(&barrier_coordinator)?;
+        }
+        let untracked_spawn_failure_stderr = String::from_utf8(untracked_spawn_failure.stderr)?;
+        assert_eq!(untracked_spawn_failure.status.code(), Some(1));
+        assert!(
+            untracked_spawn_failure_stderr
+                .contains("conversation capture and bare resume are disabled")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log)?,
+            log_before_untracked_spawn_failure,
+            "the removed official executable unexpectedly spawned"
+        );
+        let failed_untracked_head: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+        assert_eq!(
+            failed_untracked_head["workspace_heads"][0]["state"], "needs_selection",
+            "provider spawn failure must not restore an automatic head"
+        );
+        assert_eq!(
+            failed_untracked_head["pending_launches"]
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "a definitive spawn failure must release in-flight ownership"
+        );
+
+        let failed_untracked_recovery = calcifer()
+            .current_dir(&workspace)
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .args([
+                "resume",
+                "codex@work",
+                "01900000-0000-7000-8000-000000000001",
+            ])
+            .output()?;
+        assert!(
+            failed_untracked_recovery.status.success(),
+            "{}",
+            String::from_utf8(failed_untracked_recovery.stderr)?
+        );
+    }
+
+    // An incomplete supported-adapter inventory must never degrade implicitly
+    // to an untracked launch. The same command runs only after the user adds
+    // the explicit flag, and that path must skip App Server entirely.
+    let log_before_incomplete_inventory = std::fs::read_to_string(&log)?;
+    let incomplete_inventory = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_PAGINATED_INVENTORY", "1")
+        .args(["run", "codex@work", "--", "--help"])
+        .output()?;
+    assert_eq!(incomplete_inventory.status.code(), Some(1));
+    assert!(String::from_utf8(incomplete_inventory.stderr)?.contains("ambiguous"));
+    let log_after_incomplete_inventory = std::fs::read_to_string(&log)?;
+    let incomplete_inventory_delta = log_after_incomplete_inventory
+        .strip_prefix(&log_before_incomplete_inventory)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+    assert!(
+        incomplete_inventory_delta
+            .matches("app-server-thread-list")
+            .count()
+            >= 8,
+        "fixture did not reach the bounded pagination limit"
+    );
+    assert!(
+        !incomplete_inventory_delta
+            .lines()
+            .any(|line| line.ends_with("--help")),
+        "normal tracked mode spawned the provider after incomplete inventory"
+    );
+
+    let untracked_after_incomplete = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_PAGINATED_INVENTORY", "1")
+        .args(["run", "--untracked", "codex@work", "--", "--help"])
+        .output()?;
+    let untracked_after_incomplete_stderr = String::from_utf8(untracked_after_incomplete.stderr)?;
+    assert!(
+        untracked_after_incomplete.status.success(),
+        "{untracked_after_incomplete_stderr}"
+    );
+    assert!(
+        untracked_after_incomplete_stderr
+            .contains("conversation capture and bare resume are disabled")
+    );
+    let log_after_explicit_untracked = std::fs::read_to_string(&log)?;
+    let explicit_untracked_delta = log_after_explicit_untracked
+        .strip_prefix(&log_after_incomplete_inventory)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+    assert_eq!(
+        explicit_untracked_delta
+            .lines()
+            .filter(|line| line.ends_with("--help"))
+            .count(),
+        1,
+        "explicit untracked fallback must spawn the provider exactly once"
+    );
+    assert!(
+        !explicit_untracked_delta.contains("app-server"),
+        "explicit untracked fallback unexpectedly inspected inventory"
+    );
+    let incomplete_untracked_head: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        incomplete_untracked_head["workspace_heads"][0]["state"],
+        "needs_selection"
+    );
+
+    let incomplete_untracked_recovery = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert!(
+        incomplete_untracked_recovery.status.success(),
+        "{}",
+        String::from_utf8(incomplete_untracked_recovery.stderr)?
+    );
+
+    let run = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["run", "codex@work", "--", "--help"])
+        .output()?;
+    assert!(run.status.success(), "{}", String::from_utf8(run.stderr)?);
+    let managed_sessions = managed_home.join("sessions");
+    let managed_rollout =
+        managed_sessions.join("rollout-synthetic-01900000-0000-7000-8000-000000000001.jsonl");
+    assert_eq!(
+        std::fs::metadata(&managed_sessions)?.permissions().mode() & 0o777,
+        0o700,
+        "the real provider child must inherit Calcifer's 0077 umask"
+    );
+    assert_eq!(
+        std::fs::metadata(&managed_rollout)?.permissions().mode() & 0o777,
+        0o600,
+        "the real provider child must create private rollouts"
+    );
+
+    let log_before_explicit_resume = std::fs::read_to_string(&log)?;
     let resume = calcifer_with_ambient_codex_auth_overrides()
         .current_dir(&workspace)
         .env("PATH", &path)
@@ -780,21 +1430,96 @@ config_file = "{sensitive_role_path}"
         "{}",
         String::from_utf8(resume.stderr)?
     );
+    let log_after_explicit_resume = std::fs::read_to_string(&log)?;
+    assert_eq!(
+        log_after_explicit_resume
+            .matches("app-server-thread-list")
+            .count(),
+        log_before_explicit_resume
+            .matches("app-server-thread-list")
+            .count(),
+        "explicit exact adoption must use direct thread/read, not scan old sessions"
+    );
+    assert!(
+        log_after_explicit_resume
+            .matches("app-server-thread-read")
+            .count()
+            >= log_before_explicit_resume
+                .matches("app-server-thread-read")
+                .count()
+                + 2,
+        "explicit exact resume validates before launch and refreshes lifecycle after exit"
+    );
 
-    let run = calcifer_with_ambient_codex_auth_overrides()
+    let log_before_untracked_resume = std::fs::read_to_string(&log)?;
+    let untracked_resume = calcifer_with_ambient_codex_auth_overrides()
         .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
-        .args(["run", "codex@work", "--", "--help"])
+        .args(["resume", "--untracked", "codex@work"])
         .output()?;
-    assert!(run.status.success(), "{}", String::from_utf8(run.stderr)?);
+    let untracked_resume_stderr = String::from_utf8(untracked_resume.stderr)?;
+    assert!(
+        untracked_resume.status.success(),
+        "{untracked_resume_stderr}"
+    );
+    assert!(untracked_resume_stderr.contains("conversation capture and bare resume are disabled"));
+    let log_after_untracked_resume = std::fs::read_to_string(&log)?;
+    let untracked_resume_delta = log_after_untracked_resume
+        .strip_prefix(&log_before_untracked_resume)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+    assert_eq!(
+        untracked_resume_delta
+            .lines()
+            .filter(|line| line.ends_with("resume --last"))
+            .count(),
+        1,
+        "untracked resume must launch official --last exactly once"
+    );
+    assert!(
+        !untracked_resume_delta.contains("app-server")
+            && !untracked_resume_delta.contains("--version")
+    );
+    let untracked_existing_head: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        untracked_existing_head["workspace_heads"][0]["state"], "needs_selection",
+        "untracked resume must invalidate an existing automatic head"
+    );
 
+    let untracked_resume_recovery = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert!(
+        untracked_resume_recovery.status.success(),
+        "{}",
+        String::from_utf8(untracked_resume_recovery.stderr)?
+    );
+    let recovered_existing_head: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        recovered_existing_head["workspace_heads"][0]["state"],
+        "ready"
+    );
+
+    let thread_reads_before_same_second_resume = std::fs::read_to_string(&log)?
+        .matches("app-server-thread-read")
+        .count();
     let resume_last = calcifer_with_ambient_codex_auth_overrides()
         .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_FIXED_THREAD_TIMESTAMP", "1")
         .args(["resume", "codex@work"])
         .output()?;
     assert!(
@@ -802,6 +1527,256 @@ config_file = "{sensitive_role_path}"
         "{}",
         String::from_utf8(resume_last.stderr)?
     );
+    assert!(
+        std::fs::read_to_string(&log)?
+            .matches("app-server-thread-read")
+            .count()
+            > thread_reads_before_same_second_resume,
+        "a same-second rollout length/mtime change must still select the resumed thread"
+    );
+
+    let log_before_cold_resume = std::fs::read_to_string(&log)?;
+    let cold_resume = calcifer_with_ambient_codex_auth_overrides()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume"])
+        .output()?;
+    assert!(
+        cold_resume.status.success(),
+        "{}",
+        String::from_utf8(cold_resume.stderr.clone())?
+    );
+    let cold_resume_log = std::fs::read_to_string(&log)?;
+    let cold_resume_log = cold_resume_log
+        .strip_prefix(&log_before_cold_resume)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced during cold resume"))?;
+    assert!(cold_resume_log.contains("resume 01900000-0000-7000-8000-000000000001"));
+    assert!(!cold_resume_log.contains("resume --last"));
+    assert!(!cold_resume_log.contains("prompt sentinel"));
+    assert!(String::from_utf8(cold_resume.stderr)?.contains("exact ID; no prompt replay"));
+
+    let conversation_bytes = std::fs::read(&conversation_path)?;
+    let conversation_document: serde_json::Value = serde_json::from_slice(&conversation_bytes)?;
+    assert_eq!(conversation_document["schema_version"], 1);
+    assert_eq!(
+        conversation_document["conversations"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "the work binding and cross-profile concurrency fixture must both remain immutable"
+    );
+    assert_eq!(
+        conversation_document["conversations"][0]["generations"][0]["thread_id"],
+        "01900000-0000-7000-8000-000000000001"
+    );
+    assert_eq!(
+        conversation_document["conversations"][0]["generations"][0]["canonical_cwd"],
+        std::fs::canonicalize(&workspace)?
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        conversation_document["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    let conversation_text = String::from_utf8(conversation_bytes.clone())?;
+    for forbidden in [
+        "prompt sentinel",
+        "response sentinel",
+        "tool arguments sentinel",
+        "preview sentinel",
+        "rollout-synthetic",
+        "synthetic-test-only",
+    ] {
+        assert!(
+            !conversation_text.contains(forbidden),
+            "conversation registry persisted forbidden provider content: {forbidden}"
+        );
+    }
+
+    for unsupported_version in ["0.145.0", "0.145.0-alpha.11"] {
+        for app_server_shape in ["unavailable", "schema-drift"] {
+            let log_before = std::fs::read_to_string(&log)?;
+            let unsupported_exact = calcifer_with_ambient_codex_auth_overrides()
+                .current_dir(&workspace)
+                .env("PATH", &path)
+                .env("CALCIFER_HOME", &root)
+                .env("FAKE_CODEX_LOG", &log)
+                .env("FAKE_CODEX_VERSION", unsupported_version)
+                .env("FAKE_CODEX_APP_SERVER_SHAPE", app_server_shape)
+                .args([
+                    "resume",
+                    "codex@work",
+                    "01900000-0000-7000-8000-000000000001",
+                ])
+                .output()?;
+            assert!(
+                unsupported_exact.status.success(),
+                "{}",
+                String::from_utf8(unsupported_exact.stderr.clone())?
+            );
+            assert!(
+                String::from_utf8(unsupported_exact.stderr)?
+                    .contains("continuing with explicit exact resume")
+            );
+            let log_after = std::fs::read_to_string(&log)?;
+            let delta = log_after
+                .strip_prefix(&log_before)
+                .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+            assert!(delta.contains("--version"));
+            assert!(!delta.contains("app-server"));
+            assert!(delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+            assert_eq!(
+                std::fs::read(&conversation_path)?,
+                conversation_bytes,
+                "unsupported explicit fallback must not rewrite tracked metadata"
+            );
+        }
+    }
+
+    let log_before_malformed_version = std::fs::read_to_string(&log)?;
+    let malformed_version = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_VERSION", "0.145.0-alpha.01")
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert_eq!(malformed_version.status.code(), Some(1));
+    assert!(String::from_utf8(malformed_version.stderr)?.contains("invalid thread metadata"));
+    let malformed_version_log = std::fs::read_to_string(&log)?;
+    let malformed_version_delta = malformed_version_log
+        .strip_prefix(&log_before_malformed_version)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+    assert!(malformed_version_delta.contains("--version"));
+    assert!(!malformed_version_delta.contains("app-server"));
+    assert!(!malformed_version_delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+    assert_eq!(std::fs::read(&conversation_path)?, conversation_bytes);
+
+    for app_server_shape in ["unavailable", "schema-drift"] {
+        let log_before = std::fs::read_to_string(&log)?;
+        let rejected_supported_exact = calcifer()
+            .current_dir(&workspace)
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &log)
+            .env("FAKE_CODEX_VERSION", "0.144.4")
+            .env("FAKE_CODEX_APP_SERVER_SHAPE", app_server_shape)
+            .args([
+                "resume",
+                "codex@work",
+                "01900000-0000-7000-8000-000000000001",
+            ])
+            .output()?;
+        let stderr = String::from_utf8(rejected_supported_exact.stderr)?;
+        assert_eq!(rejected_supported_exact.status.code(), Some(1));
+        let expected_message = if app_server_shape == "schema-drift" {
+            "invalid thread metadata response"
+        } else {
+            "temporarily unavailable"
+        };
+        assert!(stderr.contains(expected_message));
+        let log_after = std::fs::read_to_string(&log)?;
+        let delta = log_after
+            .strip_prefix(&log_before)
+            .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+        assert!(delta.contains("--version"));
+        assert!(delta.contains("app-server"));
+        assert!(!delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+        assert_eq!(
+            std::fs::read(&conversation_path)?,
+            conversation_bytes,
+            "supported-version metadata failures must not rewrite tracked metadata"
+        );
+    }
+
+    let log_before_held_version_stdout = std::fs::read_to_string(&log)?;
+    let held_version_started = std::time::Instant::now();
+    let held_version_stdout = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_VERSION_HOLD_STDOUT", "1")
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    let held_version_elapsed = held_version_started.elapsed();
+    let held_version_stderr = String::from_utf8(held_version_stdout.stderr)?;
+    assert_eq!(held_version_stdout.status.code(), Some(1));
+    assert!(held_version_stderr.contains("temporarily unavailable"));
+    assert!(
+        held_version_elapsed < std::time::Duration::from_secs(4),
+        "version probe exceeded its wall-clock bound: {held_version_elapsed:?}"
+    );
+    let log_after_held_version_stdout = std::fs::read_to_string(&log)?;
+    let held_version_delta = log_after_held_version_stdout
+        .strip_prefix(&log_before_held_version_stdout)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
+    assert!(held_version_delta.contains("--version"));
+    assert!(!held_version_delta.contains("app-server"));
+    assert!(!held_version_delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+
+    let rollout = managed_rollout;
+    std::fs::set_permissions(&managed_sessions, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o644))?;
+    let legacy_rollout_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert!(
+        legacy_rollout_resume.status.success(),
+        "{}",
+        String::from_utf8(legacy_rollout_resume.stderr)?
+    );
+    std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o666))?;
+    let provider_log_before_unsafe_rollout = std::fs::read_to_string(&log)?;
+    let exact_invocations_before = provider_log_before_unsafe_rollout
+        .matches(" resume 01900000-0000-7000-8000-000000000001")
+        .count();
+    let unsafe_rollout_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    let unsafe_rollout_stderr = String::from_utf8(unsafe_rollout_resume.stderr)?;
+    assert_eq!(unsafe_rollout_resume.status.code(), Some(1));
+    assert!(unsafe_rollout_stderr.contains("session metadata is not supported or is unsafe"));
+    assert!(!unsafe_rollout_stderr.contains(&rollout.display().to_string()));
+    assert_eq!(
+        std::fs::read_to_string(&log)?
+            .matches(" resume 01900000-0000-7000-8000-000000000001")
+            .count(),
+        exact_invocations_before,
+        "a supported-version unsafe rollout must fail before the official TUI starts"
+    );
+    std::fs::set_permissions(&rollout, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(&managed_sessions, std::fs::Permissions::from_mode(0o700))?;
 
     let before_rejected = std::fs::read_to_string(&log)?;
     std::fs::write(&project_config, "debug = {}\n")?;
@@ -1029,6 +2004,7 @@ config_file = "{sensitive_role_path}"
     // not inherit it after the official provider process exits.
     let background_pid_file = sandbox.join("provider-background.pid");
     let background = calcifer()
+        .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -1057,6 +2033,7 @@ config_file = "{sensitive_role_path}"
     // supervisor alive, so a live provider still blocks a second writer.
     let child_pid_file = sandbox.join("provider-child.pid");
     let mut parent = calcifer()
+        .current_dir(&workspace)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
@@ -1125,6 +2102,7 @@ config_file = "{sensitive_role_path}"
     let coordinator_tracked_file =
         marker_runtime.join(format!(".test-{coordinator_marker_id}-provider-tracked"));
     let mut coordinator_parent = calcifer()
+        .current_dir(&workspace)
         .process_group(0)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
@@ -1211,6 +2189,47 @@ config_file = "{sensitive_role_path}"
         recovered_after_coordinator_kill,
         "guardian B-lock must release after the provider exits"
     );
+    let coordinator_crash_conversation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        coordinator_crash_conversation["conversations"][0]["last_safe_lifecycle"], "unknown_crash",
+        "the surviving guardian must commit an unclean boundary after coordinator failure"
+    );
+    assert_eq!(
+        coordinator_crash_conversation["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let mut clean_rollout = std::fs::OpenOptions::new().append(true).open(&rollout)?;
+    clean_rollout.write_all(
+        br#"{"timestamp":"2026-07-15T00:00:04Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+    )?;
+    clean_rollout.write_all(b"\n")?;
+    clean_rollout.sync_all()?;
+    let resume_unknown_head_over_clean_rollout = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume"])
+        .output()?;
+    let resume_unknown_stderr = String::from_utf8(resume_unknown_head_over_clean_rollout.stderr)?;
+    assert!(
+        resume_unknown_head_over_clean_rollout.status.success(),
+        "{resume_unknown_stderr}"
+    );
+    assert!(
+        resume_unknown_stderr.contains("did not have a provably clean boundary"),
+        "a clean rollout observation must not erase persisted unknown-crash state before launch"
+    );
+    let completed_resume_conversation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        completed_resume_conversation["conversations"][0]["last_safe_lifecycle"], "clean",
+        "only the completed provider lifecycle may clear persisted uncertainty"
+    );
 
     // Killing the provider-side guardian leaves the coordinator lease alive.
     // Once the exact provider PID exits, the coordinator can safely recover.
@@ -1222,12 +2241,14 @@ config_file = "{sensitive_role_path}"
     let guardian_tracked_file =
         marker_runtime.join(format!(".test-{guardian_marker_id}-provider-tracked"));
     let mut guarded_parent = calcifer()
+        .current_dir(&workspace)
         .process_group(0)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
         .env("FAKE_CODEX_LOG", &log)
         .env("FAKE_CODEX_CHILD_PID", &guarded_child_pid_file)
         .env("FAKE_CODEX_GUARD_PID", &guardian_pid_file)
+        .env("FAKE_CODEX_NO_THREAD", "1")
         .env("CALCIFER_TEST_MARKER_ID", guardian_marker_id.to_string())
         .args(["run", "codex@work", "--", "hold"])
         .stdout(std::process::Stdio::null())
@@ -1322,12 +2343,102 @@ config_file = "{sensitive_role_path}"
         "lease must recover after the orphaned provider exits"
     );
 
+    let pending_after_guardian_crash: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        pending_after_guardian_crash["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "a dead guardian must leave one durable launch for reconciliation"
+    );
+    assert_eq!(
+        pending_after_guardian_crash["pending_launches"][0]["phase"],
+        "provider_started"
+    );
+
+    let log_before_pending_untracked = std::fs::read_to_string(&log)?;
+    let pending_untracked = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["run", "--untracked", "codex@work", "--", "--help"])
+        .output()?;
+    assert_eq!(pending_untracked.status.code(), Some(1));
+    assert!(String::from_utf8(pending_untracked.stderr)?.contains("ambiguous"));
+    assert_eq!(
+        std::fs::read_to_string(&log)?,
+        log_before_pending_untracked,
+        "untracked mode must refuse a prior pending launch before provider spawn"
+    );
+    let pending_after_untracked_refusal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        pending_after_untracked_refusal["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "untracked refusal must preserve the pending launch for recovery"
+    );
+
+    let log_before_crash_resume = std::fs::read_to_string(&log)?;
+    let crash_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["resume"])
+        .output()?;
+    let crash_resume_stderr = String::from_utf8(crash_resume.stderr)?;
+    assert_eq!(crash_resume.status.code(), Some(1));
+    assert!(crash_resume_stderr.contains("ambiguous"));
+    let log_after_crash_resume = std::fs::read_to_string(&log)?;
+    let crash_resume_log = log_after_crash_resume
+        .strip_prefix(&log_before_crash_resume)
+        .ok_or_else(|| std::io::Error::other("provider log was replaced during crash resume"))?;
+    assert!(
+        !crash_resume_log.contains("resume 01900000-0000-7000-8000-000000000001"),
+        "a started launch with no materialized candidate must not start a second provider"
+    );
+    assert!(!crash_resume_log.contains("resume --last"));
+    let recovered_conversation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        recovered_conversation["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        recovered_conversation["workspace_heads"][0]["state"],
+        "needs_selection"
+    );
+
+    let explicit_crash_recovery = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    assert!(
+        explicit_crash_recovery.status.success(),
+        "{}",
+        String::from_utf8(explicit_crash_recovery.stderr)?
+    );
+
     // A terminal SIGINT reaches the whole foreground process group. The
     // guardian catches it while the provider receives the normal signal, so a
     // provider that ignores SIGINT cannot outlive every lease owner.
     let interrupted_child_pid_file = sandbox.join("interrupted-provider.pid");
     let interrupted_guardian_pid_file = sandbox.join("interrupted-guardian.pid");
     let mut interrupted_parent = calcifer()
+        .current_dir(&workspace)
         .process_group(0)
         .env("PATH", &path)
         .env("CALCIFER_HOME", &root)
@@ -1486,6 +2597,94 @@ config_file = "{sensitive_role_path}"
         "provider-side status lease must recover after app-server exit"
     );
 
+    // Explicit exact recovery must retain an existing unclean lifecycle even
+    // when a pending launch hides the workspace head and thread/read observes
+    // a later clean record. Removing the fixture executable after thread/read
+    // makes the provider spawn fail, proving pre-launch adoption alone cannot
+    // clear the durable uncertainty.
+    let mut explicit_failure_registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        explicit_failure_registry["conversations"][0]["last_safe_lifecycle"],
+        "unknown_crash"
+    );
+    clean_rollout.write_all(
+        br#"{"timestamp":"2026-07-15T00:00:05Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+    )?;
+    clean_rollout.write_all(b"\n")?;
+    clean_rollout.sync_all()?;
+    let exact_profile_id =
+        explicit_failure_registry["conversations"][0]["generations"][0]["profile_id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing exact-resume profile ID"))?
+            .to_owned();
+    let exact_canonical_cwd = std::fs::canonicalize(&workspace)?
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("non-UTF-8 exact-resume workspace"))?
+        .to_owned();
+    explicit_failure_registry["revision"] = serde_json::json!(
+        explicit_failure_registry["revision"]
+            .as_u64()
+            .ok_or_else(|| std::io::Error::other("missing registry revision"))?
+            + 1
+    );
+    explicit_failure_registry["workspace_heads"][0]["state"] = serde_json::json!("needs_selection");
+    explicit_failure_registry["pending_launches"] = serde_json::json!([{
+        "launch_id": uuid::Uuid::new_v4().to_string(),
+        "profile_id": exact_profile_id,
+        "canonical_cwd": exact_canonical_cwd,
+        "mode": "resume_last",
+        "codex_version": "0.144.4",
+        "adapter_version": env!("CARGO_PKG_VERSION"),
+        "pre_inventory": [],
+        "phase": "capture_failed",
+        "started_at": 1
+    }]);
+    std::fs::write(
+        &conversation_path,
+        serde_json::to_vec_pretty(&explicit_failure_registry)?,
+    )?;
+
+    let explicit_spawn_failure = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REMOVE_AFTER_APP_SERVER", "1")
+        .args([
+            "resume",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    let explicit_spawn_failure_stderr = String::from_utf8(explicit_spawn_failure.stderr)?;
+    assert_eq!(explicit_spawn_failure.status.code(), Some(1));
+    assert!(
+        explicit_spawn_failure_stderr.contains("did not have a provably clean boundary"),
+        "explicit exact recovery erased persisted uncertainty before spawn"
+    );
+    let explicit_failure_after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&conversation_path)?)?;
+    assert_eq!(
+        explicit_failure_after["conversations"][0]["last_safe_lifecycle"], "unknown_crash",
+        "a failed provider spawn must not clear persisted uncertainty"
+    );
+    assert_eq!(
+        explicit_failure_after["pending_launches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "explicit recovery must resolve the matching stale pending launch"
+    );
+    assert_eq!(
+        explicit_failure_after["workspace_heads"][0]["state"], "ready",
+        "explicit selection must restore the exact immutable workspace head"
+    );
+    assert!(
+        !fake_codex.exists(),
+        "the provider spawn fixture did not fail"
+    );
+
     std::fs::remove_dir_all(sandbox)?;
     Ok(())
 }
@@ -1500,6 +2699,41 @@ fn human_usage_errors_do_not_echo_unknown_values() -> Result<(), Box<dyn std::er
     assert!(output.stdout.is_empty());
     assert!(!stderr.contains(secret));
     assert!(stderr.contains("invalid command-line arguments"));
+    Ok(())
+}
+
+#[test]
+fn untracked_resume_rejects_bare_and_exact_forms_before_spawning_helpers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-untracked-usage-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&sandbox)?;
+    let state = sandbox.join("state-must-not-exist");
+    for arguments in [
+        vec!["resume", "--untracked"],
+        vec![
+            "resume",
+            "--untracked",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ],
+    ] {
+        let output = calcifer()
+            .current_dir(&sandbox)
+            .env("CALCIFER_HOME", &state)
+            .args(arguments)
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8(output.stderr)?.contains("invalid command-line arguments"));
+        assert!(
+            !state.exists(),
+            "invalid untracked form reached a stateful helper"
+        );
+    }
+    std::fs::remove_dir(&sandbox)?;
     Ok(())
 }
 

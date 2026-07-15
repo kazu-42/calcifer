@@ -96,11 +96,34 @@ The stable same-home operations are the CLI's `codex resume <thread-id>` and App
 
 Calcifer's current profile-specific `CODEX_HOME` preserves these files across wrapper restarts. Resume restores persisted conversation state, not the terminated process, live stream, or an in-flight tool call. Calcifer does not replay the previous prompt.
 
-The current command is an explicit cold restore: `calcifer resume codex@<alias> [thread-id]`. Automatic previous-thread selection still requires Calcifer to persist the source profile, canonical cwd, exact thread ID, and interruption state.
+Calcifer supports three same-home restore modes:
+
+```text
+calcifer resume codex@<alias> <thread-id>  # direct validation and exact adoption
+calcifer resume codex@<alias>              # explicit official --last convenience
+calcifer resume                            # exact Calcifer-owned workspace head
+calcifer run --untracked codex@<alias>     # explicit no-capture provider launch
+calcifer resume --untracked codex@<alias>  # explicit no-capture --last launch
+```
+
+For automatic capture, the 0.144.4 adapter initializes with `experimentalApi: false`, then pages both active and archived `thread/list` results filtered to the exact canonical cwd and `cli` source. It admits only canonical UUID root threads with no parent, non-ephemeral persistence, matching recorded CLI version, and a rollout canonically contained in the selected private managed home's `sessions` or `archived_sessions`. Nested legacy directories/files created under a prior caller umask may be `0755`/`0644`, but they must be owned by the current user, real non-symlink nodes, non-writable by group/other, and single-linked for files. New Calcifer processes set umask `0077` before creating state or spawning login, App Server, coordinator, guardian, or TUI children. It drops preview, turns, model/provider fields, and rollout content before constructing Calcifer metadata. An authoritative explicit thread uses direct `thread/read(includeTurns=false)` and never scans every old session.
+
+`run` and explicit `--last` capture a private pre-launch inventory before the TUI starts. After the TUI exits, exactly one new or uniquely changed thread may update the workspace head. Change detection combines App Server timestamps with a path-free rollout fingerprint containing device/inode, length, and nanosecond mtime/ctime, because upstream `updatedAt` and `recencyAt` are Unix seconds; ctime also detects a same-inode rename without storing the path. Zero candidates preserve the previous head only when no baseline ID disappeared; deletion, deletion plus a new thread, multiple candidates, active/archive inconsistency, duplicate IDs, pagination-cap exhaustion, wrong cwd/source/profile, malformed protocol, or unsupported schema fail closed. A pending pre-launch inventory survives a guardian crash and is reconciled under the same profile lease. Only the first `session_meta` identity and bounded persisted task-start, task-complete, and turn-aborted tags are used to classify `clean`, `interrupted`, or `unknown_crash`; transcript payloads are ignored and never replayed.
+
+An incomplete or unavailable inventory never authorizes an implicit provider launch. Users may explicitly opt into `--untracked` for `run` or profile-specific `resume --last`; this skips App Server entirely, but only after one transaction writes a durable `needs_selection` marker plus a version-free, inventory-free ownership record and verifies that no pending launch exists for the canonical workspace. The record blocks cross-profile exact adoption until the official child exits, and exact lifecycle refresh cannot overwrite a marker created after that exact process started. There is no post-exit capture; cleanup only removes ownership and preserves `needs_selection`. Bare resume remains ambiguous until the user supplies an exact same-profile thread ID, while registry failure or uncertain durability prevents the provider from spawning at all.
+
+The upstream rollout walker stops after 10,000 files per active/archived scan and records `reached_scan_cap`, but App Server v2's `ThreadListResponse` omits that flag. Calcifer cannot infer completeness from `nextCursor`. It instead takes stable filesystem snapshots before and after `thread/list`, requires each active and archived root to have strictly fewer than 10,000 regular files, maps every wire path to the matching snapshot fingerprint, and rejects symlinks, special or writable nodes, unreadable traversal, and any pre/post mutation. Missing and empty roots are equivalent. Calcifer deliberately keeps `useStateDbOnly: false`: Codex's own tests show that DB-only listing can omit a rollout until repair/indexing, and a fresh session can exist before its first user message is committed to the database.
+
+The final restore is always official `codex resume <exact-thread-id>` with no automatically supplied prompt. Stable thread lookup is profile-local: a thread captured from profile A cannot be resumed through profile B. Explicit exact resume first runs a sanitized, 256-byte-output, two-second `codex --version` probe from the neutral cwd. A clearly non-allowlisted canonical SemVer, including a valid prerelease such as `0.145.0-alpha.11`, preserves the official exact CLI fallback without starting App Server or mutating provider-owned sessions or Calcifer's registry. Malformed or noncanonical version output fails closed instead of being mistaken for an unsupported release. For allowlisted `0.144.4`, malformed App Server/session protocol also fails closed; authentication, spawn, timeout, transport, and otherwise unclassified provider availability failures remain retryable.
 
 Relevant upstream sources:
 
 - [official App Server documentation](https://developers.openai.com/codex/app-server/);
+- [non-experimental `thread/list` and `thread/read` request types](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/common.rs#L621-L648);
+- [profile-local session inventory lookup](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/rollout/src/list.rs#L1515-L1533);
+- [the internal 10,000-file scan cap and `reached_scan_cap`](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/rollout/src/list.rs#L118-L120);
+- [v2 `ThreadListResponse`, which omits the scan-cap flag](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L1191-L1201);
+- [DB-only listing skips rollout repair](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/rollout/src/recorder_tests.rs#L776-L829);
 - [thread resume types and experimental-field markers](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L310-L438);
 - [session layout](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/rollout/src/list.rs#L418-L421).
 
@@ -201,10 +224,11 @@ The safe future decision path is:
 
 Context-window exhaustion, session budgets, unauthorized responses, 5xx errors, timeouts, disconnects, parser failures, and rounded 100% are not account failover signals. See the [structured Codex error enum](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/shared.rs#L64-L113).
 
-Same-profile `calcifer resume` remains direct official CLI delegation inside
-the selected `CODEX_HOME`; Calcifer does not parse its transcript schema or
-replay input. Experimental cross-profile `thread/fork.path` and remote-TUI
-resume remain disabled behind their separate Phase 4.5 runtime/schema gate.
+Same-profile `calcifer resume` still delegates the final restore to the official
+CLI inside the selected `CODEX_HOME`. Its pinned metadata adapter never
+constructs a prompt or parses transcript message/tool payloads. Experimental
+cross-profile `thread/fork.path` and remote-TUI resume remain disabled behind
+their separate Phase 4.5 runtime/schema gate.
 
 ## What Orca currently does
 

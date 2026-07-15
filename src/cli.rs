@@ -41,6 +41,10 @@ pub(crate) enum Commands {
 
     /// Launch an official provider CLI with one immutable profile.
     Run {
+        /// Skip conversation capture and require explicit exact recovery later.
+        #[arg(long)]
+        untracked: bool,
+
         /// Provider and local profile alias, for example codex@work.
         profile: ProfileReference,
 
@@ -49,12 +53,16 @@ pub(crate) enum Commands {
         provider_args: Vec<OsString>,
     },
 
-    /// Resume a Codex session in the profile that owns it.
+    /// Resume a tracked workspace head or a session in an explicit profile.
     Resume {
-        /// Provider and local profile alias, for example codex@work.
-        profile: ProfileReference,
+        /// Use official --last without capture; requires a profile and no exact ID.
+        #[arg(long, requires = "profile", conflicts_with = "session_id")]
+        untracked: bool,
 
-        /// Exact Codex session ID or name; omit to use official `codex resume --last` behavior.
+        /// Provider and local profile alias; omit to resume this workspace's tracked head.
+        profile: Option<ProfileReference>,
+
+        /// Exact Codex session UUID; with a profile omitted, Calcifer uses the tracked head.
         session_id: Option<String>,
 
         /// Additional arguments passed to `codex resume` after `--`.
@@ -89,8 +97,11 @@ pub(crate) enum Commands {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum InternalProcessMode {
     Run,
+    RunUntracked,
     ResumeLast,
+    ResumeLastUntracked,
     ResumeExact,
+    ResumeHead,
 }
 
 #[derive(Debug, Subcommand)]

@@ -6,6 +6,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Crash-safe same-profile Codex thread capture and bare `calcifer resume`, which
+  validates the tracked workspace head and invokes exact official CLI resume
+  without replaying a prompt.
+- Conservative rollout-store completeness and change fingerprints for the
+  hidden Codex 0.144.4 filesystem scan cap and same-second thread updates.
+- Explicit `run --untracked` and profile-specific `resume --untracked` modes
+  that durably disable automatic workspace resume before skipping capture and
+  retain cross-profile-safe in-flight ownership until the provider exits.
+
+### Changed
+
+- Exact previous-thread auto-selection is now available for supported Codex
+  versions; active-profile monitoring and provider account-identity
+  verification remain future work.
+- Unix startup now applies umask `0077` before any managed state or provider
+  child is created, while owner-safe legacy `0755`/`0644` nested rollouts remain
+  readable behind the private managed-home boundary.
+
+### Fixed
+
+- Bare and explicit exact resume preserve persisted interrupted or unknown-crash
+  state through pre-launch validation, including behind pending or
+  needs-selection workspace state. Terminal profile/cwd ownership conflicts no
+  longer leave an unrecoverable pending launch in an infinite retry loop.
+
 ## [0.1.0-alpha.3] - 2026-07-15
 
 ### Added
