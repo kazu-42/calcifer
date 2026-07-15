@@ -2,7 +2,7 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. A private, credential-free compatibility gate now proves the pinned Codex `0.144.4` fork-by-path and remote-TUI behavior against synthetic state. Automatic failover and the production cross-profile conversation handoff transaction are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
+This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. A private, credential-free compatibility gate proves the pinned Codex `0.144.4` fork-by-path and remote-TUI behavior against synthetic state, and issue #48 extracts its bounded readiness relay without exposing a production session. Automatic failover and the production cross-profile conversation handoff transaction are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines handoff semantics and [ADR 0003](adr/0003-supervised-codex-session.md) defines the staged supervisor.
 
 ## Assets
 
@@ -132,7 +132,13 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   state. The ACK is one-shot, strictly parsed, and bound to the same socket; the
   sender releases its provider descriptor only by close, never explicit
   unlock. Descriptor-held flock state is the authority; a PID is not.
-- If the provider guardian is killed after reporting the exact provider PID, the coordinator retains its lease until that PID exits. If failure lands in the unobservable post-authorization/pre-report window, the coordinator deliberately remains alive and locked rather than guessing that no provider exists.
+- In the future supervised-session path, provider PIDs and process groups are
+  containment handles, not lease or reap authority. Normal release requires a
+  trusted `CHILDREN_REAPED` terminal frame from the live guardian followed by
+  an exact wait for that guardian. If the guardian disappears without that
+  proof, including after reporting provider PIDs, the coordinator parks with
+  lease A held rather than inferring safety from PID disappearance; see
+  [ADR 0003](adr/0003-supervised-codex-session.md).
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
 - Bounded metadata-only App Servers for status and thread capture inherit only
   the provider-side lease. On Unix the multithreaded parent never clears
@@ -359,15 +365,14 @@ validate or authorize a real handoff path.
 
 The remote half starts a real private Unix App Server and the official
 `codex resume --no-alt-screen --remote unix://... <target-thread-id>` TUI under
-a PTY. The bind-created App Server and WebSocket proxy sockets are not
-post-`chmod`ed and are not claimed to have mode `0600`; both remain inside the
-retained, current-user-owned mode-`0700` scratch root, whose directory search
-permission is the privacy boundary. Calcifer still requires the App Server
-socket to be owned by the current user. The proxy records its own socket's
-device/inode and checks that identity before unlink. Because the final `lstat`
-and pathname `unlink` are separate, a malicious process with the same UID can
-race them and cause a replacement entry to be unlinked; a replacement symlink
-target is never followed, but this same-user race is outside the guarantee.
+a PTY. Both sockets remain inside the retained, current-user-owned mode-`0700`
+scratch root. The extracted readiness relay explicitly sets its own socket to
+mode `0600`, reads back current UID/type/mode, records device/inode, and unlinks
+only the matching socket. A collision or replacement is preserved and fails
+closed. The App Server socket remains provider-created and is independently
+validated by the compatibility runtime. An AF_UNIX descriptor inode is not the
+filesystem pathname inode on Linux/macOS, so descriptor `fstat` cannot make
+pathname cleanup atomic; same-UID namespace races remain outside the guarantee.
 
 The proxy transparently forwards traffic while inspecting only enough of the
 startup protocol to prove readiness. It first requires a successful

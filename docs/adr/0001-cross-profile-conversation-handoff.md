@@ -233,10 +233,11 @@ production transaction described above. The gate:
   the source exists only in the source home, so the expected target-App-Server
   error response proves the TUI parsed and followed the resumed fork lineage,
   and readiness is emitted only after that response is forwarded to the TUI;
-- keeps the bind-created App Server and proxy sockets below the retained
-  owner-only mode-`0700` scratch directory rather than applying an unsafe
-  path-based `chmod` or claiming mode `0600`, while requiring the App Server
-  socket to remain current-user-owned;
+- keeps the provider-created App Server and readiness-relay sockets below the
+  retained owner-only mode-`0700` scratch directory. The extracted relay uses
+  mode `0600` with owner/type/mode readback and identity-conditioned cleanup;
+  the App Server socket is validated separately before connection. Pathname
+  operations remain outside any guarantee against hostile same-UID races;
 - models relay state atomically as `RUNNING`, unexpected `DISCONNECTED`, or
   intentional `STOPPING`, performs active poll-hangup and non-consuming `PEEK`
   checks on both streams, and requires checked shutdown;

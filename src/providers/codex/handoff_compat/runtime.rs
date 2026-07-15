@@ -14,12 +14,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::super::remote::{ReadinessProbe, ReadinessProxy, ReadinessProxyError};
 use super::super::{
     AppServerProcess, CodexThreadError, CodexUsageError, child_exit_observed_without_reaping,
     child_reap_confirmed, configure_own_process_group, force_terminate_process_tree,
     probe_codex_version_command, reap_exited_process_tree, validate_initialize_result,
 };
-use super::proxy::{ReadinessProbe, ReadinessProxy, ReadinessProxyError};
 use super::{
     CodexExecutableIdentity, CodexHandoffCapability, CodexHandoffError, HandoffSchemaContract,
     validate_handoff_schema_pair,
