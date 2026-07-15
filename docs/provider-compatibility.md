@@ -314,8 +314,10 @@ described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) is not.
 No command currently switches a user's profile or imports a user's rollout.
 The gate receives no Calcifer profile, conversation registry, credential, or
 user rollout, and incompatibility therefore cannot mutate those states.
-Transition journaling, leases, authoritative exhaustion selection, and crash
-recovery remain prerequisites before automatic handoff is enabled.
+The internal Linux/macOS no-gap target-reservation and guardian lease-transfer
+primitive is implemented. Supervisor wiring, transition journaling,
+authoritative exhaustion selection, target-fork integration, and crash recovery
+remain prerequisites before automatic handoff is enabled.
 
 Relevant upstream sources:
 

@@ -70,7 +70,8 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [ ] Model one logical conversation as a lineage of profile-local provider threads
 - [ ] Bind every lineage generation to profile, canonical cwd, trust domain, thread ID, and exact rollout path
 - [ ] Version-gate Codex's experimental `thread/fork.path` field and remote TUI contract with `codex app-server generate-json-schema --experimental --out <dir>` drift checks plus a synthetic runtime smoke test
-- [ ] Canonical containment, hard-link/symlink/owner/mode validation, serialized handoff, and explicit source-to-target lease transfer
+- [ ] Canonical containment, hard-link/symlink/owner/mode validation, serialized handoff, and complete source-to-target integration
+- [x] Linux/macOS no-gap verified target reservation and one-shot guardian provider-lease transfer; internal and unused until supervised handoff integration
 - [ ] Stop and reap the old TUI and App Server before reading its rollout under the target profile
 - [ ] Preserve source effective settings while keeping authentication/provider routing target-profile-owned
 - [ ] Materialize a new target-profile rollout, atomically commit the generation, and reconcile non-idempotent fork crash ambiguity

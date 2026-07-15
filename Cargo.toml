@@ -13,8 +13,8 @@ categories = ["command-line-utilities", "development-tools"]
 publish = false
 
 [workspace]
-members = ["crates/calcifer-macos-acl"]
-default-members = [".", "crates/calcifer-macos-acl"]
+members = ["crates/calcifer-macos-acl", "crates/calcifer-unix-child-fd"]
+default-members = [".", "crates/calcifer-macos-acl", "crates/calcifer-unix-child-fd"]
 resolver = "3"
 
 [dependencies]
@@ -33,6 +33,7 @@ uuid = { version = "1.23.5", features = ["v4"] }
 which = "8.0.4"
 
 [target.'cfg(unix)'.dependencies]
+calcifer-unix-child-fd = { version = "0.1.0", path = "crates/calcifer-unix-child-fd" }
 rustix = { version = "1.1.4", features = ["event", "fs", "net", "process", "pty", "termios"] }
 signal-hook = "0.3.18"
 

@@ -96,6 +96,7 @@ name = "calcifer"
 version = "0.1.0-alpha.4"
 dependencies = [
  "calcifer-macos-acl",
+ "calcifer-unix-child-fd",
  "clap",
  "exacl",
  "fs2",
@@ -117,6 +118,13 @@ dependencies = [
 [[package]]
 name = "calcifer-macos-acl"
 version = "0.1.0"
+
+[[package]]
+name = "calcifer-unix-child-fd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "cc"

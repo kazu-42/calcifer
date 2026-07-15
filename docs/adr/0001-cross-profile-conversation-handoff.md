@@ -1,6 +1,6 @@
 # ADR 0001: Treat conversation lineage as independent from credential profiles
 
-- Status: Accepted for the failover design; private compatibility gate implemented, production handoff transaction pending
+- Status: Accepted for the failover design; private compatibility gate and Linux/macOS no-gap target-reservation primitive implemented, supervisor integration and production handoff transaction pending
 - Date: 2026-07-15
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 
@@ -31,6 +31,40 @@ logical conversation 8f4e...
 ```
 
 Each provider process still has exactly one immutable credential profile. The logical conversation may move to another profile only between processes, after the previous process and App Server are stopped and reaped. A single handoff-coordinator lease serializes migrations. The running supervisor retains its existing source-profile lease, then reserves the target profile while holding the conversation lease; it does not try to reacquire its own source lease.
+
+### Target reservation and guardian transfer
+
+On Linux and macOS, Calcifer has an internal type-state primitive for reserving
+a revalidated target before its guardian exists and splitting that lifetime
+lease without an unlock/reacquire gap:
+
+```text
+reserved(parent target A+B)
+  -> descriptor_sent(parent target A+B, guardian provisional shared-B; awaiting ACK)
+  -> acknowledged(parent target A, guardian target B)
+```
+
+`shared-B` is not a second advisory-lock acquisition. `SCM_RIGHTS` gives the
+guardian a descriptor for the same locked open-file description. Sending
+consumes the reservation; the awaiting-ACK state cannot resend, and only a send
+failure returns the complete A+B reservation. The guardian must receive exactly
+one marker and one descriptor on its authenticated private control socket,
+validate that it is the exact target `provider.lock`, validate owner, regular
+type, private mode, single link, and inode identity, prove that this descriptor
+owns the active lock, then set and read back close-on-exec. It cannot spawn the
+App Server, TUI, or tools from the provisional state.
+
+The guardian sends a strict one-shot ACK on that same socket. Only the resulting
+acknowledged sender state can commit; commit closes the parent's B descriptor
+without `LOCK_UN` and returns an A-only coordinator state. The guardian's ACK
+operation likewise consumes its provisional state and returns a B-only state.
+No PID establishes lock authority.
+
+This primitive is ephemeral and internal. It changes no public command,
+registry or conversation schema, transition journal, or provider protocol, and
+is deliberately unused until the supervisor integration in issue #33. That
+integration must acquire locks in this order: retained source lifetime lease,
+handoff coordinator, conversation transition, target A, then target B.
 
 For the first supported Codex handoff implementation, Calcifer will prefer a **fork-by-path handoff**:
 
@@ -112,6 +146,18 @@ running(source)
 
 `thread/fork` has no Calcifer-controlled idempotency key. The prepared transition is therefore durable before the request is sent, and recovery rules are conservative:
 
+- Before the target descriptor is sent, the parent owns target A+B. A send
+  failure returns that complete reservation.
+- After a successful descriptor send but before a valid ACK, the parent retains
+  A+B and cannot commit. Rejection or guardian failure therefore leaves a
+  second writer blocked by the parent.
+- If the guardian accepted B but the ACK is lost, dropping either descriptor is
+  close-only: the survivor still owns the shared lock. The supervisor must
+  terminate and reap the guardian, or otherwise establish the descriptor's
+  exact disposition, before abandoning the awaiting state.
+- After ACK, a parent-only crash leaves guardian B authoritative; a
+  guardian-only crash leaves parent A authoritative. Neither recovery path
+  infers ownership from a PID.
 - Before `source_stopped`, the source generation remains authoritative.
 - After `source_stopped` but before a target fork exists, retrying may start a target App Server, but it must not replay a turn.
 - After `target_forked`, Calcifer must persist the returned target identity before launching the TUI.
@@ -132,7 +178,7 @@ running(source)
 9. Resume preserves history but never automatically replays an interrupted turn.
 10. Credentials remain in their profile homes; Calcifer does not copy `auth.json` into a shared runtime home.
 11. The supervisor is an event observer, not an approval responder; the official TUI must be attached before a new turn can start.
-12. Lease descriptors are held by Calcifer guardians and are not inherited by the App Server, TUI, or provider-started tools; the guardian tracks and reaps the exact App Server PID.
+12. Lease descriptors are held by Calcifer guardians and are not inherited by the App Server, TUI, or provider-started tools. A transferred descriptor is marked and read back close-on-exec before ACK, and every descriptor that has been shared is released close-only, never with explicit unlock. The guardian tracks and reaps the exact App Server PID for lifecycle management, but the descriptor-held flock remains the sole lease authority.
 
 ## Alternatives considered
 

@@ -243,12 +243,10 @@ fn inspect_profile(
                 message: "Managed neutral working directory failed validation",
             })
         })?;
-        // The account app-server is a bounded, no-turn probe. Let only its
-        // provider-side lease survive exec so a killed status parent cannot
-        // briefly admit a second credential writer before stdio EOF stops
-        // the app-server.
-        #[cfg(unix)]
-        let _provider_lock_inheritance = _lease.inherit_provider_lock().map_err(|_| {
+        // The account app-server is a bounded, no-turn probe. Its child-side
+        // provider lease survives exec while the parent's descriptor remains
+        // close-on-exec, so concurrent parent spawns cannot inherit it.
+        let provider_lease = _lease.provider_lock_for_probe().map_err(|_| {
             InspectionFailure::local(StatusFailure {
                 code: "unsafe_profile_state",
                 message: "Managed profile lease failed validation",
@@ -259,6 +257,7 @@ fn inspect_profile(
             &home,
             &neutral_working_directory,
             STATUS_TIMEOUT,
+            provider_lease,
         )
         .map_err(|failure| InspectionFailure {
             status: status_failure(failure.kind()),

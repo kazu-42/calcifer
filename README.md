@@ -176,6 +176,11 @@ Normal `run` and profile-specific `resume` remain fail-closed when Calcifer cann
 
 An active `run` or `resume` holds a split exclusive lease because a second Codex process could race credential refresh and session writes. A launch coordinator owns one half and a provider guardian owns the other; either process surviving a selective crash keeps the profile busy until the exact provider exits. Consequently, status for that active profile is currently `profile_busy` / `unknown`; a list query inspects profiles serially with a per-profile timeout. Active-session monitoring, cached last-known observations, and automatic failover still require a profile-owned usage supervisor. Provider identity is revalidated under the same exclusive lease before any future automatic selection; a changed or externally replaced login fails closed instead of silently rebinding the local alias.
 
+An internal Linux/macOS primitive can now reserve a revalidated target and
+split its lifetime lease with a guardian without an unlock/reacquire gap. It is
+not connected to a public command yet; current `run`, `resume`, `status`, and
+persisted schemas are unchanged.
+
 Example human output:
 
 ```text
@@ -285,7 +290,7 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Codex usage observation | Implemented on demand for idle profiles | Structured app-server response; active profiles need the planned supervisor |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
 | Opt-in profile pools | Design | Same provider and trust domain; bounded selection |
-| Cross-profile conversation handoff | Required failover design | Not enabled; version-gated fork into a target-profile thread, tracked as one logical conversation |
+| Cross-profile conversation handoff | Internal Linux/macOS target reservation and guardian lease-transfer primitive implemented | Supervisor transaction and user-visible switching remain disabled; the planned version-gated fork creates a target-profile thread in one logical conversation |
 | Claude setup-token profiles | Experimental plan | OS credential store where officially supported |
 | Claude subscription OAuth replication | Not planned for MVP | No undocumented OAuth endpoint or Keychain-name emulation |
 | Mid-session account hot-swap or command replay | Non-goal | Unsafe side-effect semantics |
@@ -399,7 +404,7 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 3. **Implemented:** exact same-profile thread capture, crash reconciliation, no-argument cold restore, and journaled local profile removal. Safe reauth/re-key flows remain.
 4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
-6. Add version-gated cross-profile conversation handoff as the default successful failover path; preserve one profile-local writer per lineage generation.
+6. Add version-gated cross-profile conversation handoff as the default successful failover path; the no-gap Linux/macOS target-reservation primitive is complete, while supervisor, journal, and fork integration remain pending. Preserve one profile-local writer per lineage generation.
 7. Add Claude only through provider-supported authentication and usage-observation surfaces.
 
 Detailed gates and non-goals are tracked in [docs/roadmap.md](docs/roadmap.md).
