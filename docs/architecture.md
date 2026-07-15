@@ -223,53 +223,72 @@ active run/resume/status probe and a rename choose exactly one winner and keeps
 identity verification and future remove/reauth flows from deadlocking.
 
 Confirmed profile removal uses the same published-profile lock order:
-coordinator lease, provider lease, removal-journal lock, then registry lock. A
-single private schema-v1 journal records only bounded local profile metadata,
-old/new registry revisions and digests, filesystem object identities, an entry
-count, and a SHA-256 digest of the bounded relative tree manifest. The journal
-contains no paths, filenames, credentials, raw provider identity, rollout
-metadata, or conversation content. The transaction is:
+coordinator lease, provider lease, removal lock, then registry lock. Stable
+`profiles.json` remains the exact schema-v1 shape published by alpha.4; it does
+not gain a revision field. A removal uses two bounded proof objects instead:
 
-Every normal registry writer rechecks for a removal journal, tombstone, or
-journal temporary immediately after acquiring the registry lock. Registration
-retains that guarded lock through publication. A writer whose earlier recovery
-preflight became stale therefore cannot change the revision/digest required by
-an interrupted removal; only recovery uses the unguarded registry-lock path.
+- a self-contained transient schema-v2 registry barrier containing the
+  prepared removal proof and expected stable v1 registry; and
+- a matching private schema-v1 sidecar used after the stable registry becomes
+  visible again.
 
-1. Revalidate the exact registry entry, data/profiles/provider root identities,
-   ownership marker, owner UID, private modes, file types, device, and
-   single-link regular files under both lifetime leases.
-2. Atomically write and fsync the prepared journal.
-3. Rename the UUID profile directory to `.removing-<profile-id>` under the same
-   provider root, then fsync that root.
-4. Atomically publish the next registry revision without that immutable ID.
-   This registry rename is the public visibility point.
-5. Read back the exact post-removal revision/digest, retain both metadata locks,
-   unlink the tombstone through `openat`/`statat`/`unlinkat` with no-follow
-   directory descriptors, fsync the provider root, then remove and sync the
-   journal before releasing either lock.
+The proof records only bounded local profile metadata, old/new canonical
+registry digests, filesystem object identities, an entry count, and a SHA-256
+digest of the relative tree manifest. It contains no paths, filenames,
+credentials, raw provider identity, rollout metadata, conversation content, or
+mount token. The transaction is:
 
-Before registry visibility, recovery accepts only the exact complete original
-tree or an inode-preserving tombstone whose entry count and metadata-manifest
-digest match the prepared journal, and restores the old directory; it never
-restores a partially deleted tree. After visibility, recovery never
+1. Acquire and durably sync both lifetime lock files, then revalidate the exact
+   registry entry, data/profiles/provider roots, ownership marker, owner UID,
+   private modes, types, device, mount boundary, and single-link regular files.
+2. Atomically replace stable schema-v1 `profiles.json` with the self-contained
+   transient schema-v2 barrier and fsync its parent. This is the first durable
+   transaction state, before any profile path moves.
+3. Atomically write and fsync a sidecar exactly matching the embedded proof.
+4. Rename the UUID profile directory to `.removing-<profile-id>` under the same
+   provider root, revalidate the complete manifest, then fsync that root.
+5. Atomically replace the barrier with the normal schema-v1 registry without
+   that immutable ID. This stable-v1 rename is the deletion visibility point.
+6. Read back the removed ID as absent, retain both metadata locks, unlink the
+   tombstone through constrained descriptors, fsync the provider root, then
+   remove and sync the sidecar before releasing either lock.
+
+Every normal registry writer rechecks for a barrier, sidecar, tombstone, or
+sidecar temporary immediately after acquiring the registry lock. Registration
+retains that guarded lock through publication. Alpha.4's strict schema-v1
+reader rejects the transient schema-v2 barrier, so an older writer cannot
+change the registry while a destructive pre-visibility state exists. Once the
+transaction completes or rolls back, `profiles.json` is schema-v1 again and the
+previously verified alpha.4 artifact can read the preserved state.
+
+Before deletion visibility, the barrier is authoritative. Recovery accepts
+only the exact complete original tree or an inode-preserving tombstone whose
+entry count and metadata-manifest digest match, restores the old directory if
+needed, removes the sidecar, and publishes the embedded expected v1 registry
+last. It never restores a partially deleted tree. After visibility, stable v1
+plus the sidecar is authoritative: the immutable target ID must be absent, but
+unrelated alpha.4-compatible registry changes may remain. Recovery never
 republishes credentials and may finish a partially unlinked tombstone because
-the journal pins its root inode/device and every remaining entry is revalidated
-before descriptor-relative deletion. A directory-sync error at either
-visibility boundary is resolved by exact readback; any state other than the
-recorded complete old or complete new registry is
-`removal_recovery_required`. Replaced roots, multiple or orphan tombstones,
-corrupt or oversized journals, symlinks, hard-linked files, foreign owners,
-permissive modes, special files, cross-device trees, and marker mismatches stop
-without recursive deletion.
+the proof pins its root inode/device and every remaining entry is revalidated
+before deletion. A missing, linked, malformed, or ambiguous registry, a
+mismatched barrier/sidecar, or any state that proves neither side fails as
+`removal_recovery_required` with the tombstone intact.
 
-The registry revision and profile ID establish the lineage invariant. Removal
-does not edit `conversations.json`; references to the removed ID become
-unresolved. Registering the same alias later creates a new UUID and cannot
-adopt those references. The installation-wide identity key and every unrelated
-profile remain outside the deletion tree. Filesystem unlinking is not a claim
-of cryptographic secure erasure from snapshots, backups, filesystem journals,
-or SSD media.
+Linux validation requires `statx(STATX_MNT_ID)` and cleanup opens every edge
+with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`. The removal/recovery contract
+therefore requires Linux kernel 5.8 or newer and has no weaker `st_dev` or
+ordinary-`openat` fallback. macOS opens each child relative to its parent with
+`O_NOFOLLOW` and compares raw descriptor-derived `fstatfs` mountpoint, source,
+and filesystem-type fields. Those mount tokens are ephemeral, redacted, and
+never written to a journal, JSON response, or log.
+
+Removal does not edit `conversations.json`; the immutable profile ID, not its
+alias, establishes lineage. References to a removed ID become unresolved, and
+registering the same alias later creates a new UUID that cannot adopt them. The
+installation-wide identity key and every unrelated profile remain outside the
+deletion tree. Filesystem unlinking is not a claim of cryptographic secure
+erasure from snapshots, backups, filesystem journals, or SSD media.
 
 ## Process execution
 

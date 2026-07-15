@@ -117,24 +117,33 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   JSON requires `--yes`. Before confirmation, non-TTY invocations perform no
   managed-state read, recovery, or mutation. Removal never starts a provider or
   browser process and never calls a token endpoint.
-- Removal holds both profile lifetime leases before journal or registry locks,
-  validates root and tree inode/device, current owner, private mode, real
-  directory/regular-file type, single-link files, exact marker, and bounded
-  traversal, then moves the exact tree to a same-filesystem tombstone. A
-  path-free manifest digest and entry count prevent pre-visibility recovery
-  from restoring a tree with missing credentials or session state.
-- The registry revision without the immutable profile ID is the deletion
-  visibility point. Credentials are recursively unlinked only after exact
-  readback. Descriptor-relative, no-follow traversal prevents a symlinked child
-  from redirecting cleanup outside the opened tombstone. Recovery restores only
-  a complete pre-visibility tree and only completes deletion after visibility;
-  the removal and registry locks remain held through tombstone and journal
-  durability. Ambiguity leaves the tombstone intact and reports a safe recovery
-  error.
-- Normal registry writers recheck removal artifacts after acquiring the
-  registry lock. A rename or registration that passed recovery before a
-  concurrent removal prepared its journal therefore stops without changing the
-  registry revision; the journal's old/new recovery digests remain authoritative.
+- Removal holds both profile lifetime leases before removal or registry locks,
+  durably syncs those lock files, then validates root and tree inode/device,
+  current owner, private mode, real directory/regular-file type, single-link
+  files, exact marker, mount identity, depth, and entry budget. A path-free
+  manifest digest and entry count prevent pre-visibility recovery from
+  restoring a tree with missing credentials or session state.
+- Stable `profiles.json` remains alpha.4-compatible schema v1. The first durable
+  removal state is a self-contained transient schema-v2 registry barrier that
+  embeds the expected v1 registry and prepared proof before any tree rename. A
+  strict alpha.4 reader rejects that barrier, preventing an old writer from
+  invalidating recovery. A matching sidecar is persisted next; the later stable
+  v1 registry without the immutable ID is the deletion visibility point.
+- Credentials are recursively unlinked only after stable-v1 readback proves
+  the ID absent. On Linux, every cleanup lookup uses `openat2` beneath the
+  provider descriptor with no-symlink, no-magic-link, and no-cross-mount
+  constraints; `statx` mount IDs make kernel 5.8 the minimum for removal and
+  recovery. macOS compares `fstatfs` identity for every opened descriptor.
+  Unsupported kernels and platforms fail closed without an unconstrained
+  fallback. Mount tokens may contain local path or server information, so they
+  remain ephemeral and are neither serialized nor logged.
+- Recovery restores only a complete pre-visibility tree and only completes
+  deletion after visibility; removal and registry locks remain held through
+  tombstone and sidecar durability. Missing or hard-linked registries,
+  mismatched barriers/sidecars, mount crossings, allocation-budget failures,
+  and all other ambiguity leave credential bytes intact and report a bounded
+  safe error. Normal registry writers recheck every removal artifact after
+  acquiring the registry lock.
 - Removal does not edit global Codex state, provider tokens, the installation
   identity key, unrelated profiles, or conversation lineage. Reusing an alias
   receives a fresh UUID. Filesystem unlinking does not guarantee secure erasure

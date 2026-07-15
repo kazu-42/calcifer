@@ -26,6 +26,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 ## Phase 2: Codex profile isolation
 
 - [ ] Complete `auth add/list/show/rename/remove/reauth codex` (`add`, `list`, atomic alias-only `rename`, and confirmed crash-safe local `remove` are implemented)
+- [x] Keep profile registry schema v1 rollback-compatible while using a bounded transient removal barrier, fail-closed mount proof, and immutable-ID lineage during local deletion
 - [x] Official `codex login` in a profile-specific `CODEX_HOME`
 - [x] Version-scoped private provider identity verification before profile publication
 - [x] Explicit identity verification for legacy profiles; unbound profiles remain manual-only

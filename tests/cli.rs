@@ -97,6 +97,340 @@ fn calcifer_with_ambient_codex_auth_overrides() -> Command {
     command
 }
 
+#[cfg(unix)]
+fn install_profile_remove_test_codex(
+    sandbox: &std::path::Path,
+) -> Result<(std::ffi::OsString, std::path::PathBuf), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = sandbox.join("bin");
+    let log = sandbox.join("provider.log");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::write(&log, b"")?;
+    let fake_codex = bin.join("codex");
+    std::fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+set -eu
+printf 'args=%s\n' "$*" >> "$FAKE_CODEX_LOG"
+if [ "${1:-}" = "-c" ]; then
+  [ "${2:-}" = 'cli_auth_credentials_store="file"' ]
+  [ "${3:-}" = "-c" ]
+  [ "${4:-}" = 'mcp_oauth_credentials_store="file"' ]
+  shift 4
+fi
+case "${1:-}" in
+  login)
+    umask 077
+    printf '{"auth_mode":"chatgpt","tokens":{"account_id":"scope-%s-%s"}}\n' "$PPID" "$$" > "$CODEX_HOME/auth.json"
+    ;;
+  app-server)
+    IFS= read -r initialize
+    case "$initialize" in
+      *'"method":"initialize"'*'"experimentalApi":false'*) ;;
+      *) exit 93 ;;
+    esac
+    printf '{"id":0,"result":{"userAgent":"calcifer/0.144.4 (test)","platformFamily":"unix","platformOs":"test","codexHome":"%s"}}\n' "$CODEX_HOME"
+    while IFS= read -r request; do
+      :
+    done
+    ;;
+  *)
+    exit 94
+    ;;
+esac
+"#,
+    )?;
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700))?;
+
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_entries = vec![bin];
+    path_entries.extend(std::env::split_paths(&inherited_path));
+    Ok((std::env::join_paths(path_entries)?, log))
+}
+
+#[cfg(unix)]
+fn add_profile_remove_test_profile(
+    root: &std::path::Path,
+    path: &std::ffi::OsStr,
+    log: &std::path::Path,
+    alias: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let add = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", path)
+        .env("CALCIFER_HOME", root)
+        .env("FAKE_CODEX_LOG", log)
+        .args(["auth", "add", "codex", alias])
+        .output()?;
+    if !add.status.success() {
+        return Err(std::io::Error::other(format!(
+            "failed to add codex@{alias}: {}",
+            String::from_utf8_lossy(&add.stderr)
+        ))
+        .into());
+    }
+    profile_remove_test_profile_id(root, alias)
+}
+
+#[cfg(unix)]
+fn profile_remove_test_profile_id(
+    root: &std::path::Path,
+    alias: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("profiles.json"))?)?;
+    registry["profiles"]
+        .as_array()
+        .and_then(|profiles| {
+            profiles
+                .iter()
+                .find(|profile| profile["provider"] == "codex" && profile["alias"] == alias)
+        })
+        .and_then(|profile| profile["id"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| std::io::Error::other(format!("missing codex@{alias}")))
+        .map_err(Into::into)
+}
+
+#[cfg(unix)]
+type ProfileRemoveTreeSnapshot = Vec<(std::path::PathBuf, Option<Vec<u8>>)>;
+
+#[cfg(unix)]
+fn snapshot_profile_remove_test_tree(
+    root: &std::path::Path,
+) -> Result<ProfileRemoveTreeSnapshot, Box<dyn std::error::Error>> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        entries: &mut Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        let relative = path.strip_prefix(root)?.to_path_buf();
+        if metadata.is_dir() {
+            entries.push((relative, None));
+            let mut children = std::fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()?;
+            children.sort();
+            for child in children {
+                visit(root, &child, entries)?;
+            }
+        } else if metadata.is_file() {
+            entries.push((relative, Some(std::fs::read(path)?)));
+        } else {
+            return Err(std::io::Error::other("unexpected non-file profile fixture entry").into());
+        }
+        Ok(())
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries)?;
+    Ok(entries)
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ProfileRemovePtyResult {
+    status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(unix)]
+struct ProfileRemovePtyFixture<'a> {
+    sandbox: &'a std::path::Path,
+    root: &'a std::path::Path,
+    path: &'a std::ffi::OsStr,
+    log: &'a std::path::Path,
+}
+
+#[cfg(unix)]
+fn run_profile_remove_in_pty<F>(
+    fixture: &ProfileRemovePtyFixture<'_>,
+    alias: &str,
+    input: Option<&[u8]>,
+    attempt: &str,
+    after_prompt: F,
+) -> Result<ProfileRemovePtyResult, Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+{
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let helper = fixture.sandbox.join("profile-remove-pty.py");
+    if !helper.exists() {
+        std::fs::write(
+            &helper,
+            r#"import errno
+import os
+import select
+import subprocess
+import sys
+import termios
+import time
+
+stderr_path, stdout_path, status_path, ready_path, continue_path, input_hex, executable, *arguments = sys.argv[1:]
+master, slave = os.openpty()
+attributes = termios.tcgetattr(slave)
+attributes[3] &= ~termios.ECHO
+termios.tcsetattr(slave, termios.TCSANOW, attributes)
+process = subprocess.Popen(
+    [executable, *arguments],
+    stdin=slave,
+    stdout=subprocess.PIPE,
+    stderr=slave,
+    close_fds=True,
+)
+os.close(slave)
+stderr = bytearray()
+prompt = b"Type 'yes' to continue:"
+deadline = time.monotonic() + 10.0
+while prompt not in stderr:
+    if time.monotonic() >= deadline:
+        process.kill()
+        raise RuntimeError("timed out waiting for removal prompt")
+    readable, _, _ = select.select([master], [], [], 0.05)
+    if readable:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                chunk = b""
+            else:
+                raise
+        if not chunk:
+            break
+        stderr.extend(chunk)
+    if process.poll() is not None and not readable:
+        break
+if prompt not in stderr:
+    raise RuntimeError("removal process exited without a prompt")
+with open(ready_path, "xb"):
+    pass
+deadline = time.monotonic() + 10.0
+while not os.path.exists(continue_path):
+    if time.monotonic() >= deadline:
+        process.kill()
+        raise RuntimeError("timed out waiting for test continuation")
+    time.sleep(0.01)
+if input_hex == "EOF":
+    os.write(master, b"\x04")
+else:
+    os.write(master, bytes.fromhex(input_hex))
+while process.poll() is None:
+    readable, _, _ = select.select([master], [], [], 0.05)
+    if readable:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                chunk = b""
+            else:
+                raise
+        if chunk:
+            stderr.extend(chunk)
+process.wait()
+while True:
+    readable, _, _ = select.select([master], [], [], 0)
+    if not readable:
+        break
+    try:
+        chunk = os.read(master, 4096)
+    except OSError as error:
+        if error.errno == errno.EIO:
+            break
+        raise
+    if not chunk:
+        break
+    stderr.extend(chunk)
+os.close(master)
+stdout = process.stdout.read()
+with open(stderr_path, "wb") as destination:
+    destination.write(stderr)
+with open(stdout_path, "wb") as destination:
+    destination.write(stdout)
+with open(status_path, "w", encoding="ascii") as destination:
+    destination.write(str(process.returncode))
+"#,
+        )?;
+    }
+
+    let attempt_root = fixture.sandbox.join(format!("pty-{attempt}"));
+    std::fs::create_dir(&attempt_root)?;
+    let stderr_path = attempt_root.join("stderr");
+    let stdout_path = attempt_root.join("stdout");
+    let status_path = attempt_root.join("status");
+    let ready_path = attempt_root.join("ready");
+    let continue_path = attempt_root.join("continue");
+    let input_hex = input.map_or_else(
+        || "EOF".to_owned(),
+        |bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+    );
+    let mut helper_process = Command::new("python3")
+        .arg(&helper)
+        .args([
+            stderr_path.as_os_str(),
+            stdout_path.as_os_str(),
+            status_path.as_os_str(),
+            ready_path.as_os_str(),
+            continue_path.as_os_str(),
+            std::ffi::OsStr::new(&input_hex),
+            std::ffi::OsStr::new(env!("CARGO_BIN_EXE_calcifer")),
+            std::ffi::OsStr::new("auth"),
+            std::ffi::OsStr::new("remove"),
+            std::ffi::OsStr::new(&format!("codex@{alias}")),
+        ])
+        .env("PATH", fixture.path)
+        .env("CALCIFER_HOME", fixture.root)
+        .env("FAKE_CODEX_LOG", fixture.log)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready_path.exists() {
+        if let Some(status) = helper_process.try_wait()? {
+            let output = helper_process.wait_with_output()?;
+            return Err(std::io::Error::other(format!(
+                "PTY helper exited before prompt ({status}): {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        if Instant::now() >= deadline {
+            let _ = helper_process.kill();
+            let output = helper_process.wait_with_output()?;
+            return Err(std::io::Error::other(format!(
+                "timed out waiting for PTY helper: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    after_prompt()?;
+    std::fs::write(&continue_path, b"continue")?;
+    let helper_output = helper_process.wait_with_output()?;
+    if !helper_output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "PTY helper failed: {}{}",
+            String::from_utf8_lossy(&helper_output.stdout),
+            String::from_utf8_lossy(&helper_output.stderr)
+        ))
+        .into());
+    }
+    let status = std::fs::read_to_string(status_path)?.parse()?;
+    Ok(ProfileRemovePtyResult {
+        status,
+        stdout: std::fs::read(stdout_path)?,
+        stderr: std::fs::read(stderr_path)?,
+    })
+}
+
 #[test]
 fn help_lists_only_implemented_commands() -> Result<(), Box<dyn std::error::Error>> {
     let output = calcifer().arg("--help").output()?;
@@ -524,6 +858,297 @@ fn profile_remove_requires_confirmation_and_is_offline_and_lineage_preserving()
     assert_eq!(std::fs::read(root.join("identity.key"))?, identity_key);
     assert_eq!(std::fs::read(root.join("conversations.json"))?, lineage);
     assert_eq!(std::fs::read(global_codex.join("auth.json"))?, global_auth);
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn removed_profile_lineage_never_rebinds_bare_resume_to_a_reused_alias()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-profile-remove-lineage-{}-{nonce}",
+        std::process::id()
+    ));
+    let root = sandbox.join("state");
+    let workspace = sandbox.join("workspace");
+    std::fs::create_dir_all(workspace.join(".git"))?;
+    let (path, provider_log) = install_profile_remove_test_codex(&sandbox)?;
+    let removed_id = add_profile_remove_test_profile(&root, &path, &provider_log, "work")?;
+    let canonical_workspace = std::fs::canonicalize(&workspace)?;
+    let canonical_workspace = canonical_workspace
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("test workspace path is not UTF-8"))?;
+    let conversation_id = "01900000-0000-7000-8000-000000000171";
+    let thread_id = "01900000-0000-7000-8000-000000000172";
+    let conversation_registry = serde_json::json!({
+        "schema_version": 1,
+        "revision": 7,
+        "conversations": [{
+            "conversation_id": conversation_id,
+            "provider": "codex",
+            "generations": [{
+                "generation": 0,
+                "profile_id": removed_id,
+                "thread_id": thread_id,
+                "canonical_cwd": canonical_workspace,
+                "codex_version": "0.144.4",
+                "adapter_version": env!("CARGO_PKG_VERSION"),
+                "bound_at": 1_784_073_600_i64
+            }],
+            "active_generation": 0,
+            "last_safe_lifecycle": "clean"
+        }],
+        "workspace_heads": [{
+            "provider": "codex",
+            "canonical_cwd": canonical_workspace,
+            "state": "ready",
+            "conversation_id": conversation_id,
+            "generation": 0
+        }],
+        "pending_launches": []
+    });
+    let conversation_path = root.join("conversations.json");
+    std::fs::write(
+        &conversation_path,
+        serde_json::to_vec_pretty(&conversation_registry)?,
+    )?;
+    std::fs::set_permissions(&conversation_path, std::fs::Permissions::from_mode(0o600))?;
+    let immutable_lineage = std::fs::read(&conversation_path)?;
+
+    let remove = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .args(["auth", "remove", "codex@work", "--yes"])
+        .output()?;
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(std::fs::read(&conversation_path)?, immutable_lineage);
+
+    let log_before_removed_resume = std::fs::read(&provider_log)?;
+    let removed_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .args(["resume"])
+        .output()?;
+    assert_eq!(removed_resume.status.code(), Some(1));
+    assert!(removed_resume.stdout.is_empty());
+    let removed_resume_stderr = String::from_utf8(removed_resume.stderr)?;
+    assert!(
+        removed_resume_stderr.contains("Profile codex profile was not found."),
+        "a valid head must resolve its removed immutable profile ID: {removed_resume_stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&provider_log)?,
+        log_before_removed_resume,
+        "bare resume must reject a removed immutable profile before provider spawn"
+    );
+
+    let replacement_id = add_profile_remove_test_profile(&root, &path, &provider_log, "work")?;
+    assert_ne!(replacement_id, removed_id);
+    assert_eq!(std::fs::read(&conversation_path)?, immutable_lineage);
+    let stored_registry: serde_json::Value = serde_json::from_slice(&immutable_lineage)?;
+    assert_eq!(
+        stored_registry["workspace_heads"][0]["conversation_id"],
+        conversation_id
+    );
+    assert_eq!(stored_registry["workspace_heads"][0]["generation"], 0);
+    assert_eq!(
+        stored_registry["conversations"][0]["generations"][0]["profile_id"],
+        removed_id
+    );
+    assert_ne!(
+        stored_registry["conversations"][0]["generations"][0]["profile_id"],
+        replacement_id
+    );
+
+    let log_before_reused_alias_resume = std::fs::read(&provider_log)?;
+    let reused_alias_resume = calcifer()
+        .current_dir(&workspace)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .args(["resume"])
+        .output()?;
+    assert_eq!(reused_alias_resume.status.code(), Some(1));
+    assert!(reused_alias_resume.stdout.is_empty());
+    assert!(
+        String::from_utf8(reused_alias_resume.stderr)?
+            .contains("Profile codex profile was not found.")
+    );
+    assert_eq!(
+        std::fs::read(&provider_log)?,
+        log_before_reused_alias_resume,
+        "alias reuse must not let bare resume spawn the replacement profile"
+    );
+    assert_eq!(std::fs::read(&conversation_path)?, immutable_lineage);
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_remove_tty_requires_exact_yes_and_pins_the_prompted_immutable_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-profile-remove-pty-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&sandbox)?;
+    let root = sandbox.join("state");
+    let (path, provider_log) = install_profile_remove_test_codex(&sandbox)?;
+    let confirmed_id = add_profile_remove_test_profile(&root, &path, &provider_log, "confirm")?;
+    let raced_id = add_profile_remove_test_profile(&root, &path, &provider_log, "work")?;
+    let pty_fixture = ProfileRemovePtyFixture {
+        sandbox: &sandbox,
+        root: &root,
+        path: &path,
+        log: &provider_log,
+    };
+
+    let assert_prompt = |result: &ProfileRemovePtyResult, alias: &str, profile_id: &str| {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "Remove codex@{alias} (local profile {profile_id}, created "
+            )),
+            "prompt did not identify the selected local reference and immutable ID: {stderr}"
+        );
+        assert!(
+            stderr.contains("deletes only Calcifer-managed local credentials and sessions"),
+            "prompt did not bound the local deletion scope: {stderr}"
+        );
+        assert!(
+            stderr.contains("does not revoke provider tokens"),
+            "prompt did not disclose provider-token non-revocation: {stderr}"
+        );
+        assert!(
+            stderr.contains("or guarantee secure erasure"),
+            "prompt did not disclose the secure-erasure limitation: {stderr}"
+        );
+        assert!(stderr.contains("Type 'yes' to continue:"));
+    };
+
+    let rejected_inputs: [(&str, Option<&[u8]>); 5] = [
+        ("short-y", Some(b"y\n")),
+        ("uppercase", Some(b"YES\n")),
+        ("leading-space", Some(b" yes\n")),
+        ("trailing-space", Some(b"yes \n")),
+        ("eof", None),
+    ];
+    for (attempt, input) in rejected_inputs {
+        let before = snapshot_profile_remove_test_tree(&root)?;
+        let result = run_profile_remove_in_pty(&pty_fixture, "confirm", input, attempt, || Ok(()))?;
+        assert_eq!(result.status, 1, "{attempt} unexpectedly confirmed removal");
+        assert!(
+            result.stdout.is_empty(),
+            "{attempt} wrote success to stdout"
+        );
+        assert_prompt(&result, "confirm", &confirmed_id);
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(
+                "Profile removal requires an explicit TTY confirmation or `--yes`. No local profile state was changed."
+            )
+        );
+        assert_eq!(
+            snapshot_profile_remove_test_tree(&root)?,
+            before,
+            "{attempt} changed managed state despite rejected confirmation"
+        );
+    }
+
+    let provider_log_before_confirmed_remove = std::fs::read(&provider_log)?;
+    let confirmed =
+        run_profile_remove_in_pty(&pty_fixture, "confirm", Some(b"yes\n"), "exact-yes", || {
+            Ok(())
+        })?;
+    assert_eq!(confirmed.status, 0);
+    assert_prompt(&confirmed, "confirm", &confirmed_id);
+    assert_eq!(
+        String::from_utf8(confirmed.stdout)?,
+        "Removed codex@confirm.\nThe Calcifer-managed credentials and sessions for this local profile are no longer registered.\n"
+    );
+    assert!(
+        !String::from_utf8_lossy(&confirmed.stderr).contains("Removed codex@confirm"),
+        "success output leaked onto the prompt's stderr stream"
+    );
+    assert_eq!(
+        std::fs::read(&provider_log)?,
+        provider_log_before_confirmed_remove,
+        "local removal must not invoke the provider"
+    );
+    assert!(profile_remove_test_profile_id(&root, "confirm").is_err());
+    assert_eq!(profile_remove_test_profile_id(&root, "work")?, raced_id);
+
+    let mut replacement_id = None;
+    let mut state_after_alias_reuse = None;
+    let mut provider_log_after_alias_reuse = None;
+    let raced =
+        run_profile_remove_in_pty(&pty_fixture, "work", Some(b"yes\n"), "alias-reuse", || {
+            let rename = calcifer()
+                .env("PATH", &path)
+                .env("CALCIFER_HOME", &root)
+                .env("FAKE_CODEX_LOG", &provider_log)
+                .args(["auth", "rename", "codex@work", "former-work"])
+                .output()?;
+            if !rename.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "failed to create alias-reuse race: {}",
+                    String::from_utf8_lossy(&rename.stderr)
+                ))
+                .into());
+            }
+            replacement_id = Some(add_profile_remove_test_profile(
+                &root,
+                &path,
+                &provider_log,
+                "work",
+            )?);
+            state_after_alias_reuse = Some(snapshot_profile_remove_test_tree(&root)?);
+            provider_log_after_alias_reuse = Some(std::fs::read(&provider_log)?);
+            Ok(())
+        })?;
+    let replacement_id = replacement_id
+        .ok_or_else(|| std::io::Error::other("alias-reuse hook did not register a profile"))?;
+    let state_after_alias_reuse = state_after_alias_reuse
+        .ok_or_else(|| std::io::Error::other("alias-reuse hook did not snapshot state"))?;
+    assert_ne!(replacement_id, raced_id);
+    assert_eq!(raced.status, 1);
+    assert!(raced.stdout.is_empty());
+    assert_prompt(&raced, "work", &raced_id);
+    assert!(String::from_utf8(raced.stderr)?.contains("Profile codex@work was not found."));
+    assert_eq!(
+        snapshot_profile_remove_test_tree(&root)?,
+        state_after_alias_reuse,
+        "confirmation pinned to an old ID must not mutate its alias replacement"
+    );
+    assert_eq!(
+        std::fs::read(&provider_log)?,
+        provider_log_after_alias_reuse.ok_or_else(|| std::io::Error::other(
+            "alias-reuse hook did not snapshot provider log"
+        ))?,
+        "the stale confirmation must fail before spawning the provider"
+    );
+    assert_eq!(
+        profile_remove_test_profile_id(&root, "former-work")?,
+        raced_id
+    );
+    assert_eq!(
+        profile_remove_test_profile_id(&root, "work")?,
+        replacement_id
+    );
 
     std::fs::remove_dir_all(sandbox)?;
     Ok(())

@@ -361,6 +361,17 @@ regression is found, leave the release available, document it separately, and
 publish a higher version containing the fix. Users can reinstall a previously
 verified artifact while their profile state remains in place.
 
+Profile registry state is normally kept in the schema-v1 shape understood by
+the published alpha.4 artifact. A newer Calcifer may temporarily replace that
+file with a self-contained schema-v2 barrier while `auth remove` is in progress;
+alpha.4 intentionally reports `invalid_registry` instead of writing through
+that destructive state. If a rollback encounters that error, do not delete,
+edit, or copy `profiles.json`, `removal.json`, or a `.removing-*` directory.
+Run `auth list` once with the newer verified artifact that prepared the
+transaction so bounded recovery can restore or finish stable schema-v1 state,
+then verify `auth list` before reinstalling alpha.4. A completed removal or
+pre-visibility rollback is directly alpha.4-readable.
+
 If an artifact or the release pipeline itself is compromised, stop new
 downloads through the audited emergency-removal procedure above, open a public
 incident or private security advisory as appropriate, and publish a new version

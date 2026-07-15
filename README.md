@@ -98,16 +98,28 @@ or reauthentication operation returns `profile_busy` without preparing a
 deletion.
 
 After confirmation, Calcifer validates the exact ownership-marked profile tree,
-persists a private bounded journal with a path-free tree-manifest digest,
-renames the UUID directory to a same-filesystem opaque tombstone, and atomically
-removes the immutable ID from the profile registry. That registry update is the
-visibility point: only after readback proves the ID is absent does Calcifer
-unlink the tombstone using directory-relative, no-follow filesystem operations.
-Startup and `auth list` recover an unambiguous interrupted transaction to either
-the manifest-complete old state before visibility or the complete removed state
-afterward. Ambiguous journals, replaced roots, missing entries, symlinks, hard
-links, unexpected owners or modes, and malformed tombstones fail closed without
-recursive deletion.
+then atomically replaces the stable schema-v1 `profiles.json` with a bounded,
+self-contained transient schema-v2 removal barrier. The barrier embeds the
+expected v1 registry and a path-free tree-manifest proof; it is the first
+durable transaction state and makes published alpha.4 binaries fail closed
+instead of writing through an in-progress deletion. Calcifer next persists a
+matching private sidecar, renames the UUID directory to a same-filesystem opaque
+tombstone, and atomically publishes a normal schema-v1 registry without the
+immutable ID. That final registry update is the deletion visibility point:
+only after readback proves the ID is absent does Calcifer unlink the tombstone
+through constrained directory descriptors.
+
+The next profile-registry operation, including `auth list`, recovers an
+unambiguous interruption to either the manifest-complete old state before
+visibility or the complete removed state afterward. Completed state remains
+schema-v1 and readable by alpha.4. Ambiguous or mismatched barriers and
+sidecars, replaced or missing registries and roots, symlinks, hard links,
+unexpected owners or modes, mount crossings, and malformed tombstones fail
+closed without recursive deletion. On Linux, removal and its recovery require
+kernel 5.8 or newer so `statx` mount IDs and `openat2` constraints are both
+available; Calcifer never falls back to `st_dev` or an unconstrained `openat`.
+macOS compares descriptor-derived `fstatfs` mount identities. Mount identity
+tokens remain ephemeral in memory and are never persisted or logged.
 
 Removal does not start Codex, open a browser, contact a provider endpoint,
 revoke tokens, change global `~/.codex`, delete conversation lineage metadata,
@@ -313,6 +325,11 @@ Linux glibc 2.35+ on x86-64/ARM64, macOS Intel/Apple silicon, and Windows x86-64
 release includes SHA-256 checksums and GitHub artifact attestations minted by
 the release workflow over the assembled release assets.
 The binaries are not yet code-signed or notarized.
+
+The Linux binary can run on the supported glibc baseline, but destructive
+`auth remove` and interrupted-removal recovery additionally require Linux
+kernel 5.8 or newer. On an older kernel those operations stop before mutation;
+other non-destructive commands do not inherit this kernel requirement.
 
 Download only the archive for your operating system and architecture, verify it
 before installation, and keep in mind that Calcifer is still pre-alpha. See the
