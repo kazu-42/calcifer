@@ -27,7 +27,7 @@ pub(crate) enum Commands {
     /// Inspect the local environment without reading or changing credentials.
     Doctor,
 
-    /// Register or list isolated provider profiles.
+    /// Register, verify, or list isolated provider profiles.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -113,6 +113,12 @@ pub(crate) enum AuthCommand {
 
         /// Local alias used in Calcifer commands and output.
         alias: String,
+    },
+
+    /// Verify a legacy profile's private provider identity without logging in.
+    Verify {
+        /// Existing profile to verify, for example codex@work.
+        profile: ProfileReference,
     },
 
     /// List registered profiles without reading credentials.

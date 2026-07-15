@@ -11,6 +11,7 @@ This document covers both implemented and intended guarantees. The current Unix 
 - profile selection and trust-domain policy
 - source code, prompts, conversation context, and child process output
 - Calcifer registry integrity
+- installation-local provider-identity HMAC key and private profile bindings
 
 ## Threats in scope
 
@@ -115,6 +116,43 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   own file read remains outside the guarantee until Codex exposes a supported
   project-config disable or provenance-checked effective-config interface.
 
+### Private provider identity binding
+
+Provider identity binding is supported only on Unix and only for the tested
+Codex `0.144.4` managed ChatGPT auth projection. Windows fails closed until a
+current-user-only ACL implementation exists; Calcifer never creates a normally
+accessible fallback key there.
+
+One 256-bit installation key is generated from the OS CSPRNG and stored as a
+private, owner-checked, single-link regular file. A non-provider UUID key ID
+distinguishes key loss/replacement from credential drift. Each profile marker
+contains only its schema, key ID, adapter ID, supported auth kind, and HMAC
+fingerprint. The HMAC input is domain-separated and length-delimited across
+provider, auth kind, adapter version, and effective account/workspace scope.
+Email, access/refresh/ID tokens, API keys, and reset-credit identifiers are
+never inputs.
+
+The raw scope is read through a bounded minimal projection of provider-owned
+`auth.json`, reduced immediately, and never copied to the registry, marker,
+stdout/stderr, JSON, logs, or error text. Equality rejects duplicate aliases;
+inequality is not evidence of independent quota. Existing unbound profiles are
+manual-only until explicit `auth verify` succeeds under their profile lease and
+the registry mutation lock. A changed credential produces
+`provider_identity_mismatch`; Calcifer never silently rebinds it. Missing,
+corrupt, replaced, unsafe, or unreadable key state produces
+`identity_key_unavailable` and disables identity-dependent selection.
+
+Key and marker writes use private same-directory temporary files, file fsync,
+atomic rename, and parent-directory fsync. A complete destination observed
+after parent sync failure is adopted only after an idempotent parent-sync
+retry; it is never an invitation to repeat login. Persistent uncertainty is
+reported as `identity_commit_uncertain` while the unpublished staging
+credentials remain preserved for explicit recovery. Any orphan staging
+directory blocks subsequent registration before provider login. Readers ignore
+stale temporary names. Deliberate re-key and stale temporary cleanup remain
+future recovery commands and must validate every selected binding as one
+transaction.
+
 ## Failover requirements
 
 A profile pool is user-created, provider-specific, and bound to one trust domain. Automatic failover is opt-in. The only switching signal is fresh, authoritative, version-supported exhaustion state.
@@ -150,7 +188,7 @@ Minimum future test classes include:
 1. Property tests proving non-exhaustion never switches, pools never loop, and trust domains never cross.
 2. Multi-process tests for profile leases, mutation races, crashes, and lock release.
 3. Filesystem adversarial tests for traversal, symlinks, ownership, Unix modes, Windows ACLs, and crash-injected atomic writes.
-4. Identity tests for wrong-account, ambiguous, stale, rotated, corrupt, and partial credentials.
+4. Identity tests for duplicate aliases, wrong-account drift, unbound legacy profiles, missing/replaced/unsafe keys, malformed or partial credentials, redaction, commit uncertainty, and concurrent registration/verification.
 5. Redaction tests that seed synthetic token-shaped values and scan every output channel.
 6. Adapter compatibility tests for versions, changed output, auth errors, timeouts, rate limits, and provider failures.
 7. Process tests for exact argv, PATH resolution, arbitrary-command rejection, symlink swaps, signal forwarding, exit status, and authentication environment cleanup.

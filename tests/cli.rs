@@ -394,7 +394,7 @@ case "${1:-}" in
     ;;
   login)
     umask 077
-    printf '%s\n' '{"fake":"synthetic-test-only"}' > "$CODEX_HOME/auth.json"
+    printf '{"auth_mode":"chatgpt","tokens":{"account_id":"scope-%s-%s"}}\n' "$PPID" "$$" > "$CODEX_HOME/auth.json"
     ;;
   app-server)
     if [ "${FAKE_CODEX_APP_SERVER_SHAPE:-}" = "unavailable" ]; then
@@ -551,6 +551,24 @@ esac
         .args(["auth", "add", "codex", "work"])
         .output()?;
     assert!(add.status.success(), "{}", String::from_utf8(add.stderr)?);
+
+    let unsupported_add = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
+        .env("FAKE_CODEX_VERSION", "0.145.0")
+        .args(["auth", "add", "codex", "unsupported"])
+        .output()?;
+    let unsupported_add_stderr = String::from_utf8(unsupported_add.stderr)?;
+    assert_eq!(unsupported_add.status.code(), Some(1));
+    assert!(unsupported_add_stderr.contains("not supported"));
+    assert!(!root.join("profiles/codex").read_dir()?.any(|entry| {
+        entry
+            .ok()
+            .and_then(|entry| entry.file_name().into_string().ok())
+            .is_some_and(|name| name.starts_with(".staging-"))
+    }));
 
     let trust_project = calcifer_with_ambient_codex_auth_overrides()
         .env("PATH", &path)
@@ -725,7 +743,7 @@ esac
         usage_reads_before_rejections,
         "incompatible App Servers must be rejected before usage is requested"
     );
-    assert_eq!(rejected_log.matches("app-server-gate-closed").count(), 4);
+    assert_eq!(rejected_log.matches("app-server-gate-closed").count(), 6);
 
     for shape in ["missing-rate-limits", "null-rate-limits"] {
         let malformed_usage = calcifer_with_ambient_codex_auth_overrides()
@@ -784,6 +802,31 @@ esac
         .path()
         .join("home");
     assert!(profile_directories.next().is_none());
+    let identity_marker = managed_home
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing profile directory"))?
+        .join(".calcifer-identity");
+    std::fs::remove_file(&identity_marker)?;
+    let verify = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .env("FAKE_CODEX_REQUIRE_NEUTRAL_CWD", "1")
+        .args(["--json", "auth", "verify", "codex@work"])
+        .output()?;
+    let verify_text = String::from_utf8(verify.stdout)?;
+    let verify_document: serde_json::Value = serde_json::from_str(&verify_text)?;
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8(verify.stderr)?
+    );
+    assert_eq!(verify_document["action"], "verify");
+    assert_eq!(verify_document["profiles"][0]["alias"], "work");
+    assert!(identity_marker.is_file());
+    for private_field in ["fingerprint", "key_id", "account_id", "auth_mode"] {
+        assert!(!verify_text.contains(private_field));
+    }
     let managed_config = managed_home.join("config.toml");
     let supported_managed_config = std::fs::read(&managed_config)?;
     let sensitive_role = "account-owner@example.invalid";

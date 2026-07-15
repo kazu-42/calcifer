@@ -16,12 +16,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Explicit `run --untracked` and profile-specific `resume --untracked` modes
   that durably disable automatic workspace resume before skipping capture and
   retain cross-profile-safe in-flight ownership until the provider exits.
+- Version-scoped private Codex provider-identity binding during registration and
+  explicit `calcifer auth verify codex@<alias>` migration for legacy profiles.
 
 ### Changed
 
 - Exact previous-thread auto-selection is now available for supported Codex
-  versions; active-profile monitoring and provider account-identity
-  verification remain future work.
+  versions; active-profile monitoring and automatic failover remain future
+  work.
 - Unix startup now applies umask `0077` before any managed state or provider
   child is created, while owner-safe legacy `0755`/`0644` nested rollouts remain
   readable behind the private managed-home boundary.
@@ -32,6 +34,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   state through pre-launch validation, including behind pending or
   needs-selection workspace state. Terminal profile/cwd ownership conflicts no
   longer leave an unrecoverable pending launch in an infinite retry loop.
+
+### Security
+
+- An installation-local HMAC key and profile-private identity markers reject
+  duplicate aliases for the same effective ChatGPT account/workspace scope.
+  Raw provider identifiers, fingerprints, and local key IDs remain outside the
+  registry and all human/JSON diagnostics; key loss and credential drift fail
+  closed for identity-dependent selection.
 
 ## [0.1.0-alpha.3] - 2026-07-15
 

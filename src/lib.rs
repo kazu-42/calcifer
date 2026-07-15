@@ -6,6 +6,7 @@ mod executable;
 mod output;
 mod profiles;
 mod project_config;
+mod provider_identity;
 mod providers;
 
 use std::ffi::OsString;
@@ -115,6 +116,12 @@ where
                     Err(error) => render_app_error("auth", &error, false),
                 }
             }
+            AuthCommand::Verify { profile } => match profile.provider {
+                ProviderArgument::Codex => match commands::auth::verify_codex(&profile.alias) {
+                    Ok(report) => render_auth_report(&report, cli.json),
+                    Err(error) => render_app_error("auth", &error, cli.json),
+                },
+            },
             AuthCommand::List => match commands::auth::list() {
                 Ok(report) => render_auth_report(&report, cli.json),
                 Err(error) => render_app_error("auth", &error, cli.json),
