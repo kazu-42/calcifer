@@ -16,11 +16,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Security
 
-- Profile removal revalidates owner, mode, type, marker, hard-link count,
-  filesystem, inode, mount identity, traversal depth, and entry budget before
-  deletion. Linux cleanup uses `openat2` no-cross-mount constraints and requires
+- Profile removal revalidates owner, owner-only roots, non-writable traversed
+  directory and regular-file modes, type, marker, hard-link count, filesystem,
+  inode, mount identity, traversal depth, and entry budget before deletion.
+  Linux cleanup uses `openat2` no-cross-mount constraints and requires
   kernel 5.8 or newer without fallback; macOS verifies every opened descriptor
-  with `fstatfs`. Stable profile state remains schema-v1-compatible, while
+  with `fstatfs`. Provider-created symlink and special-file leaves are never
+  opened or followed and are unlinked only relative to a constrained parent.
+  Stable profile state remains schema-v1-compatible, while
   missing, linked, malformed, or mismatched recovery state fails closed. Global
   Codex state, provider tokens, the installation identity key, unrelated
   profiles, and immutable conversation lineage are preserved; local unlinking

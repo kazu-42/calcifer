@@ -119,8 +119,14 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   browser process and never calls a token endpoint.
 - Removal holds both profile lifetime leases before removal or registry locks,
   durably syncs those lock files, then validates root and tree inode/device,
-  current owner, private mode, real directory/regular-file type, single-link
-  files, exact marker, mount identity, depth, and entry budget. A path-free
+  current owner, owner-only profile-root mode, absence of group/other write on
+  traversed directories and regular files, validated no-follow leaf types,
+  single-link non-directory entries, exact marker, mount identity, depth, and
+  entry budget. Readable provider-created descendants remain safe behind the
+  `0700` profile root, while traversed directories must retain owner `rwx`.
+  Ownership markers and lifetime locks are control-plane entries and remain
+  private single-link regular files, so symlink replacements fail before
+  transaction preparation. A path-free
   manifest digest and entry count prevent pre-visibility recovery from
   restoring a tree with missing credentials or session state.
 - Stable `profiles.json` remains alpha.4-compatible schema v1. The first durable
@@ -130,13 +136,16 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   invalidating recovery. A matching sidecar is persisted next; the later stable
   v1 registry without the immutable ID is the deletion visibility point.
 - Credentials are recursively unlinked only after stable-v1 readback proves
-  the ID absent. On Linux, every cleanup lookup uses `openat2` beneath the
-  provider descriptor with no-symlink, no-magic-link, and no-cross-mount
-  constraints; `statx` mount IDs make kernel 5.8 the minimum for removal and
-  recovery. macOS compares `fstatfs` identity for every opened descriptor.
-  Unsupported kernels and platforms fail closed without an unconstrained
-  fallback. Mount tokens may contain local path or server information, so they
-  remain ephemeral and are neither serialized nor logged.
+  the ID absent. On Linux, every traversed directory and regular file uses
+  `openat2` beneath the provider descriptor with no-symlink, no-magic-link, and
+  no-cross-mount constraints; `statx` mount IDs make kernel 5.8 the minimum for
+  removal and recovery. macOS compares `fstatfs` identity for every opened
+  descriptor. Provider-created symlinks, sockets, FIFOs, and other special
+  leaves are never opened or followed; a no-follow metadata proof is recorded
+  and descriptor-relative `unlinkat` removes only the in-tree name. Unsupported
+  kernels and platforms fail closed without an unconstrained fallback. Mount
+  tokens may contain local path or server information, so they remain ephemeral
+  and are neither serialized nor logged.
 - Recovery restores only a complete pre-visibility tree and only completes
   deletion after visibility; removal and registry locks remain held through
   tombstone and sidecar durability. Missing or hard-linked registries,

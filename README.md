@@ -113,13 +113,24 @@ The next profile-registry operation, including `auth list`, recovers an
 unambiguous interruption to either the manifest-complete old state before
 visibility or the complete removed state afterward. Completed state remains
 schema-v1 and readable by alpha.4. Ambiguous or mismatched barriers and
-sidecars, replaced or missing registries and roots, symlinks, hard links,
-unexpected owners or modes, mount crossings, and malformed tombstones fail
+sidecars, replaced or missing registries and roots, traversable or replaced
+directories, hard-linked regular files, unexpected owners, group/other-writable
+directories or regular files, mount crossings, and malformed tombstones fail
 closed without recursive deletion. On Linux, removal and its recovery require
 kernel 5.8 or newer so `statx` mount IDs and `openat2` constraints are both
 available; Calcifer never falls back to `st_dev` or an unconstrained `openat`.
 macOS compares descriptor-derived `fstatfs` mount identities. Mount identity
 tokens remain ephemeral in memory and are never persisted or logged.
+
+Provider-created symlinks, Unix sockets, FIFOs, and other non-directory leaves
+are recorded in the manifest but never opened or traversed. Cleanup unlinks
+only their names relative to an already constrained parent directory, so an
+absolute or dangling symlink target remains untouched. Regular files must be
+single-link, and every traversed directory must remain owner-readable,
+owner-writable, and owner-searchable; ambiguous replacements still fail closed.
+The ownership marker and lifetime-lock names are control-plane state, not
+provider leaves, and must remain private single-link regular files: replacing
+either with a symlink always blocks removal before a transaction is prepared.
 
 Removal does not start Codex, open a browser, contact a provider endpoint,
 revoke tokens, change global `~/.codex`, delete conversation lineage metadata,

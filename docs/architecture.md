@@ -240,7 +240,15 @@ mount token. The transaction is:
 
 1. Acquire and durably sync both lifetime lock files, then revalidate the exact
    registry entry, data/profiles/provider roots, ownership marker, owner UID,
-   private modes, types, device, mount boundary, and single-link regular files.
+   private root modes, non-group/other-writable traversed-directory and
+   regular-file modes, types, device, mount boundary, and single-link regular
+   files. Provider-created readable or executable descendants such as `0755`
+   directories and `0644` files remain valid because every ancestor through
+   the profile root is owner-only `0700`. Traversed directories must retain
+   owner `rwx`; provider-created symlinks, sockets, FIFOs, and other
+   non-directory leaves are manifest entries but are never followed or opened.
+   Ownership-marker and lifetime-lock names remain control-plane state and must
+   be private single-link regular files.
 2. Atomically replace stable schema-v1 `profiles.json` with the self-contained
    transient schema-v2 barrier and fsync its parent. This is the first durable
    transaction state, before any profile path moves.
@@ -274,14 +282,16 @@ before deletion. A missing, linked, malformed, or ambiguous registry, a
 mismatched barrier/sidecar, or any state that proves neither side fails as
 `removal_recovery_required` with the tombstone intact.
 
-Linux validation requires `statx(STATX_MNT_ID)` and cleanup opens every edge
-with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
-RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`. The removal/recovery contract
-therefore requires Linux kernel 5.8 or newer and has no weaker `st_dev` or
-ordinary-`openat` fallback. macOS opens each child relative to its parent with
-`O_NOFOLLOW` and compares raw descriptor-derived `fstatfs` mountpoint, source,
-and filesystem-type fields. Those mount tokens are ephemeral, redacted, and
-never written to a journal, JSON response, or log.
+Linux validation requires `statx(STATX_MNT_ID)` and cleanup opens every
+directory and regular-file edge with `openat2(RESOLVE_BENEATH |
+RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`. The
+removal/recovery contract therefore requires Linux kernel 5.8 or newer and has
+no weaker `st_dev` or ordinary-`openat` fallback. macOS opens those entries
+relative to their parent with `O_NOFOLLOW` and compares raw descriptor-derived
+`fstatfs` mountpoint, source, and filesystem-type fields. Non-directory special
+leaves are instead checked with no-follow metadata and removed only by
+descriptor-relative `unlinkat`, which cannot follow their target. Mount tokens
+are ephemeral, redacted, and never written to a journal, JSON response, or log.
 
 Removal does not edit `conversations.json`; the immutable profile ID, not its
 alias, establishes lineage. References to a removed ID become unresolved, and

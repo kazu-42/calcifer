@@ -337,6 +337,28 @@ fn try_reserve_removal_slot<T>(values: &mut Vec<T>) -> Result<(), ProfileError> 
     })
 }
 
+#[cfg(unix)]
+const fn removal_descendant_mode_is_safe(mode: u32) -> bool {
+    // Codex legitimately creates 0755/0644/0444 state. The owner-only 0700
+    // profile root prevents traversal by other users; descendants must only
+    // reject group/other write access, which could let another user replace an
+    // entry before descriptor-relative cleanup.
+    mode & 0o022 == 0
+}
+
+#[cfg(unix)]
+const fn removal_directory_mode_is_safe(mode: u32) -> bool {
+    removal_descendant_mode_is_safe(mode) && mode & 0o700 == 0o700
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemovalEntryKind {
+    Directory,
+    RegularFile,
+    NonFollowingLeaf,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RemovalJournal {
@@ -2316,7 +2338,7 @@ fn validate_owned_removal_tree_inner_with_limits(
         if !directory_metadata.file_type().is_dir()
             || directory_metadata.file_type().is_symlink()
             || directory_metadata.uid() != rustix::process::getuid().as_raw()
-            || directory_metadata.mode() & 0o077 != 0
+            || !removal_directory_mode_is_safe(directory_metadata.mode())
             || directory_metadata.dev() != roots.provider_root.device
         {
             return Err(ProfileError::UnsafeState(
@@ -2343,33 +2365,34 @@ fn validate_owned_removal_tree_inner_with_limits(
         for entry in entries {
             let entry_path = entry.path();
             let metadata = fs::symlink_metadata(&entry_path)?;
+            let file_type = metadata.file_type();
+            let non_following_leaf = !file_type.is_dir() && !file_type.is_file();
             let relative = entry_path.strip_prefix(path).map_err(|_| {
                 ProfileError::UnsafeState(
                     "managed profile entry escaped its removal root".to_owned(),
                 )
             })?;
-            if metadata.file_type().is_symlink()
-                || metadata.uid() != rustix::process::getuid().as_raw()
-                || metadata.mode() & 0o077 != 0
+            if metadata.uid() != rustix::process::getuid().as_raw()
                 || metadata.dev() != roots.provider_root.device
+                || (((file_type.is_dir() && !removal_directory_mode_is_safe(metadata.mode()))
+                    || (file_type.is_file() && !removal_descendant_mode_is_safe(metadata.mode())))
+                    || (!file_type.is_dir() && metadata.nlink() != 1))
             {
                 return Err(ProfileError::UnsafeState(
                     "managed profile tree contains unsafe state".to_owned(),
                 ));
             }
-            ensure_same_removal_mount(
-                &roots.provider_mount,
-                &removal_mount_identity_path(&entry_path)?,
-            )?;
+            if !non_following_leaf {
+                ensure_same_removal_mount(
+                    &roots.provider_mount,
+                    &removal_mount_identity_path(&entry_path)?,
+                )?;
+            }
             update_removal_manifest(&mut manifest, relative, &metadata)?;
-            if metadata.file_type().is_dir() {
+            if file_type.is_dir() {
                 let child_depth = budget.child_depth(depth)?;
                 try_reserve_removal_slot(&mut child_directories)?;
                 child_directories.push((entry_path, child_depth));
-            } else if !metadata.file_type().is_file() || metadata.nlink() != 1 {
-                return Err(ProfileError::UnsafeState(
-                    "managed profile tree contains a non-owned file".to_owned(),
-                ));
             }
         }
         for child in child_directories.into_iter().rev() {
@@ -2423,7 +2446,16 @@ fn update_removal_manifest(
     })?;
     manifest.update(path_len.to_le_bytes());
     manifest.update(path);
-    manifest.update([if metadata.file_type().is_dir() { 1 } else { 2 }]);
+    let file_type = metadata.file_type();
+    manifest.update([if file_type.is_dir() {
+        1
+    } else if file_type.is_file() {
+        2
+    } else if file_type.is_symlink() {
+        3
+    } else {
+        4
+    }]);
     manifest.update(metadata.dev().to_le_bytes());
     manifest.update(metadata.ino().to_le_bytes());
     manifest.update(metadata.uid().to_le_bytes());
@@ -2586,7 +2618,11 @@ fn remove_owned_tombstone_at_with_limits(
             "managed profile tree was replaced".to_owned(),
         ));
     }
-    validate_removal_stat(&tree_stat, true, expected_provider.device)?;
+    validate_removal_stat(
+        &tree_stat,
+        RemovalEntryKind::Directory,
+        expected_provider.device,
+    )?;
     let mut budget = RemovalTraversalBudget::new(max_entries, max_depth);
     remove_owned_directory_entries(
         Dir::new(tree_fd).map_err(io::Error::from)?,
@@ -2639,85 +2675,88 @@ fn remove_owned_directory_entries(
             let stat = statat(&directory_fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(io::Error::from)
                 .map_err(ProfileError::Io)?;
-            let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
-            let child_depth = if file_type.is_dir() {
-                validate_removal_stat(&stat, true, expected_device)?;
-                Some(budget.child_depth(depth)?)
-            } else {
-                validate_removal_stat(&stat, false, expected_device)?;
-                None
+            let entry_kind = removal_entry_kind(&stat);
+            validate_removal_stat(&stat, entry_kind, expected_device)?;
+            let child_depth = match entry_kind {
+                RemovalEntryKind::Directory => Some(budget.child_depth(depth)?),
+                RemovalEntryKind::RegularFile | RemovalEntryKind::NonFollowingLeaf => None,
             };
             try_reserve_removal_slot(&mut names)?;
-            names.push((entry.file_name().to_owned(), child_depth));
+            names.push((entry.file_name().to_owned(), entry_kind, child_depth));
         }
     }
-    for (name, child_depth) in names {
+    for (name, entry_kind, child_depth) in names {
         let stat = statat(&directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(io::Error::from)
             .map_err(ProfileError::Io)?;
-        let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
-        if let Some(child_depth) = child_depth {
-            if !file_type.is_dir() {
-                return Err(ProfileError::UnsafeState(
-                    "managed profile tree changed during cleanup".to_owned(),
-                ));
+        validate_removal_stat(&stat, entry_kind, expected_device)?;
+        match entry_kind {
+            RemovalEntryKind::Directory => {
+                let child_depth = child_depth.ok_or_else(|| {
+                    ProfileError::UnsafeState(
+                        "managed profile tree changed during cleanup".to_owned(),
+                    )
+                })?;
+                let child = open_removal_entry_at(&directory_fd, &name, true, expected_mount)?;
+                let opened_stat = fstat(&child)
+                    .map_err(io::Error::from)
+                    .map_err(ProfileError::Io)?;
+                if stat_identity(&opened_stat)? != stat_identity(&stat)? {
+                    return Err(ProfileError::UnsafeState(
+                        "managed profile directory was replaced during cleanup".to_owned(),
+                    ));
+                }
+                remove_owned_directory_entries(
+                    rustix::fs::Dir::new(child).map_err(io::Error::from)?,
+                    expected_device,
+                    expected_mount,
+                    budget,
+                    child_depth,
+                )?;
+                let final_stat = statat(&directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(io::Error::from)
+                    .map_err(ProfileError::Io)?;
+                if stat_identity(&final_stat)? != stat_identity(&stat)? {
+                    return Err(ProfileError::UnsafeState(
+                        "managed profile directory was replaced during cleanup".to_owned(),
+                    ));
+                }
+                let final_child =
+                    open_removal_entry_at(&directory_fd, &name, true, expected_mount)?;
+                let final_opened_stat = fstat(&final_child)
+                    .map_err(io::Error::from)
+                    .map_err(ProfileError::Io)?;
+                if stat_identity(&final_opened_stat)? != stat_identity(&stat)? {
+                    return Err(ProfileError::UnsafeState(
+                        "managed profile directory was replaced during cleanup".to_owned(),
+                    ));
+                }
+                unlinkat(&directory_fd, &name, AtFlags::REMOVEDIR)
+                    .map_err(io::Error::from)
+                    .map_err(ProfileError::Io)?;
             }
-            validate_removal_stat(&stat, true, expected_device)?;
-            let child = open_removal_entry_at(&directory_fd, &name, true, expected_mount)?;
-            let opened_stat = fstat(&child)
-                .map_err(io::Error::from)
-                .map_err(ProfileError::Io)?;
-            if stat_identity(&opened_stat)? != stat_identity(&stat)? {
-                return Err(ProfileError::UnsafeState(
-                    "managed profile directory was replaced during cleanup".to_owned(),
-                ));
+            RemovalEntryKind::RegularFile => {
+                let file = open_removal_entry_at(&directory_fd, &name, false, expected_mount)?;
+                let opened_stat = fstat(&file)
+                    .map_err(io::Error::from)
+                    .map_err(ProfileError::Io)?;
+                if stat_identity(&opened_stat)? != stat_identity(&stat)? {
+                    return Err(ProfileError::UnsafeState(
+                        "managed profile file was replaced during cleanup".to_owned(),
+                    ));
+                }
+                unlinkat(&directory_fd, &name, AtFlags::empty())
+                    .map_err(io::Error::from)
+                    .map_err(ProfileError::Io)?;
             }
-            remove_owned_directory_entries(
-                rustix::fs::Dir::new(child).map_err(io::Error::from)?,
-                expected_device,
-                expected_mount,
-                budget,
-                child_depth,
-            )?;
-            let final_stat = statat(&directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(io::Error::from)
-                .map_err(ProfileError::Io)?;
-            if stat_identity(&final_stat)? != stat_identity(&stat)? {
-                return Err(ProfileError::UnsafeState(
-                    "managed profile directory was replaced during cleanup".to_owned(),
-                ));
+            RemovalEntryKind::NonFollowingLeaf => {
+                // unlinkat without REMOVEDIR never follows a symlink and does
+                // not open sockets, FIFOs, or device nodes. A last-moment type
+                // replacement can therefore only unlink this in-tree name.
+                unlinkat(&directory_fd, &name, AtFlags::empty())
+                    .map_err(io::Error::from)
+                    .map_err(ProfileError::Io)?;
             }
-            let final_child = open_removal_entry_at(&directory_fd, &name, true, expected_mount)?;
-            let final_opened_stat = fstat(&final_child)
-                .map_err(io::Error::from)
-                .map_err(ProfileError::Io)?;
-            if stat_identity(&final_opened_stat)? != stat_identity(&stat)? {
-                return Err(ProfileError::UnsafeState(
-                    "managed profile directory was replaced during cleanup".to_owned(),
-                ));
-            }
-            unlinkat(&directory_fd, &name, AtFlags::REMOVEDIR)
-                .map_err(io::Error::from)
-                .map_err(ProfileError::Io)?;
-        } else {
-            if file_type.is_dir() {
-                return Err(ProfileError::UnsafeState(
-                    "managed profile tree changed during cleanup".to_owned(),
-                ));
-            }
-            validate_removal_stat(&stat, false, expected_device)?;
-            let file = open_removal_entry_at(&directory_fd, &name, false, expected_mount)?;
-            let opened_stat = fstat(&file)
-                .map_err(io::Error::from)
-                .map_err(ProfileError::Io)?;
-            if stat_identity(&opened_stat)? != stat_identity(&stat)? {
-                return Err(ProfileError::UnsafeState(
-                    "managed profile file was replaced during cleanup".to_owned(),
-                ));
-            }
-            unlinkat(&directory_fd, &name, AtFlags::empty())
-                .map_err(io::Error::from)
-                .map_err(ProfileError::Io)?;
         }
     }
     Ok(())
@@ -2736,18 +2775,20 @@ fn stat_identity(stat: &rustix::fs::Stat) -> Result<FileSystemIdentity, ProfileE
 #[cfg(unix)]
 fn validate_removal_stat(
     stat: &rustix::fs::Stat,
-    directory: bool,
+    expected_kind: RemovalEntryKind,
     expected_device: u64,
 ) -> Result<(), ProfileError> {
-    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
-    let expected_type = if directory {
-        file_type.is_dir()
-    } else {
-        file_type.is_file() && stat.st_nlink == 1
+    let actual_kind = removal_entry_kind(stat);
+    let mode_is_safe = match actual_kind {
+        RemovalEntryKind::Directory => removal_directory_mode_is_safe(stat.st_mode.into()),
+        RemovalEntryKind::RegularFile => removal_descendant_mode_is_safe(stat.st_mode.into()),
+        RemovalEntryKind::NonFollowingLeaf => true,
     };
-    if !expected_type
+    let link_count_is_safe = actual_kind == RemovalEntryKind::Directory || stat.st_nlink == 1;
+    if actual_kind != expected_kind
         || stat.st_uid != rustix::process::getuid().as_raw()
-        || stat.st_mode & 0o077 != 0
+        || !mode_is_safe
+        || !link_count_is_safe
         || u64::try_from(stat.st_dev).ok() != Some(expected_device)
     {
         return Err(ProfileError::UnsafeState(
@@ -2755,6 +2796,18 @@ fn validate_removal_stat(
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn removal_entry_kind(stat: &rustix::fs::Stat) -> RemovalEntryKind {
+    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    if file_type.is_dir() {
+        RemovalEntryKind::Directory
+    } else if file_type.is_file() {
+        RemovalEntryKind::RegularFile
+    } else {
+        RemovalEntryKind::NonFollowingLeaf
+    }
 }
 
 #[cfg(not(unix))]
@@ -5869,11 +5922,19 @@ config_file = "{sensitive_path}"
 
     #[cfg(unix)]
     #[test]
-    fn removal_rejects_symlink_hard_link_mode_and_marker_attacks_before_journaling()
+    fn removal_rejects_hard_link_writable_mode_and_marker_attacks_before_journaling()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        for attack in ["symlink", "hard-link", "mode", "marker"] {
+        for attack in [
+            "hard-link",
+            "file-mode",
+            "directory-mode",
+            "marker",
+            "marker-symlink",
+            "coordinator-lock-symlink",
+            "provider-lock-symlink",
+        ] {
             let root = temporary_root("remove-owned-tree-attack");
             let registry = Registry::at(root.clone());
             let profile = register_test_profile(&registry, "work")?;
@@ -5885,19 +5946,33 @@ config_file = "{sensitive_path}"
                 .join(format!("calcifer-removal-outside-{}", Uuid::new_v4()));
             write_private_file(&outside, b"synthetic-outside-private-sentinel")?;
             match attack {
-                "symlink" => {
-                    let session = profile_directory.join("home/sessions.jsonl");
-                    symlink(&outside, session)?;
-                }
                 "hard-link" => {
                     fs::remove_file(&auth)?;
                     fs::hard_link(&outside, &auth)?;
                 }
-                "mode" => {
-                    fs::set_permissions(&auth, fs::Permissions::from_mode(0o644))?;
+                "file-mode" => {
+                    fs::set_permissions(&auth, fs::Permissions::from_mode(0o666))?;
+                }
+                "directory-mode" => {
+                    fs::set_permissions(
+                        profile_directory.join("home"),
+                        fs::Permissions::from_mode(0o555),
+                    )?;
                 }
                 "marker" => {
                     fs::write(profile_directory.join(OWNER_MARKER), b"wrong-local-id")?;
+                }
+                "marker-symlink" => {
+                    fs::remove_file(profile_directory.join(OWNER_MARKER))?;
+                    symlink(&outside, profile_directory.join(OWNER_MARKER))?;
+                }
+                "coordinator-lock-symlink" => {
+                    fs::remove_file(profile_directory.join(COORDINATOR_LOCK_FILE))?;
+                    symlink(&outside, profile_directory.join(COORDINATOR_LOCK_FILE))?;
+                }
+                "provider-lock-symlink" => {
+                    fs::remove_file(profile_directory.join(PROVIDER_LOCK_FILE))?;
+                    symlink(&outside, profile_directory.join(PROVIDER_LOCK_FILE))?;
                 }
                 _ => return Err("unknown attack".into()),
             }
@@ -5917,9 +5992,177 @@ config_file = "{sensitive_path}"
                 "{attack} must not touch an outside inode"
             );
 
+            if attack == "directory-mode" {
+                fs::set_permissions(
+                    profile_directory.join("home"),
+                    fs::Permissions::from_mode(0o700),
+                )?;
+            }
             fs::remove_dir_all(root)?;
             fs::remove_file(outside)?;
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_unlinks_provider_symlink_and_socket_leaves_without_following_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let root = PathBuf::from("/tmp").join(format!(
+            "cfr-{}-{}",
+            std::process::id(),
+            &Uuid::new_v4().to_string()[..8]
+        ));
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let provider_tmp = profile_directory.join("home/tmp");
+        secure_create_dir(&provider_tmp)?;
+
+        let outside = root
+            .parent()
+            .ok_or("temporary root must have a parent")?
+            .join(format!("calcifer-removal-link-target-{}", Uuid::new_v4()));
+        write_private_file(&outside, b"outside-target-must-survive")?;
+        symlink(&outside, provider_tmp.join("provider-link"))?;
+        let dangling_target = root.join("target-that-does-not-exist");
+        let dangling_link = provider_tmp.join("dangling-provider-link");
+        symlink(&dangling_target, &dangling_link)?;
+        assert!(
+            fs::symlink_metadata(&dangling_link)?
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!dangling_target.exists());
+        let socket_path = provider_tmp.join("provider.sock");
+        let socket = UnixListener::bind(&socket_path)?;
+        drop(socket);
+
+        assert_eq!(registry.remove(Provider::Codex, "work", None)?, profile);
+        assert!(!profile_directory.exists());
+        assert_eq!(fs::read(&outside)?, b"outside-target-must-survive");
+        assert!(!socket_path.exists());
+        assert!(registry.list()?.is_empty());
+
+        fs::remove_dir_all(root)?;
+        fs::remove_file(outside)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_visibility_recovery_preserves_non_following_leaves_and_external_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{FileTypeExt, symlink};
+        use std::os::unix::net::UnixListener;
+
+        let root = PathBuf::from("/tmp").join(format!(
+            "cfr-{}-{}",
+            std::process::id(),
+            &Uuid::new_v4().to_string()[..8]
+        ));
+        let registry = Registry::at_with_removal_fault(
+            root.clone(),
+            RemovalFaultPoint::ProviderRootSyncAfterRename,
+        );
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let provider_tmp = profile_directory.join("home/tmp");
+        secure_create_dir(&provider_tmp)?;
+        let outside = root
+            .parent()
+            .ok_or("short temporary root must have a parent")?
+            .join(format!("cfr-target-{}", Uuid::new_v4()));
+        write_private_file(&outside, b"external-target-must-survive-recovery")?;
+        let link_path = provider_tmp.join("provider-link");
+        symlink(&outside, &link_path)?;
+        let socket_path = provider_tmp.join("provider.sock");
+        let socket = UnixListener::bind(&socket_path)?;
+        drop(socket);
+
+        let error = registry
+            .remove(Provider::Codex, "work", None)
+            .err()
+            .ok_or("injected pre-visibility failure must interrupt removal")?;
+        assert_eq!(error.code(), "io_error");
+        assert!(!profile_directory.exists());
+
+        let recovered = Registry::at(root.clone());
+        recovered.recover_incomplete_removal()?;
+        assert_eq!(recovered.find(Provider::Codex, "work")?, profile);
+        assert!(fs::symlink_metadata(&link_path)?.file_type().is_symlink());
+        assert!(fs::symlink_metadata(&socket_path)?.file_type().is_socket());
+        assert_eq!(
+            fs::read(&outside)?,
+            b"external-target-must-survive-recovery"
+        );
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+
+        fs::remove_dir_all(root)?;
+        fs::remove_file(outside)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_accepts_provider_readable_legacy_modes_inside_the_private_profile_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let root = temporary_root("remove-provider-readable-modes");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let sessions = profile_directory.join("home/sessions");
+        fs::DirBuilder::new().mode(0o755).create(&sessions)?;
+
+        for (name, mode) in [
+            ("rollout.jsonl", 0o644),
+            ("cached-metadata.json", 0o444),
+            ("provider-helper", 0o755),
+        ] {
+            let path = sessions.join(name);
+            write_private_file(&path, b"provider-created-local-state")?;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+
+        assert_eq!(registry.remove(Provider::Codex, "work", None)?, profile);
+        assert!(!profile_directory.exists());
+        assert!(registry.list()?.is_empty());
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn removal_rejects_owner_unreadable_regular_files_before_preparing_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("remove-owner-unreadable-file");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let auth = profile_directory.join("home/auth.json");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o000))?;
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let error = registry
+            .remove(Provider::Codex, "work", None)
+            .err()
+            .ok_or("owner-unreadable regular files must fail before visibility")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+        assert!(profile_directory.is_dir());
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+        assert!(registry.removal_tombstones()?.is_empty());
+
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
