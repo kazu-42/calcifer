@@ -299,6 +299,238 @@ fn non_normalized_home_is_rejected_before_staging() -> Result<(), Box<dyn std::e
 
 #[cfg(unix)]
 #[test]
+fn profile_remove_requires_confirmation_and_is_offline_and_lineage_preserving()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-profile-remove-{}-{nonce}",
+        std::process::id()
+    ));
+    let root = sandbox.join("state");
+    let provider_root = root.join("profiles/codex");
+    let removed_id = "01900000-0000-7000-8000-000000000017";
+    let retained_id = "01900000-0000-7000-8000-000000000018";
+    let removed = provider_root.join(removed_id);
+    let retained = provider_root.join(retained_id);
+    let global_codex = sandbox.join("global-codex");
+    let offline_bin = sandbox.join("offline-bin");
+    for directory in [
+        &sandbox,
+        &root,
+        &root.join("profiles"),
+        &provider_root,
+        &removed,
+        &removed.join("home"),
+        &retained,
+        &retained.join("home"),
+        &global_codex,
+        &offline_bin,
+    ] {
+        std::fs::create_dir(directory)?;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let private_files = [
+        (removed.join(".calcifer-profile"), removed_id.as_bytes()),
+        (removed.join("profile.lock"), b"".as_slice()),
+        (removed.join("provider.lock"), b"".as_slice()),
+        (
+            removed.join(".calcifer-identity"),
+            b"synthetic-removed-identity".as_slice(),
+        ),
+        (
+            removed.join("home/auth.json"),
+            b"synthetic-removed-auth@example.invalid".as_slice(),
+        ),
+        (
+            removed.join("home/config.toml"),
+            b"cli_auth_credentials_store = \"file\"\n".as_slice(),
+        ),
+        (
+            removed.join("home/sessions.jsonl"),
+            b"synthetic-removed-session".as_slice(),
+        ),
+        (retained.join(".calcifer-profile"), retained_id.as_bytes()),
+        (retained.join("profile.lock"), b"".as_slice()),
+        (retained.join("provider.lock"), b"".as_slice()),
+        (
+            retained.join(".calcifer-identity"),
+            b"synthetic-retained-identity".as_slice(),
+        ),
+        (
+            retained.join("home/auth.json"),
+            b"synthetic-retained-auth@example.invalid".as_slice(),
+        ),
+        (
+            retained.join("home/config.toml"),
+            b"cli_auth_credentials_store = \"file\"\n".as_slice(),
+        ),
+        (
+            retained.join("home/sessions.jsonl"),
+            b"synthetic-retained-session".as_slice(),
+        ),
+        (
+            root.join("identity.key"),
+            b"synthetic-installation-key".as_slice(),
+        ),
+        (
+            global_codex.join("auth.json"),
+            b"synthetic-global-auth@example.invalid".as_slice(),
+        ),
+    ];
+    for (path, contents) in private_files {
+        std::fs::write(&path, contents)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let registry = serde_json::json!({
+        "schema_version": 1,
+        "profiles": [
+            {"id": removed_id, "alias": "work", "provider": "codex", "created_at": 1784073600_i64},
+            {"id": retained_id, "alias": "personal", "provider": "codex", "created_at": 1784073601_i64}
+        ]
+    });
+    std::fs::write(
+        root.join("profiles.json"),
+        serde_json::to_vec_pretty(&registry)?,
+    )?;
+    std::fs::set_permissions(
+        root.join("profiles.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+    let conversations = serde_json::json!({
+        "schema_version": 1,
+        "profile_id": removed_id,
+        "sentinel": "synthetic-lineage-private-sentinel"
+    });
+    std::fs::write(
+        root.join("conversations.json"),
+        serde_json::to_vec_pretty(&conversations)?,
+    )?;
+    std::fs::set_permissions(
+        root.join("conversations.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+
+    let registry_before = std::fs::read(root.join("profiles.json"))?;
+    let removed_inode = std::fs::metadata(&removed)?.ino();
+    let without_confirmation = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "auth", "remove", "codex@work"])
+        .output()?;
+    let confirmation_error: serde_json::Value =
+        serde_json::from_slice(&without_confirmation.stderr)?;
+    assert_eq!(without_confirmation.status.code(), Some(1));
+    assert!(without_confirmation.stdout.is_empty());
+    assert_eq!(confirmation_error["error"]["code"], "confirmation_required");
+    assert_eq!(std::fs::read(root.join("profiles.json"))?, registry_before);
+    assert_eq!(std::fs::metadata(&removed)?.ino(), removed_inode);
+
+    let human_without_confirmation = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["auth", "remove", "codex@work"])
+        .output()?;
+    assert_eq!(human_without_confirmation.status.code(), Some(1));
+    assert!(human_without_confirmation.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(human_without_confirmation.stderr)?,
+        "error: Profile removal requires an explicit TTY confirmation or `--yes`. No local profile state was changed.\n"
+    );
+    assert_eq!(std::fs::read(root.join("profiles.json"))?, registry_before);
+    assert_eq!(std::fs::metadata(&removed)?.ino(), removed_inode);
+
+    let retained_inode = std::fs::metadata(&retained)?.ino();
+    let retained_auth = std::fs::read(retained.join("home/auth.json"))?;
+    let identity_key_inode = std::fs::metadata(root.join("identity.key"))?.ino();
+    let identity_key = std::fs::read(root.join("identity.key"))?;
+    let lineage_inode = std::fs::metadata(root.join("conversations.json"))?.ino();
+    let lineage = std::fs::read(root.join("conversations.json"))?;
+    let global_inode = std::fs::metadata(global_codex.join("auth.json"))?.ino();
+    let global_auth = std::fs::read(global_codex.join("auth.json"))?;
+
+    let remove = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .env("CODEX_HOME", &global_codex)
+        .args(["--json", "auth", "remove", "codex@work", "--yes"])
+        .output()?;
+    let rendered = String::from_utf8(remove.stdout.clone())?;
+    let document: serde_json::Value = serde_json::from_slice(&remove.stdout)?;
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8(remove.stderr)?
+    );
+    assert_eq!(
+        document,
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "auth",
+            "ok": true,
+            "action": "remove",
+            "removed": true,
+            "profile": {
+                "id": removed_id,
+                "alias": "work",
+                "provider": "codex",
+                "created_at": 1784073600_i64
+            }
+        })
+    );
+    assert!(!removed.exists());
+    assert_eq!(std::fs::metadata(&retained)?.ino(), retained_inode);
+    assert_eq!(
+        std::fs::read(retained.join("home/auth.json"))?,
+        retained_auth
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("identity.key"))?.ino(),
+        identity_key_inode
+    );
+    assert_eq!(std::fs::read(root.join("identity.key"))?, identity_key);
+    assert_eq!(
+        std::fs::metadata(root.join("conversations.json"))?.ino(),
+        lineage_inode
+    );
+    assert_eq!(std::fs::read(root.join("conversations.json"))?, lineage);
+    assert_eq!(
+        std::fs::metadata(global_codex.join("auth.json"))?.ino(),
+        global_inode
+    );
+    assert_eq!(std::fs::read(global_codex.join("auth.json"))?, global_auth);
+    for private in [
+        "synthetic-removed-auth@example.invalid",
+        "synthetic-removed-session",
+        "synthetic-removed-identity",
+        "synthetic-lineage-private-sentinel",
+        &root.display().to_string(),
+    ] {
+        assert!(!rendered.contains(private));
+    }
+
+    let human_remove = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["auth", "remove", "codex@personal", "--yes"])
+        .output()?;
+    assert!(human_remove.status.success());
+    assert!(human_remove.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(human_remove.stdout)?,
+        "Removed codex@personal.\nThe Calcifer-managed credentials and sessions for this local profile are no longer registered.\n"
+    );
+    assert_eq!(std::fs::read(root.join("identity.key"))?, identity_key);
+    assert_eq!(std::fs::read(root.join("conversations.json"))?, lineage);
+    assert_eq!(std::fs::read(global_codex.join("auth.json"))?, global_auth);
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn profile_rename_is_offline_atomic_and_preserves_managed_state()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

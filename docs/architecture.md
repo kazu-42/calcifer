@@ -202,7 +202,7 @@ The current `run` command does not restart or re-submit a command after the chil
 
 ## Filesystem and credential mutations
 
-On Unix, the implemented managed root uses directory mode `0700`; Calcifer-owned files and locks use `0600`. On Windows, registration currently fails closed because equivalent current-user-only ACL creation has not been verified. The current slice rejects invalid aliases, non-canonical opaque IDs, symlinked or non-regular managed files, permissive Unix modes, and ownership-marker mismatches. Owner-UID checks and hardened directory-relative open operations remain release gates.
+On Unix, the implemented managed root uses directory mode `0700`; Calcifer-owned files and locks use `0600`. On Windows, registration currently fails closed because equivalent current-user-only ACL creation has not been verified. The current slice rejects invalid aliases, non-canonical opaque IDs, symlinked or non-regular managed files, permissive Unix modes, and ownership-marker mismatches. Destructive profile removal additionally enforces owner-UID, single-link, inode/device, and hardened directory-relative traversal checks; migrating every remaining storage path to the same boundary remains a release gate.
 
 Calcifer-owned metadata updates follow a same-filesystem atomic-write sequence:
 
@@ -211,7 +211,7 @@ Calcifer-owned metadata updates follow a same-filesystem atomic-write sequence:
 3. Atomically rename it to the destination.
 4. `fsync` the parent directory.
 
-Registration happens in a staging directory and becomes visible only after the official login exits successfully; private `auth.json`, managed config, and ownership metadata pass revalidation; the installed Codex adapter passes its exact initialize/home/version gate; and a unique private identity marker has been written and synced. Credentials and binding are then published with one profile-directory rename before registry publication. The registry rename is the public visibility point: if the following directory sync fails, Calcifer preserves both the visible entry and credentials, reports `registry_commit_uncertain`, and tells the user to read back `auth list` rather than retry blindly. An identity key or marker rename followed by uncertain parent sync is read back; the same registration retries only that idempotent directory sync and adopts the complete state without invoking login again. If durability remains uncertain, Calcifer reports `identity_commit_uncertain`, keeps the profile unpublished, preserves the complete staging credentials for explicit recovery, and blocks every later registration before provider login while any orphan staging directory remains. Re-authentication, re-key, remove, and orphan-staging cleanup flows are not implemented yet. A failed normal login performs checked cleanup; a hard crash can leave a private orphan staging directory for later recovery tooling and likewise blocks a second login.
+Registration happens in a staging directory and becomes visible only after the official login exits successfully; private `auth.json`, managed config, and ownership metadata pass revalidation; the installed Codex adapter passes its exact initialize/home/version gate; and a unique private identity marker has been written and synced. Credentials and binding are then published with one profile-directory rename before registry publication. The registry rename is the public visibility point: if the following directory sync fails, Calcifer preserves both the visible entry and credentials, reports `registry_commit_uncertain`, and tells the user to read back `auth list` rather than retry blindly. An identity key or marker rename followed by uncertain parent sync is read back; the same registration retries only that idempotent directory sync and adopts the complete state without invoking login again. If durability remains uncertain, Calcifer reports `identity_commit_uncertain`, keeps the profile unpublished, preserves the complete staging credentials for explicit recovery, and blocks every later registration before provider login while any orphan staging directory remains. Re-authentication, re-key, and orphan-staging cleanup flows are not implemented yet. A failed normal login performs checked cleanup; a hard crash can leave a private orphan staging directory for later recovery tooling and likewise blocks a second login.
 
 For a published-profile alias change, failures before the atomic-rename
 visibility point leave the old complete registry visible. Failure while syncing
@@ -221,6 +221,55 @@ never a partial registry. Published-profile lifecycle operations use the lock
 order profile coordinator, profile provider, then registry. This makes an
 active run/resume/status probe and a rename choose exactly one winner and keeps
 identity verification and future remove/reauth flows from deadlocking.
+
+Confirmed profile removal uses the same published-profile lock order:
+coordinator lease, provider lease, removal-journal lock, then registry lock. A
+single private schema-v1 journal records only bounded local profile metadata,
+old/new registry revisions and digests, filesystem object identities, an entry
+count, and a SHA-256 digest of the bounded relative tree manifest. The journal
+contains no paths, filenames, credentials, raw provider identity, rollout
+metadata, or conversation content. The transaction is:
+
+Every normal registry writer rechecks for a removal journal, tombstone, or
+journal temporary immediately after acquiring the registry lock. Registration
+retains that guarded lock through publication. A writer whose earlier recovery
+preflight became stale therefore cannot change the revision/digest required by
+an interrupted removal; only recovery uses the unguarded registry-lock path.
+
+1. Revalidate the exact registry entry, data/profiles/provider root identities,
+   ownership marker, owner UID, private modes, file types, device, and
+   single-link regular files under both lifetime leases.
+2. Atomically write and fsync the prepared journal.
+3. Rename the UUID profile directory to `.removing-<profile-id>` under the same
+   provider root, then fsync that root.
+4. Atomically publish the next registry revision without that immutable ID.
+   This registry rename is the public visibility point.
+5. Read back the exact post-removal revision/digest, retain both metadata locks,
+   unlink the tombstone through `openat`/`statat`/`unlinkat` with no-follow
+   directory descriptors, fsync the provider root, then remove and sync the
+   journal before releasing either lock.
+
+Before registry visibility, recovery accepts only the exact complete original
+tree or an inode-preserving tombstone whose entry count and metadata-manifest
+digest match the prepared journal, and restores the old directory; it never
+restores a partially deleted tree. After visibility, recovery never
+republishes credentials and may finish a partially unlinked tombstone because
+the journal pins its root inode/device and every remaining entry is revalidated
+before descriptor-relative deletion. A directory-sync error at either
+visibility boundary is resolved by exact readback; any state other than the
+recorded complete old or complete new registry is
+`removal_recovery_required`. Replaced roots, multiple or orphan tombstones,
+corrupt or oversized journals, symlinks, hard-linked files, foreign owners,
+permissive modes, special files, cross-device trees, and marker mismatches stop
+without recursive deletion.
+
+The registry revision and profile ID establish the lineage invariant. Removal
+does not edit `conversations.json`; references to the removed ID become
+unresolved. Registering the same alias later creates a new UUID and cannot
+adopt those references. The installation-wide identity key and every unrelated
+profile remain outside the deletion tree. Filesystem unlinking is not a claim
+of cryptographic secure erasure from snapshots, backups, filesystem journals,
+or SSD media.
 
 ## Process execution
 

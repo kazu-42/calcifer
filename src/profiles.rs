@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::provider_identity::{IdentityError, IdentityKey, IdentityStore, ProviderIdentity};
@@ -16,6 +17,12 @@ const REGISTRY_SCHEMA_VERSION: u8 = 1;
 const REGISTRY_FILE: &str = "profiles.json";
 const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
 const LOCK_FILE: &str = "registry.lock";
+const REMOVAL_LOCK_FILE: &str = "removal.lock";
+const REMOVAL_JOURNAL_FILE: &str = "removal.json";
+const REMOVAL_JOURNAL_SCHEMA_VERSION: u8 = 1;
+const MAX_REMOVAL_JOURNAL_BYTES: usize = 16 * 1024;
+const MAX_REMOVAL_TREE_ENTRIES: usize = 100_000;
+const MAX_REMOVAL_TREE_DEPTH: usize = 128;
 const OWNER_MARKER: &str = ".calcifer-profile";
 const COORDINATOR_LOCK_FILE: &str = "profile.lock";
 const PROVIDER_LOCK_FILE: &str = "provider.lock";
@@ -181,10 +188,12 @@ impl Profile {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryDocument {
     schema_version: u8,
+    #[serde(default)]
+    revision: u64,
     profiles: Vec<Profile>,
 }
 
@@ -197,10 +206,86 @@ enum RegistryWriteStep {
     DirectorySync,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum RemovalFaultPoint {
+    JournalTemporaryCreate,
+    JournalWrite,
+    JournalFileSync,
+    JournalAtomicRename,
+    JournalDirectorySync,
+    TombstoneRename,
+    ProviderRootSyncAfterRename,
+    RegistryTemporaryCreate,
+    RegistryWrite,
+    RegistryFileSync,
+    RegistryAtomicRename,
+    RegistryDirectorySync,
+    RecursiveCleanup,
+    ProviderRootSyncAfterCleanup,
+    JournalRemove,
+    JournalRemoveDirectorySync,
+}
+
+#[cfg(test)]
+type RemovalFault = RemovalFaultPoint;
+
+#[cfg(test)]
+struct RemovalPause {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl fmt::Debug for RemovalPause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RemovalPause")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FileSystemIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemovalTreeSnapshot {
+    root: FileSystemIdentity,
+    entry_count: u64,
+    manifest_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemovalJournal {
+    schema_version: u8,
+    profile: Profile,
+    expected_registry_revision: u64,
+    removed_registry_revision: u64,
+    expected_registry_digest: String,
+    removed_registry_digest: String,
+    data_root: FileSystemIdentity,
+    profiles_root: FileSystemIdentity,
+    provider_root: FileSystemIdentity,
+    profile_tree: FileSystemIdentity,
+    profile_tree_entry_count: u64,
+    profile_tree_manifest_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemovalRoots {
+    data_root: FileSystemIdentity,
+    profiles_root: FileSystemIdentity,
+    provider_root: FileSystemIdentity,
+}
+
 impl Default for RegistryDocument {
     fn default() -> Self {
         Self {
             schema_version: REGISTRY_SCHEMA_VERSION,
+            revision: 0,
             profiles: Vec::new(),
         }
     }
@@ -219,6 +304,12 @@ pub(crate) struct Registry {
     fail_identity_key_directory_sync: bool,
     #[cfg(test)]
     fail_identity_key_recovery_directory_sync: bool,
+    #[cfg(test)]
+    removal_fault: Option<RemovalFaultPoint>,
+    #[cfg(test)]
+    removal_pause_after_cleanup: Option<RemovalPause>,
+    #[cfg(test)]
+    registry_mutation_pause_after_preflight: Option<RemovalPause>,
 }
 
 impl Registry {
@@ -235,6 +326,12 @@ impl Registry {
             fail_identity_key_directory_sync: false,
             #[cfg(test)]
             fail_identity_key_recovery_directory_sync: false,
+            #[cfg(test)]
+            removal_fault: None,
+            #[cfg(test)]
+            removal_pause_after_cleanup: None,
+            #[cfg(test)]
+            registry_mutation_pause_after_preflight: None,
         })
     }
 
@@ -248,6 +345,15 @@ impl Registry {
 
     pub(crate) fn find_by_id(&self, provider: Provider, id: &str) -> Result<Profile, ProfileError> {
         validate_profile_id(id)?;
+        self.recover_incomplete_removal()?;
+        self.find_by_id_without_recovery(provider, id)
+    }
+
+    fn find_by_id_without_recovery(
+        &self,
+        provider: Provider,
+        id: &str,
+    ) -> Result<Profile, ProfileError> {
         self.load()?
             .profiles
             .into_iter()
@@ -255,7 +361,18 @@ impl Registry {
             .ok_or_else(|| ProfileError::NotFound(format!("{} profile", provider.as_str())))
     }
 
-    #[cfg(all(test, unix))]
+    /// Re-reads an immutable ID while its profile lease is already held.
+    /// Callers must have run normal selection/recovery before taking the lease.
+    pub(crate) fn refetch_by_id_under_lease(
+        &self,
+        provider: Provider,
+        id: &str,
+    ) -> Result<Profile, ProfileError> {
+        validate_profile_id(id)?;
+        self.find_by_id_without_recovery(provider, id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn at(root: PathBuf) -> Self {
         Self {
             root,
@@ -264,6 +381,9 @@ impl Registry {
             fail_identity_recovery_directory_sync: false,
             fail_identity_key_directory_sync: false,
             fail_identity_key_recovery_directory_sync: false,
+            removal_fault: None,
+            removal_pause_after_cleanup: None,
+            registry_mutation_pause_after_preflight: None,
         }
     }
 
@@ -276,6 +396,9 @@ impl Registry {
             fail_identity_recovery_directory_sync: false,
             fail_identity_key_directory_sync: false,
             fail_identity_key_recovery_directory_sync: false,
+            removal_fault: None,
+            removal_pause_after_cleanup: None,
+            registry_mutation_pause_after_preflight: None,
         }
     }
 
@@ -288,6 +411,9 @@ impl Registry {
             fail_identity_recovery_directory_sync: fail_recovery,
             fail_identity_key_directory_sync: false,
             fail_identity_key_recovery_directory_sync: false,
+            removal_fault: None,
+            removal_pause_after_cleanup: None,
+            registry_mutation_pause_after_preflight: None,
         }
     }
 
@@ -300,6 +426,9 @@ impl Registry {
             fail_identity_recovery_directory_sync: false,
             fail_identity_key_directory_sync: true,
             fail_identity_key_recovery_directory_sync: fail_recovery,
+            removal_fault: None,
+            removal_pause_after_cleanup: None,
+            registry_mutation_pause_after_preflight: None,
         }
     }
 
@@ -312,10 +441,67 @@ impl Registry {
             fail_identity_recovery_directory_sync: false,
             fail_identity_key_directory_sync: false,
             fail_identity_key_recovery_directory_sync: false,
+            removal_fault: None,
+            removal_pause_after_cleanup: None,
+            registry_mutation_pause_after_preflight: None,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn at_with_removal_fault(root: PathBuf, fault: RemovalFault) -> Self {
+        Self {
+            root,
+            registry_write_fault: None,
+            fail_identity_marker_directory_sync: false,
+            fail_identity_recovery_directory_sync: false,
+            fail_identity_key_directory_sync: false,
+            fail_identity_key_recovery_directory_sync: false,
+            removal_fault: Some(fault),
+            removal_pause_after_cleanup: None,
+            registry_mutation_pause_after_preflight: None,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn at_with_removal_pause(
+        root: PathBuf,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self {
+            root,
+            registry_write_fault: None,
+            fail_identity_marker_directory_sync: false,
+            fail_identity_recovery_directory_sync: false,
+            fail_identity_key_directory_sync: false,
+            fail_identity_key_recovery_directory_sync: false,
+            removal_fault: None,
+            removal_pause_after_cleanup: Some(RemovalPause { reached, resume }),
+            registry_mutation_pause_after_preflight: None,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn at_with_registry_mutation_pause(
+        root: PathBuf,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self {
+            root,
+            registry_write_fault: None,
+            fail_identity_marker_directory_sync: false,
+            fail_identity_recovery_directory_sync: false,
+            fail_identity_key_directory_sync: false,
+            fail_identity_key_recovery_directory_sync: false,
+            removal_fault: None,
+            removal_pause_after_cleanup: None,
+            registry_mutation_pause_after_preflight: Some(RemovalPause { reached, resume }),
         }
     }
 
     pub(crate) fn list(&self) -> Result<Vec<Profile>, ProfileError> {
+        self.recover_incomplete_removal()?;
         let mut profiles = self.load()?.profiles;
         profiles.sort_by(|left, right| {
             left.provider
@@ -327,11 +513,343 @@ impl Registry {
     }
 
     pub(crate) fn find(&self, provider: Provider, alias: &str) -> Result<Profile, ProfileError> {
+        self.recover_incomplete_removal()?;
+        self.find_without_recovery(provider, alias)
+    }
+
+    fn find_without_recovery(
+        &self,
+        provider: Provider,
+        alias: &str,
+    ) -> Result<Profile, ProfileError> {
         self.load()?
             .profiles
             .into_iter()
             .find(|profile| profile.provider == provider && profile.alias == alias)
             .ok_or_else(|| ProfileError::NotFound(format!("{}@{alias}", provider.as_str())))
+    }
+
+    /// Reads local removal metadata without performing recovery or mutation.
+    /// This exists solely for the pre-confirmation TTY prompt.
+    pub(crate) fn preview_remove(
+        &self,
+        provider: Provider,
+        alias: &str,
+    ) -> Result<Profile, ProfileError> {
+        self.ensure_no_removal_artifacts_read_only()?;
+        self.find_without_recovery(provider, alias)
+    }
+
+    /// Removes one published profile through a journaled tombstone transaction.
+    ///
+    /// The profile's coordinator and provider leases are acquired before either
+    /// metadata lock. The registry rename that removes the immutable profile ID
+    /// is the public visibility point. Credentials are recursively unlinked only
+    /// after readback proves that visibility point completed.
+    #[cfg(unix)]
+    pub(crate) fn remove(
+        &self,
+        provider: Provider,
+        alias: &str,
+        confirmed_profile_id: Option<&str>,
+    ) -> Result<Profile, ProfileError> {
+        self.recover_incomplete_removal()?;
+        ensure_registration_supported()?;
+        let selected = self.find_without_recovery(provider, alias)?;
+        if confirmed_profile_id.is_some_and(|expected_id| expected_id != selected.id) {
+            return Err(ProfileError::NotFound(selected.reference()));
+        }
+        let _profile_lease = self.lock_profile(&selected)?;
+        let removal_lock = self.lock_removal_exclusive()?;
+        let registry_lock = self.lock_registry_mutation()?;
+
+        let mut current = self.load()?;
+        let profile_index = current
+            .profiles
+            .iter()
+            .position(|profile| profile == &selected)
+            .ok_or_else(|| ProfileError::NotFound(selected.reference()))?;
+        let roots = self.validate_removal_roots(None)?;
+        let original = self.profile_path(&selected)?;
+        let tree = validate_owned_removal_tree(&self.root, &roots, &original, &selected.id, None)?;
+
+        let expected_registry_revision = current.revision;
+        let expected_registry_digest = registry_digest(&current)?;
+        current.profiles.remove(profile_index);
+        current.revision = next_registry_revision(current.revision)?;
+        let removed_registry_revision = current.revision;
+        let removed_registry_digest = registry_digest(&current)?;
+        let journal = RemovalJournal {
+            schema_version: REMOVAL_JOURNAL_SCHEMA_VERSION,
+            profile: selected.clone(),
+            expected_registry_revision,
+            removed_registry_revision,
+            expected_registry_digest,
+            removed_registry_digest,
+            data_root: roots.data_root,
+            profiles_root: roots.profiles_root,
+            provider_root: roots.provider_root,
+            profile_tree: tree.root,
+            profile_tree_entry_count: tree.entry_count,
+            profile_tree_manifest_digest: tree.manifest_digest,
+        };
+        self.write_removal_journal(&journal)?;
+
+        let tombstone = self.tombstone_path(&selected)?;
+        if path_exists(&tombstone)? {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        self.inject_removal_fault(RemovalFaultPoint::TombstoneRename)?;
+        fs::rename(&original, &tombstone)?;
+        self.validate_removal_roots(Some(&journal))?;
+        validate_owned_removal_tree(
+            &self.root,
+            &roots,
+            &tombstone,
+            &selected.id,
+            Some(journal.tree_snapshot()),
+        )?;
+        self.inject_removal_fault(RemovalFaultPoint::ProviderRootSyncAfterRename)?;
+        sync_directory(&self.provider_root(provider)?)?;
+
+        let publication = self.save(&current);
+        match publication {
+            Ok(()) => {}
+            Err(ProfileError::RegistryCommitUncertain(_)) => {
+                let readback = self.load()?;
+                if !journal.matches_removed_registry(&readback)? {
+                    return Err(ProfileError::RemovalRecoveryRequired);
+                }
+                sync_directory(&self.root).map_err(|error| match error {
+                    ProfileError::Io(error) => ProfileError::RemovalCommitUncertain(error),
+                    other => other,
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+        let readback = self.load()?;
+        if !journal.matches_removed_registry(&readback)? {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+
+        self.finish_visible_removal(&removal_lock, &registry_lock, &journal, &tombstone)?;
+        Ok(selected)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn remove(
+        &self,
+        _provider: Provider,
+        _alias: &str,
+        _confirmed_profile_id: Option<&str>,
+    ) -> Result<Profile, ProfileError> {
+        Err(ProfileError::UnsupportedPlatform)
+    }
+
+    /// Converges an interrupted removal to an unambiguously complete old or
+    /// new state. It never republishes a profile after registry visibility.
+    pub(crate) fn recover_incomplete_removal(&self) -> Result<(), ProfileError> {
+        if !path_exists(&self.root)? {
+            return Ok(());
+        }
+        verify_private_directory(&self.root)?;
+
+        let first_journal = self.read_removal_journal()?;
+        let tombstones = self.removal_tombstones()?;
+        let temporaries = self.removal_temporaries()?;
+        if first_journal.is_none() && tombstones.is_empty() && temporaries.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(not(unix))]
+        return Err(ProfileError::UnsupportedPlatform);
+
+        #[cfg(unix)]
+        self.recover_incomplete_removal_unix()
+    }
+
+    #[cfg(unix)]
+    fn recover_incomplete_removal_unix(&self) -> Result<(), ProfileError> {
+        // Wait for a live remover to finish before inspecting a tree that may
+        // be changing through descriptor-relative cleanup. Release this gate
+        // before taking a profile lease to preserve the global lock order.
+        let quiescence_gate = self.lock_removal_exclusive()?;
+        drop(quiescence_gate);
+
+        let first_journal = self.read_removal_journal()?;
+        let tombstones = self.removal_tombstones()?;
+        let temporaries = self.removal_temporaries()?;
+        if first_journal.is_none() {
+            if !tombstones.is_empty() {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+            if temporaries.is_empty() {
+                return Ok(());
+            }
+            private_directory_identity(&self.root)?;
+            let _removal_lock = self.lock_removal_exclusive()?;
+            if self.read_removal_journal()?.is_some() {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+            let current_tombstones = self.removal_tombstones()?;
+            let current_temporaries = self.removal_temporaries()?;
+            if !current_tombstones.is_empty() {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+            if current_temporaries.is_empty() {
+                return Ok(());
+            }
+            self.remove_stale_removal_temporary(&current_temporaries)?;
+            return Ok(());
+        }
+        let journal = first_journal.ok_or(ProfileError::RemovalRecoveryRequired)?;
+        self.validate_removal_artifact_set(&journal, &tombstones, &temporaries)?;
+
+        let roots = self.validate_removal_roots(Some(&journal))?;
+        let original = self.profile_path(&journal.profile)?;
+        let tombstone = self.tombstone_path(&journal.profile)?;
+        let original_exists = path_exists(&original)?;
+        let tombstone_exists = path_exists(&tombstone)?;
+        if original_exists && tombstone_exists {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        let tree_path = if original_exists {
+            Some(original.as_path())
+        } else if tombstone_exists {
+            Some(tombstone.as_path())
+        } else {
+            None
+        };
+        let profile_lease = match tree_path {
+            Some(path)
+                if validate_owned_removal_tree(
+                    &self.root,
+                    &roots,
+                    path,
+                    &journal.profile.id,
+                    Some(journal.tree_snapshot()),
+                )
+                .is_ok() =>
+            {
+                match self.lock_removal_tree(path, &journal, &roots) {
+                    Ok(lease) => Some(lease),
+                    Err(error @ ProfileError::Busy(_)) => return Err(error),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+        let removal_lock = self.lock_removal_exclusive()?;
+        let Some(current_journal) = self.read_removal_journal()? else {
+            if self.removal_tombstones()?.is_empty() && self.removal_temporaries()?.is_empty() {
+                return Ok(());
+            }
+            return Err(ProfileError::RemovalRecoveryRequired);
+        };
+        if current_journal != journal {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        let current_tombstones = self.removal_tombstones()?;
+        let current_temporaries = self.removal_temporaries()?;
+        self.validate_removal_artifact_set(
+            &current_journal,
+            &current_tombstones,
+            &current_temporaries,
+        )?;
+        let roots = self.validate_removal_roots(Some(&journal))?;
+        let original_exists = path_exists(&original)?;
+        let tombstone_exists = path_exists(&tombstone)?;
+        if original_exists && tombstone_exists {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        let registry_lock = self.lock_exclusive()?;
+        let document = self.load()?;
+        let old_visible = journal.matches_expected_registry(&document)?;
+        let removed_visible = journal.matches_removed_registry(&document)?;
+        if old_visible == removed_visible {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+
+        if old_visible {
+            if profile_lease.is_none() {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+            match (original_exists, tombstone_exists) {
+                (true, false) => {
+                    validate_owned_removal_tree(
+                        &self.root,
+                        &roots,
+                        &original,
+                        &journal.profile.id,
+                        Some(journal.tree_snapshot()),
+                    )?;
+                }
+                (false, true) => {
+                    validate_owned_removal_tree(
+                        &self.root,
+                        &roots,
+                        &tombstone,
+                        &journal.profile.id,
+                        Some(journal.tree_snapshot()),
+                    )?;
+                    fs::rename(&tombstone, &original)?;
+                    self.validate_removal_roots(Some(&journal))?;
+                    validate_owned_removal_tree(
+                        &self.root,
+                        &roots,
+                        &original,
+                        &journal.profile.id,
+                        Some(journal.tree_snapshot()),
+                    )?;
+                    sync_directory(&self.provider_root(journal.profile.provider)?)?;
+                }
+                _ => return Err(ProfileError::RemovalRecoveryRequired),
+            }
+            self.remove_removal_journal(
+                &removal_lock,
+                &registry_lock,
+                &journal,
+                &current_temporaries,
+            )?;
+            return Ok(());
+        }
+
+        match (original_exists, tombstone_exists) {
+            (false, true) => {
+                validate_partial_owned_tombstone(
+                    &self.root,
+                    &roots,
+                    &tombstone,
+                    &journal.profile.id,
+                    journal.profile_tree,
+                )?;
+                self.finish_visible_removal(&removal_lock, &registry_lock, &journal, &tombstone)
+            }
+            (false, false) => {
+                sync_directory(&self.provider_root(journal.profile.provider)?)
+                    .map_err(removal_commit_error)?;
+                self.remove_removal_journal(
+                    &removal_lock,
+                    &registry_lock,
+                    &journal,
+                    &current_temporaries,
+                )
+            }
+            _ => Err(ProfileError::RemovalRecoveryRequired),
+        }
+    }
+
+    fn ensure_no_removal_artifacts_read_only(&self) -> Result<(), ProfileError> {
+        if !path_exists(&self.root)? {
+            return Ok(());
+        }
+        if self.read_removal_journal()?.is_some()
+            || !self.removal_tombstones()?.is_empty()
+            || !self.removal_temporaries()?.is_empty()
+        {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        Ok(())
     }
 
     /// Changes only the display alias of one immutable profile.
@@ -347,12 +865,15 @@ impl Registry {
         old_alias: &str,
         new_alias: &str,
     ) -> Result<(Profile, bool), ProfileError> {
+        self.recover_incomplete_removal()?;
         validate_alias(new_alias)?;
         ensure_registration_supported()?;
 
-        let original = self.find(provider, old_alias)?;
+        let original = self.find_without_recovery(provider, old_alias)?;
         let _profile_lease = self.lock_profile(&original)?;
-        let _registry_lock = self.lock_exclusive()?;
+        #[cfg(test)]
+        self.pause_registry_mutation_after_preflight()?;
+        let _registry_lock = self.lock_registry_mutation()?;
         let mut document = self.load()?;
         let old_reference = format!("{}@{old_alias}", provider.as_str());
         let profile_index = document
@@ -378,6 +899,7 @@ impl Registry {
         }
 
         document.profiles[profile_index].alias = new_alias.to_owned();
+        document.revision = next_registry_revision(document.revision)?;
         let renamed = document.profiles[profile_index].clone();
         self.save(&document)?;
         Ok((renamed, true))
@@ -387,11 +909,16 @@ impl Registry {
         &self,
         alias: &str,
     ) -> Result<PendingProfile<'_>, ProfileError> {
+        self.recover_incomplete_removal()?;
         validate_alias(alias)?;
         ensure_registration_supported()?;
         self.ensure_root()?;
 
-        let lock = self.lock_exclusive()?;
+        #[cfg(test)]
+        self.pause_registry_mutation_after_preflight()?;
+        // PendingProfile retains this guarded lock through provider login and
+        // publication, so no remover can prepare a journal before commit.
+        let lock = self.lock_registry_mutation()?;
         let document = self.load()?;
         if document
             .profiles
@@ -581,7 +1108,9 @@ impl Registry {
         expected_alias: Option<&str>,
     ) -> Result<(Profile, ProfileLease), ProfileError> {
         let lease = self.lock_profile(profile)?;
-        let current = self.find_by_id(profile.provider, &profile.id)?;
+        // Recovery is run before profile selection. Do not recursively acquire
+        // another profile's recovery lease while this profile lease is held.
+        let current = self.find_by_id_without_recovery(profile.provider, &profile.id)?;
         if let Some(expected_alias) = expected_alias {
             if current.alias != expected_alias {
                 return Err(ProfileError::NotFound(format!(
@@ -707,6 +1236,378 @@ impl Registry {
         Ok(RegistryLock { _file: file })
     }
 
+    /// Acquires the registry mutation lock and closes the recovery-preflight
+    /// TOCTOU before any revision or unpublished registration state changes.
+    /// Recovery itself uses `lock_exclusive` because its journal must exist.
+    fn lock_registry_mutation(&self) -> Result<RegistryLock, ProfileError> {
+        let lock = self.lock_exclusive()?;
+        self.ensure_no_removal_artifacts_read_only()?;
+        Ok(lock)
+    }
+
+    fn lock_removal_exclusive(&self) -> Result<RegistryLock, ProfileError> {
+        let file = open_private_lock_file(&self.root.join(REMOVAL_LOCK_FILE))?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(RegistryLock { _file: file })
+    }
+
+    fn provider_root(&self, provider: Provider) -> Result<PathBuf, ProfileError> {
+        validate_provider_root_components(&self.root)?;
+        Ok(self.root.join("profiles").join(provider.as_str()))
+    }
+
+    fn profile_path(&self, profile: &Profile) -> Result<PathBuf, ProfileError> {
+        validate_profile_id(&profile.id)?;
+        Ok(self.provider_root(profile.provider)?.join(&profile.id))
+    }
+
+    fn tombstone_path(&self, profile: &Profile) -> Result<PathBuf, ProfileError> {
+        validate_profile_id(&profile.id)?;
+        Ok(self
+            .provider_root(profile.provider)?
+            .join(format!(".removing-{}", profile.id)))
+    }
+
+    fn validate_removal_roots(
+        &self,
+        expected: Option<&RemovalJournal>,
+    ) -> Result<RemovalRoots, ProfileError> {
+        let profiles_root = self.root.join("profiles");
+        let provider_root = profiles_root.join("codex");
+        let roots = RemovalRoots {
+            data_root: private_directory_identity(&self.root)?,
+            profiles_root: private_directory_identity(&profiles_root)?,
+            provider_root: private_directory_identity(&provider_root)?,
+        };
+        if roots.data_root.device != roots.profiles_root.device
+            || roots.data_root.device != roots.provider_root.device
+        {
+            return Err(ProfileError::UnsafeState(
+                "managed removal roots are not on one filesystem".to_owned(),
+            ));
+        }
+        if let Some(expected) = expected {
+            if roots.data_root != expected.data_root
+                || roots.profiles_root != expected.profiles_root
+                || roots.provider_root != expected.provider_root
+            {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+        }
+        Ok(roots)
+    }
+
+    #[cfg(unix)]
+    fn lock_removal_tree(
+        &self,
+        path: &Path,
+        journal: &RemovalJournal,
+        roots: &RemovalRoots,
+    ) -> Result<ProfileLease, ProfileError> {
+        validate_owned_removal_tree(
+            &self.root,
+            roots,
+            path,
+            &journal.profile.id,
+            Some(journal.tree_snapshot()),
+        )?;
+        let coordinator = lock_existing_profile_file(
+            &path.join(COORDINATOR_LOCK_FILE),
+            &journal.profile.reference(),
+        )?;
+        let provider = lock_existing_profile_file(
+            &path.join(PROVIDER_LOCK_FILE),
+            &journal.profile.reference(),
+        )?;
+        validate_owned_removal_tree(
+            &self.root,
+            roots,
+            path,
+            &journal.profile.id,
+            Some(journal.tree_snapshot()),
+        )?;
+        Ok(ProfileLease {
+            coordinator: Some(coordinator),
+            provider: Some(provider),
+        })
+    }
+
+    fn read_removal_journal(&self) -> Result<Option<RemovalJournal>, ProfileError> {
+        let path = self.root.join(REMOVAL_JOURNAL_FILE);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ProfileError::Io(error)),
+            Ok(_) => {}
+        }
+        verify_private_single_link_regular_file(&path)
+            .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+        let mut bytes = Vec::new();
+        File::open(&path)?
+            .take((MAX_REMOVAL_JOURNAL_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_REMOVAL_JOURNAL_BYTES {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        let journal: RemovalJournal =
+            serde_json::from_slice(&bytes).map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+        journal.validate()?;
+        Ok(Some(journal))
+    }
+
+    fn write_removal_journal(&self, journal: &RemovalJournal) -> Result<(), ProfileError> {
+        journal.validate()?;
+        let bytes = serde_json::to_vec_pretty(journal)
+            .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+        if bytes.len() > MAX_REMOVAL_JOURNAL_BYTES {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        let temporary = self
+            .root
+            .join(format!(".{REMOVAL_JOURNAL_FILE}.{}.tmp", Uuid::new_v4()));
+        let destination = self.root.join(REMOVAL_JOURNAL_FILE);
+        let publication = (|| {
+            self.inject_removal_fault(RemovalFaultPoint::JournalTemporaryCreate)?;
+            let mut options = private_open_options();
+            let mut file = options.write(true).create_new(true).open(&temporary)?;
+            self.inject_removal_fault(RemovalFaultPoint::JournalWrite)?;
+            file.write_all(&bytes)?;
+            self.inject_removal_fault(RemovalFaultPoint::JournalFileSync)?;
+            file.sync_all()?;
+            verify_private_single_link_regular_file(&temporary)?;
+            drop(file);
+            self.inject_removal_fault(RemovalFaultPoint::JournalAtomicRename)?;
+            fs::rename(&temporary, &destination)?;
+            Ok(())
+        })();
+        if let Err(error) = publication {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .inject_removal_fault(RemovalFaultPoint::JournalDirectorySync)
+            .and_then(|()| sync_directory(&self.root))
+        {
+            let readback = self.read_removal_journal();
+            if readback
+                .as_ref()
+                .is_ok_and(|value| value.as_ref() == Some(journal))
+            {
+                return Err(match error {
+                    ProfileError::Io(error) => ProfileError::RemovalCommitUncertain(error),
+                    other => other,
+                });
+            }
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn removal_tombstones(&self) -> Result<Vec<(String, PathBuf)>, ProfileError> {
+        let provider_root = self.root.join("profiles/codex");
+        match fs::symlink_metadata(&provider_root) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(ProfileError::Io(error)),
+            Ok(_) => verify_private_directory(&provider_root)?,
+        }
+        let mut tombstones = Vec::new();
+        for entry in fs::read_dir(&provider_root)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+            let Some(id) = name.strip_prefix(".removing-") else {
+                continue;
+            };
+            validate_profile_id(id).map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+            tombstones.push((id.to_owned(), entry.path()));
+            if tombstones.len() > 1 {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+        }
+        Ok(tombstones)
+    }
+
+    fn removal_temporaries(&self) -> Result<Vec<PathBuf>, ProfileError> {
+        let prefix = format!(".{REMOVAL_JOURNAL_FILE}.");
+        let mut temporaries = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+            let Some(uuid) = name
+                .strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".tmp"))
+            else {
+                continue;
+            };
+            validate_profile_id(uuid).map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+            verify_private_single_link_regular_file(&entry.path())
+                .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+            if fs::metadata(entry.path())?.len() > MAX_REMOVAL_JOURNAL_BYTES as u64 {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+            temporaries.push(entry.path());
+            if temporaries.len() > 1 {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+        }
+        Ok(temporaries)
+    }
+
+    fn validate_removal_artifact_set(
+        &self,
+        journal: &RemovalJournal,
+        tombstones: &[(String, PathBuf)],
+        _temporaries: &[PathBuf],
+    ) -> Result<(), ProfileError> {
+        if tombstones.iter().any(|(id, _)| id != &journal.profile.id) {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn remove_stale_removal_temporary(&self, temporaries: &[PathBuf]) -> Result<(), ProfileError> {
+        if temporaries.len() != 1 {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        verify_private_single_link_regular_file(&temporaries[0])
+            .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+        fs::remove_file(&temporaries[0])?;
+        sync_directory(&self.root)
+    }
+
+    #[cfg(unix)]
+    fn finish_visible_removal(
+        &self,
+        _removal_lock: &RegistryLock,
+        registry_lock: &RegistryLock,
+        journal: &RemovalJournal,
+        tombstone: &Path,
+    ) -> Result<(), ProfileError> {
+        let roots = self.validate_removal_roots(Some(journal))?;
+        validate_partial_owned_tombstone(
+            &self.root,
+            &roots,
+            tombstone,
+            &journal.profile.id,
+            journal.profile_tree,
+        )?;
+        self.inject_removal_fault(RemovalFaultPoint::RecursiveCleanup)?;
+        remove_owned_tombstone_at(
+            &self.provider_root(journal.profile.provider)?,
+            tombstone,
+            journal.provider_root,
+            journal.profile_tree,
+        )
+        .map_err(removal_commit_error)?;
+        self.validate_removal_roots(Some(journal))?;
+        self.inject_removal_fault(RemovalFaultPoint::ProviderRootSyncAfterCleanup)
+            .and_then(|()| sync_directory(&self.provider_root(journal.profile.provider)?))
+            .map_err(|error| match error {
+                ProfileError::Io(error) => ProfileError::RemovalCommitUncertain(error),
+                other => other,
+            })?;
+
+        #[cfg(test)]
+        self.pause_removal_after_cleanup()?;
+
+        let current = self
+            .read_removal_journal()?
+            .ok_or(ProfileError::RemovalRecoveryRequired)?;
+        if &current != journal {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        let temporaries = self.removal_temporaries()?;
+        self.remove_removal_journal(_removal_lock, registry_lock, journal, &temporaries)
+    }
+
+    fn remove_removal_journal(
+        &self,
+        _removal_lock: &RegistryLock,
+        _registry_lock: &RegistryLock,
+        journal: &RemovalJournal,
+        temporaries: &[PathBuf],
+    ) -> Result<(), ProfileError> {
+        let current = self
+            .read_removal_journal()?
+            .ok_or(ProfileError::RemovalRecoveryRequired)?;
+        if &current != journal {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        if !temporaries.is_empty() {
+            if temporaries.len() != 1 {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+            verify_private_single_link_regular_file(&temporaries[0])
+                .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+            fs::remove_file(&temporaries[0]).map_err(ProfileError::RemovalCommitUncertain)?;
+        }
+        self.inject_removal_fault(RemovalFaultPoint::JournalRemove)
+            .map_err(removal_commit_error)?;
+        fs::remove_file(self.root.join(REMOVAL_JOURNAL_FILE))
+            .map_err(ProfileError::RemovalCommitUncertain)?;
+        self.inject_removal_fault(RemovalFaultPoint::JournalRemoveDirectorySync)
+            .and_then(|()| sync_directory(&self.root))
+            .map_err(|error| match error {
+                ProfileError::Io(error) => ProfileError::RemovalCommitUncertain(error),
+                other => other,
+            })
+    }
+
+    fn inject_removal_fault(&self, _fault: RemovalFaultPoint) -> Result<(), ProfileError> {
+        #[cfg(test)]
+        if self.removal_fault == Some(_fault) {
+            return Err(ProfileError::Io(io::Error::other(
+                "injected removal failure",
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_removal_after_cleanup(&self) -> Result<(), ProfileError> {
+        let Some(pause) = &self.removal_pause_after_cleanup else {
+            return Ok(());
+        };
+        pause.reached.send(()).map_err(|_| {
+            ProfileError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "removal test observer disconnected",
+            ))
+        })?;
+        pause.resume.recv().map_err(|_| {
+            ProfileError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "removal test controller disconnected",
+            ))
+        })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_registry_mutation_after_preflight(&self) -> Result<(), ProfileError> {
+        let Some(pause) = &self.registry_mutation_pause_after_preflight else {
+            return Ok(());
+        };
+        pause.reached.send(()).map_err(|_| {
+            ProfileError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "registry mutation test observer disconnected",
+            ))
+        })?;
+        pause.resume.recv().map_err(|_| {
+            ProfileError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "registry mutation test controller disconnected",
+            ))
+        })?;
+        Ok(())
+    }
+
     fn has_identity_bindings(
         &self,
         _document: &RegistryDocument,
@@ -751,13 +1652,568 @@ impl Registry {
 
     fn inject_registry_write_fault(&self, _step: RegistryWriteStep) -> Result<(), ProfileError> {
         #[cfg(test)]
-        if self.registry_write_fault == Some(_step) {
+        if self.registry_write_fault == Some(_step)
+            || self.removal_fault
+                == Some(match _step {
+                    RegistryWriteStep::TemporaryCreate => {
+                        RemovalFaultPoint::RegistryTemporaryCreate
+                    }
+                    RegistryWriteStep::Write => RemovalFaultPoint::RegistryWrite,
+                    RegistryWriteStep::FileSync => RemovalFaultPoint::RegistryFileSync,
+                    RegistryWriteStep::AtomicRename => RemovalFaultPoint::RegistryAtomicRename,
+                    RegistryWriteStep::DirectorySync => RemovalFaultPoint::RegistryDirectorySync,
+                })
+        {
             return Err(ProfileError::Io(io::Error::other(
                 "injected registry write failure",
             )));
         }
         Ok(())
     }
+}
+
+impl RemovalJournal {
+    fn validate(&self) -> Result<(), ProfileError> {
+        if self.schema_version != REMOVAL_JOURNAL_SCHEMA_VERSION {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        validate_profile_id(&self.profile.id).map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+        validate_alias(&self.profile.alias).map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+        if self.expected_registry_revision.checked_add(1) != Some(self.removed_registry_revision)
+            || !is_sha256_hex(&self.expected_registry_digest)
+            || !is_sha256_hex(&self.removed_registry_digest)
+            || !is_sha256_hex(&self.profile_tree_manifest_digest)
+            || self.expected_registry_digest == self.removed_registry_digest
+            || self.profile_tree_entry_count == 0
+            || self.profile_tree_entry_count
+                > u64::try_from(MAX_REMOVAL_TREE_ENTRIES)
+                    .map_err(|_| ProfileError::RemovalRecoveryRequired)?
+        {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        for identity in [
+            self.data_root,
+            self.profiles_root,
+            self.provider_root,
+            self.profile_tree,
+        ] {
+            if identity.device == 0 || identity.inode == 0 {
+                return Err(ProfileError::RemovalRecoveryRequired);
+            }
+        }
+        if self.data_root.device != self.profiles_root.device
+            || self.data_root.device != self.provider_root.device
+            || self.data_root.device != self.profile_tree.device
+        {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn tree_snapshot(&self) -> RemovalTreeSnapshot {
+        RemovalTreeSnapshot {
+            root: self.profile_tree,
+            entry_count: self.profile_tree_entry_count,
+            manifest_digest: self.profile_tree_manifest_digest.clone(),
+        }
+    }
+
+    fn matches_expected_registry(&self, document: &RegistryDocument) -> Result<bool, ProfileError> {
+        Ok(document.revision == self.expected_registry_revision
+            && registry_digest(document)? == self.expected_registry_digest
+            && document
+                .profiles
+                .iter()
+                .filter(|profile| *profile == &self.profile)
+                .count()
+                == 1)
+    }
+
+    fn matches_removed_registry(&self, document: &RegistryDocument) -> Result<bool, ProfileError> {
+        Ok(document.revision == self.removed_registry_revision
+            && registry_digest(document)? == self.removed_registry_digest
+            && !document
+                .profiles
+                .iter()
+                .any(|profile| profile.id == self.profile.id))
+    }
+}
+
+fn registry_digest(document: &RegistryDocument) -> Result<String, ProfileError> {
+    let bytes = serde_json::to_vec(document)
+        .map_err(|_| ProfileError::InvalidRegistry("registry serialization failed".to_owned()))?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn next_registry_revision(revision: u64) -> Result<u64, ProfileError> {
+    revision.checked_add(1).ok_or_else(|| {
+        ProfileError::InvalidRegistry("registry revision is out of range".to_owned())
+    })
+}
+
+fn removal_commit_error(error: ProfileError) -> ProfileError {
+    match error {
+        ProfileError::Io(error) => ProfileError::RemovalCommitUncertain(error),
+        other => other,
+    }
+}
+
+fn path_exists(path: &Path) -> Result<bool, ProfileError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ProfileError::Io(error)),
+    }
+}
+
+fn validate_provider_root_components(root: &Path) -> Result<(), ProfileError> {
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed removal root is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn private_directory_identity(path: &Path) -> Result<FileSystemIdentity, ProfileError> {
+    use std::os::unix::fs::MetadataExt;
+
+    verify_private_directory(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err(ProfileError::UnsafeState(
+            "managed directory has an unexpected owner".to_owned(),
+        ));
+    }
+    Ok(FileSystemIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn private_directory_identity(path: &Path) -> Result<FileSystemIdentity, ProfileError> {
+    verify_private_directory(path)?;
+    Err(ProfileError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+fn verify_private_single_link_regular_file(path: &Path) -> Result<(), ProfileError> {
+    use std::os::unix::fs::MetadataExt;
+
+    verify_private_regular_file(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.uid() != rustix::process::getuid().as_raw() || metadata.nlink() != 1 {
+        return Err(ProfileError::UnsafeState(
+            "managed file ownership is unsafe".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_single_link_regular_file(path: &Path) -> Result<(), ProfileError> {
+    verify_private_regular_file(path)
+}
+
+#[cfg(unix)]
+fn validate_owned_removal_tree(
+    data_root: &Path,
+    roots: &RemovalRoots,
+    path: &Path,
+    profile_id: &str,
+    expected: Option<RemovalTreeSnapshot>,
+) -> Result<RemovalTreeSnapshot, ProfileError> {
+    let expected_root = expected.as_ref().map(|snapshot| snapshot.root);
+    let snapshot =
+        validate_owned_removal_tree_inner(data_root, roots, path, profile_id, expected_root, true)?;
+    if expected.is_some_and(|expected| expected != snapshot) {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree changed after removal preparation".to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
+fn validate_partial_owned_tombstone(
+    data_root: &Path,
+    roots: &RemovalRoots,
+    path: &Path,
+    profile_id: &str,
+    expected: FileSystemIdentity,
+) -> Result<FileSystemIdentity, ProfileError> {
+    validate_owned_removal_tree_inner(data_root, roots, path, profile_id, Some(expected), false)
+        .map(|snapshot| snapshot.root)
+}
+
+#[cfg(unix)]
+fn validate_owned_removal_tree_inner(
+    data_root: &Path,
+    roots: &RemovalRoots,
+    path: &Path,
+    profile_id: &str,
+    expected: Option<FileSystemIdentity>,
+    require_marker: bool,
+) -> Result<RemovalTreeSnapshot, ProfileError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    validate_profile_id(profile_id)
+        .map_err(|_| ProfileError::UnsafeState("profile removal ID is invalid".to_owned()))?;
+    let expected_name = profile_id;
+    let expected_tombstone = format!(".removing-{profile_id}");
+    let name = path.file_name().and_then(|name| name.to_str());
+    if path.parent() != Some(data_root.join("profiles/codex").as_path())
+        || !path.starts_with(data_root)
+        || !matches!(name, Some(value) if value == expected_name || value == expected_tombstone)
+    {
+        return Err(ProfileError::UnsafeState(
+            "profile removal path is outside its managed provider root".to_owned(),
+        ));
+    }
+    let identity = private_directory_identity(path)?;
+    if identity.device != roots.provider_root.device
+        || expected.is_some_and(|expected| expected != identity)
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree was replaced".to_owned(),
+        ));
+    }
+
+    let mut manifest = Sha256::new();
+    manifest.update(b"calcifer-removal-tree-manifest-v1\0");
+    let root_metadata = fs::symlink_metadata(path)?;
+    update_removal_manifest(&mut manifest, Path::new(""), &root_metadata)?;
+
+    let mut pending = vec![(path.to_owned(), 0_usize)];
+    let mut entry_count = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > MAX_REMOVAL_TREE_DEPTH {
+            return Err(ProfileError::UnsafeState(
+                "managed profile tree is too deep".to_owned(),
+            ));
+        }
+        let directory_metadata = fs::symlink_metadata(&directory)?;
+        if !directory_metadata.file_type().is_dir()
+            || directory_metadata.file_type().is_symlink()
+            || directory_metadata.uid() != rustix::process::getuid().as_raw()
+            || directory_metadata.mode() & 0o077 != 0
+            || directory_metadata.dev() != roots.provider_root.device
+        {
+            return Err(ProfileError::UnsafeState(
+                "managed profile tree contains an unsafe directory".to_owned(),
+            ));
+        }
+        let mut entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by(|left, right| {
+            left.file_name()
+                .as_bytes()
+                .cmp(right.file_name().as_bytes())
+        });
+        let mut child_directories = Vec::new();
+        for entry in entries {
+            entry_count = entry_count.checked_add(1).ok_or_else(|| {
+                ProfileError::UnsafeState("managed profile tree is too large".to_owned())
+            })?;
+            if entry_count > MAX_REMOVAL_TREE_ENTRIES {
+                return Err(ProfileError::UnsafeState(
+                    "managed profile tree is too large".to_owned(),
+                ));
+            }
+            let entry_path = entry.path();
+            let metadata = fs::symlink_metadata(&entry_path)?;
+            let relative = entry_path.strip_prefix(path).map_err(|_| {
+                ProfileError::UnsafeState(
+                    "managed profile entry escaped its removal root".to_owned(),
+                )
+            })?;
+            if metadata.file_type().is_symlink()
+                || metadata.uid() != rustix::process::getuid().as_raw()
+                || metadata.mode() & 0o077 != 0
+                || metadata.dev() != roots.provider_root.device
+            {
+                return Err(ProfileError::UnsafeState(
+                    "managed profile tree contains unsafe state".to_owned(),
+                ));
+            }
+            update_removal_manifest(&mut manifest, relative, &metadata)?;
+            if metadata.file_type().is_dir() {
+                child_directories.push((entry_path, depth + 1));
+            } else if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+                return Err(ProfileError::UnsafeState(
+                    "managed profile tree contains a non-owned file".to_owned(),
+                ));
+            }
+        }
+        for child in child_directories.into_iter().rev() {
+            pending.push(child);
+        }
+    }
+
+    let marker = path.join(OWNER_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => {
+            verify_private_single_link_regular_file(&marker)?;
+            let marker_metadata = fs::metadata(&marker)?;
+            if marker_metadata.len() != profile_id.len() as u64 {
+                return Err(ProfileError::UnsafeState(
+                    "profile ownership marker does not match its registry entry".to_owned(),
+                ));
+            }
+            let mut marker_value = String::new();
+            File::open(marker)?.read_to_string(&mut marker_value)?;
+            if marker_value != profile_id {
+                return Err(ProfileError::UnsafeState(
+                    "profile ownership marker does not match its registry entry".to_owned(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !require_marker => {}
+        Err(error) => return Err(ProfileError::Io(error)),
+    }
+    Ok(RemovalTreeSnapshot {
+        root: identity,
+        entry_count: u64::try_from(entry_count).map_err(|_| {
+            ProfileError::UnsafeState("managed profile tree is too large".to_owned())
+        })?,
+        manifest_digest: format!("{:x}", manifest.finalize()),
+    })
+}
+
+#[cfg(unix)]
+fn update_removal_manifest(
+    manifest: &mut Sha256,
+    relative_path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ProfileError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let path = relative_path.as_os_str().as_bytes();
+    let path_len = u64::try_from(path.len()).map_err(|_| {
+        ProfileError::UnsafeState("managed profile entry name is too large".to_owned())
+    })?;
+    manifest.update(path_len.to_le_bytes());
+    manifest.update(path);
+    manifest.update([if metadata.file_type().is_dir() { 1 } else { 2 }]);
+    manifest.update(metadata.dev().to_le_bytes());
+    manifest.update(metadata.ino().to_le_bytes());
+    manifest.update(metadata.uid().to_le_bytes());
+    manifest.update(metadata.mode().to_le_bytes());
+    manifest.update(metadata.nlink().to_le_bytes());
+    manifest.update(metadata.len().to_le_bytes());
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_owned_removal_tree(
+    _data_root: &Path,
+    _roots: &RemovalRoots,
+    _path: &Path,
+    _profile_id: &str,
+    _expected: Option<RemovalTreeSnapshot>,
+) -> Result<RemovalTreeSnapshot, ProfileError> {
+    Err(ProfileError::UnsupportedPlatform)
+}
+
+/// Recursively unlinks a validated tombstone through directory descriptors.
+///
+/// Every child lookup is `*at`-relative and `NOFOLLOW`; a symlink or replaced
+/// directory therefore cannot redirect traversal outside the opened tree.
+#[cfg(unix)]
+fn remove_owned_tombstone_at(
+    provider_root: &Path,
+    tombstone: &Path,
+    expected_provider: FileSystemIdentity,
+    expected_tree: FileSystemIdentity,
+) -> Result<(), ProfileError> {
+    use rustix::fs::{AtFlags, Dir, Mode, OFlags, fstat, open, openat, statat, unlinkat};
+
+    let tombstone_name = tombstone
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ProfileError::UnsafeState("invalid removal tombstone name".to_owned()))?;
+    if tombstone.parent() != Some(provider_root) || !tombstone_name.starts_with(".removing-") {
+        return Err(ProfileError::UnsafeState(
+            "profile removal path is outside its managed provider root".to_owned(),
+        ));
+    }
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let provider_fd = open(provider_root, directory_flags, Mode::empty())
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+    let provider_stat = fstat(&provider_fd)
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+    if stat_identity(&provider_stat)? != expected_provider {
+        return Err(ProfileError::RemovalRecoveryRequired);
+    }
+    let tree_fd = openat(&provider_fd, tombstone_name, directory_flags, Mode::empty())
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+    let tree_stat = fstat(&tree_fd)
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+    if stat_identity(&tree_stat)? != expected_tree {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree was replaced".to_owned(),
+        ));
+    }
+    validate_removal_stat(&tree_stat, true, expected_provider.device)?;
+    remove_owned_directory_entries(
+        Dir::new(tree_fd).map_err(io::Error::from)?,
+        expected_provider.device,
+    )?;
+
+    let final_stat = statat(&provider_fd, tombstone_name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+    if stat_identity(&final_stat)? != expected_tree {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree was replaced during cleanup".to_owned(),
+        ));
+    }
+    unlinkat(&provider_fd, tombstone_name, AtFlags::REMOVEDIR)
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)
+}
+
+#[cfg(unix)]
+fn remove_owned_directory_entries(
+    mut directory: rustix::fs::Dir,
+    expected_device: u64,
+) -> Result<(), ProfileError> {
+    use rustix::fs::{AtFlags, Mode, OFlags, fstat, openat, statat, unlinkat};
+
+    let mut names = Vec::new();
+    for entry in directory.by_ref() {
+        let entry = entry.map_err(io::Error::from).map_err(ProfileError::Io)?;
+        if entry.file_name().to_bytes() != b"." && entry.file_name().to_bytes() != b".." {
+            names.push(entry.file_name().to_owned());
+        }
+    }
+    for name in names {
+        let stat = statat(
+            directory.fd().map_err(io::Error::from)?,
+            &name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+        let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+        if file_type.is_dir() {
+            validate_removal_stat(&stat, true, expected_device)?;
+            let child = openat(
+                directory.fd().map_err(io::Error::from)?,
+                &name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)
+            .map_err(ProfileError::Io)?;
+            let opened_stat = fstat(&child)
+                .map_err(io::Error::from)
+                .map_err(ProfileError::Io)?;
+            if stat_identity(&opened_stat)? != stat_identity(&stat)? {
+                return Err(ProfileError::UnsafeState(
+                    "managed profile directory was replaced during cleanup".to_owned(),
+                ));
+            }
+            remove_owned_directory_entries(
+                rustix::fs::Dir::new(child).map_err(io::Error::from)?,
+                expected_device,
+            )?;
+            let final_stat = statat(
+                directory.fd().map_err(io::Error::from)?,
+                &name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(io::Error::from)
+            .map_err(ProfileError::Io)?;
+            if stat_identity(&final_stat)? != stat_identity(&stat)? {
+                return Err(ProfileError::UnsafeState(
+                    "managed profile directory was replaced during cleanup".to_owned(),
+                ));
+            }
+            unlinkat(
+                directory.fd().map_err(io::Error::from)?,
+                &name,
+                AtFlags::REMOVEDIR,
+            )
+            .map_err(io::Error::from)
+            .map_err(ProfileError::Io)?;
+        } else {
+            validate_removal_stat(&stat, false, expected_device)?;
+            unlinkat(
+                directory.fd().map_err(io::Error::from)?,
+                &name,
+                AtFlags::empty(),
+            )
+            .map_err(io::Error::from)
+            .map_err(ProfileError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stat_identity(stat: &rustix::fs::Stat) -> Result<FileSystemIdentity, ProfileError> {
+    Ok(FileSystemIdentity {
+        device: u64::try_from(stat.st_dev).map_err(|_| {
+            ProfileError::UnsafeState("managed filesystem identity is invalid".to_owned())
+        })?,
+        inode: stat.st_ino,
+    })
+}
+
+#[cfg(unix)]
+fn validate_removal_stat(
+    stat: &rustix::fs::Stat,
+    directory: bool,
+    expected_device: u64,
+) -> Result<(), ProfileError> {
+    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    let expected_type = if directory {
+        file_type.is_dir()
+    } else {
+        file_type.is_file() && stat.st_nlink == 1
+    };
+    if !expected_type
+        || stat.st_uid != rustix::process::getuid().as_raw()
+        || stat.st_mode & 0o077 != 0
+        || u64::try_from(stat.st_dev).ok() != Some(expected_device)
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree changed during cleanup".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_partial_owned_tombstone(
+    _data_root: &Path,
+    _roots: &RemovalRoots,
+    _path: &Path,
+    _profile_id: &str,
+    _expected: FileSystemIdentity,
+) -> Result<FileSystemIdentity, ProfileError> {
+    Err(ProfileError::UnsupportedPlatform)
 }
 
 pub(crate) struct PendingProfile<'a> {
@@ -906,6 +2362,7 @@ impl PendingProfile<'_> {
                 return Err(ProfileError::AlreadyExists(self.profile.reference()));
             }
             document.profiles.push(self.profile.clone());
+            document.revision = next_registry_revision(document.revision)?;
             self.registry.save(&document)
         })();
 
@@ -1037,6 +2494,8 @@ pub(crate) enum ProfileError {
     MissingDataRoot,
     NotFound(String),
     RegistrationRecoveryRequired,
+    RemovalCommitUncertain(io::Error),
+    RemovalRecoveryRequired,
     RegistryCommitUncertain(io::Error),
     UnsupportedPlatform,
     UnsafeState(String),
@@ -1055,6 +2514,8 @@ impl ProfileError {
             Self::MissingDataRoot => "missing_data_root",
             Self::NotFound(_) => "profile_not_found",
             Self::RegistrationRecoveryRequired => "registration_recovery_required",
+            Self::RemovalCommitUncertain(_) => "removal_commit_uncertain",
+            Self::RemovalRecoveryRequired => "removal_recovery_required",
             Self::RegistryCommitUncertain(_) => "registry_commit_uncertain",
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::UnsafeState(_) => "unsafe_profile_state",
@@ -1078,6 +2539,11 @@ impl ProfileError {
             Self::MissingDataRoot => "Calcifer could not determine a user data directory. Set CALCIFER_HOME to an absolute path.".to_owned(),
             Self::NotFound(reference) => format!("Profile {reference} was not found."),
             Self::RegistrationRecoveryRequired => "Calcifer could not roll back a partially published profile. Do not retry registration until the managed state has been inspected.".to_owned(),
+            Self::RemovalCommitUncertain(error) => {
+                let _ = error.kind();
+                "The local profile removal reached a commit boundary whose durability could not be confirmed. Run `calcifer auth list` to complete bounded recovery before retrying.".to_owned()
+            }
+            Self::RemovalRecoveryRequired => "Calcifer found an incomplete or ambiguous local profile removal. No unsafe path was deleted; run `calcifer auth list` to attempt bounded recovery.".to_owned(),
             Self::RegistryCommitUncertain(error) => {
                 let _ = error.kind();
                 "The profile registry became visible but its durability could not be confirmed. Run `calcifer auth list` before retrying; Calcifer preserved the profile credentials.".to_owned()
@@ -1360,6 +2826,21 @@ fn lock_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError>
 }
 
 #[cfg(unix)]
+fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
+    let mut options = private_open_options();
+    let file = options.read(true).write(true).open(path)?;
+    verify_private_single_link_regular_file(path)?;
+    FileExt::try_lock_exclusive(&file).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            ProfileError::Busy(reference.to_owned())
+        } else {
+            ProfileError::Io(error)
+        }
+    })?;
+    Ok(file)
+}
+
+#[cfg(unix)]
 fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -1595,6 +3076,31 @@ fn refuse_orphaned_staging(provider_root: &Path) -> Result<(), ProfileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_platform_recovery_preserves_a_journal_temporary() {
+        let root = env::temp_dir().join(format!(
+            "calcifer-non-unix-removal-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("temporary root must be created");
+        let temporary = root.join(format!(".{REMOVAL_JOURNAL_FILE}.{}.tmp", Uuid::new_v4()));
+        let sentinel = b"non-unix-removal-artifact-must-survive";
+        fs::write(&temporary, sentinel).expect("temporary journal must be written");
+
+        let error = Registry::at(root.clone())
+            .recover_incomplete_removal()
+            .expect_err("unverified ACL platforms must fail closed");
+
+        assert_eq!(error.code(), "unsupported_platform");
+        assert_eq!(
+            fs::read(&temporary).expect("temporary journal must remain readable"),
+            sentinel
+        );
+        fs::remove_dir_all(root).expect("temporary root must be removed");
+    }
 
     #[cfg(unix)]
     fn temporary_root(test_name: &str) -> PathBuf {
@@ -2959,6 +4465,604 @@ config_file = "{sensitive_path}"
             Err(ProfileError::NotFound(_))
         ));
         assert_eq!(registry.find(Provider::Codex, "client-a")?.id, original.id);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_crash_boundaries_recover_to_one_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for fault in [
+            RemovalFault::JournalTemporaryCreate,
+            RemovalFault::JournalWrite,
+            RemovalFault::JournalFileSync,
+            RemovalFault::JournalAtomicRename,
+            RemovalFault::JournalDirectorySync,
+            RemovalFault::TombstoneRename,
+            RemovalFault::ProviderRootSyncAfterRename,
+            RemovalFault::RegistryTemporaryCreate,
+            RemovalFault::RegistryWrite,
+            RemovalFault::RegistryFileSync,
+            RemovalFault::RegistryAtomicRename,
+            RemovalFault::RegistryDirectorySync,
+            RemovalFault::RecursiveCleanup,
+            RemovalFault::ProviderRootSyncAfterCleanup,
+            RemovalFault::JournalRemove,
+            RemovalFault::JournalRemoveDirectorySync,
+        ] {
+            let root = temporary_root("removal-crash-boundary");
+            let registry = Registry::at(root.clone());
+            let profile = register_test_profile(&registry, "work")?;
+            let identity_key = fs::read(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
+            let faulting = Registry::at_with_removal_fault(root.clone(), fault);
+
+            let _ = faulting.remove(Provider::Codex, "work", None);
+            Registry::at(root.clone()).recover_incomplete_removal()?;
+
+            let profiles = Registry::at(root.clone()).list()?;
+            let removal_was_visible = matches!(
+                fault,
+                RemovalFault::RegistryDirectorySync
+                    | RemovalFault::RecursiveCleanup
+                    | RemovalFault::ProviderRootSyncAfterCleanup
+                    | RemovalFault::JournalRemove
+                    | RemovalFault::JournalRemoveDirectorySync
+            );
+            if removal_was_visible {
+                assert!(profiles.is_empty(), "{fault:?} must converge to removed");
+            } else {
+                assert_eq!(
+                    profiles,
+                    vec![profile.clone()],
+                    "{fault:?} must converge to the complete old profile"
+                );
+            }
+            assert_eq!(
+                fs::read(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?,
+                identity_key
+            );
+            let provider_root = root.join("profiles/codex");
+            assert!(!fs::read_dir(&provider_root)?.any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| entry.file_name().into_string().ok())
+                    .is_some_and(|name| name.starts_with(".removing-"))
+            }));
+            assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+            if profiles.is_empty() {
+                assert!(!provider_root.join(&profile.id).exists());
+            } else {
+                assert!(provider_root.join(&profile.id).is_dir());
+            }
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_recovery_cannot_finalize_a_journal_during_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let root = temporary_root("remove-concurrent-finalization");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker_root = root.clone();
+        let worker = thread::spawn(move || {
+            Registry::at_with_removal_pause(worker_root, reached_tx, resume_rx)
+                .remove(Provider::Codex, "work", None)
+                .map_err(|error| error.code())
+        });
+
+        reached_rx.recv_timeout(Duration::from_secs(5))?;
+        let competing_lock = open_private_lock_file(&root.join(REMOVAL_LOCK_FILE))?;
+        let lock_error = FileExt::try_lock_exclusive(&competing_lock)
+            .err()
+            .ok_or("cleanup must retain the removal lock through journal finalization")?;
+        assert_eq!(lock_error.kind(), io::ErrorKind::WouldBlock);
+        drop(competing_lock);
+        let competing_registry_lock = open_private_lock_file(&root.join(LOCK_FILE))?;
+        let registry_lock_error = FileExt::try_lock_exclusive(&competing_registry_lock)
+            .err()
+            .ok_or("cleanup must retain the registry lock through journal finalization")?;
+        assert_eq!(registry_lock_error.kind(), io::ErrorKind::WouldBlock);
+        drop(competing_registry_lock);
+
+        let (recovery_started_tx, recovery_started_rx) = mpsc::channel();
+        let recovery_root = root.clone();
+        let recovery = thread::spawn(move || {
+            recovery_started_tx
+                .send(())
+                .map_err(|_| "recovery observer disconnected")?;
+            Registry::at(recovery_root)
+                .recover_incomplete_removal()
+                .map_err(|error| error.code())
+        });
+        recovery_started_rx.recv_timeout(Duration::from_secs(5))?;
+        resume_tx.send(())?;
+        let removed = worker.join().map_err(|_| "removal worker panicked")?;
+        let recovered = recovery.join().map_err(|_| "recovery worker panicked")?;
+
+        assert_eq!(removed, Ok(profile.clone()));
+        assert_eq!(recovered, Ok(()));
+        assert!(registry.list()?.is_empty());
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+        assert!(!registry.profile_path(&profile)?.exists());
+        assert!(registry.removal_tombstones()?.is_empty());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_mutators_recheck_removal_artifacts_after_a_stale_preflight()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        for operation in ["rename", "register"] {
+            let root = temporary_root("remove-stale-mutator-preflight");
+            let registry = Registry::at(root.clone());
+            register_test_profile(&registry, "work")?;
+            register_test_profile(&registry, "personal")?;
+            let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+            let (reached_tx, reached_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let waiter_root = root.clone();
+            let waiter = thread::spawn(move || -> Result<(), &'static str> {
+                let waiting_registry =
+                    Registry::at_with_registry_mutation_pause(waiter_root, reached_tx, resume_rx);
+                match operation {
+                    "rename" => waiting_registry
+                        .rename(Provider::Codex, "personal", "client")
+                        .map(|_| ())
+                        .map_err(|error| error.code()),
+                    "register" => {
+                        let pending = waiting_registry
+                            .begin_codex_registration("client")
+                            .map_err(|error| error.code())?;
+                        write_test_codex_auth(&pending.home()).map_err(|error| error.code())?;
+                        pending
+                            .commit(test_identity_adapter())
+                            .map(|_| ())
+                            .map_err(|error| error.code())
+                    }
+                    _ => Err("invalid test operation"),
+                }
+            });
+
+            reached_rx.recv_timeout(Duration::from_secs(5))?;
+            let faulting = Registry::at_with_removal_fault(
+                root.clone(),
+                RemovalFault::ProviderRootSyncAfterRename,
+            );
+            assert!(faulting.remove(Provider::Codex, "work", None).is_err());
+            assert!(root.join(REMOVAL_JOURNAL_FILE).is_file());
+            resume_tx.send(())?;
+            let waiter_result = waiter.join().map_err(|_| "registry mutator panicked")?;
+
+            assert_eq!(
+                waiter_result,
+                Err("removal_recovery_required"),
+                "{operation} must reject artifacts that appeared after preflight"
+            );
+            assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+
+            registry.recover_incomplete_removal()?;
+            let profiles = registry.list()?;
+            assert_eq!(profiles.len(), 2);
+            assert!(profiles.iter().any(|profile| profile.alias == "work"));
+            assert!(profiles.iter().any(|profile| profile.alias == "personal"));
+            assert!(!profiles.iter().any(|profile| profile.alias == "client"));
+            assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+            assert!(!fs::read_dir(root.join("profiles/codex"))?.any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| entry.file_name().into_string().ok())
+                    .is_some_and(|name| name.starts_with(".staging-"))
+            }));
+
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_rejects_active_split_leases_without_preparing_a_transaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("remove-active-leases");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+        for lock_name in [COORDINATOR_LOCK_FILE, PROVIDER_LOCK_FILE] {
+            let lock = open_private_lock_file(&profile_directory.join(lock_name))?;
+            FileExt::lock_exclusive(&lock)?;
+            let error = registry
+                .remove(Provider::Codex, "work", None)
+                .err()
+                .ok_or("active lease must block removal")?;
+            assert_eq!(error.code(), "profile_busy");
+            assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+            assert!(profile_directory.is_dir());
+            assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+            FileExt::unlock(&lock)?;
+        }
+
+        let status_lease = registry.lock_profile(&profile)?;
+        let error = registry
+            .remove(Provider::Codex, "work", None)
+            .err()
+            .ok_or("combined status/verification lease must block removal")?;
+        assert_eq!(error.code(), "profile_busy");
+        drop(status_lease);
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+        assert!(profile_directory.is_dir());
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_rejects_symlink_hard_link_mode_and_marker_attacks_before_journaling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for attack in ["symlink", "hard-link", "mode", "marker"] {
+            let root = temporary_root("remove-owned-tree-attack");
+            let registry = Registry::at(root.clone());
+            let profile = register_test_profile(&registry, "work")?;
+            let profile_directory = registry.profile_directory(&profile)?;
+            let auth = profile_directory.join("home/auth.json");
+            let outside = root
+                .parent()
+                .ok_or("temporary root must have a parent")?
+                .join(format!("calcifer-removal-outside-{}", Uuid::new_v4()));
+            write_private_file(&outside, b"synthetic-outside-private-sentinel")?;
+            match attack {
+                "symlink" => {
+                    let session = profile_directory.join("home/sessions.jsonl");
+                    symlink(&outside, session)?;
+                }
+                "hard-link" => {
+                    fs::remove_file(&auth)?;
+                    fs::hard_link(&outside, &auth)?;
+                }
+                "mode" => {
+                    fs::set_permissions(&auth, fs::Permissions::from_mode(0o644))?;
+                }
+                "marker" => {
+                    fs::write(profile_directory.join(OWNER_MARKER), b"wrong-local-id")?;
+                }
+                _ => return Err("unknown attack".into()),
+            }
+            let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+            let error = registry
+                .remove(Provider::Codex, "work", None)
+                .err()
+                .ok_or("unsafe tree must block removal")?;
+            assert_eq!(error.code(), "unsafe_profile_state", "{attack}");
+            assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+            assert!(profile_directory.exists());
+            assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+            assert_eq!(
+                fs::read(&outside)?,
+                b"synthetic-outside-private-sentinel",
+                "{attack} must not touch an outside inode"
+            );
+
+            fs::remove_dir_all(root)?;
+            fs::remove_file(outside)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_recovery_rejects_root_replacement_and_orphan_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{DirBuilderExt, symlink};
+
+        let root = temporary_root("remove-root-replacement");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let faulting = Registry::at_with_removal_fault(
+            root.clone(),
+            RemovalFault::ProviderRootSyncAfterRename,
+        );
+        assert!(faulting.remove(Provider::Codex, "work", None).is_err());
+        let profiles_root = root.join("profiles");
+        let provider_root = profiles_root.join("codex");
+        let displaced = profiles_root.join("codex-displaced");
+        fs::rename(&provider_root, &displaced)?;
+        fs::DirBuilder::new().mode(0o700).create(&provider_root)?;
+        let tombstone_name = format!(".removing-{}", profile.id);
+        fs::rename(
+            displaced.join(&tombstone_name),
+            provider_root.join(&tombstone_name),
+        )?;
+
+        let error = registry
+            .recover_incomplete_removal()
+            .err()
+            .ok_or("provider-root replacement must fail recovery")?;
+        assert_eq!(error.code(), "removal_recovery_required");
+        assert!(provider_root.join(&tombstone_name).is_dir());
+        assert!(root.join(REMOVAL_JOURNAL_FILE).is_file());
+        fs::remove_dir_all(root)?;
+
+        let orphan_root = temporary_root("remove-orphan-tombstone");
+        let orphan_registry = Registry::at(orphan_root.clone());
+        let orphan_profile = register_test_profile(&orphan_registry, "work")?;
+        let outside = orphan_root
+            .parent()
+            .ok_or("temporary root must have a parent")?
+            .join(format!("calcifer-removal-outside-dir-{}", Uuid::new_v4()));
+        fs::DirBuilder::new().mode(0o700).create(&outside)?;
+        write_private_file(&outside.join("sentinel"), b"outside-must-survive")?;
+        let orphan = orphan_root
+            .join("profiles/codex")
+            .join(format!(".removing-{}", orphan_profile.id));
+        symlink(&outside, &orphan)?;
+        let error = orphan_registry
+            .recover_incomplete_removal()
+            .err()
+            .ok_or("journal-free tombstone must fail closed")?;
+        assert_eq!(error.code(), "removal_recovery_required");
+        assert_eq!(fs::read(outside.join("sentinel"))?, b"outside-must-survive");
+        fs::remove_file(orphan)?;
+        fs::remove_dir_all(orphan_root)?;
+        fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_recovery_rejects_duplicate_tombstones_without_deleting_either()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = temporary_root("remove-duplicate-tombstones");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let provider_root = root.join("profiles/codex");
+        let first = provider_root.join(format!(".removing-{}", Uuid::new_v4()));
+        let second = provider_root.join(format!(".removing-{}", Uuid::new_v4()));
+        fs::DirBuilder::new().mode(0o700).create(&first)?;
+        fs::DirBuilder::new().mode(0o700).create(&second)?;
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let error = registry
+            .recover_incomplete_removal()
+            .err()
+            .ok_or("duplicate tombstones must fail closed")?;
+
+        assert_eq!(error.code(), "removal_recovery_required");
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+        assert_eq!(
+            registry.find_without_recovery(Provider::Codex, "work")?,
+            profile
+        );
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_visibility_recovery_finishes_a_partially_unlinked_tombstone_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("remove-partial-cleanup");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let faulting =
+            Registry::at_with_removal_fault(root.clone(), RemovalFault::RecursiveCleanup);
+        assert!(faulting.remove(Provider::Codex, "work", None).is_err());
+        let tombstone = root
+            .join("profiles/codex")
+            .join(format!(".removing-{}", profile.id));
+        for file in [
+            OWNER_MARKER,
+            COORDINATOR_LOCK_FILE,
+            PROVIDER_LOCK_FILE,
+            crate::provider_identity::IDENTITY_MARKER_FILE,
+        ] {
+            fs::remove_file(tombstone.join(file))?;
+        }
+        fs::remove_file(tombstone.join("home/auth.json"))?;
+
+        Registry::at(root.clone()).recover_incomplete_removal()?;
+
+        assert!(!tombstone.exists());
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+        assert!(Registry::at(root.clone()).list()?.is_empty());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_visibility_recovery_never_restores_a_partially_deleted_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("remove-partial-previsibility");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let faulting = Registry::at_with_removal_fault(
+            root.clone(),
+            RemovalFault::ProviderRootSyncAfterRename,
+        );
+        assert!(faulting.remove(Provider::Codex, "work", None).is_err());
+        let tombstone = root
+            .join("profiles/codex")
+            .join(format!(".removing-{}", profile.id));
+        fs::remove_file(tombstone.join(OWNER_MARKER))?;
+
+        let error = Registry::at(root.clone())
+            .recover_incomplete_removal()
+            .err()
+            .ok_or("incomplete pre-visibility credentials must not be restored")?;
+        assert_eq!(error.code(), "removal_recovery_required");
+        assert!(tombstone.is_dir());
+        assert!(root.join(REMOVAL_JOURNAL_FILE).is_file());
+        assert_eq!(
+            registry.list().err().map(|error| error.code()),
+            Some("removal_recovery_required")
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_visibility_recovery_rejects_a_tree_missing_credentials_even_with_its_owner_marker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("remove-partial-credentials-previsibility");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let faulting = Registry::at_with_removal_fault(
+            root.clone(),
+            RemovalFault::ProviderRootSyncAfterRename,
+        );
+        assert!(faulting.remove(Provider::Codex, "work", None).is_err());
+        let tombstone = root
+            .join("profiles/codex")
+            .join(format!(".removing-{}", profile.id));
+        fs::remove_file(tombstone.join("home/auth.json"))?;
+
+        let error = Registry::at(root.clone())
+            .recover_incomplete_removal()
+            .err()
+            .ok_or("a pre-visibility tree missing credentials must not be restored")?;
+
+        assert_eq!(error.code(), "removal_recovery_required");
+        assert!(tombstone.is_dir());
+        assert!(tombstone.join(OWNER_MARKER).is_file());
+        assert!(root.join(REMOVAL_JOURNAL_FILE).is_file());
+        assert_eq!(
+            registry.list().err().map(|error| error.code()),
+            Some("removal_recovery_required")
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_removal_never_follows_an_alias_to_a_replacement_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("remove-confirmed-id-race");
+        let registry = Registry::at(root.clone());
+        let confirmed = register_test_profile(&registry, "work")?;
+
+        registry.rename(Provider::Codex, "work", "former-work")?;
+        let replacement = register_test_profile(&registry, "work")?;
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let error = registry
+            .remove(Provider::Codex, "work", Some(&confirmed.id))
+            .err()
+            .ok_or("alias reuse after confirmation must not remove its replacement")?;
+
+        assert_eq!(error.code(), "profile_not_found");
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+        assert_eq!(
+            registry.find(Provider::Codex, "former-work")?.id,
+            confirmed.id
+        );
+        assert_eq!(registry.find(Provider::Codex, "work")?.id, replacement.id);
+        assert!(registry.profile_directory(&confirmed)?.is_dir());
+        assert!(registry.profile_directory(&replacement)?.is_dir());
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removed_alias_reuse_gets_a_fresh_id_without_rebinding_lineage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = temporary_root("remove-alias-reuse-lineage");
+        let registry = Registry::at(root.clone());
+        let removed = register_test_profile(&registry, "work")?;
+        let conversation = root.join("conversations.json");
+        write_private_file(
+            &conversation,
+            format!(
+                "{{\"schema_version\":1,\"profile_id\":\"{}\",\"sentinel\":\"private-lineage\"}}",
+                removed.id
+            )
+            .as_bytes(),
+        )?;
+        let lineage_inode = fs::metadata(&conversation)?.ino();
+        let lineage = fs::read(&conversation)?;
+        let identity_key = fs::read(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
+
+        assert_eq!(registry.remove(Provider::Codex, "work", None)?, removed);
+        let replacement = register_test_profile(&registry, "work")?;
+
+        assert_ne!(replacement.id, removed.id);
+        assert_eq!(replacement.alias, removed.alias);
+        assert_eq!(fs::metadata(&conversation)?.ino(), lineage_inode);
+        assert_eq!(fs::read(&conversation)?, lineage);
+        assert_eq!(
+            fs::read(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?,
+            identity_key
+        );
+        assert!(matches!(
+            registry.find_by_id(Provider::Codex, &removed.id),
+            Err(ProfileError::NotFound(_))
+        ));
+        assert_eq!(registry.find(Provider::Codex, "work")?.id, replacement.id);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_removal_journal_is_bounded_redacted_and_non_destructive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("remove-malformed-journal");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let private = "synthetic-private-journal@example.invalid";
+        write_private_file(
+            &root.join(REMOVAL_JOURNAL_FILE),
+            format!("{{\"secret\":\"{private}\"}}").as_bytes(),
+        )?;
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let error = registry
+            .recover_incomplete_removal()
+            .err()
+            .ok_or("malformed journal must fail closed")?;
+        assert_eq!(error.code(), "removal_recovery_required");
+        assert!(!error.safe_message().contains(private));
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+        assert!(profile_directory.is_dir());
+        assert!(root.join(REMOVAL_JOURNAL_FILE).is_file());
 
         fs::remove_dir_all(root)?;
         Ok(())

@@ -10,7 +10,7 @@ mod provider_identity;
 mod providers;
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::{ExitCode, ExitStatus};
 
 use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -126,6 +126,52 @@ where
                 ProviderArgument::Codex => {
                     match commands::auth::rename_codex(&profile.alias, &new_alias) {
                         Ok(report) => render_rename_report(&report, cli.json),
+                        Err(error) => render_app_error("auth", &error, cli.json),
+                    }
+                }
+            },
+            AuthCommand::Remove { profile, yes } => match profile.provider {
+                ProviderArgument::Codex => {
+                    let confirmed_profile_id = if !yes {
+                        if cli.json || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+                            return render_app_error(
+                                "auth",
+                                &AppError::ConfirmationRequired,
+                                cli.json,
+                            );
+                        }
+                        let preview = match commands::auth::preview_remove_codex(&profile.alias) {
+                            Ok(preview) => preview,
+                            Err(error) => return render_app_error("auth", &error, false),
+                        };
+                        let prompt = format!(
+                            "Remove {} (local profile {}, created {})?\nThis deletes only Calcifer-managed local credentials and sessions; it does not revoke provider tokens or guarantee secure erasure.\nType 'yes' to continue:",
+                            preview.reference(),
+                            preview.id,
+                            preview.created_at
+                        );
+                        if write_stderr(&prompt).is_err() {
+                            return ExitCode::FAILURE;
+                        }
+                        let mut confirmation = String::new();
+                        if io::stdin().read_line(&mut confirmation).is_err()
+                            || !is_explicit_confirmation(&confirmation)
+                        {
+                            return render_app_error(
+                                "auth",
+                                &AppError::ConfirmationRequired,
+                                false,
+                            );
+                        }
+                        Some(preview.id)
+                    } else {
+                        None
+                    };
+                    match commands::auth::remove_codex(
+                        &profile.alias,
+                        confirmed_profile_id.as_deref(),
+                    ) {
+                        Ok(report) => render_remove_report(&report, cli.json),
                         Err(error) => render_app_error("auth", &error, cli.json),
                     }
                 }
@@ -314,6 +360,25 @@ fn render_rename_report(report: &commands::auth::RenameReport, json: bool) -> Ex
     }
 }
 
+fn render_remove_report(report: &commands::auth::RemoveReport, json: bool) -> ExitCode {
+    let rendered = if json {
+        report.to_json()
+    } else {
+        Ok(report.to_human())
+    };
+    match rendered {
+        Ok(rendered) if write_stdout(&rendered).is_ok() => ExitCode::SUCCESS,
+        _ => {
+            let _ = write_stderr(if json {
+                JSON_INTERNAL_ERROR
+            } else {
+                HUMAN_INTERNAL_ERROR
+            });
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn render_status_report(report: &commands::status::StatusReport, json: bool) -> ExitCode {
     let rendered = if json {
         report.to_json()
@@ -388,6 +453,12 @@ fn write_stdout(message: &str) -> io::Result<()> {
 
 fn write_stderr(message: &str) -> io::Result<()> {
     writeln!(io::stderr().lock(), "{message}")
+}
+
+fn is_explicit_confirmation(input: &str) -> bool {
+    let input = input.strip_suffix('\n').unwrap_or(input);
+    let input = input.strip_suffix('\r').unwrap_or(input);
+    input == "yes"
 }
 
 #[cfg(test)]
@@ -467,6 +538,16 @@ mod tests {
                 assert_eq!(provider_args, [OsString::from("--untracked")]);
             }
             _ => panic!("run command parsed as a different command"),
+        }
+    }
+
+    #[test]
+    fn removal_confirmation_accepts_only_exact_yes_with_a_terminal_line_ending() {
+        for accepted in ["yes", "yes\n", "yes\r\n"] {
+            assert!(is_explicit_confirmation(accepted), "{accepted:?}");
+        }
+        for rejected in ["", "y", "YES\n", " yes\n", "yes \n", "yes\n\n"] {
+            assert!(!is_explicit_confirmation(rejected), "{rejected:?}");
         }
     }
 }

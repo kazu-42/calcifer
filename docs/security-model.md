@@ -2,7 +2,7 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, and captures an exact same-profile thread key for crash-safe cold restore. Automatic failover and cross-profile conversation handoff are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
+This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. Automatic failover and cross-profile conversation handoff are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
 
 ## Assets
 
@@ -113,6 +113,32 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Codex 0.144.4 hides its 10,000-file rollout scan cap from the v2 App Server response. Calcifer proves a conservative upper bound by snapshotting active and archived roots separately before and after listing, requiring each root to remain below the cap, and mapping every wire path to the stable snapshot. Nested nodes must remain owned, real, non-symlink, and non-writable by group/other; files must have one hard link. The enclosing managed home remains owner-private.
 - Bare resume releases its initial conversation lock before waiting for a profile lease, then revalidates the unchanged UUID binding under that lease. Registry mutation order is coordinator lease, provider lease, then a short conversation lock; no conversation lock spans App Server or interactive provider I/O.
 - A conversation document update uses create-only private same-directory temporary files, file fsync, rename, and directory fsync. Post-rename sync uncertainty is read back and reported without retrying a provider launch. Newer schemas and unsafe owner/type/mode/hard-link state are never rewritten.
+- Profile removal is local-only and requires an explicit TTY `yes` or `--yes`;
+  JSON requires `--yes`. Before confirmation, non-TTY invocations perform no
+  managed-state read, recovery, or mutation. Removal never starts a provider or
+  browser process and never calls a token endpoint.
+- Removal holds both profile lifetime leases before journal or registry locks,
+  validates root and tree inode/device, current owner, private mode, real
+  directory/regular-file type, single-link files, exact marker, and bounded
+  traversal, then moves the exact tree to a same-filesystem tombstone. A
+  path-free manifest digest and entry count prevent pre-visibility recovery
+  from restoring a tree with missing credentials or session state.
+- The registry revision without the immutable profile ID is the deletion
+  visibility point. Credentials are recursively unlinked only after exact
+  readback. Descriptor-relative, no-follow traversal prevents a symlinked child
+  from redirecting cleanup outside the opened tombstone. Recovery restores only
+  a complete pre-visibility tree and only completes deletion after visibility;
+  the removal and registry locks remain held through tombstone and journal
+  durability. Ambiguity leaves the tombstone intact and reports a safe recovery
+  error.
+- Normal registry writers recheck removal artifacts after acquiring the
+  registry lock. A rename or registration that passed recovery before a
+  concurrent removal prepared its journal therefore stops without changing the
+  registry revision; the journal's old/new recovery digests remain authoritative.
+- Removal does not edit global Codex state, provider tokens, the installation
+  identity key, unrelated profiles, or conversation lineage. Reusing an alias
+  receives a fresh UUID. Filesystem unlinking does not guarantee secure erasure
+  from snapshots, backups, filesystem journals, or SSD wear leveling.
 - Lifecycle inspection is a version-pinned metadata projection. It validates the first session identity and recognizes only persisted start, complete, and abort tags; every response/tool payload is ignored. `interrupted` and `unknown_crash` may reopen the exact history with a warning, but no prompt, command, approval answer, or tool call is reconstructed or submitted. Bare and explicit exact resume retain lifecycle from a matching immutable binding even when pending or needs-selection state hides the workspace head. A clean pre-launch observation cannot clear persisted uncertainty; only lifecycle readback after the provider completes can do so. Immutable profile/cwd ownership conflicts terminalize the pending launch and require explicit selection instead of retrying forever.
 - Capture failure never silently downgrades to an uncaptured launch. Explicit `--untracked` run or profile-specific `resume --last` refuses a pending launch in the canonical workspace, atomically records metadata-only in-flight ownership and `needs_selection` before spawn, performs no inventory or post-capture, and leaves the marker intact across provider or spawn failure. Active ownership blocks cross-profile exact adoption, and exact post-exit refresh requires its original head to remain authoritative, closing both concurrency orderings. Registry errors and uncertain durability stop before spawn; bare resume remains unavailable until exact recovery.
 - Standard proxy and CA environment variables remain available for legitimate

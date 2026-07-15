@@ -172,7 +172,7 @@ pub(crate) fn supervise_codex(
         let profile = registry.find_by_id(Provider::Codex, profile_id)?;
         require_expected_alias(&profile, expected_alias)?;
         let _coordinator_lease = registry.lock_profile_coordinator(&profile)?;
-        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
+        let profile = registry.refetch_by_id_under_lease(Provider::Codex, profile_id)?;
         require_expected_alias(&profile, expected_alias)?;
         announce()?;
         let _home = registry.profile_home(&profile)?;
@@ -240,7 +240,7 @@ pub(crate) fn supervise_codex(
         let profile = registry.find_by_id(Provider::Codex, profile_id)?;
         require_expected_alias(&profile, expected_alias)?;
         let _lease = registry.lock_profile(&profile)?;
-        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
+        let profile = registry.refetch_by_id_under_lease(Provider::Codex, profile_id)?;
         require_expected_alias(&profile, expected_alias)?;
         announce()?;
         let home = registry.profile_home(&profile)?;

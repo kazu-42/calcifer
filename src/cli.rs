@@ -28,7 +28,7 @@ pub(crate) enum Commands {
     /// Inspect the local environment without reading or changing credentials.
     Doctor,
 
-    /// Register, verify, rename, or list isolated provider profiles.
+    /// Register, verify, rename, remove, or list isolated provider profiles.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -173,6 +173,16 @@ pub(crate) enum AuthCommand {
 
         /// New local alias for the same immutable profile.
         new_alias: String,
+    },
+
+    /// Remove one Calcifer-managed local profile without provider logout.
+    Remove {
+        /// Existing profile to remove, for example codex@work.
+        profile: ProfileReference,
+
+        /// Confirm deletion without an interactive TTY prompt.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// List registered profiles without reading credentials.

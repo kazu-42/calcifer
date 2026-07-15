@@ -7,7 +7,7 @@
 Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-agent CLIs with isolated account profiles and structured usage visibility.
 
 > [!WARNING]
-> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. Automatic failover, cross-profile session handoff, remove/reauth flows, and verified Windows credential ACLs are not implemented yet.
+> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, confirmed crash-safe local removal, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. Automatic failover, cross-profile session handoff, reauthentication, and verified Windows credential ACLs are not implemented yet.
 
 Calcifer is intended to make routine selection among accounts that you already own or are authorized to use feel boring: authenticate each profile through the provider's official CLI, keep each profile isolated, and start every new CLI process with an explicit profile.
 
@@ -48,6 +48,11 @@ calcifer auth verify codex@work
 # Change only a local display alias; no browser or provider process is used.
 calcifer auth rename codex@work client-a
 
+# Remove one local managed profile after a TTY confirmation, or explicitly.
+calcifer auth remove codex@client-a
+calcifer auth remove codex@client-a --yes
+calcifer --json auth remove codex@client-a --yes
+
 # Read every idle registered profile, or one idle profile, without changing the global login.
 calcifer status
 calcifer status codex@work
@@ -83,6 +88,35 @@ provider executable, opens a browser, refreshes a token, nor contacts a
 network service. If registry durability becomes uncertain after its atomic
 visibility point, Calcifer reports `registry_commit_uncertain`; read back
 `auth list` instead of retrying blindly.
+
+`auth remove` is also entirely local and offline. Without `--yes`, it requires
+stdin to be a TTY, displays the local profile ID and deletion scope, and accepts
+only an explicit `yes`. Non-TTY use without `--yes` and JSON use without
+`--yes` fail before reading or changing managed state. Removal acquires both
+profile lifetime leases, so an active run, resume, status probe, verification,
+or reauthentication operation returns `profile_busy` without preparing a
+deletion.
+
+After confirmation, Calcifer validates the exact ownership-marked profile tree,
+persists a private bounded journal with a path-free tree-manifest digest,
+renames the UUID directory to a same-filesystem opaque tombstone, and atomically
+removes the immutable ID from the profile registry. That registry update is the
+visibility point: only after readback proves the ID is absent does Calcifer
+unlink the tombstone using directory-relative, no-follow filesystem operations.
+Startup and `auth list` recover an unambiguous interrupted transaction to either
+the manifest-complete old state before visibility or the complete removed state
+afterward. Ambiguous journals, replaced roots, missing entries, symlinks, hard
+links, unexpected owners or modes, and malformed tombstones fail closed without
+recursive deletion.
+
+Removal does not start Codex, open a browser, contact a provider endpoint,
+revoke tokens, change global `~/.codex`, delete conversation lineage metadata,
+or remove Calcifer's installation identity key. Reusing the old alias creates a
+fresh profile UUID; an existing conversation remains bound to the now-missing
+old UUID and cannot silently move to the replacement account. Local unlinking
+is not guaranteed secure erasure from backups, snapshots, journaled
+filesystems, or SSD wear leveling. Use the provider's revocation controls when
+credential invalidation is required.
 
 Before interactive `run` and `resume`, Calcifer canonicalizes the working directory and checks every repository-local `.codex` layer from the nearest real `.git` root to that directory. Any `.codex/agents` filesystem node fails closed even when `config.toml` is absent; otherwise only a Codex 0.144.4-scoped set of repository settings that do not own managed authentication, provider routing, dynamic features, or state locations is accepted. Unknown keys, ambiguous filesystem nodes, invalid TOML, and files larger than 1 MiB fail before Codex starts. In a linked worktree, Codex 0.144.4 can additionally merge only `hooks` from the primary checkout; Calcifer does not resolve that external hook source, and repository hooks remain outside its sandbox guarantee. This preflight protects Calcifer's account-routing boundary, but it does not make repository hooks, plugins, tools, or code safe.
 
@@ -148,21 +182,23 @@ Example JSON envelope:
 }
 ```
 
-For structured `doctor`, `auth list`, `auth verify`, `auth rename`, `status`,
-and `update check` results, `--json` emits one JSON document on stdout. Rename
-reports `action: "rename"`, whether the alias changed, the old and new local
-references, and the existing non-secret profile record. Interactive `auth add`,
-`run`, and `resume` reject `--json` because the official provider owns the
-terminal and mixing its stream with a Calcifer JSON document would break the
-contract. Identity JSON contains only Calcifer-local profile metadata and never
-the private fingerprint, identity-key ID, or provider account scope. Update
-JSON separates immutable-release and manifest-declared attestation publication
-evidence from locally verified manifest/checksum bytes, and always marks the
-un-downloaded archive `not_downloaded`. Usage and update failures emit one
-redacted JSON document on stderr with a non-zero exit code. Clap's standard
-`--help` and `--version` output remains text even when `--json` is present.
-Within schema version 1, existing field names and meanings will remain stable;
-new fields may be added.
+For structured `doctor`, `auth list`, `auth verify`, `auth rename`,
+`auth remove --yes`, `status`, and `update check` results, `--json` emits one
+JSON document on stdout. Rename reports `action: "rename"`, whether the alias
+changed, the old and new local references, and the existing non-secret profile
+record. Remove reports `action: "remove"`, `removed: true`, and the removed
+non-secret profile record; JSON removal is accepted only with explicit `--yes`.
+Interactive `auth add`, `run`, and `resume` reject `--json` because the official
+provider owns the terminal and mixing its stream with a Calcifer JSON document
+would break the contract. Identity JSON contains only Calcifer-local profile
+metadata and never the private fingerprint, identity-key ID, or provider
+account scope. Update JSON separates immutable-release and manifest-declared
+attestation publication evidence from locally verified manifest/checksum bytes,
+and always marks the un-downloaded archive `not_downloaded`. Usage and update
+failures emit one redacted JSON document on stderr with a non-zero exit code.
+Clap's standard `--help` and `--version` output remains text even when `--json`
+is present. Within schema version 1, existing field names and meanings will
+remain stable; new fields may be added.
 
 ## Planned interface
 
@@ -312,8 +348,8 @@ The CI contract covers formatting and Clippy on Rust 1.96, tests on Linux/macOS/
 The current and next slices keep Codex profile isolation with no shared runtime home:
 
 1. **Implemented:** private Unix registry, profile-name validation, ownership markers, and atomic metadata writes.
-2. **Implemented:** `auth add/list/verify`, private Codex identity binding, `run`, same-profile `resume`, profile leases, and structured on-demand status.
-3. **Implemented:** exact same-profile thread capture, crash reconciliation, and no-argument cold restore. Safe remove/reauth/re-key flows remain.
+2. **Implemented:** `auth add/list/verify/remove`, private Codex identity binding, `run`, same-profile `resume`, profile leases, and structured on-demand status.
+3. **Implemented:** exact same-profile thread capture, crash reconciliation, no-argument cold restore, and journaled local profile removal. Safe reauth/re-key flows remain.
 4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
 6. Add version-gated cross-profile conversation handoff as the default successful failover path; preserve one profile-local writer per lineage generation.

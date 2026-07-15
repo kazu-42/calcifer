@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Confirmed offline `auth remove` for one Codex profile, with non-TTY and JSON
+  fail-safe confirmation, a bounded private journal, same-filesystem
+  tombstones, immutable-ID registry visibility, deterministic crash recovery,
+  and stable secret-free human/JSON output.
+
+### Security
+
+- Profile removal revalidates owner, mode, type, marker, hard-link count,
+  filesystem and inode identity before deletion, then uses descriptor-relative
+  no-follow traversal. It preserves global Codex state, provider tokens, the
+  installation identity key, unrelated profiles, and immutable conversation
+  lineage; local unlinking is explicitly not advertised as secure erasure.
+
 ## [0.1.0-alpha.4] - 2026-07-15
 
 ### Added
