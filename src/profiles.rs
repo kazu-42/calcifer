@@ -414,8 +414,11 @@ pub(crate) struct Registry {
 
 impl Registry {
     pub(crate) fn discover() -> Result<Self, ProfileError> {
+        let root = data_root()?;
+        #[cfg(unix)]
+        let root = canonicalize_managed_root(&root)?;
         Ok(Self {
-            root: data_root()?,
+            root,
             #[cfg(test)]
             registry_write_fault: None,
             #[cfg(test)]
@@ -756,20 +759,26 @@ impl Registry {
         }
         verify_private_directory(&self.root)?;
 
-        let first_barrier = self.read_removal_barrier()?;
-        let first_journal = self.read_removal_journal()?;
-        let tombstones = self.removal_tombstones()?;
-        let temporaries = self.removal_temporaries()?;
-        if first_barrier.is_none()
-            && first_journal.is_none()
-            && tombstones.is_empty()
-            && temporaries.is_empty()
+        let preflight = (|| {
+            Ok::<_, ProfileError>(
+                self.read_removal_barrier()?.is_none()
+                    && self.read_removal_journal()?.is_none()
+                    && self.removal_tombstones()?.is_empty()
+                    && self.removal_temporaries()?.is_empty(),
+            )
+        })();
+        if preflight
+            .as_ref()
+            .is_ok_and(|artifacts_absent| *artifacts_absent)
         {
             return Ok(());
         }
 
         #[cfg(not(unix))]
-        return Err(ProfileError::UnsupportedPlatform);
+        {
+            let _artifacts_absent = preflight?;
+            return Err(ProfileError::UnsupportedPlatform);
+        }
 
         #[cfg(unix)]
         self.recover_incomplete_removal_unix()
@@ -777,16 +786,16 @@ impl Registry {
 
     #[cfg(unix)]
     fn recover_incomplete_removal_unix(&self) -> Result<(), ProfileError> {
-        // Wait for a live remover to finish before inspecting a tree that may
-        // be changing through descriptor-relative cleanup. Release this gate
-        // before taking a profile lease to preserve the global lock order.
+        // Wait for a live remover to finish, then take one consistent artifact
+        // snapshot while it cannot unlink the journal between verification and
+        // open. Release this gate before taking a profile lease to preserve the
+        // global profile-lease -> removal-lock -> registry-lock order.
         let quiescence_gate = self.lock_removal_exclusive()?;
-        drop(quiescence_gate);
-
         let first_barrier = self.read_removal_barrier()?;
         let first_journal = self.read_removal_journal()?;
         let tombstones = self.removal_tombstones()?;
         let temporaries = self.removal_temporaries()?;
+        drop(quiescence_gate);
         let effective_journal =
             effective_removal_journal(first_barrier.as_ref(), first_journal.as_ref())?;
         if first_barrier.is_some() && first_journal.is_none() && !tombstones.is_empty() {
@@ -1530,10 +1539,9 @@ impl Registry {
             Err(error) => return Err(ProfileError::Io(error)),
             Ok(_) => {}
         }
-        verify_private_single_link_regular_file(&path)
-            .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
         let mut bytes = Vec::new();
-        File::open(&path)?
+        open_verified_registry_file(&path, true)
+            .map_err(|_| ProfileError::RemovalRecoveryRequired)?
             .take((MAX_REMOVAL_JOURNAL_BYTES + 1) as u64)
             .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_REMOVAL_JOURNAL_BYTES {
@@ -1565,8 +1573,7 @@ impl Registry {
         let destination = self.root.join(REMOVAL_JOURNAL_FILE);
         let publication = (|| {
             self.inject_removal_fault(RemovalFaultPoint::JournalTemporaryCreate)?;
-            let mut options = private_open_options();
-            let mut file = options.write(true).create_new(true).open(&temporary)?;
+            let mut file = create_new_private_file(&temporary)?;
             self.inject_removal_fault(RemovalFaultPoint::JournalWrite)?;
             file.write_all(&bytes)?;
             self.inject_removal_fault(RemovalFaultPoint::JournalFileSync)?;
@@ -2345,6 +2352,8 @@ fn validate_owned_removal_tree_inner_with_limits(
                 "managed profile tree contains an unsafe directory".to_owned(),
             ));
         }
+        verify_no_extended_macos_acl(&directory)?;
+        verify_deletable_macos_flags_path(&directory)?;
         ensure_same_removal_mount(
             &roots.provider_mount,
             &removal_mount_identity_path(&directory)?,
@@ -2382,6 +2391,8 @@ fn validate_owned_removal_tree_inner_with_limits(
                     "managed profile tree contains unsafe state".to_owned(),
                 ));
             }
+            verify_no_extended_macos_acl(&entry_path)?;
+            verify_deletable_macos_flags_path(&entry_path)?;
             if !non_following_leaf {
                 ensure_same_removal_mount(
                     &roots.provider_mount,
@@ -2635,6 +2646,12 @@ fn remove_owned_tombstone_at_with_limits(
     let final_stat = statat(&provider_fd, tombstone_name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(io::Error::from)
         .map_err(ProfileError::Io)?;
+    validate_opened_removal_entry(
+        &tree_stat,
+        &final_stat,
+        RemovalEntryKind::Directory,
+        expected_provider.device,
+    )?;
     if stat_identity(&final_stat)? != expected_tree {
         return Err(ProfileError::UnsafeState(
             "managed profile tree was replaced during cleanup".to_owned(),
@@ -2644,6 +2661,12 @@ fn remove_owned_tombstone_at_with_limits(
     let final_opened_stat = fstat(&final_tree_fd)
         .map_err(io::Error::from)
         .map_err(ProfileError::Io)?;
+    validate_opened_removal_entry(
+        &tree_stat,
+        &final_opened_stat,
+        RemovalEntryKind::Directory,
+        expected_provider.device,
+    )?;
     if stat_identity(&final_opened_stat)? != expected_tree {
         return Err(ProfileError::UnsafeState(
             "managed profile tree was replaced during cleanup".to_owned(),
@@ -2701,11 +2724,12 @@ fn remove_owned_directory_entries(
                 let opened_stat = fstat(&child)
                     .map_err(io::Error::from)
                     .map_err(ProfileError::Io)?;
-                if stat_identity(&opened_stat)? != stat_identity(&stat)? {
-                    return Err(ProfileError::UnsafeState(
-                        "managed profile directory was replaced during cleanup".to_owned(),
-                    ));
-                }
+                validate_opened_removal_entry(
+                    &stat,
+                    &opened_stat,
+                    RemovalEntryKind::Directory,
+                    expected_device,
+                )?;
                 remove_owned_directory_entries(
                     rustix::fs::Dir::new(child).map_err(io::Error::from)?,
                     expected_device,
@@ -2716,21 +2740,23 @@ fn remove_owned_directory_entries(
                 let final_stat = statat(&directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(io::Error::from)
                     .map_err(ProfileError::Io)?;
-                if stat_identity(&final_stat)? != stat_identity(&stat)? {
-                    return Err(ProfileError::UnsafeState(
-                        "managed profile directory was replaced during cleanup".to_owned(),
-                    ));
-                }
+                validate_opened_removal_entry(
+                    &stat,
+                    &final_stat,
+                    RemovalEntryKind::Directory,
+                    expected_device,
+                )?;
                 let final_child =
                     open_removal_entry_at(&directory_fd, &name, true, expected_mount)?;
                 let final_opened_stat = fstat(&final_child)
                     .map_err(io::Error::from)
                     .map_err(ProfileError::Io)?;
-                if stat_identity(&final_opened_stat)? != stat_identity(&stat)? {
-                    return Err(ProfileError::UnsafeState(
-                        "managed profile directory was replaced during cleanup".to_owned(),
-                    ));
-                }
+                validate_opened_removal_entry(
+                    &stat,
+                    &final_opened_stat,
+                    RemovalEntryKind::Directory,
+                    expected_device,
+                )?;
                 unlinkat(&directory_fd, &name, AtFlags::REMOVEDIR)
                     .map_err(io::Error::from)
                     .map_err(ProfileError::Io)?;
@@ -2740,11 +2766,12 @@ fn remove_owned_directory_entries(
                 let opened_stat = fstat(&file)
                     .map_err(io::Error::from)
                     .map_err(ProfileError::Io)?;
-                if stat_identity(&opened_stat)? != stat_identity(&stat)? {
-                    return Err(ProfileError::UnsafeState(
-                        "managed profile file was replaced during cleanup".to_owned(),
-                    ));
-                }
+                validate_opened_removal_entry(
+                    &stat,
+                    &opened_stat,
+                    RemovalEntryKind::RegularFile,
+                    expected_device,
+                )?;
                 unlinkat(&directory_fd, &name, AtFlags::empty())
                     .map_err(io::Error::from)
                     .map_err(ProfileError::Io)?;
@@ -2760,6 +2787,21 @@ fn remove_owned_directory_entries(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_opened_removal_entry(
+    expected: &rustix::fs::Stat,
+    opened: &rustix::fs::Stat,
+    expected_kind: RemovalEntryKind,
+    expected_device: u64,
+) -> Result<(), ProfileError> {
+    if stat_identity(opened)? != stat_identity(expected)? {
+        return Err(ProfileError::UnsafeState(
+            "managed profile entry was replaced during cleanup".to_owned(),
+        ));
+    }
+    validate_removal_stat(opened, expected_kind, expected_device)
 }
 
 #[cfg(unix)]
@@ -2795,7 +2837,7 @@ fn validate_removal_stat(
             "managed profile tree changed during cleanup".to_owned(),
         ));
     }
-    Ok(())
+    verify_deletable_macos_flags_stat(stat)
 }
 
 #[cfg(unix)]
@@ -3238,6 +3280,60 @@ fn require_absolute_root(path: PathBuf) -> Result<PathBuf, ProfileError> {
     Ok(path)
 }
 
+/// Resolves the existing portion of a managed Unix root exactly once.
+///
+/// User-selected roots may legitimately be reached through aliases such as
+/// macOS `/var` or a symlinked home directory. Calcifer stores the physical
+/// path and appends only components that do not exist yet. Operational storage
+/// checks can therefore reject every symlink ancestor instead of performing
+/// path-based ACL checks on a mutable symlink object.
+#[cfg(unix)]
+fn canonicalize_managed_root(path: &Path) -> Result<PathBuf, ProfileError> {
+    let normalized = require_absolute_root(path.to_path_buf())?;
+    let mut candidate = normalized.as_path();
+    let mut missing = Vec::new();
+
+    loop {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                    return Err(ProfileError::UnsafeState(
+                        "managed data root has a non-directory ancestor".to_owned(),
+                    ));
+                }
+                let mut canonical = fs::canonicalize(candidate).map_err(|_| {
+                    ProfileError::UnsafeState(
+                        "managed data root cannot be resolved safely".to_owned(),
+                    )
+                })?;
+                if !fs::metadata(&canonical)?.is_dir() {
+                    return Err(ProfileError::UnsafeState(
+                        "managed data root has a non-directory ancestor".to_owned(),
+                    ));
+                }
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = candidate.file_name().ok_or_else(|| {
+                    ProfileError::UnsafeState(
+                        "managed data root has no resolvable ancestor".to_owned(),
+                    )
+                })?;
+                missing.push(component.to_owned());
+                candidate = candidate.parent().ok_or_else(|| {
+                    ProfileError::UnsafeState(
+                        "managed data root has no resolvable ancestor".to_owned(),
+                    )
+                })?;
+            }
+            Err(error) => return Err(ProfileError::Io(error)),
+        }
+    }
+}
+
 pub(crate) fn validate_alias(alias: &str) -> Result<(), ProfileError> {
     let bytes = alias.as_bytes();
     let starts_valid = bytes.first().is_some_and(u8::is_ascii_alphanumeric);
@@ -3308,7 +3404,12 @@ fn ensure_registration_supported() -> Result<(), ProfileError> {
 fn secure_create_dir(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::DirBuilderExt;
 
+    verify_safe_creation_parent(path)?;
     fs::DirBuilder::new().mode(0o700).create(path)?;
+    if let Err(error) = clear_inherited_macos_acl(path) {
+        let _ = fs::remove_dir(path);
+        return Err(error);
+    }
     verify_private_directory(path)
 }
 
@@ -3320,12 +3421,37 @@ fn secure_create_dir(path: &Path) -> Result<(), ProfileError> {
 
 #[cfg(unix)]
 fn secure_create_dir_all(path: &Path) -> Result<(), ProfileError> {
-    use std::os::unix::fs::DirBuilderExt;
+    match fs::symlink_metadata(path) {
+        Ok(_) => return verify_private_directory(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ProfileError::Io(error)),
+    }
 
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
+    let mut missing = Vec::new();
+    let mut candidate = path;
+    loop {
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(candidate.to_owned());
+                candidate = candidate.parent().ok_or_else(|| {
+                    ProfileError::UnsafeState(
+                        "managed directory has no existing ancestor".to_owned(),
+                    )
+                })?;
+            }
+            Err(error) => return Err(ProfileError::Io(error)),
+        }
+    }
+    for directory in missing.into_iter().rev() {
+        match secure_create_dir(&directory) {
+            Ok(()) => {}
+            Err(ProfileError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                verify_private_directory(&directory)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     verify_private_directory(path)
 }
 
@@ -3350,11 +3476,11 @@ fn ensure_private_subdirectory(path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(unix)]
-fn managed_runtime_root() -> Result<PathBuf, ProfileError> {
+pub(crate) fn managed_runtime_root() -> Result<PathBuf, ProfileError> {
     use std::os::unix::fs::MetadataExt;
 
-    let runtime_root =
-        PathBuf::from("/tmp").join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
+    let runtime_root = canonicalize_managed_root(Path::new("/tmp"))?
+        .join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
     ensure_private_subdirectory(&runtime_root)?;
     let metadata = fs::symlink_metadata(&runtime_root)?;
     if metadata.uid() != rustix::process::getuid().as_raw() {
@@ -3366,20 +3492,202 @@ fn managed_runtime_root() -> Result<PathBuf, ProfileError> {
 }
 
 #[cfg(unix)]
-fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
+fn private_directory_metadata_is_safe(metadata: &fs::Metadata, expected_uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
 
+    metadata.file_type().is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == expected_uid
+        && metadata.mode() & 0o077 == 0
+}
+
+#[cfg(unix)]
+fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+    if !private_directory_metadata_is_safe(&metadata, rustix::process::getuid().as_raw()) {
         return Err(ProfileError::UnsafeState(
-            "managed directory is not a real directory".to_owned(),
+            "managed directory type, owner, or mode is unsafe".to_owned(),
         ));
     }
-    if metadata.mode() & 0o077 != 0 {
+    verify_no_extended_macos_acl(path)?;
+    verify_deletable_macos_flags_path(path)?;
+    verify_safe_creation_parent(path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_options() -> Option<exacl::AclOption> {
+    Some(exacl::AclOption::SYMLINK_ACL)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_inherited_macos_acl(path: &Path) -> Result<(), ProfileError> {
+    exacl::setfacl(&[path], &[], macos_acl_options()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })?;
+    verify_no_extended_macos_acl(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clear_inherited_macos_acl(_path: &Path) -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_no_extended_macos_acl(path: &Path) -> Result<(), ProfileError> {
+    match exacl::getfacl(path, macos_acl_options()) {
+        Ok(entries) if entries.is_empty() => Ok(()),
+        Ok(_) | Err(_) => Err(ProfileError::UnsafeState(
+            "managed path has unsupported extended permissions".to_owned(),
+        )),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_no_extended_macos_acl(_path: &Path) -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_parent_acl_entry_is_safe(entry: &exacl::AclEntry) -> bool {
+    !entry.allow
+        && entry.flags.difference(exacl::Flag::INHERITED).is_empty()
+        && entry.perms.difference(exacl::Perm::DELETE).is_empty()
+}
+
+#[cfg(target_os = "macos")]
+fn verify_safe_macos_parent_directory(parent: &Path) -> Result<(), ProfileError> {
+    let parent_stat = rustix::fs::statat(rustix::fs::CWD, parent, rustix::fs::AtFlags::empty())
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+    verify_safe_macos_creation_parent_flags(&parent_stat)?;
+    let entries = exacl::getfacl(parent, None).map_err(|_| {
+        ProfileError::UnsafeState(
+            "managed path creation parent has unsupported extended permissions".to_owned(),
+        )
+    })?;
+    if entries
+        .iter()
+        .any(|entry| !macos_parent_acl_entry_is_safe(entry))
+    {
         return Err(ProfileError::UnsafeState(
-            "managed directory is accessible by another OS user".to_owned(),
+            "managed path creation parent has unsafe extended permissions".to_owned(),
         ));
     }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_safe_macos_parent_directory(_parent: &Path) -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_safe_creation_ancestor(directory: &Path, current_uid: u32) -> Result<(), ProfileError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(directory)?;
+    let owner_is_trusted = metadata.uid() == 0 || metadata.uid() == current_uid;
+    if !owner_is_trusted {
+        return Err(ProfileError::UnsafeState(
+            "managed path has a replaceable creation ancestor".to_owned(),
+        ));
+    }
+    if metadata.file_type().is_symlink() {
+        return Err(ProfileError::UnsafeState(
+            "managed path has a symlink creation ancestor".to_owned(),
+        ));
+    }
+    let writable_by_others = metadata.mode() & 0o022 != 0;
+    let sticky = metadata.mode() & 0o1000 != 0;
+    if !metadata.is_dir() || (writable_by_others && !sticky) {
+        return Err(ProfileError::UnsafeState(
+            "managed path has a replaceable creation ancestor".to_owned(),
+        ));
+    }
+    verify_safe_macos_parent_directory(directory)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_safe_creation_parent(path: &Path) -> Result<(), ProfileError> {
+    let parent = path.parent().ok_or_else(|| {
+        ProfileError::UnsafeState("managed path has no creation parent".to_owned())
+    })?;
+    if !parent.is_absolute() {
+        return Err(ProfileError::UnsafeState(
+            "managed path creation parent is not absolute".to_owned(),
+        ));
+    }
+    if fs::canonicalize(parent)? != parent {
+        return Err(ProfileError::UnsafeState(
+            "managed path has a non-canonical creation parent".to_owned(),
+        ));
+    }
+    let current_uid = rustix::process::getuid().as_raw();
+    for directory in parent.ancestors() {
+        verify_safe_creation_ancestor(directory, current_uid)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_safe_creation_parent(_path: &Path) -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+// Darwin's benign user flags: nodump, compressed, tracked, hidden; plus the
+// benign superuser archive flag. Unknown future flags fail closed. In
+// particular, this excludes namespace-affecting opaque, immutable, append,
+// reserved no-unlink, datavault, restricted, and system no-unlink flags.
+const MACOS_BENIGN_FILE_FLAGS: u32 =
+    0x0000_0001 | 0x0000_0020 | 0x0000_0040 | 0x0000_8000 | 0x0001_0000;
+
+#[cfg(target_os = "macos")]
+fn verify_safe_macos_creation_parent_flags(stat: &rustix::fs::Stat) -> Result<(), ProfileError> {
+    // Append and immutable directory flags can allow child creation while
+    // blocking rollback or later unlink. DATAVAULT and RESTRICTED propagate to
+    // new vnodes. Unknown future flags therefore fail closed. SF_NOUNLINK is
+    // the one parent-only exception because standard macOS temp ancestry uses
+    // it and it does not prevent removing children.
+    const SF_NOUNLINK: u32 = 0x0010_0000;
+    const SAFE_CREATION_PARENT_FLAGS: u32 = MACOS_BENIGN_FILE_FLAGS | SF_NOUNLINK;
+    if stat.st_flags & !SAFE_CREATION_PARENT_FLAGS != 0 {
+        return Err(ProfileError::UnsafeState(
+            "managed path creation parent has restrictive flags".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_deletable_macos_flags_path(path: &Path) -> Result<(), ProfileError> {
+    use rustix::fs::{AtFlags, CWD, statat};
+
+    let stat = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)
+        .map_err(ProfileError::Io)?;
+    verify_deletable_macos_flags_stat(&stat)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_deletable_macos_flags_path(_path: &Path) -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_deletable_macos_flags_stat(stat: &rustix::fs::Stat) -> Result<(), ProfileError> {
+    if stat.st_flags & !MACOS_BENIGN_FILE_FLAGS != 0 {
+        return Err(ProfileError::UnsafeState(
+            "managed path has flags that prevent safe removal".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn verify_deletable_macos_flags_stat(_stat: &rustix::fs::Stat) -> Result<(), ProfileError> {
     Ok(())
 }
 
@@ -3409,11 +3717,25 @@ fn private_open_options() -> OpenOptions {
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ProfileError> {
-    let mut options = private_open_options();
-    let mut file = options.write(true).create_new(true).open(path)?;
+    let mut file = create_new_private_file(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     verify_private_regular_file(path)
+}
+
+fn create_new_private_file(path: &Path) -> Result<File, ProfileError> {
+    verify_safe_creation_parent(path)?;
+    let mut options = private_open_options();
+    let file = options.write(true).create_new(true).open(path)?;
+    let verification = clear_inherited_macos_acl(path)
+        .and_then(|()| verify_deletable_macos_flags_path(path))
+        .and_then(|()| verify_private_regular_file(path));
+    if let Err(error) = verification {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -3432,7 +3754,7 @@ fn open_verified_registry_file(
     }
     let descriptor = open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(io::Error::from)
@@ -3470,10 +3792,50 @@ fn open_verified_registry_file(
     File::open(path).map_err(ProfileError::Io)
 }
 
+#[cfg(unix)]
+fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> {
+    open_verified_private_lock_file(path, true)
+}
+
+#[cfg(not(unix))]
 fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> {
     let mut options = private_open_options();
     let file = options.read(true).write(true).create(true).open(path)?;
     verify_private_regular_file(path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_existing_private_lock_file(path: &Path) -> Result<File, ProfileError> {
+    open_verified_private_lock_file(path, false)
+}
+
+#[cfg(unix)]
+fn open_verified_private_lock_file(path: &Path, create: bool) -> Result<File, ProfileError> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    if create {
+        verify_safe_creation_parent(path)?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => verify_private_single_link_regular_file(path)?,
+        Err(error) if create && error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ProfileError::Io(error)),
+    }
+
+    let mut flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    if create {
+        flags |= OFlags::CREATE;
+    }
+    let descriptor = open(path, flags, Mode::RUSR | Mode::WUSR).map_err(|error| {
+        if error == rustix::io::Errno::LOOP {
+            ProfileError::UnsafeState("managed lock path is unsafe".to_owned())
+        } else {
+            ProfileError::Io(io::Error::from(error))
+        }
+    })?;
+    let file = File::from(descriptor);
+    private_lock_file_identity(&file, path)?;
     Ok(file)
 }
 
@@ -3516,14 +3878,14 @@ fn ensure_profile_lock_durability_with_sync(
     sync_file(coordinator)?;
     sync_file(provider)?;
     let expected_directory = private_directory_identity(profile_directory)?;
-    let expected_coordinator = locked_profile_file_identity(coordinator, &coordinator_path)?;
-    let expected_provider = locked_profile_file_identity(provider, &provider_path)?;
+    let expected_coordinator = private_lock_file_identity(coordinator, &coordinator_path)?;
+    let expected_provider = private_lock_file_identity(provider, &provider_path)?;
 
     sync_parent(profile_directory)?;
 
     if private_directory_identity(profile_directory)? != expected_directory
-        || locked_profile_file_identity(coordinator, &coordinator_path)? != expected_coordinator
-        || locked_profile_file_identity(provider, &provider_path)? != expected_provider
+        || private_lock_file_identity(coordinator, &coordinator_path)? != expected_coordinator
+        || private_lock_file_identity(provider, &provider_path)? != expected_provider
     {
         return Err(ProfileError::UnsafeState(
             "managed profile lifetime locks changed during durability check".to_owned(),
@@ -3533,7 +3895,7 @@ fn ensure_profile_lock_durability_with_sync(
 }
 
 #[cfg(unix)]
-fn locked_profile_file_identity(
+fn private_lock_file_identity(
     file: &File,
     path: &Path,
 ) -> Result<FileSystemIdentity, ProfileError> {
@@ -3557,7 +3919,7 @@ fn locked_profile_file_identity(
         || opened.nlink() != 1
     {
         return Err(ProfileError::UnsafeState(
-            "managed profile lifetime lock was replaced".to_owned(),
+            "managed lock file was replaced".to_owned(),
         ));
     }
     Ok(opened_identity)
@@ -3577,9 +3939,7 @@ fn lock_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError>
 
 #[cfg(unix)]
 fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
-    let mut options = private_open_options();
-    let file = options.read(true).write(true).open(path)?;
-    verify_private_single_link_regular_file(path)?;
+    let file = open_existing_private_lock_file(path)?;
     FileExt::try_lock_exclusive(&file).map_err(|error| {
         if error.kind() == io::ErrorKind::WouldBlock {
             ProfileError::Busy(reference.to_owned())
@@ -3605,6 +3965,9 @@ fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
             "managed file is accessible by another OS user".to_owned(),
         ));
     }
+    verify_no_extended_macos_acl(path)?;
+    verify_deletable_macos_flags_path(path)?;
+    verify_safe_creation_parent(path)?;
     Ok(())
 }
 
@@ -3732,8 +4095,7 @@ fn atomic_write_private(
     let destination = root.join(name);
     let publication = (|| {
         before_step(RegistryWriteStep::TemporaryCreate)?;
-        let mut options = private_open_options();
-        let mut file = options.write(true).create_new(true).open(&temporary)?;
+        let mut file = create_new_private_file(&temporary)?;
         before_step(RegistryWriteStep::Write)?;
         file.write_all(bytes)?;
         before_step(RegistryWriteStep::FileSync)?;
@@ -3854,11 +4216,48 @@ mod tests {
 
     #[cfg(unix)]
     fn temporary_root(test_name: &str) -> PathBuf {
-        env::temp_dir().join(format!(
+        let base = match fs::canonicalize(env::temp_dir()) {
+            Ok(base) => base,
+            Err(error) => panic!("temporary directory must have a physical path: {error}"),
+        };
+        base.join(format!(
             "calcifer-{test_name}-{}-{}",
             std::process::id(),
             Uuid::new_v4()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_root_canonicalization_resolves_existing_aliases_and_missing_suffixes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = temporary_root("canonical-managed-root");
+        secure_create_dir_all(&sandbox)?;
+        let target = sandbox.join("physical-target");
+        secure_create_dir(&target)?;
+        let alias = sandbox.join("managed-root-alias");
+        symlink(&target, &alias)?;
+
+        assert_eq!(canonicalize_managed_root(&alias)?, target);
+        assert_eq!(
+            canonicalize_managed_root(&alias.join("future").join("nested"))?,
+            target.join("future").join("nested")
+        );
+
+        let dangling = sandbox.join("dangling-managed-root");
+        symlink(sandbox.join("missing-target"), &dangling)?;
+        let error = canonicalize_managed_root(&dangling)
+            .err()
+            .ok_or("a dangling managed-root alias must fail closed")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+
+        fs::remove_file(dangling)?;
+        fs::remove_file(alias)?;
+        fs::remove_dir(target)?;
+        fs::remove_dir(sandbox)?;
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -3879,6 +4278,154 @@ mod tests {
         let bytes = serde_json::to_vec(&document)
             .map_err(|_| ProfileError::UnsafeState("test auth serialization failed".to_owned()))?;
         write_private_file(&home.join("auth.json"), &bytes)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_test_acl_options() -> Option<exacl::AclOption> {
+        Some(exacl::AclOption::SYMLINK_ACL)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn clear_macos_test_acl(path: &Path) -> io::Result<()> {
+        exacl::setfacl(&[path], &[], macos_test_acl_options())
+    }
+
+    #[cfg(target_os = "macos")]
+    struct MacosAclCleanup {
+        candidates: Vec<PathBuf>,
+        armed: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl MacosAclCleanup {
+        fn new(candidates: Vec<PathBuf>) -> Self {
+            Self {
+                candidates,
+                armed: true,
+            }
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            let mut first_error = None;
+            for path in &self.candidates {
+                match fs::symlink_metadata(path) {
+                    Ok(_) => {
+                        if let Err(error) = clear_macos_test_acl(path) {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            self.armed = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for MacosAclCleanup {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            for path in &self.candidates {
+                if fs::symlink_metadata(path).is_ok() {
+                    let _ = clear_macos_test_acl(path);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct MacosFlagCleanup {
+        candidates: Vec<PathBuf>,
+        clear_flag: &'static str,
+        armed: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl MacosFlagCleanup {
+        fn set(
+            candidates: Vec<PathBuf>,
+            target: &Path,
+            set_flag: &'static str,
+            clear_flag: &'static str,
+        ) -> io::Result<Self> {
+            use std::process::Command;
+
+            let guard = Self {
+                candidates,
+                clear_flag,
+                armed: true,
+            };
+            let status = Command::new("/usr/bin/chflags")
+                .arg(set_flag)
+                .arg(target)
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other("could not set the macOS test file flag"));
+            }
+            Ok(guard)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            use std::process::Command;
+
+            let mut first_error = None;
+            for path in &self.candidates {
+                match fs::symlink_metadata(path) {
+                    Ok(_) => match Command::new("/usr/bin/chflags")
+                        .arg(self.clear_flag)
+                        .arg(path)
+                        .status()
+                    {
+                        Ok(status) if status.success() => {}
+                        Ok(_) => {
+                            first_error.get_or_insert_with(|| {
+                                io::Error::other("could not clear the macOS test file flag")
+                            });
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    },
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            self.armed = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for MacosFlagCleanup {
+        fn drop(&mut self) {
+            use std::process::Command;
+
+            if !self.armed {
+                return;
+            }
+            for path in &self.candidates {
+                if fs::symlink_metadata(path).is_ok() {
+                    let _ = Command::new("/usr/bin/chflags")
+                        .arg(self.clear_flag)
+                        .arg(path)
+                        .status();
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -6006,15 +6553,94 @@ config_file = "{sensitive_path}"
 
     #[cfg(unix)]
     #[test]
+    fn removal_never_creates_dangling_lifetime_lock_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        for lock_name in [COORDINATOR_LOCK_FILE, PROVIDER_LOCK_FILE] {
+            let root = temporary_root("remove-dangling-lock-target");
+            let registry = Registry::at(root.clone());
+            let profile = register_test_profile(&registry, "work")?;
+            let profile_directory = registry.profile_directory(&profile)?;
+            let lock_path = profile_directory.join(lock_name);
+            fs::remove_file(&lock_path)?;
+            let outside = root
+                .parent()
+                .ok_or("temporary root must have a parent")?
+                .join(format!("calcifer-missing-lock-target-{}", Uuid::new_v4()));
+            assert!(!outside.exists());
+            symlink(&outside, &lock_path)?;
+            let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+            let error = registry
+                .remove(Provider::Codex, "work", None)
+                .err()
+                .ok_or("a symlinked lifetime lock must block removal")?;
+            assert_eq!(error.code(), "unsafe_profile_state");
+            assert_eq!(fs::read(root.join(REGISTRY_FILE))?, registry_before);
+            assert!(profile_directory.is_dir());
+            assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+            assert!(
+                !outside.exists(),
+                "opening a lifetime lock must not create its symlink target"
+            );
+
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_managed_lock_rejects_an_external_hard_link_before_locking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = temporary_root("hard-linked-locks");
+        secure_create_dir_all(&root)?;
+        let outside = root
+            .parent()
+            .ok_or("temporary root must have a parent")?
+            .join(format!("calcifer-hard-linked-lock-{}", Uuid::new_v4()));
+        write_private_file(&outside, b"unrelated-private-inode")?;
+
+        for lock_name in [
+            LOCK_FILE,
+            REMOVAL_LOCK_FILE,
+            COORDINATOR_LOCK_FILE,
+            PROVIDER_LOCK_FILE,
+        ] {
+            let lock_path = root.join(lock_name);
+            fs::hard_link(&outside, &lock_path)?;
+            let error = open_private_lock_file(&lock_path)
+                .err()
+                .ok_or("a hard-linked managed lock must be rejected")?;
+            assert_eq!(error.code(), "unsafe_profile_state", "{lock_name}");
+            assert_eq!(
+                fs::read(&outside)?,
+                b"unrelated-private-inode",
+                "{lock_name} must not modify an unrelated inode"
+            );
+            fs::remove_file(lock_path)?;
+            assert_eq!(fs::metadata(&outside)?.nlink(), 1);
+        }
+
+        fs::remove_dir_all(root)?;
+        fs::remove_file(outside)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn removal_unlinks_provider_symlink_and_socket_leaves_without_following_them()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::symlink;
         use std::os::unix::net::UnixListener;
 
-        let root = PathBuf::from("/tmp").join(format!(
-            "cfr-{}-{}",
+        let root = fs::canonicalize("/tmp")?.join(format!(
+            "c{}-{}",
             std::process::id(),
-            &Uuid::new_v4().to_string()[..8]
+            &Uuid::new_v4().to_string()[..4]
         ));
         let registry = Registry::at(root.clone());
         let profile = register_test_profile(&registry, "work")?;
@@ -6052,6 +6678,91 @@ config_file = "{sensitive_path}"
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn removal_rejects_extended_acl_on_non_following_leaves_before_visibility()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        use exacl::{AclEntry, Perm};
+
+        let root = temporary_root("remove-special-leaf-acl");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let provider_tmp = profile_directory.join("home/tmp");
+        secure_create_dir(&provider_tmp)?;
+        let tombstone = registry.tombstone_path(&profile)?;
+
+        let outside = root
+            .parent()
+            .ok_or("temporary root must have a parent")?
+            .join(format!("calcifer-special-acl-target-{}", Uuid::new_v4()));
+        write_private_file(&outside, b"outside-target-must-survive")?;
+        let link = provider_tmp.join("provider-link");
+        symlink(&outside, &link)?;
+        let fifo = provider_tmp.join("provider-fifo");
+        let fifo_status = Command::new("/usr/bin/mkfifo").arg(&fifo).status()?;
+        if !fifo_status.success() {
+            return Err("could not create the macOS FIFO test fixture".into());
+        }
+
+        let mut acl_cleanup = MacosAclCleanup::new(vec![
+            link.clone(),
+            fifo.clone(),
+            tombstone.join("home/tmp/provider-link"),
+            tombstone.join("home/tmp/provider-fifo"),
+        ]);
+        let uid = rustix::process::getuid().as_raw().to_string();
+        let deny_delete = [AclEntry::deny_user(&uid, Perm::DELETE, None)];
+        exacl::setfacl(&[&link], &deny_delete, macos_test_acl_options())?;
+        exacl::setfacl(&[&fifo], &deny_delete, macos_test_acl_options())?;
+        let fixtures_have_acl = !exacl::getfacl(&link, macos_test_acl_options())?.is_empty()
+            && !exacl::getfacl(&fifo, macos_test_acl_options())?.is_empty();
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let error_code = registry
+            .remove(Provider::Codex, "work", None)
+            .err()
+            .map(|error| error.code());
+        let registry_unchanged = fs::read(root.join(REGISTRY_FILE))? == registry_before;
+        let profile_preserved = profile_directory.is_dir();
+        let journal_absent = !root.join(REMOVAL_JOURNAL_FILE).exists();
+        let tombstones_absent = registry.removal_tombstones()?.is_empty();
+        let outside_preserved = fs::read(&outside)? == b"outside-target-must-survive";
+
+        acl_cleanup.clear()?;
+        let cleanup_registry = Registry::at(root.clone());
+        cleanup_registry.recover_incomplete_removal()?;
+        if profile_directory.is_dir() {
+            cleanup_registry.remove(Provider::Codex, "work", None)?;
+        }
+        fs::remove_dir_all(&root)?;
+        fs::remove_file(&outside)?;
+
+        assert!(
+            fixtures_have_acl,
+            "the special-leaf ACL fixture must be real"
+        );
+        assert_eq!(error_code, Some("unsafe_profile_state"));
+        assert!(registry_unchanged, "the public registry must not change");
+        assert!(
+            profile_preserved,
+            "the original profile must remain visible"
+        );
+        assert!(
+            journal_absent,
+            "preflight rejection must not create a journal"
+        );
+        assert!(
+            tombstones_absent,
+            "preflight rejection must not create a tombstone"
+        );
+        assert!(outside_preserved, "a symlink target must never be touched");
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn pre_visibility_recovery_preserves_non_following_leaves_and_external_targets()
@@ -6059,10 +6770,10 @@ config_file = "{sensitive_path}"
         use std::os::unix::fs::{FileTypeExt, symlink};
         use std::os::unix::net::UnixListener;
 
-        let root = PathBuf::from("/tmp").join(format!(
-            "cfr-{}-{}",
+        let root = fs::canonicalize("/tmp")?.join(format!(
+            "c{}-{}",
             std::process::id(),
-            &Uuid::new_v4().to_string()[..8]
+            &Uuid::new_v4().to_string()[..4]
         ));
         let registry = Registry::at_with_removal_fault(
             root.clone(),
@@ -6135,6 +6846,609 @@ config_file = "{sensitive_path}"
         assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
 
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_removal_entries_reject_post_validation_hard_links_and_mode_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        use rustix::fs::{AtFlags, CWD, Mode, OFlags, fstat, open, statat};
+
+        let root = temporary_root("opened-removal-entry-revalidation");
+        secure_create_dir_all(&root)?;
+        let expected_device = private_directory_identity(&root)?.device;
+
+        let hard_linked = root.join("hard-linked");
+        write_private_file(&hard_linked, b"credential")?;
+        let hard_link_expected = statat(CWD, &hard_linked, AtFlags::SYMLINK_NOFOLLOW)?;
+        let second_name = root.join("outside-name");
+        fs::hard_link(&hard_linked, &second_name)?;
+        let hard_link_fd = open(
+            &hard_linked,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let hard_link_opened = fstat(&hard_link_fd)?;
+        assert_eq!(
+            stat_identity(&hard_link_expected)?,
+            stat_identity(&hard_link_opened)?,
+            "the race must retain the inode while changing its link count"
+        );
+        assert_eq!(hard_link_opened.st_nlink, 2);
+        let hard_link_error = validate_opened_removal_entry(
+            &hard_link_expected,
+            &hard_link_opened,
+            RemovalEntryKind::RegularFile,
+            expected_device,
+        )
+        .err()
+        .ok_or("an opened hard-linked credential must fail closed")?;
+        assert_eq!(hard_link_error.code(), "unsafe_profile_state");
+        assert_eq!(fs::read(&hard_linked)?, b"credential");
+        assert_eq!(fs::read(&second_name)?, b"credential");
+
+        let mode_changed = root.join("mode-changed");
+        write_private_file(&mode_changed, b"credential")?;
+        let mode_expected = statat(CWD, &mode_changed, AtFlags::SYMLINK_NOFOLLOW)?;
+        fs::set_permissions(&mode_changed, fs::Permissions::from_mode(0o666))?;
+        let mode_fd = open(
+            &mode_changed,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let mode_opened = fstat(&mode_fd)?;
+        assert_eq!(
+            stat_identity(&mode_expected)?,
+            stat_identity(&mode_opened)?,
+            "the race must retain the inode while changing its mode"
+        );
+        assert_eq!(mode_opened.st_mode & 0o777, 0o666);
+        let mode_error = validate_opened_removal_entry(
+            &mode_expected,
+            &mode_opened,
+            RemovalEntryKind::RegularFile,
+            expected_device,
+        )
+        .err()
+        .ok_or("an opened group-writable credential must fail closed")?;
+        assert_eq!(mode_error.code(), "unsafe_profile_state");
+        assert_eq!(fs::read(&mode_changed)?, b"credential");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_creation_rejects_nonsticky_writable_parents_before_create()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let root = temporary_root("unsafe-creation-parent-mode");
+        secure_create_dir_all(&root)?;
+        let root_metadata = fs::symlink_metadata(&root)?;
+        let current_uid = rustix::process::getuid().as_raw();
+        assert!(private_directory_metadata_is_safe(
+            &root_metadata,
+            current_uid
+        ));
+        assert!(
+            !private_directory_metadata_is_safe(&root_metadata, current_uid.wrapping_add(1)),
+            "an existing directory owned by another UID must not become managed state"
+        );
+
+        let trusted_target = root.join("trusted-target");
+        secure_create_dir(&trusted_target)?;
+        let unsafe_link_container = root.join("unsafe-link-container");
+        secure_create_dir(&unsafe_link_container)?;
+        fs::set_permissions(&unsafe_link_container, fs::Permissions::from_mode(0o777))?;
+        let link = unsafe_link_container.join("link");
+        std::os::unix::fs::symlink(&trusted_target, &link)?;
+
+        let lexical_directory = link.join("directory");
+        let lexical_directory_error = secure_create_dir(&lexical_directory)
+            .err()
+            .ok_or("a canonical target must not hide an unsafe lexical ancestor")?;
+        assert_eq!(lexical_directory_error.code(), "unsafe_profile_state");
+        assert!(!trusted_target.join("directory").exists());
+
+        let lexical_file = link.join("credential");
+        let lexical_file_error = write_private_file(&lexical_file, b"credential")
+            .err()
+            .ok_or("private file creation must inspect the lexical ancestor chain")?;
+        assert_eq!(lexical_file_error.code(), "unsafe_profile_state");
+        assert!(!trusted_target.join("credential").exists());
+
+        let nested_target = root.join("nested-target");
+        secure_create_dir(&nested_target)?;
+        let unsafe_nested_container = root.join("unsafe-nested-container");
+        secure_create_dir(&unsafe_nested_container)?;
+        fs::set_permissions(&unsafe_nested_container, fs::Permissions::from_mode(0o777))?;
+        let nested_link = unsafe_nested_container.join("nested-link");
+        std::os::unix::fs::symlink(&nested_target, &nested_link)?;
+        let safe_link_container = root.join("safe-link-container");
+        secure_create_dir(&safe_link_container)?;
+        let outer_link = safe_link_container.join("outer-link");
+        std::os::unix::fs::symlink(&nested_link, &outer_link)?;
+
+        let nested_symlink_directory = outer_link.join("directory");
+        let nested_symlink_error = secure_create_dir(&nested_symlink_directory)
+            .err()
+            .ok_or("canonicalization must not hide an unsafe nested symlink placement")?;
+        assert_eq!(nested_symlink_error.code(), "unsafe_profile_state");
+        assert!(!nested_target.join("directory").exists());
+
+        let parent = root.join("parent");
+        secure_create_dir(&parent)?;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777))?;
+
+        let blocked = parent.join("blocked");
+        let error = secure_create_dir(&blocked)
+            .err()
+            .ok_or("a non-sticky writable parent must fail before creation")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        assert!(!blocked.exists());
+
+        let superficially_private = parent.join("private-child");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&superficially_private)?;
+        let nested = superficially_private.join("nested");
+        let ancestor_error = secure_create_dir(&nested)
+            .err()
+            .ok_or("a replaceable ancestor must fail even below a private immediate parent")?;
+        assert_eq!(ancestor_error.code(), "unsafe_profile_state");
+        assert!(!nested.exists());
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o1777))?;
+        let sticky_child = parent.join("sticky-child");
+        secure_create_dir(&sticky_child)?;
+        verify_private_directory(&sticky_child)?;
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777))?;
+        let existing_error = verify_private_directory(&sticky_child)
+            .err()
+            .ok_or("an existing managed path below an unsafe parent must fail closed")?;
+        assert_eq!(existing_error.code(), "unsafe_profile_state");
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o1777))?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn secure_creation_rejects_inheritable_macos_acls_before_creating_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        use exacl::{AclEntry, Flag, Perm};
+
+        let parent = temporary_root("inherited-macos-acl");
+        secure_create_dir_all(&parent)?;
+        let atomic_target = parent.join("atomic-state");
+        write_private_file(&atomic_target, b"old-state")?;
+        let raw_child = parent.join("raw-child");
+        let mut acl_cleanup = MacosAclCleanup::new(vec![parent.clone(), raw_child.clone()]);
+        let current_uid = rustix::process::getuid().as_raw();
+        let other_uid = if current_uid == 89 { "1" } else { "89" };
+        let mut unknown_flag = AclEntry::deny_user(other_uid, Perm::DELETE, None);
+        unknown_flag.flags = Flag::from_bits_retain(1_u32 << 31);
+        assert!(
+            !macos_parent_acl_entry_is_safe(&unknown_flag),
+            "unknown ACL flags must fail closed"
+        );
+        let mut unknown_permission = AclEntry::deny_user(other_uid, Perm::DELETE, None);
+        unknown_permission.perms |= Perm::from_bits_retain(1_u32 << 31);
+        assert!(
+            !macos_parent_acl_entry_is_safe(&unknown_permission),
+            "unknown ACL permissions must fail closed"
+        );
+        let inherited_delete = AclEntry::deny_user(other_uid, Perm::DELETE, Flag::INHERITED);
+        assert!(
+            macos_parent_acl_entry_is_safe(&inherited_delete),
+            "an inherited, non-propagating DELETE-only deny remains safe"
+        );
+        let inherited_acl = [AclEntry::allow_user(
+            other_uid,
+            Perm::READ | Perm::WRITE | Perm::EXECUTE,
+            Flag::FILE_INHERIT | Flag::DIRECTORY_INHERIT,
+        )];
+        exacl::setfacl(&[&parent], &inherited_acl, macos_test_acl_options())?;
+        assert!(!exacl::getfacl(&parent, macos_test_acl_options())?.is_empty());
+
+        fs::DirBuilder::new().mode(0o700).create(&raw_child)?;
+        assert!(
+            !exacl::getfacl(&raw_child, macos_test_acl_options())?.is_empty(),
+            "the fixture must prove that the parent ACL is inherited"
+        );
+        let existing_error = secure_create_dir_all(&raw_child)
+            .err()
+            .ok_or("an existing managed directory with an ACL must fail closed")?;
+        assert_eq!(existing_error.code(), "unsafe_profile_state");
+        assert!(
+            !exacl::getfacl(&raw_child, macos_test_acl_options())?.is_empty(),
+            "verification must not silently normalize existing ACL state"
+        );
+        clear_macos_test_acl(&raw_child)?;
+        fs::remove_dir(&raw_child)?;
+
+        let secure_child = parent.join("secure-child");
+        let directory_error = secure_create_dir(&secure_child)
+            .err()
+            .ok_or("an inheritable parent ACL must stop directory creation")?;
+        assert_eq!(directory_error.code(), "unsafe_profile_state");
+        assert!(!secure_child.exists());
+
+        let secure_file = parent.join("secure-file");
+        let file_error = write_private_file(&secure_file, b"credential")
+            .err()
+            .ok_or("an inheritable parent ACL must stop private file creation")?;
+        assert_eq!(file_error.code(), "unsafe_profile_state");
+        assert!(
+            !secure_file.exists(),
+            "no empty credential inode may be exposed before ACL cleanup"
+        );
+
+        let deep_child = parent.join("deep/leaf");
+        let recursive_error = secure_create_dir_all(&deep_child)
+            .err()
+            .ok_or("an inheritable ancestor ACL must stop recursive creation")?;
+        assert_eq!(recursive_error.code(), "unsafe_profile_state");
+        assert!(!parent.join("deep").exists());
+
+        let mut atomic_steps = Vec::new();
+        let atomic_error = atomic_write_private(
+            &parent,
+            "atomic-state",
+            b"credential-state",
+            |step| {
+                atomic_steps.push(step);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .err()
+        .ok_or("an unsafe parent ACL must stop atomic state creation")?;
+        assert_eq!(atomic_error.code(), "unsafe_profile_state");
+        assert_eq!(atomic_steps, [RegistryWriteStep::TemporaryCreate]);
+        assert_eq!(fs::read(&atomic_target)?, b"old-state");
+        assert!(!fs::read_dir(&parent)?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with(".atomic-state."))
+        }));
+
+        clear_macos_test_acl(&parent)?;
+        let non_inheritable_allow = [AclEntry::allow_user(other_uid, Perm::READ, None)];
+        exacl::setfacl(&[&parent], &non_inheritable_allow, macos_test_acl_options())?;
+        let allowed_parent_child = parent.join("allow-parent-child");
+        let allow_error = secure_create_dir(&allowed_parent_child)
+            .err()
+            .ok_or("any parent ALLOW entry must fail before creation")?;
+        assert_eq!(allow_error.code(), "unsafe_profile_state");
+        assert!(!allowed_parent_child.exists());
+
+        clear_macos_test_acl(&parent)?;
+        let deny_delete_child = [AclEntry::deny_group("everyone", Perm::DELETE_CHILD, None)];
+        exacl::setfacl(&[&parent], &deny_delete_child, macos_test_acl_options())?;
+        let denied_parent_child = parent.join("deny-delete-child");
+        let deny_error = secure_create_dir(&denied_parent_child)
+            .err()
+            .ok_or("a parent deny-delete-child ACL must fail before creation")?;
+        assert_eq!(deny_error.code(), "unsafe_profile_state");
+        assert!(!denied_parent_child.exists());
+        let denied_parent_file = parent.join("deny-delete-child-file");
+        let deny_file_error = write_private_file(&denied_parent_file, b"credential")
+            .err()
+            .ok_or("deny-delete-child must stop a private file before creation")?;
+        assert_eq!(deny_file_error.code(), "unsafe_profile_state");
+        assert!(!denied_parent_file.exists());
+
+        clear_macos_test_acl(&parent)?;
+        let safe_deny = [AclEntry::deny_group("everyone", Perm::DELETE, None)];
+        exacl::setfacl(&[&parent], &safe_deny, macos_test_acl_options())?;
+
+        secure_create_dir(&secure_child)?;
+        assert!(
+            exacl::getfacl(&secure_child, macos_test_acl_options())?.is_empty(),
+            "a non-inheritable deny ACL must not be copied to a new directory"
+        );
+        write_private_file(&secure_file, b"credential")?;
+        assert!(
+            exacl::getfacl(&secure_file, macos_test_acl_options())?.is_empty(),
+            "a private file must be ACL-free before credential bytes are written"
+        );
+        secure_create_dir_all(&deep_child)?;
+        assert!(exacl::getfacl(parent.join("deep"), macos_test_acl_options())?.is_empty());
+        assert!(exacl::getfacl(&deep_child, macos_test_acl_options())?.is_empty());
+
+        acl_cleanup.clear()?;
+        fs::remove_dir_all(parent)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn secure_creation_rejects_extended_acl_on_traversed_macos_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        use exacl::{AclEntry, Perm};
+
+        let sticky_container = temporary_root("symlink-acl-sticky-container");
+        secure_create_dir_all(&sticky_container)?;
+        fs::set_permissions(&sticky_container, fs::Permissions::from_mode(0o1777))?;
+        let target = temporary_root("symlink-acl-target");
+        secure_create_dir_all(&target)?;
+        let link = sticky_container.join("managed-link");
+        symlink(&target, &link)?;
+        let mut acl_cleanup = MacosAclCleanup::new(vec![link.clone()]);
+        let current_uid = rustix::process::getuid().as_raw();
+        let other_uid = if current_uid == 89 { "1" } else { "89" };
+        let allow_delete = [AclEntry::allow_user(other_uid, Perm::DELETE, None)];
+        exacl::setfacl(&[&link], &allow_delete, macos_test_acl_options())?;
+        let fixture_has_acl = !exacl::getfacl(&link, macos_test_acl_options())?.is_empty();
+
+        let managed_directory = link.join("managed-directory");
+        let directory_result = secure_create_dir(&managed_directory);
+        let directory_was_created = target.join("managed-directory").is_dir();
+        let managed_file = link.join("managed-file");
+        let file_result = write_private_file(&managed_file, b"credential");
+        let file_was_created = target.join("managed-file").is_file();
+
+        acl_cleanup.clear()?;
+        if target.join("managed-file").is_file() {
+            fs::remove_file(target.join("managed-file"))?;
+        }
+        if target.join("managed-directory").is_dir() {
+            fs::remove_dir(target.join("managed-directory"))?;
+        }
+        fs::remove_file(&link)?;
+        fs::set_permissions(&sticky_container, fs::Permissions::from_mode(0o700))?;
+        fs::remove_dir(&sticky_container)?;
+        fs::remove_dir(&target)?;
+
+        assert!(fixture_has_acl, "the symlink ACL fixture must be real");
+        let directory_error = directory_result
+            .err()
+            .ok_or("a replaceable ACL-bearing symlink must reject directory creation")?;
+        assert_eq!(directory_error.code(), "unsafe_profile_state");
+        assert!(
+            !directory_was_created,
+            "the symlink ACL must be rejected before mkdir"
+        );
+        let file_error = file_result
+            .err()
+            .ok_or("a replaceable ACL-bearing symlink must reject private file creation")?;
+        assert_eq!(file_error.code(), "unsafe_profile_state");
+        assert!(
+            !file_was_created,
+            "the symlink ACL must be rejected before credential inode creation"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn removal_rejects_extended_macos_acl_before_preparing_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use exacl::{AclEntry, Perm};
+
+        let root = temporary_root("remove-extended-macos-acl");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let tombstone = registry.tombstone_path(&profile)?;
+        let auth = profile_directory.join("home/auth.json");
+        let uid = rustix::process::getuid().as_raw().to_string();
+        let deny_delete = [AclEntry::deny_user(&uid, Perm::DELETE, None)];
+        exacl::setfacl(&[&auth], &deny_delete, macos_test_acl_options())?;
+        assert!(!exacl::getfacl(&auth, macos_test_acl_options())?.is_empty());
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let result = registry.remove(Provider::Codex, "work", None);
+        let error_code = result.err().map(|error| error.code());
+        let registry_unchanged = fs::read(root.join(REGISTRY_FILE))? == registry_before;
+        let profile_preserved = profile_directory.is_dir();
+        let journal_absent = !root.join(REMOVAL_JOURNAL_FILE).exists();
+        let tombstones_absent = registry.removal_tombstones()?.is_empty();
+
+        for candidate in [auth, tombstone.join("home/auth.json")] {
+            if candidate.exists() {
+                clear_macos_test_acl(&candidate)?;
+            }
+        }
+        let _ = Registry::at(root.clone()).recover_incomplete_removal();
+        fs::remove_dir_all(&root)?;
+
+        assert_eq!(error_code, Some("unsafe_profile_state"));
+        assert!(registry_unchanged, "the public registry must not change");
+        assert!(
+            profile_preserved,
+            "the original profile must remain visible"
+        );
+        assert!(
+            journal_absent,
+            "preflight rejection must not create a journal"
+        );
+        assert!(
+            tombstones_absent,
+            "preflight rejection must not create a tombstone"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn removal_rejects_immutable_macos_files_before_preparing_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("remove-immutable-macos-file");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let tombstone = registry.tombstone_path(&profile)?;
+        let auth = profile_directory.join("home/auth.json");
+        let mut immutable_cleanup = MacosFlagCleanup::set(
+            vec![auth.clone(), tombstone.join("home/auth.json")],
+            &auth,
+            "uchg",
+            "nouchg",
+        )?;
+        let registry_before = fs::read(root.join(REGISTRY_FILE))?;
+
+        let result = registry.remove(Provider::Codex, "work", None);
+        let error_code = result.err().map(|error| error.code());
+        let registry_unchanged = fs::read(root.join(REGISTRY_FILE))? == registry_before;
+        let profile_preserved = profile_directory.is_dir();
+        let journal_absent = !root.join(REMOVAL_JOURNAL_FILE).exists();
+        let tombstones_absent = registry.removal_tombstones()?.is_empty();
+
+        immutable_cleanup.clear()?;
+        let _ = Registry::at(root.clone()).recover_incomplete_removal();
+        fs::remove_dir_all(&root)?;
+
+        assert_eq!(error_code, Some("unsafe_profile_state"));
+        assert!(registry_unchanged, "the public registry must not change");
+        assert!(
+            profile_preserved,
+            "the original profile must remain visible"
+        );
+        assert!(
+            journal_absent,
+            "preflight rejection must not create a journal"
+        );
+        assert!(
+            tombstones_absent,
+            "preflight rejection must not create a tombstone"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_removal_rejects_blocking_and_unknown_file_flags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rustix::fs::{AtFlags, CWD, statat};
+
+        let root = temporary_root("macos-file-flags");
+        secure_create_dir_all(&root)?;
+        let file = root.join("state");
+        write_private_file(&file, b"state")?;
+        let stat = statat(CWD, &file, AtFlags::SYMLINK_NOFOLLOW)?;
+
+        for flag in [
+            0x0000_0002_u32,
+            0x0000_0004,
+            0x0000_0008,
+            0x0000_0010,
+            0x0000_0080,
+            0x0000_0100,
+            0x0002_0000,
+            0x0004_0000,
+            0x0008_0000,
+            0x0010_0000,
+        ] {
+            let mut flagged = stat;
+            flagged.st_flags = flag;
+            let error = verify_deletable_macos_flags_stat(&flagged)
+                .err()
+                .ok_or("blocking and unknown macOS flags must fail closed")?;
+            assert_eq!(error.code(), "unsafe_profile_state", "flag={flag:#x}");
+        }
+        for benign in [
+            0x0000_0001_u32,
+            0x0000_0020,
+            0x0000_0040,
+            0x0000_8000,
+            0x0001_0000,
+        ] {
+            let mut flagged = stat;
+            flagged.st_flags = benign;
+            verify_deletable_macos_flags_stat(&flagged)?;
+        }
+
+        for inherited in [0x0000_0080_u32, 0x0008_0000] {
+            let mut parent = stat;
+            parent.st_flags = inherited;
+            let error = verify_safe_macos_creation_parent_flags(&parent)
+                .err()
+                .ok_or("inherited restrictive parent flags must fail before creation")?;
+            assert_eq!(error.code(), "unsafe_profile_state");
+        }
+        let mut standard_temp_parent = stat;
+        standard_temp_parent.st_flags = 0x0010_0000;
+        verify_safe_macos_creation_parent_flags(&standard_temp_parent)?;
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn secure_creation_rejects_append_only_macos_parent_before_creating_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("append-only-creation-parent");
+        secure_create_dir_all(&root)?;
+        let parent = root.join("parent");
+        secure_create_dir(&parent)?;
+
+        let raw_child = parent.join("raw-child");
+        let mut raw_guard =
+            MacosFlagCleanup::set(vec![parent.clone()], &parent, "uappnd", "nouappnd")?;
+        fs::write(&raw_child, b"non-secret-fixture")?;
+        let raw_unlink_was_blocked = fs::remove_file(&raw_child).is_err();
+        raw_guard.clear()?;
+        if fs::symlink_metadata(&raw_child).is_ok() {
+            fs::remove_file(&raw_child)?;
+        }
+
+        let managed_directory = parent.join("managed-directory");
+        let mut directory_guard =
+            MacosFlagCleanup::set(vec![parent.clone()], &parent, "uappnd", "nouappnd")?;
+        let directory_result = secure_create_dir(&managed_directory);
+        let directory_was_created = managed_directory.is_dir();
+        directory_guard.clear()?;
+        if managed_directory.is_dir() {
+            fs::remove_dir(&managed_directory)?;
+        }
+
+        let managed_file = parent.join("managed-file");
+        let mut file_guard =
+            MacosFlagCleanup::set(vec![parent.clone()], &parent, "uappnd", "nouappnd")?;
+        let file_result = write_private_file(&managed_file, b"credential");
+        let file_was_created = managed_file.is_file();
+        file_guard.clear()?;
+        if managed_file.is_file() {
+            fs::remove_file(&managed_file)?;
+        }
+
+        fs::remove_dir_all(&root)?;
+
+        assert!(
+            raw_unlink_was_blocked,
+            "the append-only parent fixture must allow create but block child unlink"
+        );
+        let directory_error = directory_result
+            .err()
+            .ok_or("an append-only parent must reject managed directory creation")?;
+        assert_eq!(directory_error.code(), "unsafe_profile_state");
+        assert!(
+            !directory_was_created,
+            "the unsafe parent must be rejected before mkdir"
+        );
+        let file_error = file_result
+            .err()
+            .ok_or("an append-only parent must reject private file creation")?;
+        assert_eq!(file_error.code(), "unsafe_profile_state");
+        assert!(
+            !file_was_created,
+            "the unsafe parent must be rejected before a credential inode exists"
+        );
         Ok(())
     }
 

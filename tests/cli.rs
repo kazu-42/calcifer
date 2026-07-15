@@ -1441,7 +1441,8 @@ esac
         );
     }
     let provider_log_after_launch = String::from_utf8(std::fs::read(&provider_log)?)?;
-    assert!(provider_log_after_launch.contains(&format!("home={}", home.display())));
+    let physical_home = std::fs::canonicalize(&home)?;
+    assert!(provider_log_after_launch.contains(&format!("home={}", physical_home.display())));
     assert!(provider_log_after_launch.contains(
         "args=-c cli_auth_credentials_store=\"file\" -c mcp_oauth_credentials_store=\"file\" --help"
     ));

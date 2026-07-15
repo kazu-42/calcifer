@@ -351,8 +351,9 @@ Uninstalling a binary release does not remove managed profiles:
 rm "$HOME/.local/bin/calcifer"
 ```
 
-Delete profile state only through a future supported Calcifer command. Manual
-state deletion can destroy sessions and credentials and is not a rollback step.
+Delete a managed profile through `calcifer auth remove codex@alias` (or add
+`--yes` for an explicit non-interactive confirmation). Manual state deletion
+can destroy sessions and credentials and is not a rollback step.
 
 ## Bad-release and rollback policy
 
@@ -365,12 +366,15 @@ Profile registry state is normally kept in the schema-v1 shape understood by
 the published alpha.4 artifact. A newer Calcifer may temporarily replace that
 file with a self-contained schema-v2 barrier while `auth remove` is in progress;
 alpha.4 intentionally reports `invalid_registry` instead of writing through
-that destructive state. If a rollback encounters that error, do not delete,
-edit, or copy `profiles.json`, `removal.json`, or a `.removing-*` directory.
-Run `auth list` once with the newer verified artifact that prepared the
-transaction so bounded recovery can restore or finish stable schema-v1 state,
-then verify `auth list` before reinstalling alpha.4. A completed removal or
-pre-visibility rollback is directly alpha.4-readable.
+that destructive state. After any interrupted or uncertain `auth remove`, do
+not delete, edit, or copy `profiles.json`, `removal.json`, or a `.removing-*`
+directory. Before reinstalling alpha.4, always run `auth list` once with the
+newer verified artifact that prepared the transaction, then run it again to
+verify stable recovery. This is required even when alpha.4 can still read the
+schema-v1 registry: a post-visibility interruption can leave private
+`removal.json` or `.removing-*` recovery state beside that stable registry. A
+completed removal or pre-visibility rollback is directly alpha.4-readable only
+after that newer-artifact recovery check succeeds.
 
 If an artifact or the release pipeline itself is compromised, stop new
 downloads through the audited emergency-removal procedure above, open a public

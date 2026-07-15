@@ -490,7 +490,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
-        let root = std::env::temp_dir().join(format!(
+        let root = std::fs::canonicalize(std::env::temp_dir())?.join(format!(
             "calcifer-status-stale-alias-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()

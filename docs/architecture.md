@@ -202,7 +202,7 @@ The current `run` command does not restart or re-submit a command after the chil
 
 ## Filesystem and credential mutations
 
-On Unix, the implemented managed root uses directory mode `0700`; Calcifer-owned files and locks use `0600`. On Windows, registration currently fails closed because equivalent current-user-only ACL creation has not been verified. The current slice rejects invalid aliases, non-canonical opaque IDs, symlinked or non-regular managed files, permissive Unix modes, and ownership-marker mismatches. Destructive profile removal additionally enforces owner-UID, single-link, inode/device, and hardened directory-relative traversal checks; migrating every remaining storage path to the same boundary remains a release gate.
+On Unix, the implemented managed root uses directory mode `0700`; Calcifer-owned files and locks use `0600`. Discovery canonicalizes the deepest existing prefix of the configured data root and appends only missing normal components. Calcifer stores that physical path and injects it as `CALCIFER_HOME` into coordinator and guardian self-execs, so one launch tree cannot rediscover a different mutable alias. Creation and later verification require the operational parent to remain canonical, reject every symlink ancestor, and require every real directory ancestor to be root/current-user-owned and non-replaceable (or sticky). On macOS, creation additionally rejects parent ALLOW/inheritable ACL entries, deletion-blocking DENY entries, and append, immutable, inherited-restrictive, or unknown parent flags, then requires the new managed component to read back with an empty ACL and supported flags before secret bytes are written. The standard non-inheritable `everyone deny delete` home ACL and parent-only `SF_NOUNLINK` temp ancestry remain compatible; `deny delete_child` does not. Pre-existing extended ACLs and unsupported flags fail closed instead of being normalized. On Windows, registration currently fails closed because equivalent current-user-only ACL creation has not been verified. The current slice rejects invalid aliases, non-canonical opaque IDs, symlinked or non-regular managed files, permissive Unix modes, and ownership-marker mismatches. Destructive profile removal additionally enforces owner-UID, single-link, inode/device, and hardened directory-relative traversal checks; migrating every remaining storage path to the same boundary remains a release gate.
 
 Calcifer-owned metadata updates follow a same-filesystem atomic-write sequence:
 
@@ -242,17 +242,25 @@ mount token. The transaction is:
    registry entry, data/profiles/provider roots, ownership marker, owner UID,
    private root modes, non-group/other-writable traversed-directory and
    regular-file modes, types, device, mount boundary, and single-link regular
-   files. Provider-created readable or executable descendants such as `0755`
+   files. Every macOS removal-tree entry, including non-followed symlinks,
+   sockets, and FIFOs, must have no extended ACL entries; roots, directories,
+   and regular files must also have no deletion-blocking
+   immutable/append/no-unlink flags.
+   Provider-created readable or executable descendants such as `0755`
    directories and `0644` files remain valid because every ancestor through
    the profile root is owner-only `0700`. Traversed directories must retain
    owner `rwx`; provider-created symlinks, sockets, FIFOs, and other
    non-directory leaves are manifest entries but are never followed or opened.
    Ownership-marker and lifetime-lock names remain control-plane state and must
-   be private single-link regular files.
+   be private single-link regular files. Every managed lock is opened no-follow,
+   matched to its visible inode, and checked for private mode, owner, and one
+   link before flock or fsync.
 2. Atomically replace stable schema-v1 `profiles.json` with the self-contained
    transient schema-v2 barrier and fsync its parent. This is the first durable
    transaction state, before any profile path moves.
 3. Atomically write and fsync a sidecar exactly matching the embedded proof.
+   Every later read opens it no-follow and matches the opened descriptor to the
+   visible private, single-link inode before parsing bounded bytes.
 4. Rename the UUID profile directory to `.removing-<profile-id>` under the same
    provider root, revalidate the complete manifest, then fsync that root.
 5. Atomically replace the barrier with the normal schema-v1 registry without

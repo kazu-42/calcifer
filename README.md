@@ -116,11 +116,23 @@ schema-v1 and readable by alpha.4. Ambiguous or mismatched barriers and
 sidecars, replaced or missing registries and roots, traversable or replaced
 directories, hard-linked regular files, unexpected owners, group/other-writable
 directories or regular files, mount crossings, and malformed tombstones fail
-closed without recursive deletion. On Linux, removal and its recovery require
-kernel 5.8 or newer so `statx` mount IDs and `openat2` constraints are both
-available; Calcifer never falls back to `st_dev` or an unconstrained `openat`.
-macOS compares descriptor-derived `fstatfs` mount identities. Mount identity
-tokens remain ephemeral in memory and are never persisted or logged.
+closed without recursive deletion. On macOS, every removal-tree entry must be
+free of extended ACL entries, and managed directories and regular files must
+also have supported file flags. Calcifer resolves the deepest existing prefix
+of its configured Unix storage root to a physical path once, stores that path,
+and passes it unchanged to coordinator and guardian helpers. Later managed
+operations reject every symlink ancestor and require each real ancestor to be
+root/current-user-owned and non-replaceable. This avoids path-based ACL checks
+on mutable symlink objects while keeping symlinked home-directory aliases
+usable. Calcifer rejects a parent ACL that could grant, inherit, or block child
+deletion, and rejects append, immutable, XNU-inherited, and unknown parent
+flags. The new path must then read back
+ACL-free and safely flagged before credential bytes are written. On
+Linux, removal and its recovery require kernel 5.8 or newer
+so `statx` mount IDs and `openat2` constraints are both available; Calcifer never
+falls back to `st_dev` or an unconstrained `openat`. macOS compares
+descriptor-derived `fstatfs` mount identities. Mount identity tokens remain
+ephemeral in memory and are never persisted or logged.
 
 Provider-created symlinks, Unix sockets, FIFOs, and other non-directory leaves
 are recorded in the manifest but never opened or traversed. Cleanup unlinks
@@ -130,7 +142,10 @@ single-link, and every traversed directory must remain owner-readable,
 owner-writable, and owner-searchable; ambiguous replacements still fail closed.
 The ownership marker and lifetime-lock names are control-plane state, not
 provider leaves, and must remain private single-link regular files: replacing
-either with a symlink always blocks removal before a transaction is prepared.
+either with a symlink or hard link always blocks removal before a transaction is
+prepared. Managed lock files and the removal sidecar are opened with no-follow
+semantics and their opened descriptors are matched to the visible inode before
+any lock, read, or durability operation.
 
 Removal does not start Codex, open a browser, contact a provider endpoint,
 revoke tokens, change global `~/.codex`, delete conversation lineage metadata,

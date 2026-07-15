@@ -122,11 +122,16 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   current owner, owner-only profile-root mode, absence of group/other write on
   traversed directories and regular files, validated no-follow leaf types,
   single-link non-directory entries, exact marker, mount identity, depth, and
-  entry budget. Readable provider-created descendants remain safe behind the
-  `0700` profile root, while traversed directories must retain owner `rwx`.
+  entry budget. macOS additionally requires no extended ACL entries on every
+  tree entry, including non-followed symlinks, sockets, and FIFOs, and no
+  immutable, append-only, or no-unlink file flags on managed roots and tree
+  entries. Readable provider-created descendants remain safe behind the `0700`
+  profile root, while traversed directories must retain owner `rwx`.
   Ownership markers and lifetime locks are control-plane entries and remain
-  private single-link regular files, so symlink replacements fail before
-  transaction preparation. A path-free
+  private single-link regular files. Locks are opened no-follow and their
+  opened/visible inode, owner, mode, and link count are matched before flock or
+  fsync, so symlink and hard-link replacements fail before transaction
+  preparation. A path-free
   manifest digest and entry count prevent pre-visibility recovery from
   restoring a tree with missing credentials or session state.
 - Stable `profiles.json` remains alpha.4-compatible schema v1. The first durable
@@ -146,6 +151,26 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   kernels and platforms fail closed without an unconstrained fallback. Mount
   tokens may contain local path or server information, so they remain ephemeral
   and are neither serialized nor logged.
+- Before Unix creation or acceptance, Calcifer canonicalizes the deepest
+  existing prefix of the configured data root once and appends only missing
+  normal components. The physical path is stored and passed explicitly to
+  coordinator and guardian self-execs. Operational paths must remain canonical;
+  every symlink ancestor is rejected, and every real directory ancestor must
+  be owned by root/current user and must not be group/other replaceable unless
+  sticky. This removes mutable symlink objects from path-based ACL validation.
+  On macOS, every
+  ALLOW entry, every inheritable ACL entry, DENY permissions other than a
+  non-inheritable DELETE-only entry, and append, immutable,
+  DATAVAULT/RESTRICTED, or unknown parent flags fail before an inode exists. The
+  DELETE-only exception keeps the standard macOS home `everyone deny delete`
+  ACL compatible without admitting `deny delete_child`; parent-only
+  `SF_NOUNLINK` remains compatible with standard temp ancestry. Each new managed
+  directory or private file must then read back with an empty extended ACL and
+  supported flags before credential bytes are written. Existing extended ACL
+  state is never silently normalized.
+- Removal-sidecar reads use a no-follow descriptor and match its inode, owner,
+  private mode, and single-link state to the visible path before bounded JSON
+  parsing.
 - Recovery restores only a complete pre-visibility tree and only completes
   deletion after visibility; removal and registry locks remain held through
   tombstone and sidecar durability. Missing or hard-linked registries,
