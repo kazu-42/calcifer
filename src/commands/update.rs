@@ -741,8 +741,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<ReleaseManifest, UpdateError> {
     }
     let manifest: ReleaseManifest =
         serde_json::from_slice(without_newline).map_err(|_| UpdateError::Schema)?;
-    let value: serde_json::Value =
-        serde_json::from_slice(without_newline).map_err(|_| UpdateError::Schema)?;
+    let value = serde_json::to_value(&manifest).map_err(|_| UpdateError::Schema)?;
     let mut canonical = serde_json::to_vec(&value).map_err(|_| UpdateError::Schema)?;
     canonical.push(b'\n');
     if canonical != bytes {
@@ -1424,6 +1423,40 @@ mod tests {
         asset["digest"] = json!(format!("sha256:{}", sha256_hex(bytes)));
     }
 
+    fn transport_with_manifest(
+        fixture: &Fixture,
+        manifest_document: &serde_json::Value,
+    ) -> FakeTransport {
+        let mut manifest = serde_json::to_vec(manifest_document)
+            .unwrap_or_else(|_| panic!("fixture manifest serialization failed"));
+        manifest.push(b'\n');
+        let manifest_digest = sha256_hex(&manifest);
+        let checksums = std::str::from_utf8(&fixture.checksums)
+            .unwrap_or_else(|_| panic!("fixture checksums are not canonical UTF-8"))
+            .lines()
+            .map(|line| {
+                if line.ends_with(MANIFEST_NAME) {
+                    format!("{manifest_digest}  {MANIFEST_NAME}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect::<String>()
+            .into_bytes();
+        let mut releases: Vec<serde_json::Value> = serde_json::from_slice(&fixture.release_body)
+            .unwrap_or_else(|_| panic!("fixture release JSON is invalid"));
+        replace_asset_bytes(&mut releases, MANIFEST_NAME, &manifest);
+        replace_asset_bytes(&mut releases, CHECKSUM_NAME, &checksums);
+        let release_body = serde_json::to_vec(&releases)
+            .unwrap_or_else(|_| panic!("fixture release serialization failed"));
+
+        FakeTransport::new(vec![
+            (fixture.list_url.clone(), Ok(ok_response(release_body))),
+            (fixture.manifest_url.clone(), Ok(ok_response(manifest))),
+            (fixture.checksum_url.clone(), Ok(ok_response(checksums))),
+        ])
+    }
+
     #[test]
     fn valid_preview_release_reports_verified_metadata_but_not_archive_bytes() {
         let fixture = fixture("0.2.0-alpha.1", true);
@@ -1851,6 +1884,48 @@ mod tests {
                 Channel::Preview,
                 "0.1.0-alpha.3",
                 "x86_64-apple-darwin",
+            )),
+            "update_schema_error"
+        );
+    }
+
+    #[test]
+    fn manifest_requires_explicit_null_libc_for_targets_without_libc() {
+        let fixture = fixture("0.2.0-alpha.1", true);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fixture.manifest)
+            .unwrap_or_else(|_| panic!("fixture manifest is invalid"));
+        manifest["targets"][0]
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("fixture target is not an object"))
+            .remove("libc");
+        let transport = transport_with_manifest(&fixture, &manifest);
+
+        assert_eq!(
+            error_code(check_with(
+                &transport,
+                Channel::Preview,
+                "0.1.0-alpha.3",
+                "aarch64-apple-darwin",
+            )),
+            "update_schema_error"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_explicit_null_for_omitted_minimum_version() {
+        let fixture = fixture("0.2.0-alpha.1", true);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fixture.manifest)
+            .unwrap_or_else(|_| panic!("fixture manifest is invalid"));
+        manifest["targets"][0]["runtime_requirements"][0]["minimum_version"] =
+            serde_json::Value::Null;
+        let transport = transport_with_manifest(&fixture, &manifest);
+
+        assert_eq!(
+            error_code(check_with(
+                &transport,
+                Channel::Preview,
+                "0.1.0-alpha.3",
+                "aarch64-apple-darwin",
             )),
             "update_schema_error"
         );
