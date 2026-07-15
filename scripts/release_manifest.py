@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import json
 import os
@@ -34,6 +33,15 @@ MAX_TAR_STREAM_BYTES = (
     + (2 * tarfile.RECORDSIZE)
     + (2 * MAX_ARCHIVE_ENTRIES * tarfile.BLOCKSIZE)
 )
+GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff"
+GZIP_TRAILER_BYTES = 8
+ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+ZIP_DOS_TIME = 0
+ZIP_DOS_DATE = 33
+ZIP_CREATE_SYSTEM = 3
+ZIP_CREATE_VERSION = 20
+ZIP_EXTRACT_VERSION = 20
+ZIP_FLAGS = 0
 
 SEMVER_PATTERN = re.compile(
     r"^(0|[1-9][0-9]*)\."
@@ -173,21 +181,98 @@ def _expected_archive_entries(version: str, target: str) -> tuple[str, set[str]]
     return f"{prefix}/{binary_name}", expected
 
 
+def _expected_archive_order(version: str, target: str) -> tuple[str, ...]:
+    prefix = f"calcifer-v{version}-{target}"
+    binary_name = str(TARGET_METADATA[target]["binary"])
+    return (
+        prefix,
+        f"{prefix}/{binary_name}",
+        *(f"{prefix}/{document}" for document in RELEASE_DOCUMENTS),
+    )
+
+
+def _expected_zip_order(version: str, target: str) -> tuple[str, ...]:
+    order = _expected_archive_order(version, target)
+    return (f"{order[0]}/", *order[1:])
+
+
+def _expected_zip_external_attr(
+    name: str,
+    *,
+    directory_name: str,
+    binary_name: str,
+) -> int:
+    if name == directory_name:
+        return ((stat.S_IFDIR | 0o755) << 16) | 0x10
+    mode = 0o755 if name == binary_name else 0o644
+    return (stat.S_IFREG | mode) << 16
+
+
+def _expand_canonical_gzip(path: Path, expanded: BinaryIO) -> int:
+    """Expand exactly one packager-format gzip member under the tar size bound."""
+
+    with path.open("rb") as source:
+        if source.read(len(GZIP_HEADER)) != GZIP_HEADER:
+            raise ValueError("release tar archive has a noncanonical gzip header")
+
+        decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+        pending = b""
+        expanded_bytes = 0
+        checksum = 0
+        trailing = b""
+        while not decompressor.eof:
+            if not pending:
+                pending = source.read(64 * 1024)
+                if not pending:
+                    raise ValueError("release tar archive is invalid")
+
+            remaining = MAX_TAR_STREAM_BYTES - expanded_bytes
+            chunk = decompressor.decompress(
+                pending,
+                min(1024 * 1024, remaining + 1),
+            )
+            pending = decompressor.unconsumed_tail
+            if len(chunk) > remaining:
+                raise ValueError("release archive expands beyond the size limit")
+            if chunk:
+                expanded.write(chunk)
+                checksum = zlib.crc32(chunk, checksum)
+                expanded_bytes += len(chunk)
+
+            if decompressor.eof:
+                probe_bytes = GZIP_TRAILER_BYTES + len(GZIP_HEADER[:3])
+                trailing = decompressor.unused_data[:probe_bytes]
+                if len(trailing) < probe_bytes:
+                    trailing += source.read(probe_bytes - len(trailing))
+
+        flushed = decompressor.flush()
+        if flushed:
+            remaining = MAX_TAR_STREAM_BYTES - expanded_bytes
+            if len(flushed) > remaining:
+                raise ValueError("release archive expands beyond the size limit")
+            expanded.write(flushed)
+            checksum = zlib.crc32(flushed, checksum)
+            expanded_bytes += len(flushed)
+
+    if len(trailing) > GZIP_TRAILER_BYTES:
+        if trailing[GZIP_TRAILER_BYTES:].startswith(GZIP_HEADER[:3]):
+            raise ValueError("release tar archive must contain exactly one gzip member")
+        raise ValueError("release tar archive is invalid")
+    if len(trailing) != GZIP_TRAILER_BYTES:
+        raise ValueError("release tar archive is invalid")
+    expected_checksum, expected_size = struct.unpack("<LL", trailing)
+    if expected_checksum != checksum or expected_size != expanded_bytes:
+        raise ValueError("release tar archive is invalid")
+    return expanded_bytes
+
+
 def _inspect_tar(path: Path, version: str, target: str) -> tuple[str, str]:
     binary_path, expected = _expected_archive_entries(version, target)
+    expected_order = _expected_archive_order(version, target)
     expected_directory = binary_path.split("/", maxsplit=1)[0]
     try:
-        with (
-            path.open("rb") as source,
-            gzip.GzipFile(fileobj=source, mode="rb") as compressed,
-            tempfile.TemporaryFile() as expanded,
-        ):
-            expanded_bytes = 0
-            while chunk := compressed.read(1024 * 1024):
-                expanded_bytes += len(chunk)
-                if expanded_bytes > MAX_TAR_STREAM_BYTES:
-                    raise ValueError("release archive expands beyond the size limit")
-                expanded.write(chunk)
+        with tempfile.TemporaryFile() as expanded:
+            expanded_bytes = _expand_canonical_gzip(path, expanded)
 
             expanded.seek(0)
             archive = tarfile.open(fileobj=expanded, mode="r:")
@@ -196,6 +281,7 @@ def _inspect_tar(path: Path, version: str, target: str) -> tuple[str, str]:
                 content_bytes = 0
                 actual_content_bytes = 0
                 binary_sha256 = None
+                expected_offset = 0
                 for index, member in enumerate(archive):
                     if index >= MAX_ARCHIVE_ENTRIES:
                         raise ValueError("release archive contains too many entries")
@@ -215,6 +301,33 @@ def _inspect_tar(path: Path, version: str, target: str) -> tuple[str, str]:
                     elif not member.isreg():
                         raise ValueError(
                             "release archive layout does not match the release contract"
+                        )
+
+                    expected_mode = (
+                        0o755 if name in (expected_directory, binary_path) else 0o644
+                    )
+                    expected_type = (
+                        tarfile.DIRTYPE if name == expected_directory else tarfile.REGTYPE
+                    )
+                    if (
+                        index >= len(expected_order)
+                        or member.name != expected_order[index]
+                        or member.type != expected_type
+                        or member.mode != expected_mode
+                        or member.uid != 0
+                        or member.gid != 0
+                        or member.uname != ""
+                        or member.gname != ""
+                        or member.mtime != 0
+                        or member.linkname != ""
+                        or member.devmajor != 0
+                        or member.devminor != 0
+                        or member.pax_headers
+                        or member.offset != expected_offset
+                        or member.offset_data != expected_offset + tarfile.BLOCKSIZE
+                    ):
+                        raise ValueError(
+                            "release tar archive has noncanonical tar metadata"
                         )
                     if member.isreg():
                         if member.size < 0:
@@ -244,11 +357,17 @@ def _inspect_tar(path: Path, version: str, target: str) -> tuple[str, str]:
                         if name == binary_path:
                             binary_sha256 = digest
 
+                    expected_offset = member.offset_data + (
+                        (member.size + tarfile.BLOCKSIZE - 1)
+                        // tarfile.BLOCKSIZE
+                        * tarfile.BLOCKSIZE
+                    )
+
                 if len(names) != len(set(names)):
                     raise ValueError("release archive contains duplicate paths")
-                if set(names) != expected:
+                if tuple(names) != expected_order or set(names) != expected:
                     raise ValueError(
-                        "release archive layout does not match the release contract"
+                        "release tar archive has noncanonical tar metadata"
                     )
 
                 if binary_sha256 is None:
@@ -270,7 +389,7 @@ def _inspect_tar(path: Path, version: str, target: str) -> tuple[str, str]:
             while trailing := expanded.read(1024 * 1024):
                 if any(trailing):
                     raise ValueError("release tar archive has invalid trailing data")
-    except (gzip.BadGzipFile, tarfile.TarError, EOFError, zlib.error) as error:
+    except (tarfile.TarError, EOFError, zlib.error) as error:
         raise ValueError("release tar archive is invalid") from error
     return binary_path, binary_sha256
 
@@ -316,12 +435,12 @@ def _validate_zip_local_layout(
     members: list[zipfile.ZipInfo],
     directory_offset: int,
 ) -> None:
-    """Reject bytes that are not owned by a contiguous local-file stream."""
+    """Require the exact contiguous local headers emitted by the packager."""
 
     cursor = 0
     try:
         with path.open("rb") as source:
-            for member in sorted(members, key=lambda candidate: candidate.header_offset):
+            for member in members:
                 if member.header_offset != cursor:
                     raise ValueError("release zip archive is invalid")
                 source.seek(cursor)
@@ -330,11 +449,11 @@ def _validate_zip_local_layout(
                     raise ValueError("release zip archive is invalid")
                 (
                     signature,
-                    _,
+                    extract_version,
                     flags,
                     compression,
-                    _,
-                    _,
+                    modified_time,
+                    modified_date,
                     crc32,
                     compressed_size,
                     uncompressed_size,
@@ -343,22 +462,27 @@ def _validate_zip_local_layout(
                 ) = struct.unpack("<4s5H3L2H", header)
                 if (
                     signature != b"PK\x03\x04"
-                    or flags != member.flag_bits
-                    or flags & 0x08
-                    or compression != member.compress_type
+                    or extract_version != ZIP_EXTRACT_VERSION
+                    or flags != ZIP_FLAGS
+                    or compression != zipfile.ZIP_DEFLATED
+                    or modified_time != ZIP_DOS_TIME
+                    or modified_date != ZIP_DOS_DATE
                     or crc32 != member.CRC
                     or compressed_size != member.compress_size
                     or uncompressed_size != member.file_size
                 ):
-                    raise ValueError("release zip archive is invalid")
+                    raise ValueError(
+                        "release zip archive has noncanonical ZIP metadata"
+                    )
 
                 filename = source.read(filename_size)
                 extra = source.read(extra_size)
                 if len(filename) != filename_size or len(extra) != extra_size:
                     raise ValueError("release zip archive is invalid")
-                encoding = "utf-8" if flags & 0x800 else "cp437"
-                if filename != member.filename.encode(encoding):
-                    raise ValueError("release zip archive is invalid")
+                if filename != member.filename.encode("ascii") or extra:
+                    raise ValueError(
+                        "release zip archive has noncanonical ZIP metadata"
+                    )
 
                 cursor = source.tell() + member.compress_size
                 if cursor > directory_offset:
@@ -368,6 +492,41 @@ def _validate_zip_local_layout(
                 raise ValueError("release zip archive is invalid")
     except (struct.error, UnicodeEncodeError) as error:
         raise ValueError("release zip archive is invalid") from error
+
+
+def _validate_zip_central_metadata(
+    members: list[zipfile.ZipInfo],
+    *,
+    version: str,
+    target: str,
+) -> None:
+    expected_order = _expected_zip_order(version, target)
+    binary_name = expected_order[1]
+    directory_name = expected_order[0]
+    if tuple(member.filename for member in members) != expected_order:
+        raise ValueError("release zip archive has noncanonical ZIP metadata")
+
+    for member in members:
+        expected_external_attr = _expected_zip_external_attr(
+            member.filename,
+            directory_name=directory_name,
+            binary_name=binary_name,
+        )
+        if (
+            member.date_time != ZIP_TIMESTAMP
+            or member.compress_type != zipfile.ZIP_DEFLATED
+            or member.comment != b""
+            or member.extra != b""
+            or member.create_system != ZIP_CREATE_SYSTEM
+            or member.create_version != ZIP_CREATE_VERSION
+            or member.extract_version != ZIP_EXTRACT_VERSION
+            or member.reserved != 0
+            or member.flag_bits != ZIP_FLAGS
+            or member.volume != 0
+            or member.internal_attr != 0
+            or member.external_attr != expected_external_attr
+        ):
+            raise ValueError("release zip archive has noncanonical ZIP metadata")
 
 
 def _inspect_zip(path: Path, version: str, target: str) -> tuple[str, str]:
@@ -381,7 +540,6 @@ def _inspect_zip(path: Path, version: str, target: str) -> tuple[str, str]:
                 raise ValueError("release zip archive is invalid")
             if len(members) > MAX_ARCHIVE_ENTRIES:
                 raise ValueError("release archive contains too many entries")
-            _validate_zip_local_layout(path, members, directory_offset)
             names: list[str] = []
             content_bytes = 0
             actual_content_bytes = 0
@@ -437,6 +595,12 @@ def _inspect_zip(path: Path, version: str, target: str) -> tuple[str, str]:
 
             if binary_sha256 is None:
                 raise ValueError("release binary could not be read")
+            _validate_zip_central_metadata(
+                members,
+                version=version,
+                target=target,
+            )
+            _validate_zip_local_layout(path, members, directory_offset)
     except (
         zipfile.BadZipFile,
         EOFError,

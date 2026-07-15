@@ -1,3 +1,5 @@
+import copy
+import gzip
 import hashlib
 import io
 import json
@@ -8,7 +10,9 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 from scripts import package_release, release_manifest
 
@@ -68,6 +72,191 @@ class ReleaseManifestTests(unittest.TestCase):
             source_commit=source_commit,
             tag_ref_digest=tag_ref_digest or self.tag_ref_digest,
         )
+
+    def _windows_archive(self) -> Path:
+        return next(self.dist.glob("*x86_64-pc-windows-msvc.zip"))
+
+    def _linux_archive(self) -> Path:
+        return next(self.dist.glob("*x86_64-unknown-linux-gnu.tar.gz"))
+
+    def _assert_bundle_rejected(self, message: str) -> None:
+        with self.assertRaisesRegex(ValueError, message):
+            self.build_manifest(
+                dist=self.dist,
+                version=self.version,
+                source_commit=self.source_commit,
+            )
+
+    def _rewrite_windows_zip(
+        self,
+        mutate: Callable[[zipfile.ZipInfo], None],
+        *,
+        order: tuple[int, ...] | None = None,
+        compression: int | None = None,
+    ) -> None:
+        archive_path = self._windows_archive()
+        with zipfile.ZipFile(archive_path) as source:
+            entries = [
+                (copy.copy(member), source.read(member))
+                for member in source.infolist()
+            ]
+        if order is not None:
+            entries = [entries[index] for index in order]
+
+        encoded = io.BytesIO()
+        with zipfile.ZipFile(encoded, "w") as destination:
+            for member, contents in entries:
+                if compression is not None:
+                    member.compress_type = compression
+                mutate(member)
+                destination.writestr(member, contents)
+        archive_path.write_bytes(encoded.getvalue())
+        with zipfile.ZipFile(archive_path) as readable:
+            self.assertIsNone(readable.testzip())
+
+    @staticmethod
+    def _zip_central_records(encoded: bytes) -> tuple[int, list[tuple[int, bytes]]]:
+        end_record_offset = len(encoded) - 22
+        signature, _, _, _, count, _, directory_offset, comment_size = (
+            struct.unpack_from("<4s4H2LH", encoded, end_record_offset)
+        )
+        if signature != b"PK\x05\x06" or comment_size != 0:
+            raise AssertionError("test fixture must use a comment-free classic ZIP")
+
+        records = []
+        cursor = directory_offset
+        for _ in range(count):
+            if encoded[cursor : cursor + 4] != b"PK\x01\x02":
+                raise AssertionError("test fixture central directory is invalid")
+            filename_size, extra_size, entry_comment_size = struct.unpack_from(
+                "<HHH", encoded, cursor + 28
+            )
+            filename = encoded[cursor + 46 : cursor + 46 + filename_size]
+            records.append((cursor, filename))
+            cursor += 46 + filename_size + extra_size + entry_comment_size
+        return directory_offset, records
+
+    def _insert_zip_extra(self, *, central: bool) -> None:
+        archive_path = self._windows_archive()
+        encoded = bytearray(archive_path.read_bytes())
+        directory_offset, records = self._zip_central_records(encoded)
+        extra = b"\xfe\xca\x00\x00"
+
+        if central:
+            record_offset, _ = records[1]
+            filename_size = struct.unpack_from("<H", encoded, record_offset + 28)[0]
+            insertion_offset = record_offset + 46 + filename_size
+            encoded[insertion_offset:insertion_offset] = extra
+            struct.pack_into("<H", encoded, record_offset + 30, len(extra))
+            end_record_offset = len(encoded) - 22
+            directory_size = struct.unpack_from(
+                "<L", encoded, end_record_offset + 12
+            )[0]
+            struct.pack_into(
+                "<L", encoded, end_record_offset + 12, directory_size + len(extra)
+            )
+        else:
+            with zipfile.ZipFile(archive_path) as source:
+                member = source.infolist()[-1]
+            local_offset = member.header_offset
+            filename_size = struct.unpack_from("<H", encoded, local_offset + 26)[0]
+            insertion_offset = local_offset + 30 + filename_size
+            encoded[insertion_offset:insertion_offset] = extra
+            struct.pack_into("<H", encoded, local_offset + 28, len(extra))
+            end_record_offset = len(encoded) - 22
+            struct.pack_into(
+                "<L",
+                encoded,
+                end_record_offset + 16,
+                directory_offset + len(extra),
+            )
+
+        archive_path.write_bytes(encoded)
+        with zipfile.ZipFile(archive_path) as readable:
+            self.assertIsNone(readable.testzip())
+
+    def _patch_zip_binary_headers(
+        self,
+        *,
+        local_offset: int,
+        central_offset: int,
+        value: int,
+    ) -> None:
+        archive_path = self._windows_archive()
+        encoded = bytearray(archive_path.read_bytes())
+        with zipfile.ZipFile(archive_path) as source:
+            binary = source.infolist()[1]
+        _, records = self._zip_central_records(encoded)
+        record_offset, _ = records[1]
+        struct.pack_into("<H", encoded, binary.header_offset + local_offset, value)
+        struct.pack_into("<H", encoded, record_offset + central_offset, value)
+        archive_path.write_bytes(encoded)
+        with zipfile.ZipFile(archive_path) as readable:
+            self.assertIsNone(readable.testzip())
+
+    def _rewrite_linux_tar(
+        self,
+        mutate: Callable[[tarfile.TarInfo], None],
+        *,
+        order: tuple[int, ...] | None = None,
+        tar_format: int = tarfile.USTAR_FORMAT,
+    ) -> None:
+        archive_path = self._linux_archive()
+        with tarfile.open(archive_path, "r:gz") as source:
+            entries = []
+            for member in source:
+                if member.isdir():
+                    contents = b""
+                else:
+                    extracted = source.extractfile(member)
+                    self.assertIsNotNone(extracted)
+                    contents = extracted.read()
+                entries.append((copy.copy(member), contents))
+        if order is not None:
+            entries = [entries[index] for index in order]
+
+        with archive_path.open("wb") as raw:
+            with gzip.GzipFile(
+                fileobj=raw,
+                mode="wb",
+                filename="",
+                mtime=0,
+            ) as compressed:
+                with tarfile.open(
+                    fileobj=compressed,
+                    mode="w",
+                    format=tar_format,
+                ) as destination:
+                    for member, contents in entries:
+                        mutate(member)
+                        if member.isdir():
+                            destination.addfile(member)
+                        else:
+                            destination.addfile(member, io.BytesIO(contents))
+
+    def _patch_tar_binary_numeric_field(self, offset: int, value: int) -> None:
+        archive_path = self._linux_archive()
+        expanded = bytearray(gzip.decompress(archive_path.read_bytes()))
+        header_offset = tarfile.BLOCKSIZE
+        expanded[header_offset + offset : header_offset + offset + 8] = (
+            f"{value:07o}\0".encode("ascii")
+        )
+        checksum_offset = header_offset + 148
+        expanded[checksum_offset : checksum_offset + 8] = b"        "
+        checksum = sum(expanded[header_offset : header_offset + tarfile.BLOCKSIZE])
+        expanded[checksum_offset : checksum_offset + 8] = (
+            f"{checksum:06o}\0 ".encode("ascii")
+        )
+
+        encoded = io.BytesIO()
+        with gzip.GzipFile(
+            fileobj=encoded,
+            mode="wb",
+            filename="",
+            mtime=0,
+        ) as compressed:
+            compressed.write(expanded)
+        archive_path.write_bytes(encoded.getvalue())
 
     def test_builds_canonical_manifest_for_all_supported_targets(self) -> None:
         first = self.build_manifest(
@@ -192,10 +381,17 @@ class ReleaseManifestTests(unittest.TestCase):
 
     def test_rejects_archive_path_traversal(self) -> None:
         archive = next(self.dist.glob("*x86_64-unknown-linux-gnu.tar.gz"))
-        with tarfile.open(archive, "w:gz") as malformed:
-            info = tarfile.TarInfo("../calcifer")
-            info.size = 0
-            malformed.addfile(info)
+        with archive.open("wb") as raw:
+            with gzip.GzipFile(
+                fileobj=raw,
+                mode="wb",
+                filename="",
+                mtime=0,
+            ) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w") as malformed:
+                    info = tarfile.TarInfo("../calcifer")
+                    info.size = 0
+                    malformed.addfile(info)
 
         with self.assertRaisesRegex(ValueError, "unsafe archive path"):
             self.build_manifest(
@@ -255,16 +451,23 @@ class ReleaseManifestTests(unittest.TestCase):
     def test_rejects_nonempty_tar_directory_entries(self) -> None:
         archive = next(self.dist.glob("*aarch64-unknown-linux-gnu.tar.gz"))
         prefix = "calcifer-v0.1.0-alpha.4-aarch64-unknown-linux-gnu"
-        with tarfile.open(archive, "w:gz") as malformed:
-            directory = tarfile.TarInfo(prefix)
-            directory.type = tarfile.DIRTYPE
-            directory.size = 1
-            malformed.addfile(directory, io.BytesIO(b"x"))
-            for name in ("calcifer", "LICENSE", "README.md", "SECURITY.md"):
-                contents = name.encode("ascii")
-                member = tarfile.TarInfo(f"{prefix}/{name}")
-                member.size = len(contents)
-                malformed.addfile(member, io.BytesIO(contents))
+        with archive.open("wb") as raw:
+            with gzip.GzipFile(
+                fileobj=raw,
+                mode="wb",
+                filename="",
+                mtime=0,
+            ) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w") as malformed:
+                    directory = tarfile.TarInfo(prefix)
+                    directory.type = tarfile.DIRTYPE
+                    directory.size = 1
+                    malformed.addfile(directory, io.BytesIO(b"x"))
+                    for name in ("calcifer", "LICENSE", "README.md", "SECURITY.md"):
+                        contents = name.encode("ascii")
+                        member = tarfile.TarInfo(f"{prefix}/{name}")
+                        member.size = len(contents)
+                        malformed.addfile(member, io.BytesIO(contents))
 
         with self.assertRaisesRegex(ValueError, "directory entry must be empty"):
             self.build_manifest(
@@ -376,18 +579,223 @@ class ReleaseManifestTests(unittest.TestCase):
                 source_commit="0123456789abcdef0123456789abcdef01234567",
             )
 
+    def test_rejects_noncanonical_zip_entry_comments_and_extras(self) -> None:
+        original = self._windows_archive().read_bytes()
+
+        def add_comment(member: zipfile.ZipInfo) -> None:
+            if member.filename.endswith("/calcifer.exe"):
+                member.comment = b"noncanonical"
+
+        cases = (
+            ("central comment", lambda: self._rewrite_windows_zip(add_comment)),
+            ("central extra", lambda: self._insert_zip_extra(central=True)),
+            ("local extra", lambda: self._insert_zip_extra(central=False)),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                self._windows_archive().write_bytes(original)
+                mutate()
+                self._assert_bundle_rejected("canonical ZIP metadata")
+
+    def test_rejects_noncanonical_zip_versions_flags_timestamp_and_modes(self) -> None:
+        original = self._windows_archive().read_bytes()
+
+        def mutate_binary(
+            attribute: str,
+            value: object,
+        ) -> Callable[[zipfile.ZipInfo], None]:
+            def apply(member: zipfile.ZipInfo) -> None:
+                if member.filename.endswith("/calcifer.exe"):
+                    setattr(member, attribute, value)
+
+            return apply
+
+        cases = (
+            (
+                "timestamp",
+                lambda: self._rewrite_windows_zip(
+                    mutate_binary("date_time", (1980, 1, 2, 0, 0, 0))
+                ),
+            ),
+            (
+                "creator system",
+                lambda: self._rewrite_windows_zip(
+                    mutate_binary("create_system", 0)
+                ),
+            ),
+            (
+                "creator version",
+                lambda: self._rewrite_windows_zip(
+                    mutate_binary("create_version", 21)
+                ),
+            ),
+            (
+                "extract version",
+                lambda: self._patch_zip_binary_headers(
+                    local_offset=4,
+                    central_offset=6,
+                    value=21,
+                ),
+            ),
+            (
+                "flags",
+                lambda: self._patch_zip_binary_headers(
+                    local_offset=6,
+                    central_offset=8,
+                    value=0x800,
+                ),
+            ),
+            (
+                "internal attributes",
+                lambda: self._rewrite_windows_zip(
+                    mutate_binary("internal_attr", 1)
+                ),
+            ),
+            (
+                "mode",
+                lambda: self._rewrite_windows_zip(
+                    mutate_binary(
+                        "external_attr",
+                        (stat.S_IFREG | 0o700) << 16,
+                    )
+                ),
+            ),
+            (
+                "compression",
+                lambda: self._rewrite_windows_zip(
+                    lambda _: None,
+                    compression=zipfile.ZIP_STORED,
+                ),
+            ),
+            (
+                "order",
+                lambda: self._rewrite_windows_zip(
+                    lambda _: None,
+                    order=(0, 1, 3, 2, 4),
+                ),
+            ),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                self._windows_archive().write_bytes(original)
+                mutate()
+                self._assert_bundle_rejected("canonical ZIP metadata")
+
+    def test_rejects_noncanonical_tar_entry_metadata_and_order(self) -> None:
+        original = self._linux_archive().read_bytes()
+
+        def mutate_binary(
+            attribute: str,
+            value: object,
+        ) -> Callable[[tarfile.TarInfo], None]:
+            def apply(member: tarfile.TarInfo) -> None:
+                if member.name.endswith("/calcifer"):
+                    setattr(member, attribute, value)
+
+            return apply
+
+        cases = (
+            ("uid", mutate_binary("uid", 1), None, tarfile.USTAR_FORMAT),
+            ("gid", mutate_binary("gid", 1), None, tarfile.USTAR_FORMAT),
+            ("uname", mutate_binary("uname", "builder"), None, tarfile.USTAR_FORMAT),
+            ("gname", mutate_binary("gname", "builder"), None, tarfile.USTAR_FORMAT),
+            ("mtime", mutate_binary("mtime", 1), None, tarfile.USTAR_FORMAT),
+            ("mode", mutate_binary("mode", 0o700), None, tarfile.USTAR_FORMAT),
+            (
+                "linkname",
+                mutate_binary("linkname", "unused"),
+                None,
+                tarfile.USTAR_FORMAT,
+            ),
+            (
+                "pax",
+                mutate_binary("pax_headers", {"comment": "noncanonical"}),
+                None,
+                tarfile.PAX_FORMAT,
+            ),
+            (
+                "order",
+                lambda _: None,
+                (0, 1, 3, 2, 4),
+                tarfile.USTAR_FORMAT,
+            ),
+        )
+        for label, mutate, order, tar_format in cases:
+            with self.subTest(label=label):
+                self._linux_archive().write_bytes(original)
+                self._rewrite_linux_tar(
+                    mutate,
+                    order=order,
+                    tar_format=tar_format,
+                )
+                self._assert_bundle_rejected("canonical tar metadata")
+
+        for label, offset in (("devmajor", 329), ("devminor", 337)):
+            with self.subTest(label=label):
+                self._linux_archive().write_bytes(original)
+                self._patch_tar_binary_numeric_field(offset, 1)
+                self._assert_bundle_rejected("canonical tar metadata")
+
+    def test_rejects_noncanonical_gzip_header(self) -> None:
+        archive = self._linux_archive()
+        original = archive.read_bytes()
+        cases = (
+            ("mtime", 4, 1),
+            ("compression flags", 8, 0),
+            ("operating system", 9, 3),
+        )
+        for label, offset, value in cases:
+            with self.subTest(label=label):
+                encoded = bytearray(original)
+                encoded[offset] = value
+                archive.write_bytes(encoded)
+                self._assert_bundle_rejected("canonical gzip header")
+
+    def test_rejects_a_second_empty_gzip_member(self) -> None:
+        archive = self._linux_archive()
+        trailing_member = io.BytesIO()
+        with gzip.GzipFile(
+            fileobj=trailing_member,
+            mode="wb",
+            filename="",
+            mtime=0,
+        ):
+            pass
+        archive.write_bytes(archive.read_bytes() + trailing_member.getvalue())
+
+        self._assert_bundle_rejected("exactly one gzip member")
+
+    def test_preserves_the_bounded_tar_expansion_limit(self) -> None:
+        with (
+            mock.patch.object(release_manifest, "MAX_TAR_STREAM_BYTES", 1024),
+            self.assertRaisesRegex(ValueError, "expands beyond the size limit"),
+        ):
+            self.build_manifest(
+                dist=self.dist,
+                version=self.version,
+                source_commit=self.source_commit,
+            )
+
     @unittest.skipIf(os.name == "nt", "Tar symlink construction is not portable on Windows")
     def test_rejects_symlink_entries(self) -> None:
         archive = next(self.dist.glob("*aarch64-unknown-linux-gnu.tar.gz"))
         prefix = "calcifer-v0.1.0-alpha.4-aarch64-unknown-linux-gnu"
-        with tarfile.open(archive, "w:gz") as malformed:
-            directory = tarfile.TarInfo(prefix)
-            directory.type = tarfile.DIRTYPE
-            malformed.addfile(directory)
-            link = tarfile.TarInfo(f"{prefix}/calcifer")
-            link.type = tarfile.SYMTYPE
-            link.linkname = "/tmp/not-calcifer"
-            malformed.addfile(link)
+        with archive.open("wb") as raw:
+            with gzip.GzipFile(
+                fileobj=raw,
+                mode="wb",
+                filename="",
+                mtime=0,
+            ) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w") as malformed:
+                    directory = tarfile.TarInfo(prefix)
+                    directory.type = tarfile.DIRTYPE
+                    package_release._configure_tar_info(directory, 0o755)
+                    malformed.addfile(directory)
+                    link = tarfile.TarInfo(f"{prefix}/calcifer")
+                    link.type = tarfile.SYMTYPE
+                    link.linkname = "/tmp/not-calcifer"
+                    malformed.addfile(link)
 
         with self.assertRaisesRegex(ValueError, "regular files and directories"):
             self.build_manifest(
