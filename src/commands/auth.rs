@@ -115,6 +115,7 @@ pub(crate) fn add_codex(alias: &str) -> Result<AuthReport, AppError> {
         &home,
         &neutral_working_directory,
         IDENTITY_PROBE_TIMEOUT,
+        None,
     )
     .map_err(|_| crate::profiles::ProfileError::from(IdentityError::Unsupported))?;
     let profile = pending.commit(adapter)?;
@@ -132,12 +133,13 @@ pub(crate) fn verify_codex(alias: &str) -> Result<AuthReport, AppError> {
     let registry = Registry::discover()?;
     let profile = registry.find(Provider::Codex, alias)?;
     let neutral_working_directory = registry.neutral_working_directory()?;
-    let verified = registry.verify_or_bind_codex_identity(&profile, |home| {
+    let verified = registry.verify_or_bind_codex_identity(&profile, |home, provider_lease| {
         verify_codex_identity_adapter(
             &executable,
             home,
             &neutral_working_directory,
             IDENTITY_PROBE_TIMEOUT,
+            provider_lease,
         )
         .map_err(|_| crate::profiles::ProfileError::from(IdentityError::Unsupported))
     })?;

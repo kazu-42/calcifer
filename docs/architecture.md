@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, and a synthetic Codex 0.144.4 handoff compatibility gate are implemented. The production cross-profile handoff supervisor and automatic failover implementation remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, and an internal Linux/macOS no-gap target-reservation and guardian provider-lease transfer primitive are implemented. The production cross-profile handoff supervisor, transaction, and automatic failover remain future work.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -70,6 +70,7 @@ Future code that violates one of these invariants requires an architecture decis
 15. **Repository configuration cannot route accounts.** Interactive launch accepts only version-reviewed repository settings and binds the final provider to the canonical working directory that was inspected.
 16. **Provider identity stays private.** A bounded provider-owned scope is immediately reduced to an installation-local HMAC fingerprint; raw scopes, fingerprints, and identity-key IDs never enter public DTOs or diagnostics.
 17. **Update evidence stays precise.** An update recommendation requires an immutable release and canonical v1 manifest/checksum agreement for the exact compile target. Published attestation evidence and locally verified bytes are reported separately; an un-downloaded archive is never called verified.
+18. **Transferred leases are close-only and non-inheritable.** After a lease descriptor is shared, ownership is released only by closing the exact descriptor, never by explicitly unlocking it. A received descriptor must be marked and read back as close-on-exec before the guardian may acknowledge it or start a child.
 
 ## Codex profile model
 
@@ -208,7 +209,7 @@ CODEX_HOME=<managed-home> codex \
   app-server --stdio
 ```
 
-It completes the stable JSONL initialization handshake with `experimentalApi: false`, requires the explicitly tested Codex `0.144.4` client-scoped user-agent, and canonicalizes the returned `codexHome` against the selected managed home. Only then does it call `account/rateLimits/read`. An untested version, changed initialize schema, or different home closes the probe before the usage request. Calcifer closes stdin, waits briefly for a clean provider exit, and only then kills/reaps a stuck probe. The bounded no-turn app-server inherits only the provider side of the lease; if the status parent is killed, a second writer remains blocked until that app-server exits on stdio EOF. Input is bounded to a 1 MiB JSONL line. Normalized output includes all returned metered buckets, primary and secondary windows, reset timestamps, workspace credits, individual spend controls, and safe reset-credit count/status/expiry fields. Opaque reset-credit IDs and backend display copy are discarded before the public model is constructed.
+It completes the stable JSONL initialization handshake with `experimentalApi: false`, requires the explicitly tested Codex `0.144.4` client-scoped user-agent, and canonicalizes the returned `codexHome` against the selected managed home. Only then does it call `account/rateLimits/read`. An untested version, changed initialize schema, or different home closes the probe before the usage request. Calcifer closes stdin, waits briefly for a clean provider exit, and only then kills/reaps a stuck probe. The bounded no-turn app-server inherits only the provider side of the lease; if the status parent is killed, a second writer remains blocked until that app-server exits on stdio EOF. On Unix the parent descriptor remains close-on-exec at all times: an audited spawn boundary atomically creates a `F_DUPFD_CLOEXEC` child duplicate and clears that duplicate only after fork. The command is consumed after one spawn, the parent reads back both descriptor flags, and any failed invariant kills and reaps the child while preserving parent A+B ownership. An unrelated concurrent exec therefore cannot retain the lease after its exec boundary. This exception is restricted to bounded metadata probes that do not start turns, tools, or descendants; interactive App Server, TUI, and guardian launches inherit no lease descriptor. Input is bounded to a 1 MiB JSONL line. Normalized output includes all returned metered buckets, primary and secondary windows, reset timestamps, workspace credits, individual spend controls, and safe reset-credit count/status/expiry fields. Opaque reset-credit IDs and backend display copy are discarded before the public model is constructed.
 
 The app-server command is still marked experimental at the CLI level even though these request types are on its stable protocol subset. Status output records the detected Codex version when safely parseable, the Calcifer adapter version, protocol, tested version set, and `compatible | incompatible | unverified` state. Unknown methods, malformed schemas, auth errors, timeouts, and spawn failures are explicit `unknown` observations. Calcifer does not fall back to `/status` text scraping or undocumented backend endpoints. Binary provenance is not yet cryptographically verified and remains a user-level `PATH` trust assumption.
 
@@ -241,6 +242,39 @@ resolve pinned profile or explicit pool
 A pool is traversed at most once per invocation.
 ```
 
+The implemented target-reservation primitive gives the future supervisor an
+ephemeral, no-gap ownership transition on Linux and macOS:
+
+```text
+verified target reserved: parent owns target A + B
+  -> B descriptor sent once: parent still owns A + B;
+     guardian provisionally holds a descriptor for the same locked open-file description
+  -> guardian validates the exact visible lock, proves that descriptor owns its lock,
+     sets and reads back close-on-exec, then sends an ACK on the same control socket
+  -> sender strictly parses that ACK and closes its B descriptor without LOCK_UN
+  -> split ownership: parent owns target A / guardian owns target B
+```
+
+Sending consumes the reservation, and the awaiting-ACK state has no resend or
+commit-without-ACK operation. A send failure returns the complete A+B
+reservation. An invalid descriptor or ACK cannot advance either side. These
+states are internal and ephemeral; they add no registry schema, journal event,
+provider protocol, or public CLI operation.
+
+The complete supervisor must respect one global acquisition order:
+
+```text
+already-held source lifetime lease
+  -> handoff coordinator
+  -> conversation transition
+  -> target coordinator lease A
+  -> target provider lease B
+```
+
+The primitive in this slice acquires only the target A+B pair. Issue #33 is
+responsible for placing it after the handoff and conversation-transition locks
+and for retaining every required owner across the non-idempotent handoff.
+
 The current `run` command does not restart or re-submit a command after the child begins execution. The planned supervisor treats credential profiles and conversation lineage as separate aggregates. It continues the same user-visible conversation after failover by creating a target-profile Codex thread from the validated source rollout, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion. The supervisor connection remains event-only and never races the official TUI to answer approvals or other server-initiated requests; no new turn is admitted without an attached TUI. The full decision and recovery model is in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
 
 ## Filesystem and credential mutations
@@ -264,6 +298,12 @@ never a partial registry. Published-profile lifecycle operations use the lock
 order profile coordinator, profile provider, then registry. This makes an
 active run/resume/status probe and a rename choose exactly one winner and keeps
 identity verification and future remove/reauth flows from deadlocking.
+
+Cross-profile handoff adds higher-level locks but does not change that local
+order: retain the source lifetime lease, acquire the handoff coordinator, then
+the conversation transition, and finally reserve target coordinator A followed
+by target provider B. A caller must never reserve a target before either
+higher-level lock and then wait for them.
 
 Confirmed profile removal uses the same published-profile lock order:
 coordinator lease, provider lease, removal lock, then registry lock. Stable
@@ -391,6 +431,13 @@ The current process launcher:
   cannot discover repository-local configuration through an ancestor;
 - avoid logging raw arguments or the child environment.
 
+Ordinary `run` and `resume` keep their existing guardian path: the guardian
+directly acquires provider lease B during the authenticated launch handshake.
+The Linux/macOS `SCM_RIGHTS` transfer is a separate internal primitive for the
+future supervised target handoff, where A+B must be reserved before a target
+guardian exists. No public command currently calls it, and the ordinary
+run/resume/status behavior and persisted schemas are unchanged.
+
 The official CLI still receives ordinary terminal, locale, proxy, and CA
 environment needed for interactive and enterprise operation. Calcifer does not
 claim to protect credentials from a hostile same-user proxy or trust store.
@@ -416,6 +463,26 @@ Failures that must not trigger another account include:
 - stale usage data or a failed status source.
 
 Rollback applies to Calcifer metadata, default pointers, observation caches, and staged registration. It does not overwrite a newer credential with an older copy.
+
+Target-reservation rollback is ownership-based rather than PID-based:
+
+- failure before reservation completes leaves no target ownership;
+- descriptor-send failure returns the complete A+B reservation to the caller;
+- after a successful send and before a valid ACK, the parent keeps A+B and
+  cannot commit the split;
+- a malformed frame, wrong descriptor, failed lock-ownership proof, or failed
+  close-on-exec check is rejected and closed by the guardian without an ACK;
+- an invalid or missing ACK leaves the sender's awaiting state in possession of
+  A+B, while a guardian that already received B can independently keep B live;
+- after a valid ACK, the parent releases only its B descriptor by closing it,
+  without `LOCK_UN`, and retains A; and
+- a coordinator-only or guardian-only crash leaves the other exact descriptor
+  authoritative until that owner exits or explicitly closes it.
+
+The #33 supervisor must terminate and reap the guardian, or otherwise establish
+the exact descriptor disposition, before abandoning an ambiguous ACK and
+releasing the reservation. PIDs may be used to signal and reap a known child,
+but never to infer lease ownership or authorize another writer.
 
 ## Open design work
 

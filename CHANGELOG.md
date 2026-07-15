@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Internal Linux/macOS no-gap target reservation and one-shot guardian
+  provider-lease transfer, with consume-by-value ACK state transitions for the
+  future supervised cross-profile handoff. Public commands and persisted
+  schemas remain unchanged until supervisor integration.
 - Confirmed offline `auth remove` for one Codex profile, with non-TTY and JSON
   fail-safe confirmation, an alpha.4-blocking transient registry barrier, a
   bounded private sidecar, same-filesystem tombstones, immutable-ID registry
@@ -16,6 +20,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Security
 
+- The transfer primitive is restricted to a future supervisor-provided,
+  already-authenticated private guardian stream. Within that stream, lease
+  descriptors are accepted only after strict frame, inode, owner, type, mode,
+  link, active-lock, and close-on-exec validation. ACK loss and selective
+  process crashes retain at least one exact lock owner; shared descriptors are
+  released close-only and are not inherited across provider-child `exec`.
+- Metadata probes no longer make a lease descriptor inheritable in the parent.
+  Unix launch atomically creates a close-on-exec child duplicate and clears
+  only that duplicate after fork, so an unrelated concurrent exec cannot retain
+  the profile lock. Spawn and readback failures keep the parent's A+B authority
+  and reap any child before returning.
 - Profile removal revalidates owner, owner-only roots, non-writable traversed
   directory and regular-file modes, type, marker, hard-link count, filesystem,
   inode, mount identity, traversal depth, and entry budget before deletion.

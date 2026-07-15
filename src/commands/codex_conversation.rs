@@ -478,32 +478,34 @@ impl<'a> CaptureContext<'a> {
     }
 
     fn inventory(&self) -> Result<CodexThreadInventory, AppError> {
-        let _inheritance = self.provider_lease.inherit_provider_lock()?;
+        let provider_lease = self.provider_lease.provider_lock_for_probe()?;
         read_thread_inventory(
             self.executable,
             self.home,
             self.neutral_working_directory,
             self.working_directory,
             THREAD_METADATA_TIMEOUT,
+            provider_lease,
         )
         .map_err(map_thread_error)
         .map_err(AppError::from)
     }
 
     fn probe_version(&self) -> Result<String, AppError> {
-        let _inheritance = self.provider_lease.inherit_provider_lock()?;
+        let provider_lease = self.provider_lease.provider_lock_for_probe()?;
         probe_codex_version(
             self.executable,
             self.home,
             self.neutral_working_directory,
             VERSION_PROBE_TIMEOUT,
+            provider_lease,
         )
         .map_err(map_thread_error)
         .map_err(AppError::from)
     }
 
     fn read_thread(&self, thread_id: &str) -> Result<CodexThreadRead, AppError> {
-        let _inheritance = self.provider_lease.inherit_provider_lock()?;
+        let provider_lease = self.provider_lease.provider_lock_for_probe()?;
         read_thread_metadata(
             self.executable,
             self.home,
@@ -511,6 +513,7 @@ impl<'a> CaptureContext<'a> {
             self.working_directory,
             thread_id,
             THREAD_METADATA_TIMEOUT,
+            provider_lease,
         )
         .map_err(map_thread_error)
         .map_err(AppError::from)

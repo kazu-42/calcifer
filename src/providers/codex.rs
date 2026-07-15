@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -475,9 +475,15 @@ pub fn read_account_usage(
     codex_home: &Path,
     working_directory: &Path,
     timeout: Duration,
+    inherited_provider_lease: Option<&File>,
 ) -> Result<CodexUsageObservation, CodexUsageFailure> {
-    let (mut process, codex_version, deadline) =
-        initialize_compatible_app_server(codex_executable, codex_home, working_directory, timeout)?;
+    let (mut process, codex_version, deadline) = initialize_compatible_app_server(
+        codex_executable,
+        codex_home,
+        working_directory,
+        timeout,
+        inherited_provider_lease,
+    )?;
 
     process
         .send(&json!({ "method": "initialized", "params": {} }))
@@ -511,9 +517,15 @@ pub(crate) fn verify_codex_identity_adapter(
     codex_home: &Path,
     working_directory: &Path,
     timeout: Duration,
+    inherited_provider_lease: Option<&File>,
 ) -> Result<CodexIdentityAdapter, CodexUsageFailure> {
-    let (_process, codex_version, _deadline) =
-        initialize_compatible_app_server(codex_executable, codex_home, working_directory, timeout)?;
+    let (_process, codex_version, _deadline) = initialize_compatible_app_server(
+        codex_executable,
+        codex_home,
+        working_directory,
+        timeout,
+        inherited_provider_lease,
+    )?;
     if codex_version == "0.144.4" {
         Ok(CodexIdentityAdapter::v0_144_4())
     } else {
@@ -529,6 +541,7 @@ fn initialize_compatible_app_server(
     codex_home: &Path,
     working_directory: &Path,
     timeout: Duration,
+    inherited_provider_lease: Option<&File>,
 ) -> Result<(AppServerProcess, String, Instant), CodexUsageFailure> {
     if !codex_executable.is_absolute() {
         return Err(CodexUsageFailure::before_gate(CodexUsageError::Spawn));
@@ -537,8 +550,13 @@ fn initialize_compatible_app_server(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| CodexUsageFailure::before_gate(CodexUsageError::Timeout))?;
-    let mut process = AppServerProcess::spawn(codex_executable, codex_home, working_directory)
-        .map_err(CodexUsageFailure::before_gate)?;
+    let mut process = AppServerProcess::spawn(
+        codex_executable,
+        codex_home,
+        working_directory,
+        inherited_provider_lease,
+    )
+    .map_err(CodexUsageFailure::before_gate)?;
 
     process
         .send(&json!({
@@ -574,25 +592,32 @@ pub(crate) fn probe_codex_version(
     codex_home: &Path,
     working_directory: &Path,
     timeout: Duration,
+    inherited_provider_lease: Option<&File>,
 ) -> Result<String, CodexThreadError> {
     let deadline = thread_deadline(codex_executable, timeout)?;
     let command = managed_command(codex_executable, codex_home);
-    probe_codex_version_command(command, working_directory, deadline)
+    probe_codex_version_command(
+        command,
+        working_directory,
+        deadline,
+        inherited_provider_lease,
+    )
 }
 
 fn probe_codex_version_command(
     mut command: Command,
     working_directory: &Path,
     deadline: Instant,
+    inherited_provider_lease: Option<&File>,
 ) -> Result<String, CodexThreadError> {
     configure_own_process_group(&mut command);
-    let mut child = command
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .current_dir(working_directory)
-        .spawn()
+        .current_dir(working_directory);
+    let mut child = spawn_with_optional_inherited_fd(command, inherited_provider_lease)
         .map_err(|_| CodexThreadError::Spawn)?;
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -693,6 +718,7 @@ pub(crate) fn read_thread_inventory(
     neutral_working_directory: &Path,
     canonical_cwd: &Path,
     timeout: Duration,
+    inherited_provider_lease: Option<&File>,
 ) -> Result<CodexThreadInventory, CodexThreadError> {
     let canonical_cwd = fs::canonicalize(canonical_cwd).map_err(|_| CodexThreadError::Protocol)?;
     if !canonical_cwd.is_dir() {
@@ -709,6 +735,7 @@ pub(crate) fn read_thread_inventory(
         codex_home,
         neutral_working_directory,
         deadline,
+        inherited_provider_lease,
     )?;
 
     if !rollout_before.complete() {
@@ -1024,6 +1051,7 @@ pub(crate) fn read_thread_metadata(
     canonical_cwd: &Path,
     thread_id: &str,
     timeout: Duration,
+    inherited_provider_lease: Option<&File>,
 ) -> Result<CodexThreadRead, CodexThreadError> {
     validate_canonical_uuid(thread_id)?;
     let canonical_cwd = fs::canonicalize(canonical_cwd).map_err(|_| CodexThreadError::Protocol)?;
@@ -1036,6 +1064,7 @@ pub(crate) fn read_thread_metadata(
         codex_home,
         neutral_working_directory,
         deadline,
+        inherited_provider_lease,
     )?;
     process
         .send(&json!({
@@ -1088,10 +1117,15 @@ fn initialize_thread_client(
     codex_home: &Path,
     neutral_working_directory: &Path,
     deadline: Instant,
+    inherited_provider_lease: Option<&File>,
 ) -> Result<(AppServerProcess, String), CodexThreadError> {
-    let mut process =
-        AppServerProcess::spawn(codex_executable, codex_home, neutral_working_directory)
-            .map_err(map_thread_transport)?;
+    let mut process = AppServerProcess::spawn(
+        codex_executable,
+        codex_home,
+        neutral_working_directory,
+        inherited_provider_lease,
+    )
+    .map_err(map_thread_transport)?;
     process
         .send(&json!({
             "id": INITIALIZE_REQUEST_ID,
@@ -1641,23 +1675,25 @@ impl AppServerProcess {
         codex_executable: &Path,
         codex_home: &Path,
         working_directory: &Path,
+        inherited_provider_lease: Option<&File>,
     ) -> Result<Self, CodexUsageError> {
         let mut command = managed_command(codex_executable, codex_home);
         command.args(["app-server", "--stdio"]);
-        Self::spawn_command(command, working_directory)
+        Self::spawn_command(command, working_directory, inherited_provider_lease)
     }
 
     fn spawn_command(
         mut command: Command,
         working_directory: &Path,
+        inherited_provider_lease: Option<&File>,
     ) -> Result<Self, CodexUsageError> {
         configure_own_process_group(&mut command);
-        let mut child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .current_dir(working_directory)
-            .spawn()
+            .current_dir(working_directory);
+        let mut child = spawn_with_optional_inherited_fd(command, inherited_provider_lease)
             .map_err(|_| CodexUsageError::Spawn)?;
 
         let stdin = match child.stdin.take() {
@@ -1936,6 +1972,31 @@ fn configure_own_process_group(command: &mut Command) {
     }
     #[cfg(not(unix))]
     let _ = command;
+}
+
+fn spawn_with_optional_inherited_fd(
+    mut command: Command,
+    inherited_provider_lease: Option<&File>,
+) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        if let Some(provider_lease) = inherited_provider_lease {
+            return calcifer_unix_child_fd::spawn_with_inherited_fd(
+                command,
+                provider_lease.as_fd(),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    if inherited_provider_lease.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "provider lease inheritance is unsupported on this platform",
+        ));
+    }
+    command.spawn()
 }
 
 pub(super) fn force_terminate_process_tree(
@@ -2488,7 +2549,7 @@ mod tests {
     {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exit 7"]);
-        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"))
+        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"), None)
             .map_err(|error| io::Error::other(error.to_string()))?;
 
         assert!(process.shutdown().is_err());
@@ -2511,6 +2572,7 @@ mod tests {
             command,
             Path::new("/tmp"),
             Instant::now() + Duration::from_secs(2),
+            None,
         )?;
 
         assert_eq!(version, "0.144.4");
@@ -3300,6 +3362,7 @@ mod tests {
             Path::new("profile-home"),
             Path::new("neutral-working-directory"),
             Duration::from_secs(1),
+            None,
         );
 
         let failure = result

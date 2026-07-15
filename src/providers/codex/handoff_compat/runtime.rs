@@ -176,7 +176,7 @@ fn verify_before_remote_until(
     revalidate_executable_metadata(executable)?;
     let version_command =
         isolated_command(&executable.canonical_path, &target_home, &environment_home);
-    let version = probe_codex_version_command(version_command, &workspace, deadline)
+    let version = probe_codex_version_command(version_command, &workspace, deadline, None)
         .map_err(map_thread_error)?;
     target_config.revalidate(&target_home)?;
     revalidate_probe_roots(
@@ -737,8 +737,8 @@ fn fork_synthetic_rollout(
         environment_home.as_ref(),
     );
     command.args(["app-server", "--stdio"]);
-    let mut process =
-        AppServerProcess::spawn_command(command, workspace.as_ref()).map_err(map_usage_error)?;
+    let mut process = AppServerProcess::spawn_command(command, workspace.as_ref(), None)
+        .map_err(map_usage_error)?;
     process
         .send(&json!({
             "id": INITIALIZE_REQUEST_ID,

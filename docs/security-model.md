@@ -118,9 +118,32 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   `.git` boundary rather than either the caller's repository cwd or a profile
   home below user-selected `CALCIFER_HOME`.
 - Interactive launch uses a coordinator/provider-guardian pair with two fixed-order lease files. Either surviving process blocks a second writer after a selective crash, while the official provider and its background tools inherit neither descriptor.
+- Future supervised target handoff has an internal Linux/macOS no-gap transfer
+  primitive. The future supervisor must first supply an already-authenticated
+  private Unix control socket; stream authentication and lifecycle deadlines
+  are integration requirements for issue #33, not properties inferred by the
+  descriptor primitive. It then sends exactly one sentinel byte and exactly
+  one provider-lease descriptor. Missing, duplicated, unknown, or truncated
+  ancillary data fails closed. The guardian compares the received and visible
+  lock's device/inode, requires a current-UID private single-link regular file,
+  proves that the received open-file description owns the active advisory lock,
+  and sets and reads back `FD_CLOEXEC` before it may acknowledge the transfer.
+  No App Server, TUI, or provider tool may start from the provisional pre-ACK
+  state. The ACK is one-shot, strictly parsed, and bound to the same socket; the
+  sender releases its provider descriptor only by close, never explicit
+  unlock. Descriptor-held flock state is the authority; a PID is not.
 - If the provider guardian is killed after reporting the exact provider PID, the coordinator retains its lease until that PID exits. If failure lands in the unobservable post-authorization/pre-report window, the coordinator deliberately remains alive and locked rather than guessing that no provider exists.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
-- Bounded metadata-only App Servers for status and thread capture inherit only the provider-side lease. They issue no turn/tool methods and are started only while Calcifer owns the profile coordinator/provider order. This keeps a killed probe parent from admitting a second credential writer until stdio EOF terminates the probe.
+- Bounded metadata-only App Servers for status and thread capture inherit only
+  the provider-side lease. On Unix the multithreaded parent never clears
+  close-on-exec: Calcifer atomically duplicates B with `F_DUPFD_CLOEXEC`, then
+  clears only the selected post-fork child's duplicate before its one consumed
+  spawn. Parent flag readback, child kill/reap on failure, and exact
+  device/inode exec tests prevent unrelated children from retaining B. These
+  probes issue no turn/tool methods or descendants and start only while
+  Calcifer owns the profile coordinator/provider order. This keeps a killed
+  probe parent from admitting a second credential writer until stdio EOF
+  terminates the probe without exposing B to interactive App Servers or tools.
 - Automatic same-profile restore never guesses the newest thread. A private pending baseline is synced before provider spawn; only one new or uniquely changed root CLI thread can be adopted after direct metadata validation. Same-second changes use a path-free device/inode/length/nanosecond-mtime fingerprint in addition to provider timestamps. Zero candidates preserve the previous head only when every baseline ID remains present. Deleted, multiple, archived, wrong-profile/cwd, missing, corrupt, unsupported, capped, pre/post-mutated, or inconsistent results stop before automatic provider launch.
 - Codex 0.144.4 hides its 10,000-file rollout scan cap from the v2 App Server response. Calcifer proves a conservative upper bound by snapshotting active and archived roots separately before and after listing, requiring each root to remain below the cap, and mapping every wire path to the stable snapshot. Nested nodes must remain owned, real, non-symlink, and non-writable by group/other; files must have one hard link. The enclosing managed home remains owner-private.
 - Bare resume releases its initial conversation lock before waiting for a profile lease, then revalidates the unchanged UUID binding under that lease. Registry mutation order is coordinator lease, provider lease, then a short conversation lock; no conversation lock spans App Server or interactive provider I/O.
@@ -240,6 +263,11 @@ the registry mutation lock. A changed credential produces
 `provider_identity_mismatch`; Calcifer never silently rebinds it. Missing,
 corrupt, replaced, unsafe, or unreadable key state produces
 `identity_key_unavailable` and disables identity-dependent selection.
+
+`VerifiedTargetReservation` keeps the installation-local identity fingerprint
+inside its private guard and exposes only internal equality comparison. The
+fingerprint, provider account/workspace scope, and identity-key ID do not enter
+the guardian transfer frame, public DTOs, diagnostics, or transition journals.
 
 Key and marker writes use private same-directory temporary files, file fsync,
 atomic rename, and parent-directory fsync. A complete destination observed
@@ -411,6 +439,12 @@ The selector keeps an attempted-profile set, traverses a pool no more than once,
 
 A successful switch continues the same logical conversation. Credential profile identity remains immutable for each provider process, while the conversation advances to a new target-profile Codex thread generation. A serialized handoff retains the existing source-profile lease and reserves a freshly revalidated target profile. The source TUI and App Server must then be stopped and reaped while Calcifer retains source ownership. The source rollout is accepted only from Calcifer-owned metadata after canonical containment, owner, mode, regular-file, single-hard-link, and symlink validation. The target App Server imports that history through a version-gated provider API and must return the expected lineage plus a distinct rollout contained under the target profile before activation; Calcifer verifies that the source rollout content is unchanged and never copies credentials into a shared runtime home. The prepared transition is synced before the non-idempotent fork request, so crash recovery adopts only one uniquely matching target fork and otherwise fails closed. Source ownership is released only after the target generation is committed and attached.
 
+The target-reservation and guardian lease-transfer primitive described above is
+implemented, but no production command calls it yet. Issue #33 must integrate
+it beneath the handoff coordinator and conversation-transition locks, own the
+guardian lifecycle through ambiguous ACK outcomes, and preserve the global
+lock order before automatic switching can be enabled.
+
 The supervisor may subscribe to thread events for usage monitoring, but it never answers approvals or any other server-initiated request. Only the attached official TUI may respond, and no new turn is admitted while that TUI is absent. Source effective execution settings are fixed at fork time; target authentication and provider routing cannot be replaced by a remote-client override.
 
 If the provider version, experimental schema, path provenance, target identity, or transition state is ambiguous, the handoff stops with the source rollout intact. A fresh thread may be offered as an explicit recovery choice, but it is not reported as a successful automatic resume.
@@ -438,3 +472,16 @@ Minimum future test classes include:
 9. Session tests proving lineage/profile separation, one writer per rollout generation, canonical path containment, hard-link rejection, serialized lease transfer, and no prompt replay across crash or handoff paths.
 10. Transition-recovery tests for crashes before source stop, after source stop, after sending the non-idempotent target fork, before registry commit, and before remote TUI attach.
 11. Subscription tests proving the monitor cannot answer approvals, a TUI must attach before input, and target authentication/provider routing cannot be overridden during rejoin.
+12. Target-reservation race tests proving a single nonblocking winner across
+    competing reservations, rename, status, run/resume, and identity
+    verification, with no provider probe started by a losing reservation.
+13. Lease-transfer adversarial tests for a wrong or replaced inode, an unlocked
+    same-inode descriptor, malformed marker, missing or multiple descriptors,
+    ancillary truncation, owner/type/mode/link violations, and close-on-exec
+    readback before ACK.
+14. Transfer recovery tests proving send failure returns A+B, ACK cannot commit
+    early, invalid or lost ACK preserves ownership, coordinator-only and
+    guardian-only crashes keep a second writer blocked, and no matching lease
+    descriptor survives an actual provider-child `exec`. A deterministic
+    pre-exec barrier additionally proves the parent remains close-on-exec and a
+    concurrent unrelated child receives no matching device/inode.

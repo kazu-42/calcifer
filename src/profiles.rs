@@ -1157,18 +1157,11 @@ impl Registry {
     pub(crate) fn verify_or_bind_codex_identity(
         &self,
         profile: &Profile,
-        resolve_adapter: impl FnOnce(&Path) -> Result<CodexIdentityAdapter, ProfileError>,
+        resolve_adapter: impl FnOnce(&Path, Option<&File>) -> Result<CodexIdentityAdapter, ProfileError>,
     ) -> Result<VerifiedProviderIdentityLease, ProfileError> {
         let lease = self.lock_profile(profile)?;
         let home = self.profile_home(profile)?;
-        let adapter = {
-            // The version-only App Server probe receives the provider-side
-            // lease. If the verifier is killed, its stdio EOF stops the probe
-            // before another credential writer can acquire this profile.
-            #[cfg(unix)]
-            let _provider_lock_inheritance = lease.inherit_provider_lock()?;
-            resolve_adapter(&home)?
-        };
+        let adapter = resolve_adapter(&home, lease.provider_lock_for_probe()?)?;
         let profile_directory = self.profile_directory(profile)?;
         let _registry_lock = self.lock_exclusive()?;
         let document = self.load()?;
@@ -1209,19 +1202,15 @@ impl Registry {
     /// Revalidates a bound profile after acquiring its exclusive process lease.
     /// The returned guard keeps that lease alive until launch authorization is
     /// either consumed or abandoned.
-    #[allow(dead_code)] // Consumed by the failover selector introduced in issue #4.
+    #[allow(dead_code)] // Reused by target reservation and pool selection.
     pub(crate) fn revalidate_codex_identity(
         &self,
         profile: &Profile,
-        resolve_adapter: impl FnOnce(&Path) -> Result<CodexIdentityAdapter, ProfileError>,
+        resolve_adapter: impl FnOnce(&Path, Option<&File>) -> Result<CodexIdentityAdapter, ProfileError>,
     ) -> Result<VerifiedProviderIdentityLease, ProfileError> {
         let lease = self.lock_profile(profile)?;
         let home = self.profile_home(profile)?;
-        let adapter = {
-            #[cfg(unix)]
-            let _provider_lock_inheritance = lease.inherit_provider_lock()?;
-            resolve_adapter(&home)?
-        };
+        let adapter = resolve_adapter(&home, lease.provider_lock_for_probe()?)?;
         let profile_directory = self.profile_directory(profile)?;
         let store = IdentityStore::new(&self.root);
         let key = store.load_key()?;
@@ -1231,6 +1220,29 @@ impl Registry {
             _lease: lease,
             profile: profile.clone(),
             identity: current,
+        })
+    }
+
+    /// Reserves both target locks only after private identity revalidation.
+    ///
+    /// The returned guard is consumed by the Linux/macOS one-shot guardian
+    /// transfer. It exposes identity equality only; account-derived material
+    /// never enters the control frame or a public DTO.
+    #[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+    pub(crate) fn reserve_verified_codex_target(
+        &self,
+        profile: &Profile,
+        resolve_adapter: impl FnOnce(&Path, Option<&File>) -> Result<CodexIdentityAdapter, ProfileError>,
+    ) -> Result<VerifiedTargetReservation, ProfileError> {
+        let verified = self.revalidate_codex_identity(profile, resolve_adapter)?;
+        // Rename takes the same A+B locks. Refetching by immutable ID while
+        // those locks are still held gives the reservation a deterministic
+        // current alias regardless of which operation won first.
+        let current = self.find_by_id_without_recovery(profile.provider, &profile.id)?;
+        Ok(VerifiedTargetReservation {
+            lease: verified._lease,
+            profile: current,
+            identity: verified.identity,
         })
     }
 
@@ -1299,6 +1311,49 @@ impl Registry {
         Ok(ProfileLease {
             coordinator: None,
             provider: Some(provider),
+        })
+    }
+
+    /// Receives the provider half of an already-held target reservation.
+    ///
+    /// The descriptor is accepted only when it still names the exact private
+    /// `provider.lock` for this profile. It is marked close-on-exec before the
+    /// caller can acknowledge receipt, so provider children and tools cannot
+    /// inherit the lease.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+    pub(crate) fn receive_profile_provider_lease<'control>(
+        &self,
+        profile: &Profile,
+        control: &'control std::os::unix::net::UnixStream,
+    ) -> Result<UnacknowledgedTargetGuardianLease<'control>, ProfileError> {
+        use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+
+        let profile_dir = self.profile_directory(profile)?;
+        let provider_path = profile_dir.join(PROVIDER_LOCK_FILE);
+        let provider = receive_provider_lock_descriptor(control)?;
+        let flags = fcntl_getfd(&provider).map_err(io::Error::from)?;
+        fcntl_setfd(&provider, flags | FdFlags::CLOEXEC).map_err(io::Error::from)?;
+        if !fcntl_getfd(&provider)
+            .map_err(io::Error::from)?
+            .contains(FdFlags::CLOEXEC)
+        {
+            return Err(ProfileError::UnsafeState(
+                "received provider lock is inheritable".to_owned(),
+            ));
+        }
+        let provider = File::from(provider);
+        private_lock_file_identity(&provider, &provider_path)?;
+        verify_received_provider_lock_ownership(&provider, &provider_path)?;
+        Ok(UnacknowledgedTargetGuardianLease {
+            guardian: TargetGuardianLease {
+                lease: ProfileLease {
+                    coordinator: None,
+                    provider: Some(provider),
+                },
+                profile: profile.clone(),
+            },
+            control,
         })
     }
 
@@ -3091,6 +3146,18 @@ pub(crate) struct VerifiedProviderIdentityLease {
     identity: ProviderIdentity,
 }
 
+/// A freshly revalidated target profile with both lifetime locks held.
+///
+/// Provider identity material remains private to this guard. The handoff
+/// selector may compare identities and transfer the provider lock, but cannot
+/// serialize or expose the fingerprint or account-derived inputs.
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct VerifiedTargetReservation {
+    lease: ProfileLease,
+    profile: Profile,
+    identity: ProviderIdentity,
+}
+
 impl VerifiedProviderIdentityLease {
     pub(crate) const fn profile(&self) -> &Profile {
         &self.profile
@@ -3102,51 +3169,444 @@ impl VerifiedProviderIdentityLease {
     }
 }
 
-#[cfg(unix)]
-impl ProfileLease {
-    /// Temporarily allows the provider-side lock to survive one `exec`.
-    ///
-    /// This is used only by the one-shot account app-server. That process does
-    /// not start turns or tools, so it cannot leak the descriptor to provider
-    /// background jobs. If the status parent is killed, the app-server keeps
-    /// the profile busy until its stdio closes and it exits.
-    pub(crate) fn inherit_provider_lock(
-        &self,
-    ) -> Result<ProviderLockInheritance<'_>, ProfileError> {
-        use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl VerifiedTargetReservation {
+    pub(crate) const fn profile(&self) -> &Profile {
+        &self.profile
+    }
 
-        let provider = self
-            .provider
+    pub(crate) fn same_provider_identity(&self, other: &Self) -> bool {
+        self.identity.same_provider_identity(&other.identity)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn send_provider_lease<'control>(
+        self,
+        control: &'control std::os::unix::net::UnixStream,
+    ) -> Result<AwaitingProviderLeaseAck<'control>, Box<ProviderLeaseTransferSendError>> {
+        if self.lease.coordinator.is_none() {
+            return Err(Box::new(ProviderLeaseTransferSendError {
+                reservation: self,
+                error: ProfileError::UnsafeState(
+                    "provider lease transfer requires the coordinator lock".to_owned(),
+                ),
+            }));
+        }
+        let Some(provider) = self.lease.provider.as_ref() else {
+            return Err(Box::new(ProviderLeaseTransferSendError {
+                reservation: self,
+                error: ProfileError::UnsafeState(
+                    "provider lease transfer requires the provider lock".to_owned(),
+                ),
+            }));
+        };
+        match send_provider_lock_descriptor(control, provider) {
+            Ok(()) => Ok(AwaitingProviderLeaseAck {
+                reservation: self,
+                control,
+            }),
+            Err(error) => Err(Box::new(ProviderLeaseTransferSendError {
+                reservation: self,
+                error,
+            })),
+        }
+    }
+}
+
+impl ProfileLease {
+    /// Borrows the provider-side lock for one child-only inheritance action.
+    ///
+    /// The parent descriptor always remains close-on-exec. Provider adapters
+    /// must pass this file to the audited Unix spawn boundary, which clears the
+    /// flag only in the selected post-fork child.
+    pub(crate) fn provider_lock_file(&self) -> Result<&File, ProfileError> {
+        self.provider
             .as_ref()
-            .ok_or_else(|| ProfileError::UnsafeState("provider lock is not held".to_owned()))?;
-        let original = fcntl_getfd(provider).map_err(io::Error::from)?;
-        fcntl_setfd(provider, original.difference(FdFlags::CLOEXEC)).map_err(io::Error::from)?;
-        Ok(ProviderLockInheritance { provider, original })
+            .ok_or_else(|| ProfileError::UnsafeState("provider lock is not held".to_owned()))
+    }
+
+    /// Returns the provider descriptor only where the audited child-side
+    /// inheritance boundary is available.
+    ///
+    /// Non-Unix platforms keep the lease in the parent but preserve their
+    /// existing ordinary-spawn behavior. The adapter's `Some` branch remains
+    /// an invariant guard and must never be reached there.
+    pub(crate) fn provider_lock_for_probe(&self) -> Result<Option<&File>, ProfileError> {
+        let provider = self.provider_lock_file()?;
+        #[cfg(unix)]
+        {
+            Ok(Some(provider))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = provider;
+            Ok(None)
+        }
+    }
+}
+
+/// A complete target reservation whose provider descriptor was sent once.
+///
+/// This state has no resend operation. Dropping it before an ACK closes the
+/// sender copies without `LOCK_UN`; a guardian that already received the
+/// descriptor therefore continues to hold the provider lock.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct AwaitingProviderLeaseAck<'control> {
+    reservation: VerifiedTargetReservation,
+    control: &'control std::os::unix::net::UnixStream,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl<'control> AwaitingProviderLeaseAck<'control> {
+    pub(crate) fn receive_ack(
+        self,
+    ) -> Result<AcknowledgedProviderLeaseTransfer, Box<ProviderLeaseAckError<'control>>> {
+        match receive_provider_lease_ack(self.control) {
+            Ok(()) => Ok(AcknowledgedProviderLeaseTransfer {
+                reservation: self.reservation,
+            }),
+            Err(error) => Err(Box::new(ProviderLeaseAckError {
+                awaiting: self,
+                error,
+            })),
+        }
+    }
+}
+
+/// A target reservation whose validated guardian ACK was read from the same
+/// private control stream that carried B.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct AcknowledgedProviderLeaseTransfer {
+    reservation: VerifiedTargetReservation,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl AcknowledgedProviderLeaseTransfer {
+    pub(crate) fn commit(mut self) -> Result<TargetCoordinatorLease, ProfileError> {
+        let provider = self.reservation.lease.provider.take().ok_or_else(|| {
+            ProfileError::UnsafeState("transferred provider lock is not held".to_owned())
+        })?;
+        // Do not call `FileExt::unlock`: the receiving guardian owns another
+        // descriptor for this same locked open-file description.
+        drop(provider);
+        Ok(TargetCoordinatorLease {
+            lease: self.reservation.lease,
+            profile: self.reservation.profile,
+        })
+    }
+}
+
+/// Preserves the awaiting state when the guardian ACK is missing or invalid.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct ProviderLeaseAckError<'control> {
+    awaiting: AwaitingProviderLeaseAck<'control>,
+    error: ProfileError,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl<'control> ProviderLeaseAckError<'control> {
+    pub(crate) fn into_parts(self) -> (AwaitingProviderLeaseAck<'control>, ProfileError) {
+        (self.awaiting, self.error)
+    }
+
+    fn into_error(self) -> ProfileError {
+        self.error
+    }
+}
+
+/// Preserves the complete reservation when the descriptor send itself fails.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct ProviderLeaseTransferSendError {
+    reservation: VerifiedTargetReservation,
+    error: ProfileError,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl ProviderLeaseTransferSendError {
+    pub(crate) fn into_parts(self) -> (VerifiedTargetReservation, ProfileError) {
+        (self.reservation, self.error)
+    }
+
+    fn into_error(self) -> ProfileError {
+        self.error
+    }
+}
+
+/// The coordinator half retained after the guardian acknowledges B.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct TargetCoordinatorLease {
+    lease: ProfileLease,
+    profile: Profile,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl TargetCoordinatorLease {
+    pub(crate) const fn profile(&self) -> &Profile {
+        &self.profile
+    }
+}
+
+/// The provider half adopted by the authenticated target guardian.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct TargetGuardianLease {
+    lease: ProfileLease,
+    profile: Profile,
+}
+
+/// A validated B descriptor that cannot authorize child launch until it has
+/// sent exactly one ACK on the stream that carried the descriptor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct UnacknowledgedTargetGuardianLease<'control> {
+    guardian: TargetGuardianLease,
+    control: &'control std::os::unix::net::UnixStream,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl<'control> UnacknowledgedTargetGuardianLease<'control> {
+    pub(crate) fn send_ack(
+        self,
+    ) -> Result<TargetGuardianLease, Box<ProviderLeaseGuardianAckSendError<'control>>> {
+        match send_provider_lease_ack(self.control) {
+            Ok(()) => Ok(self.guardian),
+            Err(error) => Err(Box::new(ProviderLeaseGuardianAckSendError {
+                guardian: self,
+                error,
+            })),
+        }
+    }
+}
+
+/// Preserves provisional B ownership when the guardian cannot send its ACK.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+pub(crate) struct ProviderLeaseGuardianAckSendError<'control> {
+    guardian: UnacknowledgedTargetGuardianLease<'control>,
+    error: ProfileError,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl<'control> ProviderLeaseGuardianAckSendError<'control> {
+    pub(crate) fn into_parts(self) -> (UnacknowledgedTargetGuardianLease<'control>, ProfileError) {
+        (self.guardian, self.error)
+    }
+
+    fn into_error(self) -> ProfileError {
+        self.error
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // First consumed by supervised handoff in issue #33.
+impl TargetGuardianLease {
+    pub(crate) const fn profile(&self) -> &Profile {
+        &self.profile
     }
 }
 
 impl Drop for ProfileLease {
     fn drop(&mut self) {
-        if let Some(provider) = &self.provider {
-            let _ = FileExt::unlock(provider);
+        // `SCM_RIGHTS` and inherited descriptors share the same locked
+        // open-file description on Unix. An explicit `LOCK_UN` from any owner
+        // would therefore revoke every other owner's authority. Closing our
+        // descriptors in reverse acquisition order releases an untransferred
+        // lock normally, while a transferred lock remains held until its last
+        // descriptor closes.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            drop(self.provider.take());
+            drop(self.coordinator.take());
         }
-        if let Some(coordinator) = &self.coordinator {
-            let _ = FileExt::unlock(coordinator);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            if let Some(provider) = &self.provider {
+                let _ = FileExt::unlock(provider);
+            }
+            if let Some(coordinator) = &self.coordinator {
+                let _ = FileExt::unlock(coordinator);
+            }
         }
     }
 }
 
-#[cfg(unix)]
-pub(crate) struct ProviderLockInheritance<'a> {
-    provider: &'a File,
-    original: rustix::io::FdFlags,
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PROVIDER_LEASE_TRANSFER_MARKER: u8 = 0xC1;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PROVIDER_LEASE_ACK_MARKER: u8 = 0xA1;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn send_provider_lock_descriptor(
+    control: &std::os::unix::net::UnixStream,
+    provider: &File,
+) -> Result<(), ProfileError> {
+    use std::io::IoSlice;
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsFd;
+
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, sendmsg};
+
+    let descriptors = [provider.as_fd()];
+    let mut ancillary_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut ancillary_space);
+    if !ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)) {
+        return Err(ProfileError::UnsafeState(
+            "provider lease transfer descriptor did not fit".to_owned(),
+        ));
+    }
+    let payload = [PROVIDER_LEASE_TRANSFER_MARKER];
+    let slices = [IoSlice::new(&payload)];
+    let flags = provider_lease_send_flags(control)?;
+    loop {
+        match sendmsg(control, &slices, &mut ancillary, flags) {
+            Ok(1) => return Ok(()),
+            Ok(_) => {
+                return Err(ProfileError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "provider lease transfer was incomplete",
+                )));
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+        }
+    }
 }
 
-#[cfg(unix)]
-impl Drop for ProviderLockInheritance<'_> {
-    fn drop(&mut self) {
-        let _ = rustix::io::fcntl_setfd(self.provider, self.original);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn provider_lease_send_flags(
+    control: &std::os::unix::net::UnixStream,
+) -> Result<rustix::net::SendFlags, ProfileError> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = control;
+        Ok(rustix::net::SendFlags::NOSIGNAL)
     }
+    #[cfg(target_os = "macos")]
+    {
+        rustix::net::sockopt::set_socket_nosigpipe(control, true).map_err(io::Error::from)?;
+        if !rustix::net::sockopt::socket_nosigpipe(control).map_err(io::Error::from)? {
+            return Err(ProfileError::UnsafeState(
+                "provider lease control socket allows SIGPIPE".to_owned(),
+            ));
+        }
+        Ok(rustix::net::SendFlags::empty())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn send_provider_lease_ack(control: &std::os::unix::net::UnixStream) -> Result<(), ProfileError> {
+    let flags = provider_lease_send_flags(control)?;
+    loop {
+        match rustix::net::send(control, &[PROVIDER_LEASE_ACK_MARKER], flags) {
+            Ok(1) => return Ok(()),
+            Ok(_) => {
+                return Err(ProfileError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "provider lease ACK was incomplete",
+                )));
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn receive_provider_lease_ack(
+    control: &std::os::unix::net::UnixStream,
+) -> Result<(), ProfileError> {
+    let mut payload = [0_u8; 1];
+    loop {
+        match rustix::net::recv(control, &mut payload[..], rustix::net::RecvFlags::empty()) {
+            Ok((_, 1)) if payload == [PROVIDER_LEASE_ACK_MARKER] => return Ok(()),
+            Ok((_, 0)) => {
+                return Err(ProfileError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "provider guardian closed before ACK",
+                )));
+            }
+            Ok(_) => {
+                return Err(ProfileError::UnsafeState(
+                    "provider guardian ACK is invalid".to_owned(),
+                ));
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // Called by the issue #33 guardian receive path.
+fn receive_provider_lock_descriptor(
+    control: &std::os::unix::net::UnixStream,
+) -> Result<rustix::fd::OwnedFd, ProfileError> {
+    use std::io::IoSliceMut;
+    use std::mem::MaybeUninit;
+
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+
+    let mut payload = [0_u8; 1];
+    let mut ancillary_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut ancillary_space);
+    let received = loop {
+        let mut slices = [IoSliceMut::new(&mut payload)];
+        #[cfg(target_os = "linux")]
+        let flags = RecvFlags::CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = RecvFlags::empty();
+        match recvmsg(control, &mut slices, &mut ancillary, flags) {
+            Ok(received) => break received,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let flags_are_invalid = received.flags != rustix::net::ReturnFlags::CMSG_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags_are_invalid = !received.flags.is_empty();
+    if received.bytes != 1 || payload != [PROVIDER_LEASE_TRANSFER_MARKER] || flags_are_invalid {
+        return Err(ProfileError::UnsafeState(
+            "provider lease transfer frame is invalid".to_owned(),
+        ));
+    }
+
+    let mut descriptors = Vec::new();
+    let mut rights_messages = 0_usize;
+    for message in ancillary.drain() {
+        match message {
+            RecvAncillaryMessage::ScmRights(received_descriptors) => {
+                rights_messages += 1;
+                descriptors.extend(received_descriptors);
+            }
+            _ => {
+                return Err(ProfileError::UnsafeState(
+                    "provider lease transfer contained unsupported metadata".to_owned(),
+                ));
+            }
+        }
+    }
+    if rights_messages != 1 || descriptors.len() != 1 {
+        return Err(ProfileError::UnsafeState(
+            "provider lease transfer must contain exactly one descriptor".to_owned(),
+        ));
+    }
+    descriptors.pop().ok_or_else(|| {
+        ProfileError::UnsafeState("provider lease transfer descriptor is missing".to_owned())
+    })
 }
 
 #[derive(Debug)]
@@ -4084,6 +4544,34 @@ fn private_lock_file_identity(
     Ok(opened_identity)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_received_provider_lock_ownership(
+    provider: &File,
+    path: &Path,
+) -> Result<(), ProfileError> {
+    let probe = open_existing_private_lock_file(path)?;
+    match FileExt::try_lock_exclusive(&probe) {
+        Ok(()) => {
+            // No pre-existing B lock existed. Closing the probe releases the
+            // lock it just acquired; the received descriptor is not accepted.
+            drop(probe);
+            return Err(ProfileError::UnsafeState(
+                "received provider descriptor was not already locked".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(ProfileError::Io(error)),
+    }
+
+    match FileExt::try_lock_exclusive(provider) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(ProfileError::UnsafeState(
+            "received provider descriptor does not own the active lock".to_owned(),
+        )),
+        Err(error) => Err(ProfileError::Io(error)),
+    }
+}
+
 fn lock_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
     let file = open_private_lock_file(path)?;
     FileExt::try_lock_exclusive(&file).map_err(|error| {
@@ -4648,6 +5136,315 @@ mod tests {
         pending.commit(test_identity_adapter())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn send_test_lease_frame(
+        control: &std::os::unix::net::UnixStream,
+        marker: u8,
+        descriptors: &[std::os::fd::BorrowedFd<'_>],
+    ) -> io::Result<()> {
+        use std::io::IoSlice;
+        use std::mem::MaybeUninit;
+
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+
+        if descriptors.is_empty() || descriptors.len() > 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "test lease frame needs one or two descriptors",
+            ));
+        }
+        let mut ancillary_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut ancillary_space);
+        if !ancillary.push(SendAncillaryMessage::ScmRights(descriptors)) {
+            return Err(io::Error::other(
+                "test lease descriptors did not fit ancillary buffer",
+            ));
+        }
+        let payload = [marker];
+        let slices = [IoSlice::new(&payload)];
+        loop {
+            match sendmsg(control, &slices, &mut ancillary, SendFlags::empty()) {
+                Ok(1) => return Ok(()),
+                Ok(_) => return Err(io::Error::other("test lease frame was incomplete")),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(io::Error::from(error)),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct LeaseTransferTestChild {
+        child: Option<std::process::Child>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl LeaseTransferTestChild {
+        fn spawn(
+            role: &str,
+            root: &Path,
+            profile: &Profile,
+            socket_path: Option<&Path>,
+            sent_marker: Option<&Path>,
+        ) -> io::Result<Self> {
+            use std::process::Command;
+
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "profiles::tests::provider_lease_cross_process_helper",
+                    "--nocapture",
+                ])
+                .env("CALCIFER_TEST_LEASE_CHILD_ROLE", role)
+                .env("CALCIFER_TEST_LEASE_ROOT", root)
+                .env("CALCIFER_TEST_LEASE_PROFILE_ID", &profile.id);
+            if let Some(socket_path) = socket_path {
+                command.env("CALCIFER_TEST_LEASE_SOCKET", socket_path);
+            }
+            if let Some(sent_marker) = sent_marker {
+                command.env("CALCIFER_TEST_LEASE_SENT_MARKER", sent_marker);
+            }
+            Ok(Self {
+                child: Some(command.spawn()?),
+            })
+        }
+
+        fn child_mut(&mut self) -> io::Result<&mut std::process::Child> {
+            self.child
+                .as_mut()
+                .ok_or_else(|| io::Error::other("lease test child was already reaped"))
+        }
+
+        fn kill_and_wait(mut self) -> io::Result<std::process::ExitStatus> {
+            let mut child = self
+                .child
+                .take()
+                .ok_or_else(|| io::Error::other("lease test child was already reaped"))?;
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            child.kill()?;
+            child.wait()
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for LeaseTransferTestChild {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct LeaseTransferTestSocket(PathBuf);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for LeaseTransferTestSocket {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn accept_lease_transfer_test_child(
+        listener: &std::os::unix::net::UnixListener,
+        child: &mut LeaseTransferTestChild,
+    ) -> io::Result<std::os::unix::net::UnixStream> {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .ok_or_else(|| io::Error::other("lease test deadline overflow"))?;
+        loop {
+            match listener.accept() {
+                Ok((control, _)) => {
+                    control.set_nonblocking(false)?;
+                    return Ok(control);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            if let Some(status) = child.child_mut()?.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "lease test child exited before connect: {status}"
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "lease test child did not connect",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn wait_for_lease_transfer_test_marker(
+        path: &Path,
+        child: &mut LeaseTransferTestChild,
+    ) -> io::Result<()> {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .ok_or_else(|| io::Error::other("lease marker deadline overflow"))?;
+        loop {
+            if path.is_file() {
+                return Ok(());
+            }
+            if let Some(status) = child.child_mut()?.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "lease test child exited before marker: {status}"
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "lease test child did not publish send marker",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn retry_profile_operation_after_exec_boundary<T>(
+        mut operation: impl FnMut() -> Result<T, ProfileError>,
+    ) -> Result<T, ProfileError> {
+        use std::time::{Duration, Instant};
+
+        // CLOEXEC is applied by exec, not fork. A different parallel test may
+        // briefly snapshot this process's locked descriptors while its helper
+        // child is between those operations. Retry only the post-final-close
+        // availability assertion; live-owner exclusion remains immediate, and
+        // exact descriptor scans separately reject any post-exec inheritance.
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or_else(|| ProfileError::Io(io::Error::other("lease retry deadline overflow")))?;
+        loop {
+            match operation() {
+                Err(ProfileError::Busy(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn lock_profile_after_exec_boundary(
+        registry: &Registry,
+        profile: &Profile,
+    ) -> Result<ProfileLease, ProfileError> {
+        retry_profile_operation_after_exec_boundary(|| registry.lock_profile(profile))
+    }
+
+    #[cfg(unix)]
+    fn reserve_target_after_exec_boundary(
+        registry: &Registry,
+        profile: &Profile,
+    ) -> Result<VerifiedTargetReservation, ProfileError> {
+        retry_profile_operation_after_exec_boundary(|| {
+            registry.reserve_verified_codex_target(profile, |_, _| Ok(test_identity_adapter()))
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_lease_transfer_contender(
+        root: &Path,
+        profile: &Profile,
+        expect_busy: bool,
+    ) -> io::Result<()> {
+        let role = if expect_busy {
+            "contender-busy"
+        } else {
+            "contender-free"
+        };
+        let child = LeaseTransferTestChild::spawn(role, root, profile, None, None)?;
+        let mut child = child;
+        let status = child.child_mut()?.wait()?;
+        child.child = None;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "lease contender assertion failed: {status}"
+            )))
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn send_lease_transfer_test_marker(
+        control: &std::os::unix::net::UnixStream,
+        marker: u8,
+    ) -> Result<(), ProfileError> {
+        let flags = provider_lease_send_flags(control)?;
+        loop {
+            match rustix::net::send(control, &[marker], flags) {
+                Ok(1) => return Ok(()),
+                Ok(_) => {
+                    return Err(ProfileError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "lease test marker was incomplete",
+                    )));
+                }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn process_lease_descriptor_count(expected: &str) -> io::Result<usize> {
+        use std::os::unix::fs::MetadataExt;
+
+        #[cfg(target_os = "linux")]
+        let descriptor_directory = Path::new("/proc/self/fd");
+        #[cfg(target_os = "macos")]
+        let descriptor_directory = Path::new("/dev/fd");
+
+        // Collect first so opening a macOS `/dev/fd/N` entry cannot add a
+        // transient descriptor to the directory iteration itself. Unlike
+        // Linux procfs, macOS fdescfs reports the mount-node device from path
+        // metadata; opening the entry and fstat'ing that file yields the
+        // underlying descriptor's exact device and inode.
+        let descriptor_paths = fs::read_dir(descriptor_directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut count = 0_usize;
+        for descriptor_path in descriptor_paths {
+            #[cfg(target_os = "linux")]
+            let metadata = fs::metadata(descriptor_path);
+            #[cfg(target_os = "macos")]
+            let metadata = OpenOptions::new()
+                .read(true)
+                .open(descriptor_path)
+                .and_then(|descriptor| descriptor.metadata());
+            match metadata {
+                Ok(metadata) if format!("{}:{}", metadata.dev(), metadata.ino()) == expected => {
+                    count += 1;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) => {}
+                #[cfg(target_os = "macos")]
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::NXIO.raw_os_error()) => {}
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error()) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(count)
+    }
+
     #[test]
     fn alias_validation_rejects_paths_and_ambiguous_references() {
         for alias in ["", ".hidden", "../work", "work/personal", "a@b", "火"] {
@@ -5123,7 +5920,7 @@ config_file = "{sensitive_path}"
         let adapter_probe_ran = AtomicBool::new(false);
 
         let error = registry
-            .verify_or_bind_codex_identity(&profile, |_| {
+            .verify_or_bind_codex_identity(&profile, |_, _| {
                 adapter_probe_ran.store(true, Ordering::SeqCst);
                 Ok(test_identity_adapter())
             })
@@ -5154,17 +5951,17 @@ config_file = "{sensitive_path}"
         fs::remove_file(profile_directory.join(crate::provider_identity::IDENTITY_MARKER_FILE))?;
 
         let unverified = registry
-            .revalidate_codex_identity(&profile, |_| Ok(test_identity_adapter()))
+            .revalidate_codex_identity(&profile, |_, _| Ok(test_identity_adapter()))
             .err()
             .ok_or("legacy profile must remain unverified")?;
         assert_eq!(unverified.code(), "provider_identity_unverified");
 
         let first =
-            registry.verify_or_bind_codex_identity(&profile, |_| Ok(test_identity_adapter()))?;
+            registry.verify_or_bind_codex_identity(&profile, |_, _| Ok(test_identity_adapter()))?;
         assert_eq!(first.profile(), &profile);
         drop(first);
         let repeated =
-            registry.verify_or_bind_codex_identity(&profile, |_| Ok(test_identity_adapter()))?;
+            registry.verify_or_bind_codex_identity(&profile, |_, _| Ok(test_identity_adapter()))?;
         drop(repeated);
 
         let home = registry.profile_home(&profile)?;
@@ -5172,7 +5969,7 @@ config_file = "{sensitive_path}"
         let changed_scope = Uuid::new_v4().to_string();
         write_test_codex_auth_for_scope(&home, &changed_scope)?;
         let error = registry
-            .revalidate_codex_identity(&profile, |_| Ok(test_identity_adapter()))
+            .revalidate_codex_identity(&profile, |_, _| Ok(test_identity_adapter()))
             .err()
             .ok_or("changed credentials must fail closed")?;
         assert_eq!(error.code(), "provider_identity_mismatch");
@@ -5204,7 +6001,7 @@ config_file = "{sensitive_path}"
         write_test_codex_auth_for_scope(&second_home, &duplicate_scope)?;
 
         let error = registry
-            .verify_or_bind_codex_identity(&second, |_| Ok(test_identity_adapter()))
+            .verify_or_bind_codex_identity(&second, |_, _| Ok(test_identity_adapter()))
             .err()
             .ok_or("legacy duplicate must fail")?;
         assert_eq!(error.code(), "duplicate_provider_identity");
@@ -5249,7 +6046,7 @@ config_file = "{sensitive_path}"
         write_test_codex_auth_for_scope(&second_home, &duplicate_scope)?;
 
         let error = registry
-            .verify_or_bind_codex_identity(&second, |_| Ok(test_identity_adapter()))
+            .verify_or_bind_codex_identity(&second, |_, _| Ok(test_identity_adapter()))
             .err()
             .ok_or("preexisting duplicate bindings must fail")?;
         assert_eq!(error.code(), "duplicate_provider_identity");
@@ -5291,7 +6088,7 @@ config_file = "{sensitive_path}"
                 thread::spawn(move || {
                     worker_barrier.wait();
                     Registry::at(worker_root)
-                        .verify_or_bind_codex_identity(&profile, |_| Ok(test_identity_adapter()))
+                        .verify_or_bind_codex_identity(&profile, |_, _| Ok(test_identity_adapter()))
                         .map(|verified| verified.profile().reference())
                         .map_err(|error| error.code())
                 })
@@ -5340,7 +6137,7 @@ config_file = "{sensitive_path}"
         fs::remove_file(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
 
         let error = registry
-            .revalidate_codex_identity(&profile, |_| Ok(test_identity_adapter()))
+            .revalidate_codex_identity(&profile, |_, _| Ok(test_identity_adapter()))
             .err()
             .ok_or("missing key must fail closed")?;
         assert_eq!(error.code(), "identity_key_unavailable");
@@ -5838,6 +6635,981 @@ config_file = "{sensitive_path}"
 
         assert_eq!(fs::read(root.join(REGISTRY_FILE))?, before);
         assert_eq!(registry.find(Provider::Codex, "work")?, profile);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn provider_lease_cross_process_helper() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let Some(role) = env::var_os("CALCIFER_TEST_LEASE_CHILD_ROLE") else {
+            return Ok(());
+        };
+        let role = role
+            .into_string()
+            .map_err(|_| "lease child role must be UTF-8")?;
+        let root = PathBuf::from(
+            env::var_os("CALCIFER_TEST_LEASE_ROOT").ok_or("lease child root is missing")?,
+        );
+        let profile_id = env::var("CALCIFER_TEST_LEASE_PROFILE_ID")?;
+        let registry = Registry::at(root);
+        let profile = registry.find_by_id(Provider::Codex, &profile_id)?;
+
+        match role.as_str() {
+            "inherited-descriptor-holder" => {
+                let expected = env::var("CALCIFER_TEST_LEASE_IDENTITY")?;
+                let descriptor_count = process_lease_descriptor_count(&expected)?;
+                if descriptor_count != 1 {
+                    return Err(format!(
+                        "selected child inherited {descriptor_count} provider lease descriptors for {expected}"
+                    )
+                    .into());
+                }
+                let marker = PathBuf::from(
+                    env::var_os("CALCIFER_TEST_LEASE_SENT_MARKER")
+                        .ok_or("inherited descriptor marker is missing")?,
+                );
+                write_private_file(&marker, b"ready")?;
+                let mut release = [0_u8; 1];
+                io::stdin().read_exact(&mut release)?;
+                Ok(())
+            }
+            "unrelated-descriptor-child" => {
+                let expected = env::var("CALCIFER_TEST_LEASE_IDENTITY")?;
+                if process_lease_descriptor_count(&expected)? != 0 {
+                    Err("unrelated child inherited the provider lease".into())
+                } else {
+                    Ok(())
+                }
+            }
+            "coordinator" => {
+                let reservation = registry
+                    .reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+                let socket_path = PathBuf::from(
+                    env::var_os("CALCIFER_TEST_LEASE_SOCKET")
+                        .ok_or("lease child socket is missing")?,
+                );
+                let control = UnixStream::connect(socket_path)?;
+                control.set_read_timeout(Some(Duration::from_secs(10)))?;
+                let awaiting = reservation
+                    .send_provider_lease(&control)
+                    .map_err(|failure| (*failure).into_error())?;
+                if let Some(sent_marker) = env::var_os("CALCIFER_TEST_LEASE_SENT_MARKER") {
+                    write_private_file(&PathBuf::from(sent_marker), b"sent")?;
+                }
+                let acknowledged = awaiting
+                    .receive_ack()
+                    .map_err(|failure| (*failure).into_error())?;
+                let _coordinator = acknowledged.commit()?;
+                send_lease_transfer_test_marker(&control, b'C')?;
+                let mut release = [0_u8; 1];
+                (&control).read_exact(&mut release)?;
+                Ok(())
+            }
+            "guardian" => {
+                let socket_path = PathBuf::from(
+                    env::var_os("CALCIFER_TEST_LEASE_SOCKET")
+                        .ok_or("lease child socket is missing")?,
+                );
+                let control = UnixStream::connect(socket_path)?;
+                control.set_read_timeout(Some(Duration::from_secs(10)))?;
+                let _guardian = registry
+                    .receive_profile_provider_lease(&profile, &control)?
+                    .send_ack()
+                    .map_err(|failure| (*failure).into_error())?;
+                send_lease_transfer_test_marker(&control, b'G')?;
+                let mut release = [0_u8; 1];
+                (&control).read_exact(&mut release)?;
+                Ok(())
+            }
+            "contender-busy" => match registry.lock_profile(&profile) {
+                Err(ProfileError::Busy(_)) => Ok(()),
+                Ok(lease) => {
+                    drop(lease);
+                    Err("contender unexpectedly acquired a busy target".into())
+                }
+                Err(error) => Err(error.into()),
+            },
+            "contender-free" => {
+                drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+                Ok(())
+            }
+            _ => Err("unknown lease child role".into()),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn metadata_probe_inherits_provider_lease_only_in_the_selected_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+        use std::process::{Command, Stdio};
+
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        let root = temporary_root("child-only-provider-inheritance");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let lease = registry.lock_profile(&profile)?;
+        let provider = lease.provider_lock_file()?;
+        let metadata = provider.metadata()?;
+        let expected = format!("{}:{}", metadata.dev(), metadata.ino());
+        let marker = root.join(format!(".inherited-ready-{}", Uuid::new_v4()));
+
+        assert!(fcntl_getfd(provider)?.contains(FdFlags::CLOEXEC));
+
+        let mut selected_command = Command::new(std::env::current_exe()?);
+        selected_command
+            .args([
+                "--exact",
+                "profiles::tests::provider_lease_cross_process_helper",
+                "--nocapture",
+            ])
+            .env(
+                "CALCIFER_TEST_LEASE_CHILD_ROLE",
+                "inherited-descriptor-holder",
+            )
+            .env("CALCIFER_TEST_LEASE_ROOT", &root)
+            .env("CALCIFER_TEST_LEASE_PROFILE_ID", &profile.id)
+            .env("CALCIFER_TEST_LEASE_IDENTITY", &expected)
+            .env("CALCIFER_TEST_LEASE_SENT_MARKER", &marker)
+            .stdin(Stdio::piped());
+        let selected_child =
+            calcifer_unix_child_fd::spawn_with_inherited_fd(selected_command, provider.as_fd())?;
+        let mut selected_child = LeaseTransferTestChild {
+            child: Some(selected_child),
+        };
+        wait_for_lease_transfer_test_marker(&marker, &mut selected_child)?;
+
+        // The post-fork child clears only its copy. The shared parent table
+        // remains close-on-exec for every unrelated concurrent spawn.
+        assert!(fcntl_getfd(provider)?.contains(FdFlags::CLOEXEC));
+        let mut unrelated = Command::new(std::env::current_exe()?);
+        let unrelated_status = unrelated
+            .args([
+                "--exact",
+                "profiles::tests::provider_lease_cross_process_helper",
+                "--nocapture",
+            ])
+            .env(
+                "CALCIFER_TEST_LEASE_CHILD_ROLE",
+                "unrelated-descriptor-child",
+            )
+            .env("CALCIFER_TEST_LEASE_ROOT", &root)
+            .env("CALCIFER_TEST_LEASE_PROFILE_ID", &profile.id)
+            .env("CALCIFER_TEST_LEASE_IDENTITY", &expected)
+            .status()?;
+        assert!(
+            unrelated_status.success(),
+            "an unrelated exec must not inherit the provider lease"
+        );
+        assert!(fcntl_getfd(provider)?.contains(FdFlags::CLOEXEC));
+
+        // Once the parent closes A+B, the selected metadata child is the sole
+        // B owner. Its descriptor, not its PID, keeps the target unavailable.
+        drop(lease);
+        run_lease_transfer_contender(&root, &profile, true)?;
+
+        let child = selected_child.child_mut()?;
+        child
+            .stdin
+            .take()
+            .ok_or("selected child stdin is missing")?
+            .write_all(b"R")?;
+        let status = child.wait()?;
+        selected_child.child = None;
+        assert!(
+            status.success(),
+            "selected metadata child must exit cleanly"
+        );
+        run_lease_transfer_contender(&root, &profile, false)?;
+
+        fs::remove_file(marker)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn metadata_probe_spawn_failure_preserves_parent_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsFd;
+        use std::process::Command;
+
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        let root = temporary_root("child-only-provider-spawn-failure");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let lease = registry.lock_profile(&profile)?;
+        let provider = lease.provider_lock_file()?;
+        let command = Command::new(root.join("missing-provider-executable"));
+
+        let error = calcifer_unix_child_fd::spawn_with_inherited_fd(command, provider.as_fd())
+            .err()
+            .ok_or("a missing provider executable must fail before launch")?;
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(fcntl_getfd(provider)?.contains(FdFlags::CLOEXEC));
+        let busy = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("failed child spawn must leave parent A+B authoritative")?;
+        assert_eq!(busy.code(), "profile_busy");
+
+        drop(lease);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn target_identity_resolver_never_makes_parent_lease_inheritable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        let root = temporary_root("target-resolver-child-inheritance-race");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let provider_path = registry
+            .profile_directory(&profile)?
+            .join(PROVIDER_LOCK_FILE);
+        let metadata = fs::metadata(provider_path)?;
+        let expected = format!("{}:{}", metadata.dev(), metadata.ino());
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker_root = root.clone();
+        let worker_profile = profile.clone();
+
+        let worker = thread::spawn(move || {
+            let worker_registry = Registry::at(worker_root);
+            let reservation = worker_registry.reserve_verified_codex_target(
+                &worker_profile,
+                |_, provider_lease| {
+                    let provider_lease = provider_lease.ok_or_else(|| {
+                        ProfileError::Io(io::Error::other(
+                            "Unix target resolver did not receive its provider lease",
+                        ))
+                    })?;
+                    let close_on_exec = fcntl_getfd(provider_lease)
+                        .map(|flags| flags.contains(FdFlags::CLOEXEC))
+                        .map_err(|error| ProfileError::Io(io::Error::from(error)))?;
+                    reached_tx.send(close_on_exec).map_err(|_| {
+                        ProfileError::Io(io::Error::other(
+                            "target resolver race observer disconnected",
+                        ))
+                    })?;
+                    release_rx.recv().map_err(|_| {
+                        ProfileError::Io(io::Error::other(
+                            "target resolver race release disconnected",
+                        ))
+                    })?;
+                    Ok(test_identity_adapter())
+                },
+            )?;
+            drop(reservation);
+            Ok::<(), ProfileError>(())
+        });
+
+        let parent_close_on_exec = match reached_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(close_on_exec) => close_on_exec,
+            Err(error) => {
+                let _ = release_tx.send(());
+                let _ = worker.join();
+                return Err(error.into());
+            }
+        };
+        let mut unrelated = Command::new(std::env::current_exe()?);
+        let unrelated_status = unrelated
+            .args([
+                "--exact",
+                "profiles::tests::provider_lease_cross_process_helper",
+                "--nocapture",
+            ])
+            .env(
+                "CALCIFER_TEST_LEASE_CHILD_ROLE",
+                "unrelated-descriptor-child",
+            )
+            .env("CALCIFER_TEST_LEASE_ROOT", &root)
+            .env("CALCIFER_TEST_LEASE_PROFILE_ID", &profile.id)
+            .env("CALCIFER_TEST_LEASE_IDENTITY", &expected)
+            .status();
+        let release_result = release_tx.send(());
+        let worker_result = worker
+            .join()
+            .map_err(|_| "target resolver worker panicked")?;
+        release_result?;
+        worker_result?;
+        let unrelated_status = unrelated_status?;
+
+        assert!(
+            parent_close_on_exec,
+            "the parent provider descriptor must remain close-on-exec during resolution"
+        );
+        assert!(
+            unrelated_status.success(),
+            "an unrelated concurrent exec must not inherit the target lease"
+        );
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn transferred_provider_lease_survives_real_owner_process_crashes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+
+        let root = temporary_root("cross-process-provider-transfer");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+
+        // A coordinator child transfers B to this process, commits only after
+        // the strict ACK, then is killed and reaped. Its surviving B owner is
+        // the sole authority blocking an independent contender process.
+        {
+            let socket_path = registry.supervisor_socket_path(&profile, &Uuid::new_v4())?;
+            let listener = UnixListener::bind(&socket_path)?;
+            let socket_cleanup = LeaseTransferTestSocket(socket_path.clone());
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            let mut child = LeaseTransferTestChild::spawn(
+                "coordinator",
+                &root,
+                &profile,
+                Some(&socket_path),
+                None,
+            )?;
+            let mut control = accept_lease_transfer_test_child(&listener, &mut child)?;
+            control.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let guardian = registry
+                .receive_profile_provider_lease(&profile, &control)?
+                .send_ack()
+                .map_err(|failure| (*failure).into_error())?;
+            let mut committed = [0_u8; 1];
+            control.read_exact(&mut committed)?;
+            assert_eq!(committed, [b'C']);
+            let status = child.kill_and_wait()?;
+            assert!(!status.success(), "coordinator child must be killed");
+
+            run_lease_transfer_contender(&root, &profile, true)?;
+            drop(guardian);
+            run_lease_transfer_contender(&root, &profile, false)?;
+            drop(control);
+            drop(listener);
+            drop(socket_cleanup);
+        }
+
+        // If the coordinator dies after sendmsg but before the guardian reads
+        // or ACKs B, the descriptor queued in the kernel still owns the exact
+        // locked open-file description. There is no unlock window between the
+        // dead sender and the eventual guardian receive.
+        {
+            let sent_marker = root.join(format!(".lease-sent-{}", Uuid::new_v4()));
+            let socket_path = registry.supervisor_socket_path(&profile, &Uuid::new_v4())?;
+            let listener = UnixListener::bind(&socket_path)?;
+            let socket_cleanup = LeaseTransferTestSocket(socket_path.clone());
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            let mut child = LeaseTransferTestChild::spawn(
+                "coordinator",
+                &root,
+                &profile,
+                Some(&socket_path),
+                Some(&sent_marker),
+            )?;
+            let control = accept_lease_transfer_test_child(&listener, &mut child)?;
+            wait_for_lease_transfer_test_marker(&sent_marker, &mut child)?;
+            let status = child.kill_and_wait()?;
+            assert!(
+                !status.success(),
+                "pre-ACK coordinator child must be killed"
+            );
+
+            run_lease_transfer_contender(&root, &profile, true)?;
+            let guardian = registry.receive_profile_provider_lease(&profile, &control)?;
+            run_lease_transfer_contender(&root, &profile, true)?;
+            drop(guardian);
+            drop(control);
+            run_lease_transfer_contender(&root, &profile, false)?;
+
+            fs::remove_file(sent_marker)?;
+            drop(listener);
+            drop(socket_cleanup);
+        }
+
+        // A guardian child receives and ACKs B. After it is killed and reaped,
+        // the parent coordinator's A remains sufficient to block an
+        // independent contender until the exact A descriptor is closed.
+        {
+            let reservation = registry
+                .reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+            let socket_path = registry.supervisor_socket_path(&profile, &Uuid::new_v4())?;
+            let listener = UnixListener::bind(&socket_path)?;
+            let socket_cleanup = LeaseTransferTestSocket(socket_path.clone());
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            let mut child = LeaseTransferTestChild::spawn(
+                "guardian",
+                &root,
+                &profile,
+                Some(&socket_path),
+                None,
+            )?;
+            let mut control = accept_lease_transfer_test_child(&listener, &mut child)?;
+            control.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let awaiting = reservation
+                .send_provider_lease(&control)
+                .map_err(|failure| (*failure).into_error())?;
+            let acknowledged = awaiting
+                .receive_ack()
+                .map_err(|failure| (*failure).into_error())?;
+            let coordinator = acknowledged.commit()?;
+            let mut guardian_ready = [0_u8; 1];
+            control.read_exact(&mut guardian_ready)?;
+            assert_eq!(guardian_ready, [b'G']);
+            let status = child.kill_and_wait()?;
+            assert!(!status.success(), "guardian child must be killed");
+
+            run_lease_transfer_contender(&root, &profile, true)?;
+            drop(coordinator);
+            run_lease_transfer_contender(&root, &profile, false)?;
+            drop(control);
+            drop(listener);
+            drop(socket_cleanup);
+        }
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn transferred_provider_lease_survives_coordinator_release_without_a_reacquire_gap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("transferred-provider-survives-coordinator");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+
+        let sent = reservation
+            .send_provider_lease(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+        #[cfg(target_os = "macos")]
+        assert!(rustix::net::sockopt::socket_nosigpipe(&sender)?);
+        let guardian = registry
+            .receive_profile_provider_lease(&profile, &receiver)?
+            .send_ack()
+            .map_err(|failure| (*failure).into_error())?;
+        let acknowledged = sent
+            .receive_ack()
+            .map_err(|failure| (*failure).into_error())?;
+        let coordinator = acknowledged.commit()?;
+
+        drop(coordinator);
+        let error = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("the guardian provider lease must block a second reservation")?;
+        assert_eq!(error.code(), "profile_busy");
+
+        drop(guardian);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn transferred_provider_lease_and_coordinator_each_block_a_second_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("transferred-provider-split-ownership");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+
+        let sent = reservation
+            .send_provider_lease(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+        let guardian = registry
+            .receive_profile_provider_lease(&profile, &receiver)?
+            .send_ack()
+            .map_err(|failure| (*failure).into_error())?;
+        let acknowledged = sent
+            .receive_ack()
+            .map_err(|failure| (*failure).into_error())?;
+        let coordinator = acknowledged.commit()?;
+
+        drop(guardian);
+        let error = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("the coordinator lease must block a second reservation")?;
+        assert_eq!(error.code(), "profile_busy");
+
+        drop(coordinator);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unacknowledged_provider_lease_transfer_keeps_the_parent_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("unacknowledged-provider-transfer");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+
+        let sent = reservation
+            .send_provider_lease(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+        let guardian = registry.receive_profile_provider_lease(&profile, &receiver)?;
+        drop(guardian);
+
+        let error = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("a failed ACK must leave the complete reservation with the parent")?;
+        assert_eq!(error.code(), "profile_busy");
+
+        drop(sent);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn guardian_lease_survives_sender_cleanup_when_the_ack_is_lost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("lost-ack-sender-cleanup");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+
+        let sent = reservation
+            .send_provider_lease(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+        let guardian = registry.receive_profile_provider_lease(&profile, &receiver)?;
+        drop(sent);
+
+        let error = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("sender cleanup must not unlock the guardian's shared lock")?;
+        assert_eq!(error.code(), "profile_busy");
+
+        drop(guardian);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn invalid_guardian_ack_preserves_the_awaiting_target_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("invalid-provider-lease-ack");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+        let awaiting = reservation
+            .send_provider_lease(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+        let guardian = registry.receive_profile_provider_lease(&profile, &receiver)?;
+
+        assert_eq!(
+            rustix::net::send(
+                &receiver,
+                &[PROVIDER_LEASE_ACK_MARKER ^ 0xff],
+                provider_lease_send_flags(&receiver)?,
+            )?,
+            1
+        );
+        let failure = awaiting
+            .receive_ack()
+            .err()
+            .ok_or("an invalid ACK must not authorize sender commit")?;
+        let (awaiting, error) = (*failure).into_parts();
+        assert_eq!(error.code(), "unsafe_profile_state");
+        let busy = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("invalid ACK must preserve the complete target reservation")?;
+        assert_eq!(busy.code(), "profile_busy");
+
+        drop(guardian);
+        drop(awaiting);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn guardian_ack_send_failure_preserves_provisional_provider_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("provider-lease-ack-send-failure");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+        let awaiting = reservation
+            .send_provider_lease(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+        let guardian = registry.receive_profile_provider_lease(&profile, &receiver)?;
+        drop(awaiting);
+        drop(sender);
+
+        let failure = guardian
+            .send_ack()
+            .err()
+            .ok_or("ACK to a closed read side must fail")?;
+        let (guardian, error) = (*failure).into_parts();
+        assert_eq!(error.code(), "io_error");
+        let busy = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("provisional guardian B must survive sender cleanup")?;
+        assert_eq!(busy.code(), "profile_busy");
+
+        drop(guardian);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn received_provider_lease_is_non_inheritable_and_bound_to_the_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixStream;
+        use std::process::Command;
+
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        let root = temporary_root("received-provider-cloexec");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+
+        let sent = reservation
+            .send_provider_lease(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+        let guardian = registry.receive_profile_provider_lease(&profile, &receiver)?;
+        let provider = guardian
+            .guardian
+            .lease
+            .provider
+            .as_ref()
+            .ok_or("received guardian lease must own the provider descriptor")?;
+        assert!(fcntl_getfd(provider)?.contains(FdFlags::CLOEXEC));
+        assert_eq!(guardian.guardian.profile(), &profile);
+        let metadata = provider.metadata()?;
+        let inherited = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "profiles::tests::provider_lease_descriptor_is_closed_across_exec",
+            ])
+            .env(
+                "CALCIFER_TEST_LEASE_IDENTITY",
+                format!("{}:{}", metadata.dev(), metadata.ino()),
+            )
+            .status()?;
+        assert!(
+            inherited.success(),
+            "an exec child must not inherit the guardian lease descriptor"
+        );
+
+        drop(sent);
+        drop(guardian);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn provider_lease_descriptor_is_closed_across_exec() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(expected) = env::var_os("CALCIFER_TEST_LEASE_IDENTITY") else {
+            return Ok(());
+        };
+        let expected = expected
+            .into_string()
+            .map_err(|_| "test lease identity must be UTF-8")?;
+        assert_eq!(
+            process_lease_descriptor_count(&expected)?,
+            0,
+            "a provider lease descriptor survived exec"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn provider_lease_receiver_rejects_a_different_lock_descriptor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("provider-transfer-wrong-lock");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let coordinator = reservation
+            .lease
+            .coordinator
+            .as_ref()
+            .ok_or("verified reservation must own the coordinator lock")?;
+        let (sender, receiver) = UnixStream::pair()?;
+
+        send_test_lease_frame(
+            &sender,
+            PROVIDER_LEASE_TRANSFER_MARKER,
+            &[coordinator.as_fd()],
+        )?;
+        let error = registry
+            .receive_profile_provider_lease(&profile, &receiver)
+            .err()
+            .ok_or("the coordinator descriptor must not be accepted as provider authority")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+
+        drop(reservation);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn provider_lease_receiver_rejects_an_unlocked_reopen_of_the_same_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("provider-transfer-unlocked-reopen");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let reopened =
+            open_existing_private_lock_file(&profile_directory.join(PROVIDER_LOCK_FILE))?;
+        let (sender, receiver) = UnixStream::pair()?;
+
+        send_test_lease_frame(&sender, PROVIDER_LEASE_TRANSFER_MARKER, &[reopened.as_fd()])?;
+        let error = registry
+            .receive_profile_provider_lease(&profile, &receiver)
+            .err()
+            .ok_or("an unlocked descriptor must not become guardian authority")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+
+        drop(reopened);
+        drop(reservation);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn provider_lease_receiver_rejects_a_replaced_visible_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("provider-transfer-replaced-lock");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let provider_path = profile_directory.join(PROVIDER_LOCK_FILE);
+        let displaced_path = profile_directory.join("provider.lock.displaced");
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+        let sent = reservation
+            .send_provider_lease(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+
+        fs::rename(&provider_path, &displaced_path)?;
+        write_private_file(&provider_path, b"")?;
+        let error = registry
+            .receive_profile_provider_lease(&profile, &receiver)
+            .err()
+            .ok_or("a descriptor for the displaced lock must fail closed")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+
+        drop(sent);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn provider_lease_receiver_rejects_malformed_and_multiple_descriptor_frames()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write as _;
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+
+        for case in ["wrong-marker", "missing-descriptor", "multiple-descriptors"] {
+            let root = temporary_root(case);
+            let registry = Registry::at(root.clone());
+            let profile = register_test_profile(&registry, "work")?;
+            let reservation = registry
+                .reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+            let provider = reservation
+                .lease
+                .provider
+                .as_ref()
+                .ok_or("verified reservation must own the provider lock")?;
+            let coordinator = reservation
+                .lease
+                .coordinator
+                .as_ref()
+                .ok_or("verified reservation must own the coordinator lock")?;
+            let (mut sender, receiver) = UnixStream::pair()?;
+
+            match case {
+                "wrong-marker" => send_test_lease_frame(
+                    &sender,
+                    PROVIDER_LEASE_TRANSFER_MARKER ^ 0xff,
+                    &[provider.as_fd()],
+                )?,
+                "missing-descriptor" => {
+                    sender.write_all(&[PROVIDER_LEASE_TRANSFER_MARKER])?;
+                }
+                "multiple-descriptors" => send_test_lease_frame(
+                    &sender,
+                    PROVIDER_LEASE_TRANSFER_MARKER,
+                    &[provider.as_fd(), coordinator.as_fd()],
+                )?,
+                _ => return Err("unknown malformed transfer test case".into()),
+            }
+            let error = registry
+                .receive_profile_provider_lease(&profile, &receiver)
+                .err()
+                .ok_or("a malformed transfer frame must fail closed")?;
+            assert_eq!(error.code(), "unsafe_profile_state", "case: {case}");
+
+            drop(reservation);
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn provider_lease_send_failure_returns_the_complete_target_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("provider-transfer-send-failure");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+        drop(receiver);
+
+        let failure = reservation
+            .send_provider_lease(&sender)
+            .err()
+            .ok_or("sending to a closed guardian socket must fail")?;
+        let (reservation, error) = (*failure).into_parts();
+        assert_eq!(error.code(), "io_error");
+        let busy = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("send failure must preserve both target locks")?;
+        assert_eq!(busy.code(), "profile_busy");
+
+        drop(reservation);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_target_reservation_has_a_single_nonblocking_winner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = temporary_root("exclusive-verified-target-reservation");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let first =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let losing_probe_ran = AtomicBool::new(false);
+
+        let error = registry
+            .reserve_verified_codex_target(&profile, |_, _| {
+                losing_probe_ran.store(true, Ordering::SeqCst);
+                Ok(test_identity_adapter())
+            })
+            .err()
+            .ok_or("a second target reservation must lose without blocking")?;
+        assert_eq!(error.code(), "profile_busy");
+        assert!(!losing_probe_ran.load(Ordering::SeqCst));
+
+        drop(first);
+        drop(reserve_target_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_target_reservation_refetches_the_alias_after_rename_wins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("target-reservation-after-rename");
+        let registry = Registry::at(root.clone());
+        let stale = register_test_profile(&registry, "work")?;
+        let (renamed, _) = registry.rename(Provider::Codex, "work", "personal")?;
+
+        let reservation = reserve_target_after_exec_boundary(&registry, &stale)?;
+        assert_eq!(reservation.profile(), &renamed);
+
+        drop(reservation);
         fs::remove_dir_all(root)?;
         Ok(())
     }
