@@ -1033,10 +1033,20 @@ mod tests {
     fn exact_binding_lookup_ignores_pending_and_selection_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = registry_fixture("exact-binding-lookup", false)?;
+        let _ = fixture
+            .conversations
+            .finish_launch(&fixture.launch_id, LaunchResolution::NoThread)?;
         let thread_id = Uuid::new_v4().to_string();
         let mut binding = binding_for(&fixture.profile_id, &thread_id, &fixture.workspace);
         binding.lifecycle = ConversationLifecycle::UnknownCrash;
         fixture.conversations.adopt(binding)?;
+        fixture.conversations.begin_launch(
+            &fixture.profile_id,
+            &fixture.workspace,
+            LaunchMode::Run,
+            "0.144.4",
+            Vec::new(),
+        )?;
         fixture
             .conversations
             .mark_workspace_ambiguous(&fixture.workspace)?;
@@ -1084,6 +1094,77 @@ mod tests {
         assert_eq!(adopted.lifecycle, ConversationLifecycle::Interrupted);
 
         fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_recovery_refuses_cross_profile_tracked_pending_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = pending_registry("cross-profile-tracked-pending")?;
+        let selected_profile = Uuid::new_v4().to_string();
+        let selected_thread = Uuid::new_v4().to_string();
+
+        let error = adopt_exact_binding(
+            &fixture.conversations,
+            &selected_profile,
+            &fixture.workspace,
+            binding_for(&selected_profile, &selected_thread, &fixture.workspace),
+        )
+        .err()
+        .ok_or_else(|| {
+            std::io::Error::other("cross-profile tracked pending launch allowed exact adoption")
+        })?;
+
+        assert_eq!(error.code(), "conversation_ambiguous");
+        assert!(
+            fixture
+                .conversations
+                .pending_for(&fixture.profile_id, &fixture.workspace)?
+                .is_some_and(|pending| pending.launch_id == fixture.launch_id),
+            "refusal must preserve the existing owner for reconciliation"
+        );
+        assert!(
+            fixture
+                .conversations
+                .find_bound_thread(&selected_profile, &selected_thread, &fixture.workspace)?
+                .is_none(),
+            "refusal must not persist the conflicting exact binding"
+        );
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_recovery_resolves_same_profile_tracked_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for provider_started in [false, true] {
+            let fixture = registry_fixture("same-profile-tracked-pending", provider_started)?;
+            let selected_thread = Uuid::new_v4().to_string();
+
+            let adopted = adopt_exact_binding(
+                &fixture.conversations,
+                &fixture.profile_id,
+                &fixture.workspace,
+                binding_for(&fixture.profile_id, &selected_thread, &fixture.workspace),
+            )?;
+
+            assert_eq!(adopted.profile_id, fixture.profile_id);
+            assert_eq!(adopted.thread_id, selected_thread);
+            assert!(
+                fixture
+                    .conversations
+                    .pending_for(&adopted.profile_id, &fixture.workspace)?
+                    .is_none(),
+                "same-profile recovery must resolve its tracked pending launch"
+            );
+            assert_eq!(
+                fixture.conversations.resolve_head(&fixture.workspace)?,
+                adopted
+            );
+
+            fs::remove_dir_all(fixture.root)?;
+        }
         Ok(())
     }
 

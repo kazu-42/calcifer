@@ -371,12 +371,16 @@ impl ConversationRegistry {
         })
     }
 
+    /// Adopts an exact binding only while no launch owns the workspace.
+    /// Same-profile recovery must resolve its pending launch before this write.
     pub(crate) fn adopt(&self, binding: BindingInput) -> Result<HeadBinding, ConversationError> {
         validate_binding_input(&binding)?;
         self.transact(|document| {
-            if document.pending_launches.iter().any(|pending| {
-                pending.mode.is_untracked() && pending.canonical_cwd == binding.canonical_cwd
-            }) {
+            if document
+                .pending_launches
+                .iter()
+                .any(|pending| pending.canonical_cwd == binding.canonical_cwd)
+            {
                 return Err(ConversationError::Ambiguous);
             }
             bind_document(document, binding)
