@@ -59,6 +59,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   manifest semantics, artifact-attested raw and peeled source-tag identity,
   no-bypass repository controls, assembled-asset attestations, and the
   immutable release attestation before reporting success.
+- Release tags must be annotated objects, and the maintainer runbook binds
+  protected CI, dry-run builds, tag creation, tag-workflow selection, public
+  asset verification, and both attestation layers to one recorded commit.
 - Documented coordinated vulnerability disclosure, including patched-release
   ordering, urgent-notification exceptions, and audited emergency release
   removal under the no-bypass release-tag ruleset.
@@ -140,5 +143,5 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Exact previous-thread auto-selection, active-profile monitoring, and provider account-identity verification are not implemented; current status reads idle local profiles, which may alias the same underlying account.
 
 [Unreleased]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.4...HEAD
-[0.1.0-alpha.4]: https://github.com/kazu-42/calcifer/releases/tag/v0.1.0-alpha.4
+[0.1.0-alpha.4]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.3...v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/kazu-42/calcifer/releases/tag/v0.1.0-alpha.3

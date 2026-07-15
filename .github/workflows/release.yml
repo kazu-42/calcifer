@@ -115,8 +115,8 @@ jobs:
           tag_ref_digest="$(jq -r '.object.sha' <<<"${tag_ref_json}")"
           tag_ref_type="$(jq -r '.object.type' <<<"${tag_ref_json}")"
           if [[ ! "${tag_ref_digest}" =~ ^[0-9a-f]{40}$ ]] \
-            || [[ "${tag_ref_type}" != "tag" && "${tag_ref_type}" != "commit" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} has an invalid Git ref object." >&2
+            || [[ "${tag_ref_type}" != "tag" ]]; then
+            echo "Release tag ${GITHUB_REF_NAME} must be an annotated Git tag object." >&2
             exit 1
           fi
           printf 'tag_ref_digest=%s\n' "${tag_ref_digest}" >> "${GITHUB_OUTPUT}"

@@ -15,6 +15,8 @@ selects a tag ref.
 The release workflow enforces these boundaries:
 
 - The tag must exactly match the Calcifer version in `Cargo.toml`.
+- The release tag must be an annotated Git tag object. Lightweight tags fail
+  before draft creation and again during the local publication preflight.
 - Tag-triggered draft staging is restricted to the canonical
   `kazu-42/calcifer` repository; a fork or repository transfer fails before
   writing a GitHub Release until the manifest contract is deliberately updated.
@@ -83,12 +85,25 @@ compatibility.
 ## Dry run
 
 After the release workflow exists on the default branch, run the complete build
-matrix without publishing:
+matrix without publishing. Record the exact remote `main` commit first and
+select only a workflow run for that SHA:
 
 ```console
+git fetch origin main
+release_commit="$(git rev-parse refs/remotes/origin/main)"
+dispatched_after="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 gh workflow run release.yml --repo kazu-42/calcifer --ref main
-run_id="$(gh run list --repo kazu-42/calcifer --workflow release.yml \
-  --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId')"
+run_json='[]'
+for _ in {1..30}; do
+  run_json="$(gh run list --repo kazu-42/calcifer --workflow release.yml \
+    --event workflow_dispatch --commit "$release_commit" \
+    --created ">=$dispatched_after" --limit 1 --json databaseId,headSha)"
+  test "$(jq -r 'length' <<<"$run_json")" -eq 0 || break
+  sleep 2
+done
+test "$(jq -r 'length' <<<"$run_json")" -eq 1
+test "$(jq -r '.[0].headSha' <<<"$run_json")" = "$release_commit"
+run_id="$(jq -r '.[0].databaseId' <<<"$run_json")"
 gh run watch "$run_id" --repo kazu-42/calcifer --exit-status
 ```
 
@@ -102,18 +117,60 @@ Makefile also run the release matrix without any write or OIDC permissions.
    - moves the relevant `CHANGELOG.md` entries into the matching release
      section;
    - updates compatibility or installation documentation when needed.
-2. Merge only after protected-branch checks pass.
-3. Run the release workflow manually on `main` and inspect all five native
-   builds and the assembled `release-bundle` artifact.
+2. Merge only after protected-branch checks pass. Record the merged release PR's
+   exact commit and verify the protected `main` CI run for that SHA. Replace
+   `123` with the release-preparation PR number:
+
+   ```console
+   release_pr=123
+   release_commit="$(gh pr view "$release_pr" --repo kazu-42/calcifer \
+     --json mergeCommit,state \
+     --jq 'select(.state == "MERGED") | .mergeCommit.oid')"
+   test -n "$release_commit"
+   git fetch origin main --tags
+   git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
+   ci_json="$(gh run list --repo kazu-42/calcifer --workflow ci.yml \
+     --event push --commit "$release_commit" --limit 1 \
+     --json databaseId,headSha)"
+   test "$(jq -r 'length' <<<"$ci_json")" -eq 1
+   test "$(jq -r '.[0].headSha' <<<"$ci_json")" = "$release_commit"
+   ci_run_id="$(jq -r '.[0].databaseId' <<<"$ci_json")"
+   gh run watch "$ci_run_id" --repo kazu-42/calcifer --exit-status
+   ```
+
+3. Require remote `main` to still equal that recorded commit, then run the
+   release workflow manually and inspect all five native builds and the
+   assembled `release-bundle` artifact. Select the run by commit, never by
+   repository-wide recency:
+
+   ```console
+   git fetch origin main
+   test "$(git rev-parse refs/remotes/origin/main)" = "$release_commit"
+   dispatched_after="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+   gh workflow run release.yml --repo kazu-42/calcifer --ref main
+   dry_run_json='[]'
+   for _ in {1..30}; do
+     dry_run_json="$(gh run list --repo kazu-42/calcifer --workflow release.yml \
+       --event workflow_dispatch --commit "$release_commit" \
+       --created ">=$dispatched_after" --limit 1 --json databaseId,headSha)"
+     test "$(jq -r 'length' <<<"$dry_run_json")" -eq 0 || break
+     sleep 2
+   done
+   test "$(jq -r 'length' <<<"$dry_run_json")" -eq 1
+   test "$(jq -r '.[0].headSha' <<<"$dry_run_json")" = "$release_commit"
+   dry_run_id="$(jq -r '.[0].databaseId' <<<"$dry_run_json")"
+   gh run watch "$dry_run_id" --repo kazu-42/calcifer --exit-status
+   ```
+
 4. Create an annotated tag on the exact reviewed `main` commit. The value of
    `version` must match `Cargo.toml` exactly:
 
    ```console
    version=0.1.0-alpha.4
    git fetch origin main --tags
-   git switch main
-   git pull --ff-only origin main
-   git tag -a "v${version}" -m "Calcifer v${version}"
+   git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
+   git tag -a "v${version}" "$release_commit" -m "Calcifer v${version}"
+   tag_pushed_after="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
    git push origin "refs/tags/v${version}"
    ```
 
@@ -121,8 +178,19 @@ Makefile also run the release matrix without any write or OIDC permissions.
    **Stage draft GitHub Release**; no public release exists yet:
 
    ```console
-   run_id="$(gh run list --repo kazu-42/calcifer --workflow release.yml \
-     --event push --limit 1 --json databaseId --jq '.[0].databaseId')"
+   run_id=''
+   for _ in {1..30}; do
+     tag_run_json="$(gh run list --repo kazu-42/calcifer \
+       --workflow release.yml --event push --commit "$release_commit" \
+       --created ">=$tag_pushed_after" --limit 20 \
+       --json databaseId,headBranch,headSha)"
+     run_id="$(jq -r --arg tag "v${version}" --arg sha "$release_commit" \
+       '[.[] | select(.headBranch == $tag and .headSha == $sha)] \
+        | .[0].databaseId // empty' <<<"$tag_run_json")"
+     test -z "$run_id" || break
+     sleep 2
+   done
+   test -n "$run_id"
    gh run watch "$run_id" --repo kazu-42/calcifer --exit-status
    ```
 
@@ -148,20 +216,36 @@ Makefile also run the release matrix without any write or OIDC permissions.
    stable version it marks the release latest; prereleases are never latest.
 
 7. As an independent readback, download the now-public assets into another
-   clean directory and check `SHA256SUMS`. On macOS use
-   `shasum -a 256 -c SHA256SUMS`; elsewhere use
-   `sha256sum --check SHA256SUMS`.
+   clean directory. The local verifier rejects a missing, duplicate, or
+   unexpected asset and validates the canonical manifest and `SHA256SUMS`.
+   Then verify both provenance layers for every one of the seven assets: the
+   release-workflow artifact attestation and the immutable-release asset
+   attestation. Finally verify the release attestation itself.
 
    ```console
    verify_dir="$(mktemp -d)"
    gh release download "v${version}" --repo github.com/kazu-42/calcifer \
      --dir "$verify_dir"
-   (cd "$verify_dir" && \
-     if command -v sha256sum >/dev/null; then \
-       sha256sum --check SHA256SUMS; \
-     else \
-       shasum -a 256 -c SHA256SUMS; \
-     fi)
+   tag_ref_digest="$(gh api --hostname github.com \
+     "repos/kazu-42/calcifer/git/ref/tags/v${version}" --jq '.object.sha')"
+   python3 scripts/verify_release.py \
+     --dist "$verify_dir" \
+     --version "$version" \
+     --source-commit "$release_commit" \
+     --tag-ref-digest "$tag_ref_digest" \
+     --local-only
+   for asset in "$verify_dir"/*; do
+     gh attestation verify "$asset" \
+       --hostname github.com \
+       --repo kazu-42/calcifer \
+       --signer-workflow \
+         github.com/kazu-42/calcifer/.github/workflows/release.yml \
+       --source-ref "refs/tags/v${version}" \
+       --source-digest "$release_commit" \
+       --deny-self-hosted-runners >/dev/null
+     gh release verify-asset "v${version}" "$asset" \
+       --repo github.com/kazu-42/calcifer >/dev/null
+   done
    gh release verify "v${version}" --repo github.com/kazu-42/calcifer
    ```
 
@@ -249,9 +333,13 @@ On Linux or macOS, extract the archive for the current architecture and copy the
 binary into a user-owned directory on `PATH`:
 
 ```console
-tar -xzf calcifer-v0.1.0-alpha.4-<target>.tar.gz
+version=0.1.0-alpha.4
+# Choose the exact Rust target for this host from the supported-artifacts table.
+target=x86_64-unknown-linux-gnu
+prefix="calcifer-v${version}-${target}"
+tar -xzf "${prefix}.tar.gz"
 install -d "$HOME/.local/bin"
-install -m 0755 calcifer-v0.1.0-alpha.4-<target>/calcifer "$HOME/.local/bin/calcifer"
+install -m 0755 "${prefix}/calcifer" "$HOME/.local/bin/calcifer"
 ```
 
 On Windows, expand the `.zip` archive and place `calcifer.exe` in a user-owned

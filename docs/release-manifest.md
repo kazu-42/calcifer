@@ -90,10 +90,12 @@ name only within the already selected GitHub Release.
 - The GitHub Release prerelease flag must agree with that channel.
 - `source_commit` is the exact tagged commit already required to be reachable
   from `main` and to have every protected check green.
-- `tag_ref_digest` is the exact raw Git ref object SHA observed by the workflow.
-  It equals `source_commit` for a lightweight tag and is the distinct tag-object
-  SHA for an annotated tag. It is inside the checksummed and artifact-attested
-  manifest so the local publisher cannot establish a newer baseline.
+- Release tags must be annotated Git tag objects. Lightweight tags fail before
+  any draft is created and also fail the maintainer-local publication preflight.
+- `tag_ref_digest` is the exact raw annotated-tag object SHA observed by the
+  workflow, distinct from the peeled `source_commit`. It is inside the
+  checksummed and artifact-attested manifest so the local publisher cannot
+  establish a newer baseline.
 - The active no-bypass release-tag ruleset rejects updates and deletions of
   every `v*` tag. The workflow pins both the raw tag-ref digest and the peeled
   `source_commit`, then rechecks both values before creating the draft. The
@@ -121,9 +123,8 @@ bundle, repeats every artifact-attestation verification, checks repository
 immutability controls with admin-read access, and publishes the exact numeric
 draft release ID once. After publication it verifies that the release
 attestation names exactly the local asset set and binds the package subject to
-the manifest's `tag_ref_digest`. For an annotated tag, that digest is the tag
-object SHA and intentionally differs from the peeled `source_commit`; for a
-lightweight tag, the two values are equal.
+the manifest's `tag_ref_digest`. That digest is the annotated tag-object SHA and
+intentionally differs from the peeled `source_commit`.
 
 Seeing attestation descriptors in the manifest is not local cryptographic
 verification. A consumer must report separately whether attestations are

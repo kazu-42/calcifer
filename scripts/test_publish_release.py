@@ -394,6 +394,15 @@ class PublishReleaseTests(unittest.TestCase):
             self.publisher.publish(context)
         self.assertEqual(self.client.patch_calls, [])
 
+    def test_rejects_lightweight_release_tag_before_publish(self) -> None:
+        self.client.tag_ref = lambda _: {
+            "object": {"sha": self.tag_ref_digest, "type": "commit"}
+        }
+
+        with self.assertRaisesRegex(ValueError, "raw tag ref"):
+            self.publisher.preflight(dist=self.dist, expected_tag=self.tag)
+        self.assertEqual(self.client.patch_calls, [])
+
     def test_rejects_token_and_host_environment_overrides(self) -> None:
         for variable, value in (
             ("GH_TOKEN", "token"),
