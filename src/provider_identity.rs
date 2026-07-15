@@ -137,6 +137,14 @@ impl<'a> IdentityStore<'a> {
         &self,
         existing_bindings: bool,
     ) -> Result<IdentityKey, IdentityError> {
+        self.load_or_create_key_with_sync(existing_bindings, sync_directory)
+    }
+
+    fn load_or_create_key_with_sync(
+        &self,
+        existing_bindings: bool,
+        sync_parent: impl FnOnce(&Path) -> Result<(), IdentityError>,
+    ) -> Result<IdentityKey, IdentityError> {
         ensure_identity_supported()?;
         verify_identity_directory(self.root).map_err(|_| IdentityError::KeyUnavailable)?;
         let path = self.root.join(IDENTITY_KEY_FILE);
@@ -146,10 +154,19 @@ impl<'a> IdentityStore<'a> {
                 if existing_bindings {
                     return Err(IdentityError::KeyUnavailable);
                 }
-                self.create_key()
+                self.create_key(sync_parent)
             }
             Err(_) => Err(IdentityError::KeyUnavailable),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_or_create_key_with_sync_for_test(
+        &self,
+        existing_bindings: bool,
+        sync_parent: impl FnOnce(&Path) -> Result<(), IdentityError>,
+    ) -> Result<IdentityKey, IdentityError> {
+        self.load_or_create_key_with_sync(existing_bindings, sync_parent)
     }
 
     pub(crate) fn load_key(&self) -> Result<IdentityKey, IdentityError> {
@@ -159,7 +176,10 @@ impl<'a> IdentityStore<'a> {
         read_identity_key(&path).map_err(normalize_key_error)
     }
 
-    fn create_key(&self) -> Result<IdentityKey, IdentityError> {
+    fn create_key(
+        &self,
+        sync_parent: impl FnOnce(&Path) -> Result<(), IdentityError>,
+    ) -> Result<IdentityKey, IdentityError> {
         let mut secret = [0_u8; IDENTITY_KEY_BYTES];
         getrandom::fill(&mut secret).map_err(|_| IdentityError::KeyUnavailable)?;
         let key = IdentityKey {
@@ -172,7 +192,7 @@ impl<'a> IdentityStore<'a> {
             secret: encode_hex(&key.secret),
         };
         let bytes = serde_json::to_vec(&document).map_err(|_| IdentityError::Invalid)?;
-        atomic_publish_private(self.root, IDENTITY_KEY_FILE, &bytes)?;
+        atomic_publish_private_with_sync(self.root, IDENTITY_KEY_FILE, &bytes, sync_parent)?;
         Ok(key)
     }
 
@@ -264,6 +284,15 @@ impl<'a> IdentityStore<'a> {
         profile_directory: &Path,
         binding: &ProviderIdentity,
     ) -> Result<(), IdentityError> {
+        self.publish_marker_with_sync(profile_directory, binding, sync_directory)
+    }
+
+    fn publish_marker_with_sync(
+        &self,
+        profile_directory: &Path,
+        binding: &ProviderIdentity,
+        sync_parent: impl FnOnce(&Path) -> Result<(), IdentityError>,
+    ) -> Result<(), IdentityError> {
         ensure_identity_supported()?;
         verify_identity_directory(profile_directory)?;
         if self.marker_exists(profile_directory)? {
@@ -277,7 +306,22 @@ impl<'a> IdentityStore<'a> {
             fingerprint: encode_hex(&binding.fingerprint),
         };
         let bytes = serde_json::to_vec(&marker).map_err(|_| IdentityError::Invalid)?;
-        atomic_publish_private(profile_directory, IDENTITY_MARKER_FILE, &bytes)
+        atomic_publish_private_with_sync(
+            profile_directory,
+            IDENTITY_MARKER_FILE,
+            &bytes,
+            sync_parent,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_marker_with_sync_for_test(
+        &self,
+        profile_directory: &Path,
+        binding: &ProviderIdentity,
+        sync_parent: impl FnOnce(&Path) -> Result<(), IdentityError>,
+    ) -> Result<(), IdentityError> {
+        self.publish_marker_with_sync(profile_directory, binding, sync_parent)
     }
 
     pub(crate) fn revalidate_marker(
@@ -388,10 +432,6 @@ fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, IdentityError> {
         return Err(IdentityError::Invalid);
     }
     Ok(bytes)
-}
-
-fn atomic_publish_private(root: &Path, name: &str, bytes: &[u8]) -> Result<(), IdentityError> {
-    atomic_publish_private_with_sync(root, name, bytes, sync_directory)
 }
 
 fn atomic_publish_private_with_sync(

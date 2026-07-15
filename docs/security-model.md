@@ -144,10 +144,14 @@ corrupt, replaced, unsafe, or unreadable key state produces
 
 Key and marker writes use private same-directory temporary files, file fsync,
 atomic rename, and parent-directory fsync. A complete destination observed
-after parent sync failure is `identity_commit_uncertain`, not an invitation to
-repeat login. Readers ignore stale temporary names. Deliberate re-key and stale
-temporary cleanup remain future recovery commands and must validate every
-selected binding as one transaction.
+after parent sync failure is adopted only after an idempotent parent-sync
+retry; it is never an invitation to repeat login. Persistent uncertainty is
+reported as `identity_commit_uncertain` while the unpublished staging
+credentials remain preserved for explicit recovery. Any orphan staging
+directory blocks subsequent registration before provider login. Readers ignore
+stale temporary names. Deliberate re-key and stale temporary cleanup remain
+future recovery commands and must validate every selected binding as one
+transaction.
 
 ## Failover requirements
 

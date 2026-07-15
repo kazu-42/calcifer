@@ -86,13 +86,18 @@ atomic rename, and parent-directory fsync. Readers accept only the exact final
 name and ignore stale temporary files. Owner, mode, regular-file, symlink, and
 hard-link checks run before use.
 
-A parent-directory sync failure after a complete destination rename returns
-`identity_commit_uncertain`. Explicit verification can be retried: it reads and
-validates the complete marker before deciding whether any mutation remains.
-Registration does not publish the profile registry entry until its marker is
-complete. Registry publication retains its existing recovery rule: uncertain
-registry durability preserves visible credentials rather than deleting a
-possibly referenced profile.
+A parent-directory sync failure after a complete key or marker rename returns
+`identity_commit_uncertain`. Registration reads back the complete private state
+and retries only the idempotent parent sync; it never repeats provider login.
+If that recovery sync also fails, the registry remains unpublished and the
+complete staging credentials are preserved for explicit recovery. Any orphan
+staging directory observed under the registration lock blocks all later
+registration before provider login, so unresolved credentials cannot be
+silently duplicated. Explicit verification can likewise be retried: it reads
+and validates the complete marker before deciding whether any mutation remains.
+Registry publication retains its existing recovery rule: uncertain registry
+durability preserves visible credentials rather than deleting a possibly
+referenced profile.
 
 Missing, corrupt, replaced, unsafe, or unreadable installation keys all become
 `identity_key_unavailable`. Calcifer never generates a replacement while any

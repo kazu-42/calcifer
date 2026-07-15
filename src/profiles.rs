@@ -201,6 +201,14 @@ pub(crate) struct Registry {
     root: PathBuf,
     #[cfg(test)]
     fail_registry_directory_sync: bool,
+    #[cfg(test)]
+    fail_identity_marker_directory_sync: bool,
+    #[cfg(test)]
+    fail_identity_recovery_directory_sync: bool,
+    #[cfg(test)]
+    fail_identity_key_directory_sync: bool,
+    #[cfg(test)]
+    fail_identity_key_recovery_directory_sync: bool,
 }
 
 impl Registry {
@@ -209,6 +217,14 @@ impl Registry {
             root: data_root()?,
             #[cfg(test)]
             fail_registry_directory_sync: false,
+            #[cfg(test)]
+            fail_identity_marker_directory_sync: false,
+            #[cfg(test)]
+            fail_identity_recovery_directory_sync: false,
+            #[cfg(test)]
+            fail_identity_key_directory_sync: false,
+            #[cfg(test)]
+            fail_identity_key_recovery_directory_sync: false,
         })
     }
 
@@ -234,6 +250,10 @@ impl Registry {
         Self {
             root,
             fail_registry_directory_sync: false,
+            fail_identity_marker_directory_sync: false,
+            fail_identity_recovery_directory_sync: false,
+            fail_identity_key_directory_sync: false,
+            fail_identity_key_recovery_directory_sync: false,
         }
     }
 
@@ -242,6 +262,34 @@ impl Registry {
         Self {
             root,
             fail_registry_directory_sync: true,
+            fail_identity_marker_directory_sync: false,
+            fail_identity_recovery_directory_sync: false,
+            fail_identity_key_directory_sync: false,
+            fail_identity_key_recovery_directory_sync: false,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn at_with_identity_sync_failures(root: PathBuf, fail_recovery: bool) -> Self {
+        Self {
+            root,
+            fail_registry_directory_sync: false,
+            fail_identity_marker_directory_sync: true,
+            fail_identity_recovery_directory_sync: fail_recovery,
+            fail_identity_key_directory_sync: false,
+            fail_identity_key_recovery_directory_sync: false,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn at_with_identity_key_sync_failures(root: PathBuf, fail_recovery: bool) -> Self {
+        Self {
+            root,
+            fail_registry_directory_sync: false,
+            fail_identity_marker_directory_sync: false,
+            fail_identity_recovery_directory_sync: false,
+            fail_identity_key_directory_sync: true,
+            fail_identity_key_recovery_directory_sync: fail_recovery,
         }
     }
 
@@ -282,11 +330,13 @@ impl Registry {
             return Err(ProfileError::AlreadyExists(format!("codex@{alias}")));
         }
 
-        let id = Uuid::new_v4().to_string();
         let profiles_root = self.root.join("profiles");
         ensure_private_subdirectory(&profiles_root)?;
         let provider_root = profiles_root.join("codex");
         ensure_private_subdirectory(&provider_root)?;
+        refuse_orphaned_staging(&provider_root)?;
+
+        let id = Uuid::new_v4().to_string();
         let staging = provider_root.join(format!(".staging-{id}"));
         secure_create_dir(&staging)?;
         write_private_file(&staging.join(OWNER_MARKER), id.as_bytes())?;
@@ -305,6 +355,7 @@ impl Registry {
             },
             staging,
             committed: false,
+            preserve_staging: false,
         })
     }
 
@@ -597,6 +648,7 @@ pub(crate) struct PendingProfile<'a> {
     profile: Profile,
     staging: PathBuf,
     committed: bool,
+    preserve_staging: bool,
 }
 
 impl PendingProfile<'_> {
@@ -614,8 +666,47 @@ impl PendingProfile<'_> {
         verify_managed_codex_home(&self.home())?;
         let document = self.registry.load()?;
         let store = IdentityStore::new(&self.registry.root);
-        let key =
-            store.load_or_create_key(self.registry.has_identity_bindings(&document, &store)?)?;
+        let existing_bindings = self.registry.has_identity_bindings(&document, &store)?;
+        #[cfg(test)]
+        let key_publication = if self.registry.fail_identity_key_directory_sync {
+            store.load_or_create_key_with_sync_for_test(existing_bindings, |_| {
+                Err(IdentityError::Io(io::Error::other(
+                    "injected identity key directory sync failure",
+                )))
+            })
+        } else {
+            store.load_or_create_key(existing_bindings)
+        };
+        #[cfg(not(test))]
+        let key_publication = store.load_or_create_key(existing_bindings);
+
+        let key = match key_publication {
+            Ok(key) => key,
+            Err(IdentityError::CommitUncertain) => {
+                // A newly generated key was completely renamed and read back,
+                // but its parent sync failed. Re-open that exact private key
+                // and retry only the idempotent data-root sync. Provider login
+                // has already succeeded and must never be repeated blindly.
+                let recovered_key = store.load_key();
+                #[cfg(test)]
+                let directory_synced = if self.registry.fail_identity_key_recovery_directory_sync {
+                    false
+                } else {
+                    sync_directory(&self.registry.root).is_ok()
+                };
+                #[cfg(not(test))]
+                let directory_synced = sync_directory(&self.registry.root).is_ok();
+
+                match (recovered_key, directory_synced) {
+                    (Ok(key), true) => key,
+                    _ => {
+                        self.preserve_staging = true;
+                        return Err(ProfileError::from(IdentityError::CommitUncertain));
+                    }
+                }
+            }
+            Err(error) => return Err(ProfileError::from(error)),
+        };
         let identity = store.derive_codex_binding(&self.home(), &key, adapter)?;
         if let Some(conflict) = self
             .registry
@@ -626,7 +717,46 @@ impl PendingProfile<'_> {
                 existing: conflict.reference(),
             });
         }
-        store.publish_marker(&self.staging, &identity)?;
+        #[cfg(test)]
+        let marker_publication = if self.registry.fail_identity_marker_directory_sync {
+            store.publish_marker_with_sync_for_test(&self.staging, &identity, |_| {
+                Err(IdentityError::Io(io::Error::other(
+                    "injected identity marker directory sync failure",
+                )))
+            })
+        } else {
+            store.publish_marker(&self.staging, &identity)
+        };
+        #[cfg(not(test))]
+        let marker_publication = store.publish_marker(&self.staging, &identity);
+
+        match marker_publication {
+            Ok(()) => {}
+            Err(IdentityError::CommitUncertain) => {
+                // The marker rename is already visible and its file contents
+                // were synced. Revalidate those exact bytes and retry only the
+                // idempotent parent-directory sync; never repeat provider login.
+                // If durability remains unknown, preserve the complete staging
+                // directory for explicit recovery instead of deleting credentials.
+                let marker_is_complete = store
+                    .revalidate_marker(&self.staging, &key, &identity)
+                    .is_ok();
+                #[cfg(test)]
+                let directory_synced = if self.registry.fail_identity_recovery_directory_sync {
+                    false
+                } else {
+                    sync_directory(&self.staging).is_ok()
+                };
+                #[cfg(not(test))]
+                let directory_synced = sync_directory(&self.staging).is_ok();
+
+                if !marker_is_complete || !directory_synced {
+                    self.preserve_staging = true;
+                    return Err(ProfileError::from(IdentityError::CommitUncertain));
+                }
+            }
+            Err(error) => return Err(ProfileError::from(error)),
+        }
         store.revalidate_marker(&self.staging, &key, &identity)?;
 
         let final_directory = self
@@ -697,7 +827,7 @@ impl PendingProfile<'_> {
 
 impl Drop for PendingProfile<'_> {
     fn drop(&mut self) {
-        if self.committed {
+        if self.committed || self.preserve_staging {
             return;
         }
         let _ = safe_remove_staging(&self.staging, &self.profile.id);
@@ -1304,6 +1434,30 @@ fn safe_remove_staging(path: &Path, id: &str) -> Result<(), ProfileError> {
     Ok(())
 }
 
+fn refuse_orphaned_staging(provider_root: &Path) -> Result<(), ProfileError> {
+    verify_private_directory(provider_root)?;
+    for entry in fs::read_dir(provider_root)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            ProfileError::UnsafeState("managed profile entry name is invalid".to_owned())
+        })?;
+        let Some(id) = name.strip_prefix(".staging-") else {
+            continue;
+        };
+        validate_profile_id(id).map_err(|_| {
+            ProfileError::UnsafeState("managed staging entry name is invalid".to_owned())
+        })?;
+        verify_owned_profile_directory(&entry.path(), id)?;
+        // The registry lock spans every live registration, so a staging
+        // directory observed after acquiring it is necessarily crash-stale or
+        // deliberately preserved after a commit-uncertain result. Starting a
+        // second login could publish duplicate credentials while the first
+        // transaction remains unresolved.
+        return Err(ProfileError::RegistrationRecoveryRequired);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1543,6 +1697,151 @@ config_file = "{sensitive_path}"
         assert!(staging.is_dir());
         drop(pending);
         assert!(!staging.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_adopts_a_complete_marker_after_uncertain_parent_sync()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("identity-sync-recovered");
+        let registry = Registry::at_with_identity_sync_failures(root.clone(), false);
+        let pending = registry.begin_codex_registration("work")?;
+        let staging = pending.staging.clone();
+        write_test_codex_auth(&pending.home())?;
+
+        let profile = pending.commit(test_identity_adapter())?;
+
+        assert!(!staging.exists());
+        assert_eq!(registry.list()?, vec![profile.clone()]);
+        assert!(
+            registry
+                .profile_directory(&profile)?
+                .join(crate::provider_identity::IDENTITY_MARKER_FILE)
+                .is_file()
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_preserves_credentials_when_marker_durability_remains_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("identity-sync-persistent-failure");
+        let registry = Registry::at_with_identity_sync_failures(root.clone(), true);
+        let pending = registry.begin_codex_registration("work")?;
+        let staging = pending.staging.clone();
+        let home = pending.home();
+        write_test_codex_auth(&home)?;
+
+        let error = pending
+            .commit(test_identity_adapter())
+            .err()
+            .ok_or("persistent identity sync failure must stop registration")?;
+
+        assert_eq!(error.code(), "identity_commit_uncertain");
+        assert!(staging.is_dir());
+        assert!(home.join("auth.json").is_file());
+        assert!(
+            staging
+                .join(crate::provider_identity::IDENTITY_MARKER_FILE)
+                .is_file()
+        );
+        assert!(registry.list()?.is_empty());
+
+        let retry_registry = Registry::at(root.clone());
+        let retry_error = retry_registry
+            .begin_codex_registration("retry")
+            .err()
+            .ok_or("orphaned marker staging must block a second login")?;
+        assert_eq!(retry_error.code(), "registration_recovery_required");
+        assert_eq!(
+            fs::read_dir(root.join("profiles/codex"))?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".staging-"))
+                })
+                .count(),
+            1
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_adopts_a_complete_key_after_uncertain_parent_sync()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("identity-key-sync-recovered");
+        let registry = Registry::at_with_identity_key_sync_failures(root.clone(), false);
+        let pending = registry.begin_codex_registration("work")?;
+        let staging = pending.staging.clone();
+        write_test_codex_auth(&pending.home())?;
+
+        let profile = pending.commit(test_identity_adapter())?;
+
+        assert!(!staging.exists());
+        assert_eq!(registry.list()?, vec![profile]);
+        assert!(
+            root.join(crate::provider_identity::IDENTITY_KEY_FILE)
+                .is_file()
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_preserves_credentials_when_key_durability_remains_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("identity-key-sync-persistent-failure");
+        let registry = Registry::at_with_identity_key_sync_failures(root.clone(), true);
+        let pending = registry.begin_codex_registration("work")?;
+        let staging = pending.staging.clone();
+        let home = pending.home();
+        write_test_codex_auth(&home)?;
+
+        let error = pending
+            .commit(test_identity_adapter())
+            .err()
+            .ok_or("persistent identity key sync failure must stop registration")?;
+
+        assert_eq!(error.code(), "identity_commit_uncertain");
+        assert!(staging.is_dir());
+        assert!(home.join("auth.json").is_file());
+        assert!(
+            root.join(crate::provider_identity::IDENTITY_KEY_FILE)
+                .is_file()
+        );
+        assert!(registry.list()?.is_empty());
+
+        let retry_registry = Registry::at(root.clone());
+        let retry_error = retry_registry
+            .begin_codex_registration("retry")
+            .err()
+            .ok_or("orphaned key staging must block a second login")?;
+        assert_eq!(retry_error.code(), "registration_recovery_required");
+        assert_eq!(
+            fs::read_dir(root.join("profiles/codex"))?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".staging-"))
+                })
+                .count(),
+            1
+        );
+
         fs::remove_dir_all(root)?;
         Ok(())
     }
