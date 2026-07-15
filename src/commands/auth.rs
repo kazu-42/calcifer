@@ -30,6 +30,16 @@ pub(crate) struct RenameReport {
     profile: Profile,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct RemoveReport {
+    schema_version: u8,
+    command: &'static str,
+    ok: bool,
+    action: &'static str,
+    removed: bool,
+    profile: Profile,
+}
+
 impl RenameReport {
     pub(crate) fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
@@ -37,6 +47,19 @@ impl RenameReport {
 
     pub(crate) fn to_human(&self) -> String {
         format!("Renamed {} to {}.", self.from, self.to)
+    }
+}
+
+impl RemoveReport {
+    pub(crate) fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+
+    pub(crate) fn to_human(&self) -> String {
+        format!(
+            "Removed {}.\nThe Calcifer-managed credentials and sessions for this local profile are no longer registered.",
+            self.profile.reference()
+        )
     }
 }
 
@@ -155,6 +178,26 @@ pub(crate) fn rename_codex(old_alias: &str, new_alias: &str) -> Result<RenameRep
         changed,
         from,
         to,
+        profile,
+    })
+}
+
+pub(crate) fn preview_remove_codex(registry: &Registry, alias: &str) -> Result<Profile, AppError> {
+    Ok(registry.preview_remove(Provider::Codex, alias)?)
+}
+
+pub(crate) fn remove_codex(
+    registry: &Registry,
+    alias: &str,
+    confirmed_profile_id: Option<&str>,
+) -> Result<RemoveReport, AppError> {
+    let profile = registry.remove(Provider::Codex, alias, confirmed_profile_id)?;
+    Ok(RemoveReport {
+        schema_version: 1,
+        command: "auth",
+        ok: true,
+        action: "remove",
+        removed: true,
         profile,
     })
 }

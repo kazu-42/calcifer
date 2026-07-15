@@ -18,14 +18,15 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Per-profile ownership marker and staging cleanup boundary
 - [x] Unix `0700`/`0600`, symlink/type checks, and atomic registry writes
 - [ ] Windows current-user-only ACL creation and validation
-- [ ] Owner-UID checks and hardened directory-relative filesystem operations
+- [ ] Owner-UID checks and hardened directory-relative filesystem operations (implemented for destructive profile removal; remaining storage paths still require migration)
 - [x] OS advisory locks for the current single-profile operations
 - [ ] Deterministic multi-profile/session lock ordering
 - [ ] Redaction and crash-injection test harnesses
 
 ## Phase 2: Codex profile isolation
 
-- [ ] Complete `auth add/list/show/rename/remove/reauth codex` (`add`, `list`, and atomic alias-only `rename` are implemented)
+- [ ] Complete `auth add/list/show/rename/remove/reauth codex` (`add`, `list`, atomic alias-only `rename`, and confirmed crash-safe local `remove` are implemented)
+- [x] Keep profile registry schema v1 rollback-compatible while using a bounded transient removal barrier, fail-closed mount proof, and immutable-ID lineage during local deletion
 - [x] Official `codex login` in a profile-specific `CODEX_HOME`
 - [x] Version-scoped private provider identity verification before profile publication
 - [x] Explicit identity verification for legacy profiles; unbound profiles remain manual-only

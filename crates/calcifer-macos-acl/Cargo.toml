@@ -1,0 +1,18 @@
+[package]
+name = "calcifer-macos-acl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Internal fd-bound macOS ACL inspection for Calcifer"
+license = "MIT"
+publish = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+expect_used = "deny"
+todo = "deny"
+unwrap_used = "deny"

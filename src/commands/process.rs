@@ -50,7 +50,8 @@ pub(crate) fn run_codex(
     } else {
         InternalProcessMode::Run
     };
-    spawn_supervisor(alias, mode, None, provider_args)
+    let registry = Registry::discover()?;
+    spawn_supervisor(&registry, alias, mode, None, provider_args)
 }
 
 pub(crate) fn resume_codex(
@@ -66,7 +67,8 @@ pub(crate) fn resume_codex(
         (None, true) => InternalProcessMode::ResumeLastUntracked,
         (Some(_), true) => return Err(AppError::ProviderArgumentRejected),
     };
-    spawn_supervisor(alias, mode, session_id, provider_args)
+    let registry = Registry::discover()?;
+    spawn_supervisor(&registry, alias, mode, session_id, provider_args)
 }
 
 pub(crate) fn resume_workspace_codex(provider_args: &[OsString]) -> Result<ExitStatus, AppError> {
@@ -111,6 +113,7 @@ pub(crate) fn resume_workspace_codex(provider_args: &[OsString]) -> Result<ExitS
     };
     let profile = registry.find_by_id(Provider::Codex, &head.profile_id)?;
     spawn_supervisor(
+        &registry,
         &profile.alias,
         InternalProcessMode::ResumeHead,
         Some(&head.thread_id),
@@ -119,6 +122,7 @@ pub(crate) fn resume_workspace_codex(provider_args: &[OsString]) -> Result<ExitS
 }
 
 fn spawn_supervisor(
+    registry: &Registry,
     alias: &str,
     mode: InternalProcessMode,
     session_id: Option<&str>,
@@ -126,10 +130,9 @@ fn spawn_supervisor(
 ) -> Result<ExitStatus, AppError> {
     #[cfg(unix)]
     let _termination_guard = install_process_signal_guard()?;
-    let registry = Registry::discover()?;
     let profile = registry.find(Provider::Codex, alias)?;
     let executable = std::env::current_exe()?;
-    let mut command = internal_calcifer_command(&executable);
+    let mut command = internal_calcifer_command(&executable, registry.managed_root());
     command
         .arg("__internal-codex")
         .arg(&profile.id)
@@ -172,7 +175,7 @@ pub(crate) fn supervise_codex(
         let profile = registry.find_by_id(Provider::Codex, profile_id)?;
         require_expected_alias(&profile, expected_alias)?;
         let _coordinator_lease = registry.lock_profile_coordinator(&profile)?;
-        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
+        let profile = registry.refetch_by_id_under_lease(Provider::Codex, profile_id)?;
         require_expected_alias(&profile, expected_alias)?;
         announce()?;
         let _home = registry.profile_home(&profile)?;
@@ -202,6 +205,7 @@ pub(crate) fn supervise_codex(
             mode,
             session_id,
             provider_args,
+            registry.managed_root(),
             launch_context.working_directory(),
         )?;
         let control = match accept_provider_guardian(&listener, &mut guardian)? {
@@ -240,7 +244,7 @@ pub(crate) fn supervise_codex(
         let profile = registry.find_by_id(Provider::Codex, profile_id)?;
         require_expected_alias(&profile, expected_alias)?;
         let _lease = registry.lock_profile(&profile)?;
-        let profile = registry.find_by_id(Provider::Codex, profile_id)?;
+        let profile = registry.refetch_by_id_under_lease(Provider::Codex, profile_id)?;
         require_expected_alias(&profile, expected_alias)?;
         announce()?;
         let home = registry.profile_home(&profile)?;
@@ -437,10 +441,11 @@ fn spawn_provider_guardian(
     mode: InternalProcessMode,
     session_id: Option<&str>,
     provider_args: &[OsString],
+    calcifer_home: &std::path::Path,
     working_directory: &std::path::Path,
 ) -> Result<Child, AppError> {
     let executable = std::env::current_exe()?;
-    let mut command = internal_calcifer_command(&executable);
+    let mut command = internal_calcifer_command(&executable, calcifer_home);
     command
         .arg("__internal-codex-provider")
         .arg(profile_id)
@@ -463,12 +468,18 @@ fn spawn_provider_guardian(
     command.spawn().map_err(AppError::from)
 }
 
-fn internal_calcifer_command(executable: &std::path::Path) -> Command {
+fn internal_calcifer_command(
+    executable: &std::path::Path,
+    calcifer_home: &std::path::Path,
+) -> Command {
     let mut command = Command::new(executable);
     sanitize_managed_environment(&mut command);
     // Calcifer itself does not use CODEX_HOME. The selected managed home is
     // reintroduced only on the final, validated official Codex command.
     command.env_remove("CODEX_HOME");
+    // All helpers in one launch tree must retain the physical root selected by
+    // the public process even when the user's symlink alias changes later.
+    command.env("CALCIFER_HOME", calcifer_home);
     command
 }
 
@@ -741,8 +752,7 @@ fn test_marker_path(kind: &str) -> Option<PathBuf> {
     let marker_id = std::env::var_os("CALCIFER_TEST_MARKER_ID")?;
     let marker_id = marker_id.to_str()?;
     let marker_id = Uuid::parse_str(marker_id).ok()?;
-    let runtime_root =
-        PathBuf::from("/tmp").join(format!("calcifer-{}", rustix::process::getuid().as_raw()));
+    let runtime_root = crate::profiles::managed_runtime_root().ok()?;
     Some(runtime_root.join(format!(".test-{marker_id}-{kind}")))
 }
 
@@ -814,7 +824,13 @@ mod tests {
 
     #[test]
     fn internal_calcifer_helpers_drop_explicit_provider_secrets() {
-        let command = internal_calcifer_command(std::path::Path::new("/synthetic/calcifer"));
+        let calcifer_home = std::path::Path::new("/physical/calcifer-home");
+        let command =
+            internal_calcifer_command(std::path::Path::new("/synthetic/calcifer"), calcifer_home);
+
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "CALCIFER_HOME" && value == Some(calcifer_home.as_os_str())
+        }));
 
         for denied in [
             "OPENAI_API_KEY",

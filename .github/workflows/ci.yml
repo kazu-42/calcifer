@@ -56,6 +56,53 @@ jobs:
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Run tests
         run: cargo +1.96.0 test --all-targets --all-features --locked
+      - name: Test Linux mount-boundary enforcement
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          command -v jq
+          command -v unshare
+          command -v mount
+          command -v umount
+          sudo -n true
+          uname -a
+
+          test_name='profiles::tests::removal_rejects_same_device_bind_mount_during_validation_and_cleanup'
+          test_binary="$(
+            cargo +1.96.0 test \
+              --lib \
+              --all-features \
+              --locked \
+              --no-run \
+              --message-format=json |
+              jq -r '
+                select(
+                  .reason == "compiler-artifact"
+                  and .profile.test == true
+                  and .target.name == "calcifer"
+                  and (.target.kind | index("lib")) != null
+                  and .executable != null
+                )
+                | .executable
+              ' |
+              tail -n 1
+          )"
+
+          test -n "$test_binary"
+          test -x "$test_binary"
+          "$test_binary" --list | grep -Fqx "$test_name: test"
+
+          sudo -n unshare \
+            --mount \
+            --propagation private \
+            -- \
+            "$test_binary" \
+            "$test_name" \
+            --exact \
+            --ignored \
+            --nocapture
 
   msrv:
     name: MSRV (1.85.0)

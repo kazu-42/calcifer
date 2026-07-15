@@ -202,7 +202,7 @@ The current `run` command does not restart or re-submit a command after the chil
 
 ## Filesystem and credential mutations
 
-On Unix, the implemented managed root uses directory mode `0700`; Calcifer-owned files and locks use `0600`. On Windows, registration currently fails closed because equivalent current-user-only ACL creation has not been verified. The current slice rejects invalid aliases, non-canonical opaque IDs, symlinked or non-regular managed files, permissive Unix modes, and ownership-marker mismatches. Owner-UID checks and hardened directory-relative open operations remain release gates.
+On Unix, the implemented managed root uses directory mode `0700`; Calcifer-owned files and locks use `0600`. Discovery canonicalizes the deepest existing prefix of the configured data root and appends only missing normal components. Calcifer stores that physical path and injects it as `CALCIFER_HOME` into coordinator and guardian self-execs, so one launch tree cannot rediscover a different mutable alias. Interactive removal likewise retains one discovered registry across preview, confirmation, and mutation. Creation and later verification require the operational parent to remain canonical, reject every symlink ancestor, and require every real directory ancestor to be root/current-user-owned and non-replaceable by ordinary mode checks (or sticky). On macOS, one acceptance decision reads type, owner, mode, file flags, extended ACL, and device/inode from the same no-follow descriptor and compares that identity with the visible pathname. Creation additionally rejects parent ALLOW/inheritable ACL entries, deletion-blocking DENY entries, ACL-level or unknown policy bits, and append, immutable, inherited-restrictive, or unknown parent flags. A new private inode has inherited ACL state cleared and read back through the same open descriptor before secret bytes are written. The standard non-inheritable `everyone deny delete` home ACL and parent-only `SF_NOUNLINK` temp ancestry remain compatible; `deny delete_child` does not. Pre-existing extended ACLs and unsupported flags fail closed instead of being normalized. This descriptor binding prevents one decision from mixing different vnodes, but it cannot permanently pin the pathname against another OS principal that already has ACL-granted namespace or security-metadata authority; such an active race is outside the guarantee because the official CLI accepts `CODEX_HOME` only as a pathname. On Windows, registration currently fails closed because equivalent current-user-only ACL creation has not been verified. The current slice rejects invalid aliases, non-canonical opaque IDs, symlinked or non-regular managed files, permissive Unix modes, and ownership-marker mismatches. Destructive profile removal additionally enforces owner-UID, single-link, inode/device, and hardened directory-relative traversal checks; migrating every remaining storage path to the same boundary remains a release gate.
 
 Calcifer-owned metadata updates follow a same-filesystem atomic-write sequence:
 
@@ -211,7 +211,7 @@ Calcifer-owned metadata updates follow a same-filesystem atomic-write sequence:
 3. Atomically rename it to the destination.
 4. `fsync` the parent directory.
 
-Registration happens in a staging directory and becomes visible only after the official login exits successfully; private `auth.json`, managed config, and ownership metadata pass revalidation; the installed Codex adapter passes its exact initialize/home/version gate; and a unique private identity marker has been written and synced. Credentials and binding are then published with one profile-directory rename before registry publication. The registry rename is the public visibility point: if the following directory sync fails, Calcifer preserves both the visible entry and credentials, reports `registry_commit_uncertain`, and tells the user to read back `auth list` rather than retry blindly. An identity key or marker rename followed by uncertain parent sync is read back; the same registration retries only that idempotent directory sync and adopts the complete state without invoking login again. If durability remains uncertain, Calcifer reports `identity_commit_uncertain`, keeps the profile unpublished, preserves the complete staging credentials for explicit recovery, and blocks every later registration before provider login while any orphan staging directory remains. Re-authentication, re-key, remove, and orphan-staging cleanup flows are not implemented yet. A failed normal login performs checked cleanup; a hard crash can leave a private orphan staging directory for later recovery tooling and likewise blocks a second login.
+Registration happens in a staging directory and becomes visible only after the official login exits successfully; private `auth.json`, managed config, and ownership metadata pass revalidation; the installed Codex adapter passes its exact initialize/home/version gate; and a unique private identity marker has been written and synced. Credentials and binding are then published with one profile-directory rename before registry publication. The registry rename is the public visibility point: if the following directory sync fails, Calcifer preserves both the visible entry and credentials, reports `registry_commit_uncertain`, and tells the user to read back `auth list` rather than retry blindly. An identity key or marker rename followed by uncertain parent sync is read back; the same registration retries only that idempotent directory sync and adopts the complete state without invoking login again. If durability remains uncertain, Calcifer reports `identity_commit_uncertain`, keeps the profile unpublished, preserves the complete staging credentials for explicit recovery, and blocks every later registration before provider login while any orphan staging directory remains. Re-authentication, re-key, and orphan-staging cleanup flows are not implemented yet. A failed normal login performs checked cleanup; a hard crash can leave a private orphan staging directory for later recovery tooling and likewise blocks a second login.
 
 For a published-profile alias change, failures before the atomic-rename
 visibility point leave the old complete registry visible. Failure while syncing
@@ -221,6 +221,92 @@ never a partial registry. Published-profile lifecycle operations use the lock
 order profile coordinator, profile provider, then registry. This makes an
 active run/resume/status probe and a rename choose exactly one winner and keeps
 identity verification and future remove/reauth flows from deadlocking.
+
+Confirmed profile removal uses the same published-profile lock order:
+coordinator lease, provider lease, removal lock, then registry lock. Stable
+`profiles.json` remains the exact schema-v1 shape published by alpha.4; it does
+not gain a revision field. A removal uses two bounded proof objects instead:
+
+- a self-contained transient schema-v2 registry barrier containing the
+  prepared removal proof and expected stable v1 registry; and
+- a matching private schema-v1 sidecar used after the stable registry becomes
+  visible again.
+
+The proof records only bounded local profile metadata, old/new canonical
+registry digests, filesystem object identities, an entry count, and a SHA-256
+digest of the relative tree manifest. It contains no paths, filenames,
+credentials, raw provider identity, rollout metadata, conversation content, or
+mount token. The transaction is:
+
+1. Acquire and durably sync both lifetime lock files, then revalidate the exact
+   registry entry, data/profiles/provider roots, ownership marker, owner UID,
+   private root modes, non-group/other-writable traversed-directory and
+   regular-file modes, types, device, mount boundary, and single-link regular
+   files. Every macOS removal-tree entry, including non-followed symlinks,
+   sockets, and FIFOs, must have no extended ACL entries; roots, directories,
+   and regular files must also have no deletion-blocking
+   immutable/append/no-unlink flags.
+   Provider-created readable or executable descendants such as `0755`
+   directories and `0644` files remain valid because every ancestor through
+   the profile root is owner-only `0700`. Traversed directories must retain
+   owner `rwx`; provider-created symlinks, sockets, FIFOs, and other
+   non-directory leaves are manifest entries but are never followed or opened.
+   Ownership-marker and lifetime-lock names remain control-plane state and must
+   be private single-link regular files. Every managed lock is opened no-follow,
+   matched to its visible inode, and checked for private mode, owner, and one
+   link before flock or fsync.
+2. Atomically replace stable schema-v1 `profiles.json` with the self-contained
+   transient schema-v2 barrier and fsync its parent. This is the first durable
+   transaction state, before any profile path moves.
+3. Atomically write and fsync a sidecar exactly matching the embedded proof.
+   Every later read opens it no-follow and matches the opened descriptor to the
+   visible private, single-link inode before parsing bounded bytes.
+4. Rename the UUID profile directory to `.removing-<profile-id>` under the same
+   provider root, revalidate the complete manifest, then fsync that root.
+5. Atomically replace the barrier with the normal schema-v1 registry without
+   that immutable ID. This stable-v1 rename is the deletion visibility point.
+6. Read back the removed ID as absent, retain both metadata locks, unlink the
+   tombstone through constrained descriptors, fsync the provider root, then
+   remove and sync the sidecar before releasing either lock.
+
+Every normal registry writer rechecks for a barrier, sidecar, tombstone, or
+sidecar temporary immediately after acquiring the registry lock. Registration
+retains that guarded lock through publication. Alpha.4's strict schema-v1
+reader rejects the transient schema-v2 barrier, so an older writer cannot
+change the registry while a destructive pre-visibility state exists. Once the
+transaction completes or rolls back, `profiles.json` is schema-v1 again and the
+previously verified alpha.4 artifact can read the preserved state.
+
+Before deletion visibility, the barrier is authoritative. Recovery accepts
+only the exact complete original tree or an inode-preserving tombstone whose
+entry count and metadata-manifest digest match, restores the old directory if
+needed, removes the sidecar, and publishes the embedded expected v1 registry
+last. It never restores a partially deleted tree. After visibility, stable v1
+plus the sidecar is authoritative: the immutable target ID must be absent, but
+unrelated alpha.4-compatible registry changes may remain. Recovery never
+republishes credentials and may finish a partially unlinked tombstone because
+the proof pins its root inode/device and every remaining entry is revalidated
+before deletion. A missing, linked, malformed, or ambiguous registry, a
+mismatched barrier/sidecar, or any state that proves neither side fails as
+`removal_recovery_required` with the tombstone intact.
+
+Linux validation requires `statx(STATX_MNT_ID)` and cleanup opens every
+directory and regular-file edge with `openat2(RESOLVE_BENEATH |
+RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`. The
+removal/recovery contract therefore requires Linux kernel 5.8 or newer and has
+no weaker `st_dev` or ordinary-`openat` fallback. macOS opens those entries
+relative to their parent with `O_NOFOLLOW` and compares raw descriptor-derived
+`fstatfs` mountpoint, source, and filesystem-type fields. Non-directory special
+leaves are instead checked with no-follow metadata and removed only by
+descriptor-relative `unlinkat`, which cannot follow their target. Mount tokens
+are ephemeral, redacted, and never written to a journal, JSON response, or log.
+
+Removal does not edit `conversations.json`; the immutable profile ID, not its
+alias, establishes lineage. References to a removed ID become unresolved, and
+registering the same alias later creates a new UUID that cannot adopt them. The
+installation-wide identity key and every unrelated profile remain outside the
+deletion tree. Filesystem unlinking is not a claim of cryptographic secure
+erasure from snapshots, backups, filesystem journals, or SSD media.
 
 ## Process execution
 

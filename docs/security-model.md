@@ -2,7 +2,7 @@
 
 Calcifer will handle high-value local credentials. Its safest useful design is a small process wrapper with explicit trust boundaries, strict profile isolation, redacted diagnostics, and fail-closed provider adapters.
 
-This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, and captures an exact same-profile thread key for crash-safe cold restore. Automatic failover and cross-profile conversation handoff are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
+This document covers both implemented and intended guarantees. The current Unix Codex slice creates isolated file-backed credentials through the official login flow, may let the official CLI refresh them during run, resume, or status, captures an exact same-profile thread key for crash-safe cold restore, and can remove one owned local profile through a confirmed crash-safe tombstone transaction. Automatic failover and cross-profile conversation handoff are not implemented; [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines their required boundary.
 
 ## Assets
 
@@ -38,6 +38,13 @@ Calcifer cannot protect credentials from:
 - a compromised official provider CLI, plugin, hook, or child tool;
 - a malicious repository executed by the wrapped agent;
 - provider compromise or provider-side account recovery;
+- on macOS, a different OS principal that already has mode- or ACL-granted
+  authority to alter a managed node, its security metadata, or its namespace
+  and races validation or mutates the pathname after the final check. This
+  includes node `DELETE`, parent `DELETE_CHILD`/`ADD_FILE`/`ADD_SUBDIRECTORY`,
+  `WRITE_SECURITY`, and ownership-change authority. The official Codex CLI
+  accepts `CODEX_HOME` only as a pathname and exposes no supported
+  descriptor-based handoff;
 - all exposure through OS swap, crash dumps, or debugging facilities.
 
 Calcifer is not a sandbox and does not make an untrusted repository safe.
@@ -113,6 +120,83 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Codex 0.144.4 hides its 10,000-file rollout scan cap from the v2 App Server response. Calcifer proves a conservative upper bound by snapshotting active and archived roots separately before and after listing, requiring each root to remain below the cap, and mapping every wire path to the stable snapshot. Nested nodes must remain owned, real, non-symlink, and non-writable by group/other; files must have one hard link. The enclosing managed home remains owner-private.
 - Bare resume releases its initial conversation lock before waiting for a profile lease, then revalidates the unchanged UUID binding under that lease. Registry mutation order is coordinator lease, provider lease, then a short conversation lock; no conversation lock spans App Server or interactive provider I/O.
 - A conversation document update uses create-only private same-directory temporary files, file fsync, rename, and directory fsync. Post-rename sync uncertainty is read back and reported without retrying a provider launch. Newer schemas and unsafe owner/type/mode/hard-link state are never rewritten.
+- Profile removal is local-only and requires an explicit TTY `yes` or `--yes`;
+  JSON requires `--yes`. Before confirmation, non-TTY invocations perform no
+  managed-state read, recovery, or mutation. Removal never starts a provider or
+  browser process and never calls a token endpoint.
+- Removal holds both profile lifetime leases before removal or registry locks,
+  durably syncs those lock files, then validates root and tree inode/device,
+  current owner, owner-only profile-root mode, absence of group/other write on
+  traversed directories and regular files, validated no-follow leaf types,
+  single-link non-directory entries, exact marker, mount identity, depth, and
+  entry budget. macOS additionally requires no extended ACL entries on every
+  tree entry, including non-followed symlinks, sockets, and FIFOs, and no
+  immutable, append-only, or no-unlink file flags on managed roots and tree
+  entries. Readable provider-created descendants remain safe behind the `0700`
+  profile root, while traversed directories must retain owner `rwx`.
+  Ownership markers and lifetime locks are control-plane entries and remain
+  private single-link regular files. Locks are opened no-follow and their
+  opened/visible inode, owner, mode, and link count are matched before flock or
+  fsync, so symlink and hard-link replacements fail before transaction
+  preparation. A path-free
+  manifest digest and entry count prevent pre-visibility recovery from
+  restoring a tree with missing credentials or session state.
+- Stable `profiles.json` remains alpha.4-compatible schema v1. The first durable
+  removal state is a self-contained transient schema-v2 registry barrier that
+  embeds the expected v1 registry and prepared proof before any tree rename. A
+  strict alpha.4 reader rejects that barrier, preventing an old writer from
+  invalidating recovery. A matching sidecar is persisted next; the later stable
+  v1 registry without the immutable ID is the deletion visibility point.
+- Credentials are recursively unlinked only after stable-v1 readback proves
+  the ID absent. On Linux, every traversed directory and regular file uses
+  `openat2` beneath the provider descriptor with no-symlink, no-magic-link, and
+  no-cross-mount constraints; `statx` mount IDs make kernel 5.8 the minimum for
+  removal and recovery. macOS compares `fstatfs` identity for every opened
+  descriptor. Provider-created symlinks, sockets, FIFOs, and other special
+  leaves are never opened or followed; a no-follow metadata proof is recorded
+  and descriptor-relative `unlinkat` removes only the in-tree name. Unsupported
+  kernels and platforms fail closed without an unconstrained fallback. Mount
+  tokens may contain local path or server information, so they remain ephemeral
+  and are neither serialized nor logged.
+- Before Unix creation or acceptance, Calcifer canonicalizes the deepest
+  existing prefix of the configured data root once and appends only missing
+  normal components. The physical path is stored and passed explicitly to
+  coordinator and guardian self-execs. Operational paths must remain canonical;
+  every symlink ancestor is rejected, and every real directory ancestor must
+  be owned by root/current user and must not be group/other replaceable unless
+  sticky. On macOS, each existing managed regular file or directory and each
+  creation ancestor is opened with no-follow semantics. Type, owner, mode, file
+  flags, extended ACL, and device/inode identity used by one acceptance
+  decision are read from that same descriptor with `fstat` and
+  `acl_get_fd_np(ACL_TYPE_EXTENDED)`; the descriptor identity must also match a
+  no-follow lookup of the visible pathname. Any open, ACL, metadata, identity,
+  unsupported tag/bit, or malformed native representation fails closed. No
+  pathname ACL result is combined with metadata from a different vnode. This
+  binds one validation decision, but it is not a globally atomic snapshot and
+  does not permanently pin the pathname against an already-authorized active
+  mutator described above. Every ALLOW entry, every inheritable ACL entry, DENY permissions other than a
+  non-inheritable DELETE-only entry, and append, immutable,
+  DATAVAULT/RESTRICTED, or unknown parent flags fail before an inode exists. The
+  DELETE-only exception keeps the standard macOS home `everyone deny delete`
+  ACL compatible without admitting `deny delete_child`; parent-only
+  `SF_NOUNLINK` remains compatible with standard temp ancestry. Each new managed
+  directory or private file must then read back through its open descriptor
+  with an empty extended ACL and supported flags before credential bytes are
+  written. Existing extended ACL state is never silently normalized.
+- Removal-sidecar reads use a no-follow descriptor and match its inode, owner,
+  private mode, and single-link state to the visible path before bounded JSON
+  parsing.
+- Recovery restores only a complete pre-visibility tree and only completes
+  deletion after visibility; removal and registry locks remain held through
+  tombstone and sidecar durability. Missing or hard-linked registries,
+  mismatched barriers/sidecars, mount crossings, allocation-budget failures,
+  and all other ambiguity leave credential bytes intact and report a bounded
+  safe error. Normal registry writers recheck every removal artifact after
+  acquiring the registry lock.
+- Removal does not edit global Codex state, provider tokens, the installation
+  identity key, unrelated profiles, or conversation lineage. Reusing an alias
+  receives a fresh UUID. Filesystem unlinking does not guarantee secure erasure
+  from snapshots, backups, filesystem journals, or SSD wear leveling.
 - Lifecycle inspection is a version-pinned metadata projection. It validates the first session identity and recognizes only persisted start, complete, and abort tags; every response/tool payload is ignored. `interrupted` and `unknown_crash` may reopen the exact history with a warning, but no prompt, command, approval answer, or tool call is reconstructed or submitted. Bare and explicit exact resume retain lifecycle from a matching immutable binding even when pending or needs-selection state hides the workspace head. A clean pre-launch observation cannot clear persisted uncertainty; only lifecycle readback after the provider completes can do so. Immutable profile/cwd ownership conflicts terminalize the pending launch and require explicit selection instead of retrying forever.
 - Capture failure never silently downgrades to an uncaptured launch. Explicit `--untracked` run or profile-specific `resume --last` refuses a pending launch in the canonical workspace, atomically records metadata-only in-flight ownership and `needs_selection` before spawn, performs no inventory or post-capture, and leaves the marker intact across provider or spawn failure. Active ownership blocks cross-profile exact adoption, and exact post-exit refresh requires its original head to remain authoritative, closing both concurrency orderings. Registry errors and uncertain durability stop before spawn; bare resume remains unavailable until exact recovery.
 - Standard proxy and CA environment variables remain available for legitimate

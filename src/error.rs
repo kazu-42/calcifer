@@ -9,6 +9,7 @@ use crate::project_config::ProjectConfigError;
 
 #[derive(Debug)]
 pub(crate) enum AppError {
+    ConfirmationRequired,
     Conversation(ConversationError),
     Executable(ExecutableError),
     InteractiveJsonUnsupported,
@@ -23,6 +24,7 @@ pub(crate) enum AppError {
 impl AppError {
     pub(crate) const fn code(&self) -> &'static str {
         match self {
+            Self::ConfirmationRequired => "confirmation_required",
             Self::Conversation(error) => error.code(),
             Self::Executable(error) => error.code(),
             Self::InteractiveJsonUnsupported => "interactive_json_unsupported",
@@ -37,6 +39,7 @@ impl AppError {
 
     pub(crate) fn safe_message(&self) -> String {
         match self {
+            Self::ConfirmationRequired => "Profile removal requires an explicit TTY confirmation or `--yes`. No local profile state was changed.".to_owned(),
             Self::Conversation(error) => error.safe_message().to_owned(),
             Self::Executable(error) => error.safe_message().to_owned(),
             Self::InteractiveJsonUnsupported => "--json is not available for interactive auth, run, or resume commands because provider output owns the terminal.".to_owned(),
