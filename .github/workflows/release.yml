@@ -9,7 +9,11 @@ on:
       - Cargo.toml
       - Makefile
       - scripts/package_release.py
+      - scripts/release_manifest.py
       - scripts/test_package_release.py
+      - scripts/test_release_manifest.py
+      - scripts/test_verify_release.py
+      - scripts/verify_release.py
   push:
     tags:
       - "v*"
@@ -37,6 +41,9 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      source_commit: ${{ steps.version.outputs.source_commit }}
+      tag_ref_digest: ${{ steps.version.outputs.tag_ref_digest }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -65,7 +72,32 @@ jobs:
           fi
           printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
 
+          source_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          printf 'source_commit=%s\n' "${source_commit}" >> "${GITHUB_OUTPUT}"
+          release_channel="$(python3 - "${version}" <<'PY'
+          import sys
+
+          from scripts.release_manifest import release_channel
+
+          print(release_channel(sys.argv[1]))
+          PY
+          )"
+          if [[ "${release_channel}" == "preview" ]]; then
+            printf 'prerelease=true\n' >> "${GITHUB_OUTPUT}"
+          else
+            printf 'prerelease=false\n' >> "${GITHUB_OUTPUT}"
+          fi
+
+          if [[ "${IS_PUBLISH_EVENT}" == "true" ]] \
+            && [[ "${GITHUB_REPOSITORY}" != "kazu-42/calcifer" ]]; then
+            echo "Release publication is restricted to kazu-42/calcifer; found ${GITHUB_REPOSITORY}." >&2
+            exit 1
+          fi
+
           if [[ "${IS_PUBLISH_EVENT}" != "true" ]]; then
+            # No remote tag exists for PR/manual dry runs. This output is unused
+            # unless the publish job is enabled.
+            printf 'tag_ref_digest=%s\n' "${source_commit}" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
@@ -74,7 +106,28 @@ jobs:
             exit 1
           fi
 
-          release_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          tag_ref_json="$(gh api --method GET \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")"
+          tag_ref_digest="$(jq -r '.object.sha' <<<"${tag_ref_json}")"
+          tag_ref_type="$(jq -r '.object.type' <<<"${tag_ref_json}")"
+          if [[ ! "${tag_ref_digest}" =~ ^[0-9a-f]{40}$ ]] \
+            || [[ "${tag_ref_type}" != "tag" && "${tag_ref_type}" != "commit" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} has an invalid Git ref object." >&2
+            exit 1
+          fi
+          printf 'tag_ref_digest=%s\n' "${tag_ref_digest}" >> "${GITHUB_OUTPUT}"
+
+          tagged_commit="$(gh api --method GET \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}" \
+            --jq '.sha')"
+          if [[ "${tagged_commit}" != "${source_commit}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} resolved to ${tagged_commit}, expected ${source_commit}." >&2
+            exit 1
+          fi
+
+          release_commit="${source_commit}"
           git fetch --no-tags origin main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "${release_commit}" refs/remotes/origin/main; then
             echo "Release tags must point to a commit on main." >&2
@@ -146,6 +199,42 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: cargo +"${RUST_TOOLCHAIN}" build --release --locked --target "${TARGET}"
+      - name: Verify Linux glibc compatibility
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          binary="target/${TARGET}/release/calcifer"
+          runner_glibc="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
+          if [[ "${runner_glibc}" != "2.35" ]]; then
+            echo "Linux release runners must provide the documented glibc 2.35 baseline; found ${runner_glibc}." >&2
+            exit 1
+          fi
+
+          required_glibc="$(
+            readelf --version-info "${binary}" \
+              | sed -nE 's/.*Name: GLIBC_([0-9]+(\.[0-9]+)+).*/\1/p' \
+              | sort -Vu \
+              | tail -n 1
+          )"
+          if [[ -z "${required_glibc}" ]]; then
+            echo "Unable to determine the binary's required glibc symbol version." >&2
+            exit 1
+          fi
+          if [[ "$(printf '%s\n' "${required_glibc}" "2.35" | sort -V | tail -n 1)" != "2.35" ]]; then
+            echo "Binary requires GLIBC_${required_glibc}, newer than the documented 2.35 baseline." >&2
+            exit 1
+          fi
+
+          {
+            echo "### ${TARGET} runtime evidence"
+            echo
+            echo "- Native smoke-test runner glibc: ${runner_glibc}"
+            echo "- Highest required binary symbol: GLIBC_${required_glibc}"
+          } >> "${GITHUB_STEP_SUMMARY}"
       - name: Smoke test native binary
         shell: bash
         env:
@@ -227,6 +316,10 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check out release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Download target archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -236,6 +329,7 @@ jobs:
       - name: Validate bundle and write checksums
         shell: bash
         env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
@@ -257,11 +351,27 @@ jobs:
             echo "Expected exactly five release archives, found ${archive_count}." >&2
             exit 1
           fi
+
+          python3 scripts/release_manifest.py \
+            --dist dist \
+            --output dist/calcifer-release-manifest-v1.json \
+            --version "${VERSION}" \
+            --source-commit "${SOURCE_COMMIT}"
+
+          checksum_assets=(
+            "calcifer-release-manifest-v1.json"
+            "${expected[@]}"
+          )
           (
             cd dist
-            LC_ALL=C sha256sum "${expected[@]}" > SHA256SUMS
+            LC_ALL=C sha256sum "${checksum_assets[@]}" > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
+          python3 scripts/verify_release.py \
+            --dist dist \
+            --version "${VERSION}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --local-only
       - name: Upload release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -278,17 +388,33 @@ jobs:
       - validate
       - bundle
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       attestations: write
       contents: write
       id-token: write
     steps:
+      - name: Check out release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Download release bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-bundle
           path: dist
+      - name: Verify release bundle locally
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_release.py \
+            --dist dist \
+            --version "${VERSION}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --local-only
       - name: Refuse to replace an existing release
         shell: bash
         env:
@@ -296,27 +422,246 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          # shellcheck disable=SC2016
+          release_query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){id,isDraft,tagName}}}'
+          if ! release_lookup="$(gh api graphql \
+            -f query="${release_query}" \
+            -F owner="${GITHUB_REPOSITORY_OWNER}" \
+            -F name="${repository_name}" \
+            -F tag="${TAG}")"; then
+            echo "Unable to determine whether release ${TAG} exists." >&2
+            exit 1
+          fi
+          if ! jq -e \
+            '.data.repository != null and (.data.repository | has("release"))' \
+            <<<"${release_lookup}" >/dev/null; then
+            echo "GitHub returned an invalid release lookup for ${TAG}." >&2
+            exit 1
+          fi
+          if jq -e '.data.repository.release != null' \
+            <<<"${release_lookup}" >/dev/null; then
             echo "Release ${TAG} already exists; published artifacts are never replaced." >&2
             exit 1
           fi
-      - name: Attest release artifacts
+          gh attestation verify --help >/dev/null
+          gh release verify --help >/dev/null
+          gh release verify-asset --help >/dev/null
+      # This attests the exact assembled bytes after local semantic validation.
+      # It is not a separate provenance statement emitted by each native build job.
+      - name: Attest assembled release artifacts
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: dist/*
-      - name: Create immutable-by-policy pre-release
+      - name: Verify assembled-artifact attestations
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
         run: |
           set -euo pipefail
-          gh release create "${TAG}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --fail-on-no-commits \
-            --generate-notes \
-            --notes "Pre-alpha release. Verify SHA256SUMS and GitHub artifact attestations before installation." \
-            --prerelease \
-            --latest=false \
+          for asset in dist/*; do
+            verified=false
+            for attempt in {1..10}; do
+              if gh attestation verify "${asset}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+                --source-ref "${GITHUB_REF}" \
+                --source-digest "${SOURCE_COMMIT}" \
+                --deny-self-hosted-runners >/dev/null; then
+                verified=true
+                break
+              fi
+              if [[ "${attempt}" -lt 10 ]]; then
+                sleep 3
+              fi
+            done
+            if [[ "${verified}" != "true" ]]; then
+              echo "Artifact attestation was not verifiable for ${asset} within the deadline." >&2
+              exit 1
+            fi
+          done
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+          TAG: ${{ github.ref_name }}
+          TAG_REF_DIGEST: ${{ needs.validate.outputs.tag_ref_digest }}
+        run: |
+          set -euo pipefail
+          current_tag_ref="$(gh api --method GET \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" \
+            --jq '.object.sha')"
+          if [[ "${current_tag_ref}" != "${TAG_REF_DIGEST}" ]]; then
+            echo "Tag ${TAG} ref digest is ${current_tag_ref}, expected ${TAG_REF_DIGEST}." >&2
+            exit 1
+          fi
+
+          tag_commit="$(gh api --method GET \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/commits/${TAG}" \
+            --jq '.sha')"
+          if [[ "${tag_commit}" != "${SOURCE_COMMIT}" ]]; then
+            echo "Tag ${TAG} resolved to ${tag_commit}, expected ${SOURCE_COMMIT}." >&2
+            exit 1
+          fi
+
+          release_args=(
+            --repo "${GITHUB_REPOSITORY}"
+            --verify-tag
+            --target "${SOURCE_COMMIT}"
+            --fail-on-no-commits
+            --generate-notes
+            --notes "Verify SHA256SUMS and GitHub artifact attestations before installation."
+            --draft
+            --latest=false
             --title "Calcifer ${TAG}"
+          )
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "${TAG}" "${release_args[@]}"
+      - name: Upload and verify draft assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG}" dist/* --repo "${GITHUB_REPOSITORY}"
+          draft_verified=false
+          for attempt in {1..20}; do
+            if gh api --method GET \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+              > "${RUNNER_TEMP}/release-draft.json" \
+              && python3 scripts/verify_release.py \
+                --release-json "${RUNNER_TEMP}/release-draft.json" \
+                --dist dist \
+                --version "${VERSION}" \
+                --source-commit "${SOURCE_COMMIT}" \
+                --expected-prerelease "${PRERELEASE}" \
+                --stage draft; then
+              draft_verified=true
+              break
+            fi
+            if [[ "${attempt}" -lt 20 ]]; then
+              sleep 3
+            fi
+          done
+          if [[ "${draft_verified}" != "true" ]]; then
+            echo "Draft release did not match the local bundle within the verification deadline." >&2
+            exit 1
+          fi
+      - name: Publish and verify immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+          TAG: ${{ github.ref_name }}
+          TAG_REF_DIGEST: ${{ needs.validate.outputs.tag_ref_digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          latest_flag="--latest"
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            latest_flag="--latest=false"
+          fi
+
+          current_tag_ref="$(gh api --method GET \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" \
+            --jq '.object.sha')"
+          if [[ "${current_tag_ref}" != "${TAG_REF_DIGEST}" ]]; then
+            echo "Tag ${TAG} ref digest is ${current_tag_ref}, expected ${TAG_REF_DIGEST}." >&2
+            exit 1
+          fi
+
+          tag_commit="$(gh api --method GET \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/commits/${TAG}" \
+            --jq '.sha')"
+          if [[ "${tag_commit}" != "${SOURCE_COMMIT}" ]]; then
+            echo "Tag ${TAG} resolved to ${tag_commit}, expected ${SOURCE_COMMIT}." >&2
+            exit 1
+          fi
+
+          gh release edit "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            "${latest_flag}"
+
+          immutable=false
+          for attempt in {1..40}; do
+            if gh api --method GET \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+              > "${RUNNER_TEMP}/release-published.json" \
+              && jq -e '.immutable == true' "${RUNNER_TEMP}/release-published.json" >/dev/null; then
+              immutable=true
+              break
+            fi
+            if [[ "${attempt}" -lt 40 ]]; then
+              sleep 3
+            fi
+          done
+          if [[ "${immutable}" != "true" ]]; then
+            echo "Published release did not become immutable within the verification deadline." >&2
+            exit 1
+          fi
+
+          python3 scripts/verify_release.py \
+            --release-json "${RUNNER_TEMP}/release-published.json" \
+            --dist dist \
+            --version "${VERSION}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --expected-prerelease "${PRERELEASE}" \
+            --stage published
+
+          release_verified=false
+          for attempt in {1..40}; do
+            if gh release verify "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --format json \
+              > "${RUNNER_TEMP}/release-attestation.json" \
+              && python3 scripts/verify_release.py \
+                --release-attestation-json "${RUNNER_TEMP}/release-attestation.json" \
+                --dist dist \
+                --version "${VERSION}" \
+                --source-commit "${SOURCE_COMMIT}" \
+                --tag-ref-digest "${TAG_REF_DIGEST}"; then
+              release_verified=true
+              break
+            fi
+            if [[ "${attempt}" -lt 40 ]]; then
+              sleep 3
+            fi
+          done
+          if [[ "${release_verified}" != "true" ]]; then
+            echo "The immutable release attestation was not verifiable within the deadline." >&2
+            exit 1
+          fi
+          for asset in dist/*; do
+            asset_verified=false
+            for attempt in {1..10}; do
+              if gh release verify-asset "${TAG}" "${asset}" \
+                --repo "${GITHUB_REPOSITORY}"; then
+                asset_verified=true
+                break
+              fi
+              if [[ "${attempt}" -lt 10 ]]; then
+                sleep 2
+              fi
+            done
+            if [[ "${asset_verified}" != "true" ]]; then
+              echo "Release attestation did not verify ${asset} within the deadline." >&2
+              exit 1
+            fi
+          done

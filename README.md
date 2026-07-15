@@ -229,7 +229,8 @@ If `~/.local/bin` is not on `PATH`, run `~/.local/bin/calcifer --json doctor` or
 Starting with `v0.1.0-alpha.3`, Calcifer publishes pre-release archives for
 Linux glibc 2.35+ on x86-64/ARM64, macOS Intel/Apple silicon, and Windows x86-64 on the
 [GitHub Releases page](https://github.com/kazu-42/calcifer/releases). Every
-release includes SHA-256 checksums and GitHub build-provenance attestations.
+release includes SHA-256 checksums and GitHub artifact attestations minted by
+the release workflow over the assembled release assets.
 The binaries are not yet code-signed or notarized.
 
 Download only the archive for your operating system and architecture, verify it
