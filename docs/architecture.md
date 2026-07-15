@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration, pinned launch, same-profile resume, and structured on-demand status are implemented. The cross-profile conversation handoff design is accepted; its supervisor and automatic failover implementation remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, and structured on-demand status are implemented. The cross-profile conversation handoff design is accepted; its supervisor and automatic failover implementation remain future work.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -38,6 +38,7 @@ A repository-local file must never be able to select an account or failover pool
 | --- | --- | --- |
 | CLI parser | Parse explicit commands and the `--` provider-argument boundary | Accept implicit external subcommands or an arbitrary executable |
 | Registry | Store non-secret opaque profile metadata | Store raw tokens in diagnostics or logs |
+| Private identity store | Detect equivalent Codex account/workspace scopes without exposing provider identifiers | Claim that different scopes have independent quota |
 | Conversation lineage registry | Bind one logical conversation to ordered profile-local thread generations | Treat a credential profile ID as the conversation ID |
 | Provider adapter | Build an isolated environment and classify supported structured signals | Reimplement undocumented OAuth flows or scrape TUI text |
 | Profile lease | Serialize profile mutation, usage probes, and child lifetime | Rely on PID files as the lock authority |
@@ -65,6 +66,7 @@ Future code that violates one of these invariants requires an architecture decis
 13. **Conversations have lineage.** Every provider thread is bound to its credential profile and canonical working directory, while one user-visible conversation may advance through multiple profile-local thread generations in one trust domain.
 14. **Resume is not replay.** Restoring persisted conversation history never resubmits an interrupted prompt, command, or tool action.
 15. **Repository configuration cannot route accounts.** Interactive launch accepts only version-reviewed repository settings and binds the final provider to the canonical working directory that was inspected.
+16. **Provider identity stays private.** A bounded provider-owned scope is immediately reduced to an installation-local HMAC fingerprint; raw scopes, fingerprints, and identity-key IDs never enter public DTOs or diagnostics.
 
 ## Codex profile model
 
@@ -103,7 +105,9 @@ the [managed config specification](../specs/managed-codex-config.md).
 
 Different profiles may run concurrently. The same profile has at most one official CLI child or usage probe because either operation may refresh profile-local credentials.
 
-The registry currently proves local profile provenance, not provider account uniqueness. It does not publish or compare a stable provider account ID, so two local aliases can still refer to the same ChatGPT account. Identity verification is required before aliases may safely participate in a failover pool.
+The public registry proves only local profile provenance. Separately, each new supported Codex profile has a private `.calcifer-identity` marker bound to an installation-local `identity.key`. Calcifer derives a versioned HMAC-SHA-256 fingerprint over length-delimited provider, supported auth kind, adapter version, and effective `tokens.account_id`; the raw account/workspace scope remains only in provider-owned `auth.json`. Registration rejects an equal verified fingerprint under another alias. Distinct fingerprints establish only different effective routing scopes, not independent quota.
+
+Profiles created before this binding remain valid for explicit `run`, `resume`, and status. `calcifer auth verify codex@<alias>` acquires the profile lease, performs the exact `0.144.4` initialize/home/version gate without an account request, parses the same bounded auth projection, and serializes its uniqueness check and marker publication under the registry lock. It never opens a login flow or rewrites credentials. A future selector must use the lease-retaining revalidation API: missing markers, key loss/replacement, unsupported adapters/auth modes, malformed auth, and fingerprint drift stop the whole selection attempt. See [ADR 0002](adr/0002-private-provider-identity-binding.md).
 
 ## Implemented same-profile resume
 
@@ -191,7 +195,7 @@ Calcifer-owned metadata updates follow a same-filesystem atomic-write sequence:
 3. Atomically rename it to the destination.
 4. `fsync` the parent directory.
 
-Registration happens in a staging directory and becomes visible only after the official login exits successfully and a private regular `auth.json`, ownership marker, and expected directory layout are present. The profile directory is renamed and its provider parent synced before registry publication. The registry rename is the visibility point: if the following directory sync fails, Calcifer preserves both the visible entry and credentials, reports `registry_commit_uncertain`, and tells the user to read back `auth list` rather than retry blindly. Stable provider identity verification, interrupted-staging recovery, re-authentication, and remove flows are not implemented yet. A failed normal login performs checked cleanup; a hard crash can leave a private orphan staging directory for later recovery tooling.
+Registration happens in a staging directory and becomes visible only after the official login exits successfully; private `auth.json`, managed config, and ownership metadata pass revalidation; the installed Codex adapter passes its exact initialize/home/version gate; and a unique private identity marker has been written and synced. Credentials and binding are then published with one profile-directory rename before registry publication. The registry rename is the public visibility point: if the following directory sync fails, Calcifer preserves both the visible entry and credentials, reports `registry_commit_uncertain`, and tells the user to read back `auth list` rather than retry blindly. An identity file rename followed by uncertain parent sync is read back and reported as `identity_commit_uncertain`; a retry adopts an already-complete marker rather than invoking login again. Re-authentication, re-key, remove, and orphan-staging cleanup flows are not implemented yet. A failed normal login performs checked cleanup; a hard crash can leave a private orphan staging directory for later recovery tooling.
 
 ## Process execution
 
@@ -263,7 +267,7 @@ Rollback applies to Calcifer metadata, default pointers, observation caches, and
 
 Before the first stable release, the project still needs reviewed ADRs for:
 
-- provider identity verification;
+- deliberate all-profile re-key recovery after identity-key loss;
 - process/PTY supervision on Linux, macOS, and Windows;
 - supported Codex version/schema gates and observation cache TTL/backoff;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;

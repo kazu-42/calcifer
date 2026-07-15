@@ -7,7 +7,7 @@
 Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-agent CLIs with isolated account profiles and structured usage visibility.
 
 > [!WARNING]
-> **Status: functional pre-alpha.** Codex profile registration, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. Automatic failover, cross-profile session handoff, remove/reauth flows, and verified Windows credential ACLs are not implemented yet.
+> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. Automatic failover, cross-profile session handoff, remove/reauth flows, and verified Windows credential ACLs are not implemented yet.
 
 Calcifer is intended to make routine selection among accounts that you already own or are authorized to use feel boring: authenticate each profile through the provider's official CLI, keep each profile isolated, and start every new CLI process with an explicit profile.
 
@@ -42,6 +42,9 @@ calcifer auth add codex work
 calcifer auth add codex personal
 calcifer auth list
 
+# Bind a profile created by an earlier Calcifer release without logging in again.
+calcifer auth verify codex@work
+
 # Read every idle registered profile, or one idle profile, without changing the global login.
 calcifer status
 calcifer status codex@work
@@ -61,7 +64,7 @@ calcifer resume codex@work 01900000-0000-7000-8000-000000000001
 calcifer resume
 ```
 
-Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes authentication, project trust, and session state there, so exiting Calcifer does not discard the conversation. Calcifer accepts supported Codex project-trust updates semantically while continuing to require profile-local file storage for both Codex account and MCP OAuth credentials and reject profile/provider routing overrides, including MCP OAuth callback URL and port overrides. Managed Codex role configuration is currently unsupported: both a top-level `agents` table and any auto-discovered `CODEX_HOME/agents` node fail closed because role files can add indirect complete configuration layers. `calcifer resume codex@work` remains the explicit official `codex resume --last` convenience; bare `calcifer resume` resolves Calcifer's exact tracked workspace thread and never falls back to `--last`.
+Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes authentication, project trust, and session state there, so exiting Calcifer does not discard the conversation. Before publication, Calcifer version-gates the installed Codex `0.144.4` adapter and derives an installation-private HMAC fingerprint from the effective ChatGPT account/workspace scope in the provider-owned credential file. A second local alias for the same scope is rejected without displaying or storing the raw scope outside `auth.json`; different scopes are not claimed to guarantee independent provider quota. Profiles created by earlier releases remain usable for explicit operations and become failover-eligible only after an explicit, non-interactive `auth verify` succeeds. Calcifer accepts supported Codex project-trust updates semantically while continuing to require profile-local file storage for both Codex account and MCP OAuth credentials and reject profile/provider routing overrides, including MCP OAuth callback URL and port overrides. Managed Codex role configuration is currently unsupported: both a top-level `agents` table and any auto-discovered `CODEX_HOME/agents` node fail closed because role files can add indirect complete configuration layers. `calcifer resume codex@work` remains the explicit official `codex resume --last` convenience; bare `calcifer resume` resolves Calcifer's exact tracked workspace thread and never falls back to `--last`.
 
 Before interactive `run` and `resume`, Calcifer canonicalizes the working directory and checks every repository-local `.codex` layer from the nearest real `.git` root to that directory. Any `.codex/agents` filesystem node fails closed even when `config.toml` is absent; otherwise only a Codex 0.144.4-scoped set of repository settings that do not own managed authentication, provider routing, dynamic features, or state locations is accepted. Unknown keys, ambiguous filesystem nodes, invalid TOML, and files larger than 1 MiB fail before Codex starts. In a linked worktree, Codex 0.144.4 can additionally merge only `hooks` from the primary checkout; Calcifer does not resolve that external hook source, and repository hooks remain outside its sandbox guarantee. This preflight protects Calcifer's account-routing boundary, but it does not make repository hooks, plugins, tools, or code safe.
 
@@ -77,7 +80,7 @@ Normal `run` and profile-specific `resume` remain fail-closed when Calcifer cann
 
 `status` starts the installed official `codex app-server` inside each idle profile and calls the structured `account/rateLimits/read` method. Before that read, it requires the tested Codex `0.144.4` initialize contract and verifies that the server reports the selected canonical `CODEX_HOME`. Untested versions, changed initialize data, a different home, or a changed usage schema fail closed as `unknown`; Calcifer does not send the usage request after an initialize-gate rejection. It displays all returned limit buckets, primary and secondary used/remaining percentages, reset times, workspace credit state, monthly spend control when present, and rate-limit reset-credit count and expirations. It does not scrape the interactive `/status` screen or read token values from `auth.json`.
 
-An active `run` or `resume` holds a split exclusive lease because a second Codex process could race credential refresh and session writes. A launch coordinator owns one half and a provider guardian owns the other; either process surviving a selective crash keeps the profile busy until the exact provider exits. Consequently, status for that active profile is currently `profile_busy` / `unknown`; a list query inspects profiles serially with a per-profile timeout. Active-session monitoring, cached last-known observations, and automatic failover still require a profile-owned usage supervisor. Also, a Calcifer profile is a local alias: provider identity is not yet verified, so two aliases may point to the same underlying account and quota.
+An active `run` or `resume` holds a split exclusive lease because a second Codex process could race credential refresh and session writes. A launch coordinator owns one half and a provider guardian owns the other; either process surviving a selective crash keeps the profile busy until the exact provider exits. Consequently, status for that active profile is currently `profile_busy` / `unknown`; a list query inspects profiles serially with a per-profile timeout. Active-session monitoring, cached last-known observations, and automatic failover still require a profile-owned usage supervisor. Provider identity is revalidated under the same exclusive lease before any future automatic selection; a changed or externally replaced login fails closed instead of silently rebinding the local alias.
 
 Example human output:
 
@@ -115,7 +118,7 @@ Example JSON envelope:
 }
 ```
 
-For structured `doctor`, `auth list`, and `status` results, `--json` emits one JSON document on stdout. Interactive `auth add`, `run`, and `resume` reject `--json` because the official provider owns the terminal and mixing its stream with a Calcifer JSON document would break the contract. Usage failures emit one redacted JSON document on stderr with exit code `2`. Clap's standard `--help` and `--version` output remains text even when `--json` is present. Within schema version 1, existing field names and meanings will remain stable; new fields may be added.
+For structured `doctor`, `auth list`, `auth verify`, and `status` results, `--json` emits one JSON document on stdout. Interactive `auth add`, `run`, and `resume` reject `--json` because the official provider owns the terminal and mixing its stream with a Calcifer JSON document would break the contract. Identity JSON contains only Calcifer-local profile metadata and never the private fingerprint, identity-key ID, or provider account scope. Usage failures emit one redacted JSON document on stderr with exit code `2`. Clap's standard `--help` and `--version` output remains text even when `--json` is present. Within schema version 1, existing field names and meanings will remain stable; new fields may be added.
 
 ## Planned interface
 
@@ -155,6 +158,7 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Read-only environment diagnostics | Implemented | No credential access |
 | Codex profile isolation | Implemented on Unix | One `CODEX_HOME` per profile; official Codex login and refresh |
 | Same-profile Codex resume | Implemented on Unix for Codex 0.144.4 | Tracked workspace head, explicit exact thread ID, or official `--last`; no prompt replay |
+| Private Codex identity binding | Implemented for 0.144.4 ChatGPT auth | HMAC equality only; duplicate aliases and credential drift fail closed |
 | Codex usage observation | Implemented on demand for idle profiles | Structured app-server response; active profiles need the planned supervisor |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
 | Opt-in profile pools | Design | Same provider and trust domain; bounded selection |
@@ -250,8 +254,8 @@ The CI contract covers formatting and Clippy on Rust 1.96, tests on Linux/macOS/
 The current and next slices keep Codex profile isolation with no shared runtime home:
 
 1. **Implemented:** private Unix registry, profile-name validation, ownership markers, and atomic metadata writes.
-2. **Implemented:** `auth add/list`, `run`, same-profile `resume`, profile leases, and structured on-demand status.
-3. **Implemented:** exact same-profile thread capture, crash reconciliation, and no-argument cold restore. Provider identity verification and safe remove/reauth flows remain.
+2. **Implemented:** `auth add/list/verify`, private Codex identity binding, `run`, same-profile `resume`, profile leases, and structured on-demand status.
+3. **Implemented:** exact same-profile thread capture, crash reconciliation, and no-argument cold restore. Safe remove/reauth/re-key flows remain.
 4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
 6. Add version-gated cross-profile conversation handoff as the default successful failover path; preserve one profile-local writer per lineage generation.

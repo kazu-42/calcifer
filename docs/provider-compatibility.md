@@ -82,6 +82,51 @@ Relevant sources and local policy:
 - [Codex 0.144.4 configuration loader](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/config/src/loader/mod.rs);
 - [managed repository configuration specification](../specs/managed-codex-project-config.md).
 
+## Codex private provider identity
+
+Codex `0.144.4` has no stable public account read that returns the effective
+account/workspace routing scope: `account/read` exposes email and plan type,
+and `codex login status` exposes only the authentication kind. Neither is a
+safe uniqueness key. For this one allowlisted release, the provider-owned
+file-backed auth model contains `auth_mode` and optional
+`tokens.account_id`; the official login flow derives that value from the
+selected ChatGPT account/workspace and uses it as `ChatGPT-Account-ID` on
+backend requests.
+
+Calcifer therefore treats this as a version-scoped persisted compatibility
+surface, not a cross-version API. Before registration or explicit legacy
+verification it performs the normal App Server initialize/home/version gate,
+but sends no account request. It then reads at most 1 MiB from the private
+regular `auth.json` and decodes only `auth_mode` plus `tokens.account_id`.
+Missing, empty, malformed, oversized, unsupported-auth, or untested-version
+state fails closed. JWT claims, email, plan type, API-key modes, and `codex
+login status` are not used.
+
+The account scope is immediately reduced with an installation-local,
+domain-separated HMAC over a length-delimited tuple containing provider,
+supported auth kind, adapter version, and scope. The raw scope is never
+persisted outside `auth.json`; the key ID and fingerprint are private marker
+fields and never public output. Equal fingerprints prove that two aliases use
+the same effective routing scope and are rejected. Different fingerprints do
+not prove independent provider quota.
+
+New registration writes the binding inside staging before the profile
+directory and registry entry become visible. Existing unbound profiles remain
+usable for explicit run, resume, and status; `calcifer auth verify
+codex@<alias>` adds the binding without login, credential copying, or direct
+OAuth refresh. Verification holds the profile lease through the compatibility
+probe and auth read, then serializes the uniqueness check and marker commit
+against registration. Future automatic selection must rederive and compare the
+binding under the same retained lease. Key loss/replacement, credential drift,
+or ambiguous legacy duplicates stop selection and require explicit recovery.
+
+Relevant upstream sources:
+
+- [Codex 0.144.4 persisted token model](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/login/src/token_data.rs#L10-L41);
+- [official login persistence](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/login/src/server.rs#L860-L900);
+- [account request routing header](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/model-provider/src/bearer_auth_provider.rs#L28-L45);
+- [account/read response](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/app-server-protocol/src/protocol/v2/account.rs#L479-L495).
+
 ## Codex resume
 
 Codex persists sessions beneath the selected `CODEX_HOME`, normally as:
@@ -199,7 +244,7 @@ The normalized response can contain:
 
 Reset-credit detail arrays may be absent or shorter than `availableCount`; the count is authoritative. A missing summary means unavailable, not zero. Calcifer intentionally discards opaque reset-credit IDs and backend-provided title/description before constructing its public output.
 
-Each read is attached to the local profile ID, canonical managed home, and exclusive lease—not to an email address. Calcifer does not yet verify a stable provider account identity, so two registered aliases may represent the same account and quota. A profile with an active `run` or `resume` child reports busy/unknown; Calcifer does not start a second app-server against the same refreshable `auth.json`.
+Each read is attached to the local profile ID, canonical managed home, and exclusive lease—not to an email address. New profiles also have the private version-scoped identity binding described above; legacy unbound profiles can still be read but cannot participate in automatic selection until explicit verification. A profile with an active `run` or `resume` child reports busy/unknown; Calcifer does not start a second app-server against the same refreshable `auth.json`.
 
 `account/usage/read` is a different token-activity report. It is not a quota or exhaustion signal and is not used for profile selection.
 

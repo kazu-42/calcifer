@@ -14,6 +14,43 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Capability proving that the installed Codex process passed the exact
+/// identity-adapter initialize/home/version gate.
+///
+/// The production constructor is private to this provider module. Other
+/// modules can receive and consume the capability but cannot mint one.
+#[derive(Clone, Copy)]
+pub(crate) struct CodexIdentityAdapter {
+    _private: (),
+}
+
+impl CodexIdentityAdapter {
+    const fn v0_144_4() -> Self {
+        Self { _private: () }
+    }
+
+    pub(crate) const fn id(self) -> &'static str {
+        Self::supported_id()
+    }
+
+    pub(crate) const fn version(self) -> &'static str {
+        Self::supported_version()
+    }
+
+    pub(crate) const fn supported_id() -> &'static str {
+        "codex-auth-json/0.144.4/v1"
+    }
+
+    pub(crate) const fn supported_version() -> &'static str {
+        "0.144.4"
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) const fn for_test() -> Self {
+        Self::v0_144_4()
+    }
+}
+
 pub(crate) const CLI_FILE_CREDENTIALS_OVERRIDE: &str = r#"cli_auth_credentials_store="file""#;
 pub(crate) const MCP_OAUTH_FILE_CREDENTIALS_OVERRIDE: &str =
     r#"mcp_oauth_credentials_store="file""#;
@@ -437,6 +474,60 @@ pub fn read_account_usage(
     working_directory: &Path,
     timeout: Duration,
 ) -> Result<CodexUsageObservation, CodexUsageFailure> {
+    let (mut process, codex_version, deadline) =
+        initialize_compatible_app_server(codex_executable, codex_home, working_directory, timeout)?;
+
+    process
+        .send(&json!({ "method": "initialized", "params": {} }))
+        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
+    process
+        .send(&json!({
+            "id": RATE_LIMITS_REQUEST_ID,
+            "method": CODEX_STATUS_PROTOCOL,
+            "params": null
+        }))
+        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
+
+    let result = process
+        .receive_result(RATE_LIMITS_REQUEST_ID, deadline)
+        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
+    let usage = parse_rate_limits_result(result)
+        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
+    Ok(CodexUsageObservation {
+        codex_version,
+        usage,
+    })
+}
+
+/// Verifies the installed App Server before enabling the persisted 0.144.4
+/// auth projection used for private provider identity binding.
+///
+/// This performs only the initialize/home/version gate. It does not call an
+/// account endpoint, refresh endpoint, or browser login flow.
+pub(crate) fn verify_codex_identity_adapter(
+    codex_executable: &Path,
+    codex_home: &Path,
+    working_directory: &Path,
+    timeout: Duration,
+) -> Result<CodexIdentityAdapter, CodexUsageFailure> {
+    let (_process, codex_version, _deadline) =
+        initialize_compatible_app_server(codex_executable, codex_home, working_directory, timeout)?;
+    if codex_version == "0.144.4" {
+        Ok(CodexIdentityAdapter::v0_144_4())
+    } else {
+        Err(CodexUsageFailure::incompatible(
+            CodexUsageError::Unsupported,
+            Some(codex_version),
+        ))
+    }
+}
+
+fn initialize_compatible_app_server(
+    codex_executable: &Path,
+    codex_home: &Path,
+    working_directory: &Path,
+    timeout: Duration,
+) -> Result<(AppServerProcess, String, Instant), CodexUsageFailure> {
     if !codex_executable.is_absolute() {
         return Err(CodexUsageFailure::before_gate(CodexUsageError::Spawn));
     }
@@ -468,27 +559,7 @@ pub fn read_account_usage(
         .map_err(CodexUsageFailure::before_gate)?;
     let codex_version = validate_initialize_result(initialize_result, codex_home)
         .map_err(|error| CodexUsageFailure::incompatible(error.kind, error.codex_version))?;
-
-    process
-        .send(&json!({ "method": "initialized", "params": {} }))
-        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
-    process
-        .send(&json!({
-            "id": RATE_LIMITS_REQUEST_ID,
-            "method": CODEX_STATUS_PROTOCOL,
-            "params": null
-        }))
-        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
-
-    let result = process
-        .receive_result(RATE_LIMITS_REQUEST_ID, deadline)
-        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
-    let usage = parse_rate_limits_result(result)
-        .map_err(|error| CodexUsageFailure::after_gate(error, &codex_version))?;
-    Ok(CodexUsageObservation {
-        codex_version,
-        usage,
-    })
+    Ok((process, codex_version, deadline))
 }
 
 /// Reads only the official CLI version without relying on App Server support.

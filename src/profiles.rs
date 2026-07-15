@@ -9,6 +9,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::provider_identity::{IdentityError, IdentityKey, IdentityStore, ProviderIdentity};
+use crate::providers::codex::CodexIdentityAdapter;
+
 const REGISTRY_SCHEMA_VERSION: u8 = 1;
 const REGISTRY_FILE: &str = "profiles.json";
 const LOCK_FILE: &str = "registry.lock";
@@ -356,6 +359,92 @@ impl Registry {
         })
     }
 
+    /// Creates or checks the private identity marker for a legacy profile.
+    ///
+    /// Lock order is profile lease, then registry lock. Registration holds only
+    /// the registry lock while operating on an unpublished staging directory,
+    /// so the two flows cannot deadlock. Future re-authentication must preserve
+    /// this order for published profiles.
+    pub(crate) fn verify_or_bind_codex_identity(
+        &self,
+        profile: &Profile,
+        resolve_adapter: impl FnOnce(&Path) -> Result<CodexIdentityAdapter, ProfileError>,
+    ) -> Result<VerifiedProviderIdentityLease, ProfileError> {
+        let lease = self.lock_profile(profile)?;
+        let home = self.profile_home(profile)?;
+        let adapter = {
+            // The version-only App Server probe receives the provider-side
+            // lease. If the verifier is killed, its stdio EOF stops the probe
+            // before another credential writer can acquire this profile.
+            #[cfg(unix)]
+            let _provider_lock_inheritance = lease.inherit_provider_lock()?;
+            resolve_adapter(&home)?
+        };
+        let profile_directory = self.profile_directory(profile)?;
+        let _registry_lock = self.lock_exclusive()?;
+        let document = self.load()?;
+        if !document
+            .profiles
+            .iter()
+            .any(|registered| registered == profile)
+        {
+            return Err(ProfileError::NotFound(profile.reference()));
+        }
+
+        let store = IdentityStore::new(&self.root);
+        let key = store.load_or_create_key(self.has_identity_bindings(&document, &store)?)?;
+        let current = store.derive_codex_binding(&home, &key, adapter)?;
+        let marker_exists = store.marker_exists(&profile_directory)?;
+        if marker_exists {
+            store.revalidate_marker(&profile_directory, &key, &current)?;
+        }
+        if let Some(conflict) =
+            self.find_identity_conflict(&document, &store, &key, &current, Some(&profile.id))?
+        {
+            return Err(ProfileError::DuplicateProviderIdentity {
+                requested: profile.reference(),
+                existing: conflict.reference(),
+            });
+        }
+        if !marker_exists {
+            store.publish_marker(&profile_directory, &current)?;
+        }
+
+        Ok(VerifiedProviderIdentityLease {
+            _lease: lease,
+            profile: profile.clone(),
+            identity: current,
+        })
+    }
+
+    /// Revalidates a bound profile after acquiring its exclusive process lease.
+    /// The returned guard keeps that lease alive until launch authorization is
+    /// either consumed or abandoned.
+    #[allow(dead_code)] // Consumed by the failover selector introduced in issue #4.
+    pub(crate) fn revalidate_codex_identity(
+        &self,
+        profile: &Profile,
+        resolve_adapter: impl FnOnce(&Path) -> Result<CodexIdentityAdapter, ProfileError>,
+    ) -> Result<VerifiedProviderIdentityLease, ProfileError> {
+        let lease = self.lock_profile(profile)?;
+        let home = self.profile_home(profile)?;
+        let adapter = {
+            #[cfg(unix)]
+            let _provider_lock_inheritance = lease.inherit_provider_lock()?;
+            resolve_adapter(&home)?
+        };
+        let profile_directory = self.profile_directory(profile)?;
+        let store = IdentityStore::new(&self.root);
+        let key = store.load_key()?;
+        let current = store.derive_codex_binding(&home, &key, adapter)?;
+        store.revalidate_marker(&profile_directory, &key, &current)?;
+        Ok(VerifiedProviderIdentityLease {
+            _lease: lease,
+            profile: profile.clone(),
+            identity: current,
+        })
+    }
+
     /// Acquires the coordinator side of the split process lease.
     ///
     /// A launch coordinator holds this lock while its provider guardian holds
@@ -458,6 +547,48 @@ impl Registry {
         FileExt::lock_exclusive(&file)?;
         Ok(RegistryLock { _file: file })
     }
+
+    fn has_identity_bindings(
+        &self,
+        _document: &RegistryDocument,
+        store: &IdentityStore<'_>,
+    ) -> Result<bool, ProfileError> {
+        let provider_root = self.root.join("profiles").join("codex");
+        verify_private_directory(&provider_root)?;
+        for entry in fs::read_dir(provider_root)? {
+            let path = entry?.path();
+            // Never traverse an untrusted entry to look for a marker. A
+            // malformed orphan blocks key creation instead of being skipped.
+            verify_private_directory(&path)?;
+            if store.marker_exists(&path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn find_identity_conflict<'a>(
+        &self,
+        document: &'a RegistryDocument,
+        store: &IdentityStore<'_>,
+        key: &IdentityKey,
+        candidate: &ProviderIdentity,
+        excluded_profile_id: Option<&str>,
+    ) -> Result<Option<&'a Profile>, ProfileError> {
+        for profile in &document.profiles {
+            if excluded_profile_id == Some(profile.id.as_str()) {
+                continue;
+            }
+            let profile_directory = self.profile_directory(profile)?;
+            let Some(binding) = store.read_marker(&profile_directory, key)? else {
+                continue;
+            };
+            if candidate.same_provider_identity(&binding) {
+                return Ok(Some(profile));
+            }
+        }
+        Ok(None)
+    }
 }
 
 pub(crate) struct PendingProfile<'a> {
@@ -479,8 +610,25 @@ impl PendingProfile<'_> {
         Ok(())
     }
 
-    pub(crate) fn commit(mut self) -> Result<Profile, ProfileError> {
+    pub(crate) fn commit(mut self, adapter: CodexIdentityAdapter) -> Result<Profile, ProfileError> {
         verify_managed_codex_home(&self.home())?;
+        let document = self.registry.load()?;
+        let store = IdentityStore::new(&self.registry.root);
+        let key =
+            store.load_or_create_key(self.registry.has_identity_bindings(&document, &store)?)?;
+        let identity = store.derive_codex_binding(&self.home(), &key, adapter)?;
+        if let Some(conflict) = self
+            .registry
+            .find_identity_conflict(&document, &store, &key, &identity, None)?
+        {
+            return Err(ProfileError::DuplicateProviderIdentity {
+                requested: self.profile.reference(),
+                existing: conflict.reference(),
+            });
+        }
+        store.publish_marker(&self.staging, &identity)?;
+        store.revalidate_marker(&self.staging, &key, &identity)?;
+
         let final_directory = self
             .staging
             .parent()
@@ -565,6 +713,23 @@ pub(crate) struct ProfileLease {
     provider: Option<File>,
 }
 
+pub(crate) struct VerifiedProviderIdentityLease {
+    _lease: ProfileLease,
+    profile: Profile,
+    identity: ProviderIdentity,
+}
+
+impl VerifiedProviderIdentityLease {
+    pub(crate) const fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
+    #[allow(dead_code)] // Used by pool uniqueness validation in issue #4.
+    pub(crate) fn same_provider_identity(&self, other: &Self) -> bool {
+        self.identity.same_provider_identity(&other.identity)
+    }
+}
+
 #[cfg(unix)]
 impl ProfileLease {
     /// Temporarily allows the provider-side lock to survive one `exec`.
@@ -616,6 +781,8 @@ impl Drop for ProviderLockInheritance<'_> {
 pub(crate) enum ProfileError {
     AlreadyExists(String),
     Busy(String),
+    DuplicateProviderIdentity { requested: String, existing: String },
+    Identity(IdentityError),
     InvalidAlias,
     InvalidRegistry(String),
     Io(io::Error),
@@ -632,6 +799,8 @@ impl ProfileError {
         match self {
             Self::AlreadyExists(_) => "profile_already_exists",
             Self::Busy(_) => "profile_busy",
+            Self::DuplicateProviderIdentity { .. } => "duplicate_provider_identity",
+            Self::Identity(error) => error.code(),
             Self::InvalidAlias => "invalid_profile_alias",
             Self::InvalidRegistry(_) => "invalid_registry",
             Self::Io(_) => "io_error",
@@ -648,6 +817,13 @@ impl ProfileError {
         match self {
             Self::AlreadyExists(reference) => format!("Profile {reference} already exists."),
             Self::Busy(reference) => format!("Profile {reference} is already in use."),
+            Self::DuplicateProviderIdentity {
+                requested,
+                existing,
+            } => format!(
+                "Profiles {requested} and {existing} resolve to the same private provider identity. Choose a different provider account."
+            ),
+            Self::Identity(error) => error.safe_message().to_owned(),
             Self::InvalidAlias => "Profile aliases must be 1-64 ASCII letters, digits, '.', '_' or '-', and must start with a letter or digit.".to_owned(),
             Self::InvalidRegistry(reason) => format!("Calcifer's profile registry is invalid: {reason}."),
             Self::Io(_) => "Calcifer could not access its managed profile storage.".to_owned(),
@@ -675,6 +851,12 @@ impl std::error::Error for ProfileError {}
 impl From<io::Error> for ProfileError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<IdentityError> for ProfileError {
+    fn from(error: IdentityError) -> Self {
+        Self::Identity(error)
     }
 }
 
@@ -1135,6 +1317,31 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
+    fn write_test_codex_auth(home: &Path) -> Result<(), ProfileError> {
+        let account_scope = Uuid::new_v4().to_string();
+        write_test_codex_auth_for_scope(home, &account_scope)
+    }
+
+    #[cfg(unix)]
+    fn write_test_codex_auth_for_scope(
+        home: &Path,
+        account_scope: &str,
+    ) -> Result<(), ProfileError> {
+        let document = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "account_id": account_scope }
+        });
+        let bytes = serde_json::to_vec(&document)
+            .map_err(|_| ProfileError::UnsafeState("test auth serialization failed".to_owned()))?;
+        write_private_file(&home.join("auth.json"), &bytes)
+    }
+
+    #[cfg(unix)]
+    const fn test_identity_adapter() -> CodexIdentityAdapter {
+        CodexIdentityAdapter::for_test()
+    }
+
     #[test]
     fn alias_validation_rejects_paths_and_ambiguous_references() {
         for alias in ["", ".hidden", "../work", "work/personal", "a@b", "火"] {
@@ -1342,16 +1549,400 @@ config_file = "{sensitive_path}"
 
     #[cfg(unix)]
     #[test]
+    fn registration_rejects_duplicate_provider_identity_and_cleans_staging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("duplicate-provider-identity");
+        let registry = Registry::at(root.clone());
+        let account_scope = Uuid::new_v4().to_string();
+
+        let first = registry.begin_codex_registration("work")?;
+        write_test_codex_auth_for_scope(&first.home(), &account_scope)?;
+        let first_profile = first.commit(test_identity_adapter())?;
+
+        let second = registry.begin_codex_registration("personal")?;
+        write_test_codex_auth_for_scope(&second.home(), &account_scope)?;
+        let second_staging = second.staging.clone();
+        let error = second
+            .commit(test_identity_adapter())
+            .err()
+            .ok_or("duplicate identity must fail")?;
+
+        assert_eq!(error.code(), "duplicate_provider_identity");
+        let message = error.safe_message();
+        assert!(message.contains("codex@work"));
+        assert!(message.contains("codex@personal"));
+        assert!(!message.contains(&account_scope));
+        assert!(!second_staging.exists());
+        assert_eq!(registry.list()?, vec![first_profile]);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_allows_distinct_provider_scopes() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("distinct-provider-identities");
+        let registry = Registry::at(root.clone());
+
+        for alias in ["work", "personal"] {
+            let pending = registry.begin_codex_registration(alias)?;
+            write_test_codex_auth(&pending.home())?;
+            pending.commit(test_identity_adapter())?;
+        }
+
+        assert_eq!(registry.list()?.len(), 2);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_duplicate_registrations_publish_at_most_one_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let root = temporary_root("concurrent-duplicate-registration");
+        let account_scope = Uuid::new_v4().to_string();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for alias in ["work", "personal"] {
+            let worker_root = root.clone();
+            let worker_scope = account_scope.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                worker_barrier.wait();
+                let registry = Registry::at(worker_root);
+                let pending = registry
+                    .begin_codex_registration(alias)
+                    .map_err(|error| error.code())?;
+                write_test_codex_auth_for_scope(&pending.home(), &worker_scope)
+                    .map_err(|error| error.code())?;
+                pending
+                    .commit(test_identity_adapter())
+                    .map(|profile| profile.reference())
+                    .map_err(|error| error.code())
+            }));
+        }
+        barrier.wait();
+
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().map_err(|_| "registration worker panicked"))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(result, Err(code) if *code == "duplicate_provider_identity")
+                })
+                .count(),
+            1
+        );
+
+        let registry = Registry::at(root.clone());
+        assert_eq!(registry.list()?.len(), 1);
+        assert!(!root.join("profiles/codex").read_dir()?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with(".staging-"))
+        }));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_verification_respects_an_active_profile_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = temporary_root("verify-active-lease");
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_codex_registration("work")?;
+        write_test_codex_auth(&pending.home())?;
+        let profile = pending.commit(test_identity_adapter())?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        fs::remove_file(profile_directory.join(crate::provider_identity::IDENTITY_MARKER_FILE))?;
+        let _active_process_lease = registry.lock_profile(&profile)?;
+        let adapter_probe_ran = AtomicBool::new(false);
+
+        let error = registry
+            .verify_or_bind_codex_identity(&profile, |_| {
+                adapter_probe_ran.store(true, Ordering::SeqCst);
+                Ok(test_identity_adapter())
+            })
+            .err()
+            .ok_or("verification must not enter an active profile")?;
+        assert_eq!(error.code(), "profile_busy");
+        assert!(!adapter_probe_ran.load(Ordering::SeqCst));
+        assert!(
+            !profile_directory
+                .join(crate::provider_identity::IDENTITY_MARKER_FILE)
+                .exists()
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_verification_is_explicit_idempotent_and_detects_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("legacy-identity-verification");
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_codex_registration("work")?;
+        write_test_codex_auth(&pending.home())?;
+        let profile = pending.commit(test_identity_adapter())?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        fs::remove_file(profile_directory.join(crate::provider_identity::IDENTITY_MARKER_FILE))?;
+
+        let unverified = registry
+            .revalidate_codex_identity(&profile, |_| Ok(test_identity_adapter()))
+            .err()
+            .ok_or("legacy profile must remain unverified")?;
+        assert_eq!(unverified.code(), "provider_identity_unverified");
+
+        let first =
+            registry.verify_or_bind_codex_identity(&profile, |_| Ok(test_identity_adapter()))?;
+        assert_eq!(first.profile(), &profile);
+        drop(first);
+        let repeated =
+            registry.verify_or_bind_codex_identity(&profile, |_| Ok(test_identity_adapter()))?;
+        drop(repeated);
+
+        let home = registry.profile_home(&profile)?;
+        fs::remove_file(home.join("auth.json"))?;
+        let changed_scope = Uuid::new_v4().to_string();
+        write_test_codex_auth_for_scope(&home, &changed_scope)?;
+        let error = registry
+            .revalidate_codex_identity(&profile, |_| Ok(test_identity_adapter()))
+            .err()
+            .ok_or("changed credentials must fail closed")?;
+        assert_eq!(error.code(), "provider_identity_mismatch");
+        assert!(!error.safe_message().contains(&changed_scope));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_duplicate_verification_mutates_neither_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("legacy-duplicate-verification");
+        let registry = Registry::at(root.clone());
+        let duplicate_scope = Uuid::new_v4().to_string();
+
+        let first = registry.begin_codex_registration("work")?;
+        write_test_codex_auth_for_scope(&first.home(), &duplicate_scope)?;
+        let first = first.commit(test_identity_adapter())?;
+
+        let second = registry.begin_codex_registration("personal")?;
+        write_test_codex_auth(&second.home())?;
+        let second = second.commit(test_identity_adapter())?;
+        let second_directory = registry.profile_directory(&second)?;
+        fs::remove_file(second_directory.join(crate::provider_identity::IDENTITY_MARKER_FILE))?;
+        let second_home = registry.profile_home(&second)?;
+        fs::remove_file(second_home.join("auth.json"))?;
+        write_test_codex_auth_for_scope(&second_home, &duplicate_scope)?;
+
+        let error = registry
+            .verify_or_bind_codex_identity(&second, |_| Ok(test_identity_adapter()))
+            .err()
+            .ok_or("legacy duplicate must fail")?;
+        assert_eq!(error.code(), "duplicate_provider_identity");
+        assert!(!error.safe_message().contains(&duplicate_scope));
+        assert!(registry.profile_home(&first)?.join("auth.json").is_file());
+        assert!(registry.profile_home(&second)?.join("auth.json").is_file());
+        assert!(
+            !second_directory
+                .join(crate::provider_identity::IDENTITY_MARKER_FILE)
+                .exists()
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_detects_preexisting_duplicate_bindings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("preexisting-duplicate-bindings");
+        let registry = Registry::at(root.clone());
+        let duplicate_scope = Uuid::new_v4().to_string();
+
+        let first = registry.begin_codex_registration("work")?;
+        write_test_codex_auth_for_scope(&first.home(), &duplicate_scope)?;
+        let first = first.commit(test_identity_adapter())?;
+        let first_directory = registry.profile_directory(&first)?;
+
+        let second = registry.begin_codex_registration("personal")?;
+        write_test_codex_auth(&second.home())?;
+        let second = second.commit(test_identity_adapter())?;
+        let second_directory = registry.profile_directory(&second)?;
+        let marker_name = crate::provider_identity::IDENTITY_MARKER_FILE;
+        fs::remove_file(second_directory.join(marker_name))?;
+        write_private_file(
+            &second_directory.join(marker_name),
+            &fs::read(first_directory.join(marker_name))?,
+        )?;
+        let second_home = registry.profile_home(&second)?;
+        fs::remove_file(second_home.join("auth.json"))?;
+        write_test_codex_auth_for_scope(&second_home, &duplicate_scope)?;
+
+        let error = registry
+            .verify_or_bind_codex_identity(&second, |_| Ok(test_identity_adapter()))
+            .err()
+            .ok_or("preexisting duplicate bindings must fail")?;
+        assert_eq!(error.code(), "duplicate_provider_identity");
+        assert!(!error.safe_message().contains(&duplicate_scope));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_legacy_verification_publishes_at_most_one_duplicate_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let root = temporary_root("concurrent-legacy-verification");
+        let registry = Registry::at(root.clone());
+        let duplicate_scope = Uuid::new_v4().to_string();
+        let mut profiles = Vec::new();
+        for alias in ["work", "personal"] {
+            let pending = registry.begin_codex_registration(alias)?;
+            write_test_codex_auth(&pending.home())?;
+            let profile = pending.commit(test_identity_adapter())?;
+            let directory = registry.profile_directory(&profile)?;
+            fs::remove_file(directory.join(crate::provider_identity::IDENTITY_MARKER_FILE))?;
+            let home = registry.profile_home(&profile)?;
+            fs::remove_file(home.join("auth.json"))?;
+            write_test_codex_auth_for_scope(&home, &duplicate_scope)?;
+            profiles.push(profile);
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = profiles
+            .into_iter()
+            .map(|profile| {
+                let worker_root = root.clone();
+                let worker_barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    worker_barrier.wait();
+                    Registry::at(worker_root)
+                        .verify_or_bind_codex_identity(&profile, |_| Ok(test_identity_adapter()))
+                        .map(|verified| verified.profile().reference())
+                        .map_err(|error| error.code())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().map_err(|_| "verification worker panicked"))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(result, Err(code) if *code == "duplicate_provider_identity")
+                })
+                .count(),
+            1
+        );
+        let marker_count = fs::read_dir(root.join("profiles/codex"))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .join(crate::provider_identity::IDENTITY_MARKER_FILE)
+                    .is_file()
+            })
+            .count();
+        assert_eq!(marker_count, 1);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_identity_key_disables_bound_profile_revalidation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("lost-identity-key");
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_codex_registration("work")?;
+        write_test_codex_auth(&pending.home())?;
+        let profile = pending.commit(test_identity_adapter())?;
+        fs::remove_file(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
+
+        let error = registry
+            .revalidate_codex_identity(&profile, |_| Ok(test_identity_adapter()))
+            .err()
+            .ok_or("missing key must fail closed")?;
+        assert_eq!(error.code(), "identity_key_unavailable");
+        assert!(
+            !root
+                .join(crate::provider_identity::IDENTITY_KEY_FILE)
+                .exists()
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_binding_prevents_silent_key_recreation() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("orphaned-binding-key-loss");
+        let registry = Registry::at(root.clone());
+        let first = registry.begin_codex_registration("work")?;
+        write_test_codex_auth(&first.home())?;
+        first.commit(test_identity_adapter())?;
+
+        fs::remove_file(root.join(REGISTRY_FILE))?;
+        let empty_registry = serde_json::to_vec_pretty(&RegistryDocument::default())?;
+        write_private_file(&root.join(REGISTRY_FILE), &empty_registry)?;
+        fs::remove_file(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
+
+        let replacement = registry.begin_codex_registration("replacement")?;
+        write_test_codex_auth(&replacement.home())?;
+        let error = replacement
+            .commit(test_identity_adapter())
+            .err()
+            .ok_or("orphaned binding must block key recreation")?;
+        assert_eq!(error.code(), "identity_key_unavailable");
+        assert!(
+            !root
+                .join(crate::provider_identity::IDENTITY_KEY_FILE)
+                .exists()
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn published_profiles_accept_the_previous_managed_config_during_upgrade()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = temporary_root("legacy-config-upgrade");
         let registry = Registry::at(root.clone());
         let pending = registry.begin_codex_registration("work")?;
-        write_private_file(
-            &pending.home().join("auth.json"),
-            br#"{"synthetic":"test-only"}"#,
-        )?;
-        let profile = pending.commit()?;
+        write_test_codex_auth(&pending.home())?;
+        let profile = pending.commit(test_identity_adapter())?;
         let config = root
             .join("profiles")
             .join("codex")
@@ -1376,7 +1967,7 @@ config_file = "{sensitive_path}"
         let root = temporary_root("missing-auth");
         let registry = Registry::at(root.clone());
         let pending = registry.begin_codex_registration("work")?;
-        let result = pending.commit();
+        let result = pending.commit(test_identity_adapter());
         assert!(matches!(result, Err(ProfileError::UnsafeState(_))));
         assert!(registry.list()?.is_empty());
         fs::remove_dir_all(root)?;
@@ -1391,15 +1982,12 @@ config_file = "{sensitive_path}"
         let registry = Registry::at(root.clone());
 
         let pending = registry.begin_codex_registration("work")?;
-        write_private_file(
-            &pending.home().join("auth.json"),
-            br#"{"synthetic":"test-only"}"#,
-        )?;
+        write_test_codex_auth(&pending.home())?;
         fs::write(
             pending.home().join("config.toml"),
             b"cli_auth_credentials_store = \"file\"\n[agents.reviewer]\ndescription = \"synthetic\"\n",
         )?;
-        let role_error = match pending.commit() {
+        let role_error = match pending.commit(test_identity_adapter()) {
             Err(error) => error,
             Ok(_) => panic!("registration published a role config"),
         };
@@ -1408,12 +1996,9 @@ config_file = "{sensitive_path}"
         assert!(registry.list()?.is_empty());
 
         let pending = registry.begin_codex_registration("work")?;
-        write_private_file(
-            &pending.home().join("auth.json"),
-            br#"{"synthetic":"test-only"}"#,
-        )?;
+        write_test_codex_auth(&pending.home())?;
         fs::create_dir(pending.home().join("agents"))?;
-        let node_error = match pending.commit() {
+        let node_error = match pending.commit(test_identity_adapter()) {
             Err(error) => error,
             Ok(_) => panic!("registration published an auto-discovered agents node"),
         };
@@ -1436,11 +2021,8 @@ config_file = "{sensitive_path}"
         let root = temporary_root("profile-revalidation");
         let registry = Registry::at(root.clone());
         let pending = registry.begin_codex_registration("work")?;
-        write_private_file(
-            &pending.home().join("auth.json"),
-            br#"{"synthetic":"test-only"}"#,
-        )?;
-        let profile = pending.commit()?;
+        write_test_codex_auth(&pending.home())?;
+        let profile = pending.commit(test_identity_adapter())?;
         let home = root
             .join("profiles")
             .join("codex")
@@ -1487,11 +2069,8 @@ config_file = "{sensitive_path}"
         let root = temporary_root("profile-agents-revalidation");
         let registry = Registry::at(root.clone());
         let pending = registry.begin_codex_registration("work")?;
-        write_private_file(
-            &pending.home().join("auth.json"),
-            br#"{"synthetic":"test-only"}"#,
-        )?;
-        let profile = pending.commit()?;
+        write_test_codex_auth(&pending.home())?;
+        let profile = pending.commit(test_identity_adapter())?;
         let home = root
             .join("profiles")
             .join("codex")
@@ -1539,12 +2118,9 @@ config_file = "{sensitive_path}"
         let root = temporary_root("registry-sync-failure");
         let registry = Registry::at_with_registry_sync_failure(root.clone());
         let pending = registry.begin_codex_registration("work")?;
-        write_private_file(
-            &pending.home().join("auth.json"),
-            br#"{"synthetic":"test-only"}"#,
-        )?;
+        write_test_codex_auth(&pending.home())?;
 
-        let result = pending.commit();
+        let result = pending.commit(test_identity_adapter());
         assert!(matches!(
             result,
             Err(ProfileError::RegistryCommitUncertain(_))

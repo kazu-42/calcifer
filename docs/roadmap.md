@@ -26,7 +26,8 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 
 - [ ] Complete `auth add/list/show/remove/reauth codex` (`add` and `list` are implemented)
 - [x] Official `codex login` in a profile-specific `CODEX_HOME`
-- [ ] Provider identity verification before profile publication
+- [x] Version-scoped private provider identity verification before profile publication
+- [x] Explicit identity verification for legacy profiles; unbound profiles remain manual-only
 - [x] File-backed credential-store configuration scoped to the managed home
 - [x] Revalidate managed auth/config and reject account/provider-routing argument overrides
 - [ ] Complete adapter-selected executable hardening and process supervision (direct argv, owner/parent-mode checks, crash-tolerant split launch leases, and ordinary exit codes are implemented; complete signal semantics remain)
