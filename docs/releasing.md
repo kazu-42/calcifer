@@ -249,9 +249,9 @@ On Linux or macOS, extract the archive for the current architecture and copy the
 binary into a user-owned directory on `PATH`:
 
 ```console
-tar -xzf calcifer-v0.1.0-alpha.3-<target>.tar.gz
+tar -xzf calcifer-v0.1.0-alpha.4-<target>.tar.gz
 install -d "$HOME/.local/bin"
-install -m 0755 calcifer-v0.1.0-alpha.3-<target>/calcifer "$HOME/.local/bin/calcifer"
+install -m 0755 calcifer-v0.1.0-alpha.4-<target>/calcifer "$HOME/.local/bin/calcifer"
 ```
 
 On Windows, expand the `.zip` archive and place `calcifer.exe` in a user-owned
