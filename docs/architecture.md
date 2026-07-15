@@ -86,7 +86,20 @@ managed root/
 ```
 
 The display name is not used as a filesystem path. A generated opaque ID is
-mapped from a validated, normalized display name. Calcifer writes a minimal
+mapped from a validated display name. That opaque ID is the durable ownership
+key; the alias is mutable local metadata. `auth rename` acquires the published
+profile lease and then the registry lock, revalidates the ID-to-alias mapping,
+and atomically replaces only the registry document. It never reads or rewrites
+credentials, provider-identity markers, session state, or conversation state,
+and it never renames the managed directory. Run, resume, status, identity, and
+conversation references continue to resolve to the immutable profile ID. A
+public run/resume reference is converted to that ID before the internal
+coordinator starts; the coordinator rechecks the expected alias while holding
+its profile lease, and the provider guardian receives only the immutable ID.
+Consequently, a rename that wins the race makes a stale launch fail before its
+notice or provider spawn, while a coordinator that wins keeps rename busy.
+
+Calcifer writes a minimal
 managed `config.toml` and revalidates it with a Codex-version-scoped semantic
 policy. Supported project trust and reviewed user settings may change, while
 account/provider routing, state locations, dynamic extensions, and project-root
@@ -196,6 +209,15 @@ Calcifer-owned metadata updates follow a same-filesystem atomic-write sequence:
 4. `fsync` the parent directory.
 
 Registration happens in a staging directory and becomes visible only after the official login exits successfully; private `auth.json`, managed config, and ownership metadata pass revalidation; the installed Codex adapter passes its exact initialize/home/version gate; and a unique private identity marker has been written and synced. Credentials and binding are then published with one profile-directory rename before registry publication. The registry rename is the public visibility point: if the following directory sync fails, Calcifer preserves both the visible entry and credentials, reports `registry_commit_uncertain`, and tells the user to read back `auth list` rather than retry blindly. An identity key or marker rename followed by uncertain parent sync is read back; the same registration retries only that idempotent directory sync and adopts the complete state without invoking login again. If durability remains uncertain, Calcifer reports `identity_commit_uncertain`, keeps the profile unpublished, preserves the complete staging credentials for explicit recovery, and blocks every later registration before provider login while any orphan staging directory remains. Re-authentication, re-key, remove, and orphan-staging cleanup flows are not implemented yet. A failed normal login performs checked cleanup; a hard crash can leave a private orphan staging directory for later recovery tooling and likewise blocks a second login.
+
+For a published-profile alias change, failures before the atomic-rename
+visibility point leave the old complete registry visible. Failure while syncing
+the parent directory occurs after the visibility point and therefore returns
+`registry_commit_uncertain`; a read-back sees one complete old-or-new document,
+never a partial registry. Published-profile lifecycle operations use the lock
+order profile coordinator, profile provider, then registry. This makes an
+active run/resume/status probe and a rename choose exactly one winner and keeps
+identity verification and future remove/reauth flows from deadlocking.
 
 ## Process execution
 

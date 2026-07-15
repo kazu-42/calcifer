@@ -299,6 +299,304 @@ fn non_normalized_home_is_rejected_before_staging() -> Result<(), Box<dyn std::e
 
 #[cfg(unix)]
 #[test]
+fn profile_rename_is_offline_atomic_and_preserves_managed_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-profile-rename-{}-{nonce}",
+        std::process::id()
+    ));
+    let bin = sandbox.join("bin");
+    let offline_bin = sandbox.join("offline-bin");
+    let root = sandbox.join("state");
+    let provider_log = sandbox.join("provider.log");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir(&offline_bin)?;
+    let fake_codex = bin.join("codex");
+    std::fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+set -eu
+printf 'home=%s args=%s\n' "${CODEX_HOME:-unset}" "$*" >> "$FAKE_CODEX_LOG"
+if [ "${1:-}" = "-c" ]; then
+  shift 4
+fi
+case "${1:-}" in
+  --version)
+    printf 'codex-cli %s\n' "${FAKE_CODEX_VERSION:-0.144.4}"
+    ;;
+  login)
+    umask 077
+    printf '{"auth_mode":"chatgpt","tokens":{"account_id":"scope-%s-%s","access_token":"synthetic-private-sentinel@example.invalid"}}\n' "$PPID" "$$" > "$CODEX_HOME/auth.json"
+    ;;
+  app-server)
+    IFS= read -r initialize
+    case "$initialize" in
+      *'"method":"initialize"'*'"experimentalApi":false'*) ;;
+      *) exit 93 ;;
+    esac
+    printf '{"id":0,"result":{"userAgent":"calcifer/0.144.4 (test)","platformFamily":"unix","platformOs":"test","codexHome":"%s"}}\n' "$CODEX_HOME"
+    IFS= read -r initialized || exit 0
+    ;;
+esac
+"#,
+    )?;
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700))?;
+    let path = std::env::join_paths([bin.as_path()])?;
+
+    let add = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .args(["auth", "add", "codex", "work"])
+        .output()?;
+    assert!(add.status.success(), "{}", String::from_utf8(add.stderr)?);
+    let add_personal = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .args(["auth", "add", "codex", "personal"])
+        .output()?;
+    assert!(
+        add_personal.status.success(),
+        "{}",
+        String::from_utf8(add_personal.stderr)?
+    );
+
+    let registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("profiles.json"))?)?;
+    let profile = &registry["profiles"][0];
+    let profile_id = profile["id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("profile id must be present"))?;
+    let created_at = profile["created_at"].clone();
+    let profile_dir = root.join("profiles").join("codex").join(profile_id);
+    let home = profile_dir.join("home");
+    let auth = home.join("auth.json");
+    let config = home.join("config.toml");
+    let sessions = home.join("sessions.jsonl");
+    let identity = profile_dir.join(".calcifer-provider-identity");
+    std::fs::write(&sessions, b"synthetic-session-private-sentinel")?;
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(&identity, b"synthetic-identity-private-sentinel")?;
+    std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600))?;
+    let before_inode = std::fs::metadata(&profile_dir)?.ino();
+    let before = [
+        std::fs::read(&auth)?,
+        std::fs::read(&config)?,
+        std::fs::read(&sessions)?,
+        std::fs::read(&identity)?,
+        std::fs::read(profile_dir.join(".calcifer-profile"))?,
+    ];
+    let provider_log_before = std::fs::read(&provider_log)?;
+
+    let rename = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "auth", "rename", "codex@work", "client-a"])
+        .output()?;
+    let rename_document: serde_json::Value = serde_json::from_slice(&rename.stdout)?;
+    assert!(
+        rename.status.success(),
+        "{}",
+        String::from_utf8(rename.stderr.clone())?
+    );
+    assert!(rename.stderr.is_empty());
+    assert_eq!(rename_document["schema_version"], 1);
+    assert_eq!(rename_document["command"], "auth");
+    assert_eq!(rename_document["ok"], true);
+    assert_eq!(rename_document["action"], "rename");
+    assert_eq!(rename_document["changed"], true);
+    assert_eq!(rename_document["from"], "codex@work");
+    assert_eq!(rename_document["to"], "codex@client-a");
+    assert_eq!(rename_document["profile"]["id"], profile_id);
+    assert_eq!(rename_document["profile"]["alias"], "client-a");
+    assert_eq!(rename_document["profile"]["provider"], "codex");
+    assert_eq!(rename_document["profile"]["created_at"], created_at);
+
+    let rendered = String::from_utf8(rename.stdout)?;
+    for private in [
+        "synthetic-private-sentinel@example.invalid",
+        "synthetic-session-private-sentinel",
+        "synthetic-identity-private-sentinel",
+        &root.display().to_string(),
+    ] {
+        assert!(!rendered.contains(private));
+    }
+    assert_eq!(std::fs::metadata(&profile_dir)?.ino(), before_inode);
+    assert_eq!(
+        [
+            std::fs::read(&auth)?,
+            std::fs::read(&config)?,
+            std::fs::read(&sessions)?,
+            std::fs::read(&identity)?,
+            std::fs::read(profile_dir.join(".calcifer-profile"))?,
+        ],
+        before
+    );
+    assert_eq!(std::fs::read(&provider_log)?, provider_log_before);
+
+    let stale_handoff = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .args(["__internal-codex", profile_id, "codex@work", "run"])
+        .output()?;
+    let stale_handoff_error = String::from_utf8(stale_handoff.stderr)?;
+    assert_eq!(stale_handoff.status.code(), Some(1));
+    assert_eq!(
+        stale_handoff_error,
+        "error: Profile codex@work was not found.\n"
+    );
+    assert_eq!(std::fs::read(&provider_log)?, provider_log_before);
+
+    let registry_after_rename = std::fs::read(root.join("profiles.json"))?;
+    for (arguments, expected_code) in [
+        (
+            ["codex@client-a", "../private-sentinel"],
+            "invalid_profile_alias",
+        ),
+        (["codex@client-a", "personal"], "profile_already_exists"),
+        (["codex@missing", "replacement"], "profile_not_found"),
+    ] {
+        let failure = calcifer()
+            .env("PATH", &offline_bin)
+            .env("CALCIFER_HOME", &root)
+            .args(["--json", "auth", "rename", arguments[0], arguments[1]])
+            .output()?;
+        let document: serde_json::Value = serde_json::from_slice(&failure.stderr)?;
+        assert_eq!(failure.status.code(), Some(1));
+        assert!(failure.stdout.is_empty());
+        assert_eq!(document["schema_version"], 1);
+        assert_eq!(document["command"], "auth");
+        assert_eq!(document["ok"], false);
+        assert_eq!(document["error"]["code"], expected_code);
+        let failure_text = String::from_utf8(failure.stderr)?;
+        for private in [
+            "synthetic-private-sentinel@example.invalid",
+            "synthetic-session-private-sentinel",
+            "synthetic-identity-private-sentinel",
+            "private-sentinel",
+            &root.display().to_string(),
+        ] {
+            assert!(!failure_text.contains(private));
+        }
+        assert_eq!(
+            std::fs::read(root.join("profiles.json"))?,
+            registry_after_rename
+        );
+    }
+
+    let old = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "status", "codex@work"])
+        .output()?;
+    let old_error: serde_json::Value = serde_json::from_slice(&old.stderr)?;
+    assert_eq!(old.status.code(), Some(1));
+    assert_eq!(old_error["error"]["code"], "profile_not_found");
+
+    let unchanged = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "auth", "rename", "codex@client-a", "client-a"])
+        .output()?;
+    let unchanged_document: serde_json::Value = serde_json::from_slice(&unchanged.stdout)?;
+    assert!(unchanged.status.success());
+    assert_eq!(unchanged_document["changed"], false);
+    assert_eq!(unchanged_document["from"], "codex@client-a");
+    assert_eq!(unchanged_document["to"], "codex@client-a");
+
+    let human = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["auth", "rename", "codex@client-a", "client-b"])
+        .output()?;
+    assert!(human.status.success());
+    assert_eq!(
+        String::from_utf8(human.stdout)?,
+        "Renamed codex@client-a to codex@client-b.\n"
+    );
+    assert!(human.stderr.is_empty());
+    assert_eq!(std::fs::read(&provider_log)?, provider_log_before);
+
+    let list = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "auth", "list"])
+        .output()?;
+    let list_document: serde_json::Value = serde_json::from_slice(&list.stdout)?;
+    assert!(list.status.success());
+    assert!(
+        list_document["profiles"]
+            .as_array()
+            .is_some_and(|profiles| {
+                profiles
+                    .iter()
+                    .any(|profile| profile["id"] == profile_id && profile["alias"] == "client-b")
+            })
+    );
+
+    let status = calcifer()
+        .env("PATH", &offline_bin)
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "status", "codex@client-b"])
+        .output()?;
+    let status_document: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(status.status.code(), Some(1));
+    assert_eq!(status_document["profiles"][0]["profile"], "codex@client-b");
+    assert_ne!(
+        status_document["profiles"][0]["error"]["code"],
+        "profile_not_found"
+    );
+
+    for (arguments, version) in [
+        (
+            vec!["run", "--untracked", "codex@client-b", "--", "--help"],
+            None,
+        ),
+        (vec!["resume", "--untracked", "codex@client-b"], None),
+        (
+            vec![
+                "resume",
+                "codex@client-b",
+                "01900000-0000-7000-8000-000000000001",
+            ],
+            Some("0.144.5"),
+        ),
+    ] {
+        let mut command = calcifer();
+        command
+            .env("PATH", &path)
+            .env("CALCIFER_HOME", &root)
+            .env("FAKE_CODEX_LOG", &provider_log)
+            .args(arguments);
+        if let Some(version) = version {
+            command.env("FAKE_CODEX_VERSION", version);
+        }
+        let output = command.output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8(output.stderr)?
+        );
+    }
+    let provider_log_after_launch = String::from_utf8(std::fs::read(&provider_log)?)?;
+    assert!(provider_log_after_launch.contains(&format!("home={}", home.display())));
+    assert!(provider_log_after_launch.contains(
+        "args=-c cli_auth_credentials_store=\"file\" -c mcp_oauth_credentials_store=\"file\" --help"
+    ));
+    assert!(provider_log_after_launch.contains("resume --last"));
+    assert!(provider_log_after_launch.contains("resume 01900000-0000-7000-8000-000000000001"));
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_codex_profile_supports_status_run_and_exact_resume()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;

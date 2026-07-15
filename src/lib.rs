@@ -122,6 +122,14 @@ where
                     Err(error) => render_app_error("auth", &error, cli.json),
                 },
             },
+            AuthCommand::Rename { profile, new_alias } => match profile.provider {
+                ProviderArgument::Codex => {
+                    match commands::auth::rename_codex(&profile.alias, &new_alias) {
+                        Ok(report) => render_rename_report(&report, cli.json),
+                        Err(error) => render_app_error("auth", &error, cli.json),
+                    }
+                }
+            },
             AuthCommand::List => match commands::auth::list() {
                 Ok(report) => render_auth_report(&report, cli.json),
                 Err(error) => render_app_error("auth", &error, cli.json),
@@ -179,7 +187,8 @@ where
             Err(error) => render_app_error("status", &error, cli.json),
         },
         Commands::InternalCodex {
-            profile,
+            profile_id,
+            expected_profile,
             mode,
             session_id,
             provider_args,
@@ -191,42 +200,41 @@ where
                     true,
                 );
             }
-            match profile.provider {
+            match expected_profile.provider {
                 ProviderArgument::Codex => {
                     let notice = match mode {
                         cli::InternalProcessMode::Run => format!(
                             "Calcifer: launching codex@{} (explicit profile).",
-                            profile.alias
+                            expected_profile.alias
                         ),
                         cli::InternalProcessMode::RunUntracked => format!(
                             "Calcifer: launching codex@{} in explicit untracked mode.",
-                            profile.alias
+                            expected_profile.alias
                         ),
                         cli::InternalProcessMode::ResumeLast => format!(
                             "Calcifer: resuming latest session in codex@{} (same profile; no prompt replay).",
-                            profile.alias
+                            expected_profile.alias
                         ),
                         cli::InternalProcessMode::ResumeLastUntracked => format!(
                             "Calcifer: resuming the latest session in codex@{} in explicit untracked mode.",
-                            profile.alias
+                            expected_profile.alias
                         ),
                         cli::InternalProcessMode::ResumeExact => format!(
                             "Calcifer: resuming requested thread in codex@{} (same profile; no prompt replay).",
-                            profile.alias
+                            expected_profile.alias
                         ),
                         cli::InternalProcessMode::ResumeHead => format!(
                             "Calcifer: resuming this workspace's tracked thread in codex@{} (same profile; exact ID; no prompt replay).",
-                            profile.alias
+                            expected_profile.alias
                         ),
                     };
-                    if write_stderr(&notice).is_err() {
-                        return ExitCode::FAILURE;
-                    }
                     match commands::process::supervise_codex(
-                        &profile.alias,
+                        profile_id.as_str(),
+                        &expected_profile.alias,
                         mode,
                         session_id.as_deref(),
                         &provider_args,
+                        || write_stderr(&notice),
                     ) {
                         Ok(status) => exit_code_from_status(status),
                         Err(error) => render_app_error("__internal-codex", &error, false),
@@ -235,7 +243,7 @@ where
             }
         }
         Commands::InternalCodexProvider {
-            profile,
+            profile_id,
             run_id,
             mode,
             session_id,
@@ -248,23 +256,40 @@ where
                     true,
                 );
             }
-            match profile.provider {
-                ProviderArgument::Codex => match commands::process::guard_codex(
-                    &profile.alias,
-                    &run_id,
-                    mode,
-                    session_id.as_deref(),
-                    &provider_args,
-                ) {
-                    Ok(status) => exit_code_from_status(status),
-                    Err(error) => render_app_error("__internal-codex-provider", &error, false),
-                },
+            match commands::process::guard_codex(
+                profile_id.as_str(),
+                &run_id,
+                mode,
+                session_id.as_deref(),
+                &provider_args,
+            ) {
+                Ok(status) => exit_code_from_status(status),
+                Err(error) => render_app_error("__internal-codex-provider", &error, false),
             }
         }
     }
 }
 
 fn render_auth_report(report: &commands::auth::AuthReport, json: bool) -> ExitCode {
+    let rendered = if json {
+        report.to_json()
+    } else {
+        Ok(report.to_human())
+    };
+    match rendered {
+        Ok(rendered) if write_stdout(&rendered).is_ok() => ExitCode::SUCCESS,
+        _ => {
+            let _ = write_stderr(if json {
+                JSON_INTERNAL_ERROR
+            } else {
+                HUMAN_INTERNAL_ERROR
+            });
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn render_rename_report(report: &commands::auth::RenameReport, json: bool) -> ExitCode {
     let rendered = if json {
         report.to_json()
     } else {

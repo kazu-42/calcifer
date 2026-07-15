@@ -24,7 +24,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 
 ## Phase 2: Codex profile isolation
 
-- [ ] Complete `auth add/list/show/remove/reauth codex` (`add` and `list` are implemented)
+- [ ] Complete `auth add/list/show/rename/remove/reauth codex` (`add`, `list`, and atomic alias-only `rename` are implemented)
 - [x] Official `codex login` in a profile-specific `CODEX_HOME`
 - [x] Version-scoped private provider identity verification before profile publication
 - [x] Explicit identity verification for legacy profiles; unbound profiles remain manual-only

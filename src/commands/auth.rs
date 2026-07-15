@@ -18,6 +18,28 @@ pub(crate) struct AuthReport {
     profiles: Vec<Profile>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct RenameReport {
+    schema_version: u8,
+    command: &'static str,
+    ok: bool,
+    action: &'static str,
+    changed: bool,
+    from: String,
+    to: String,
+    profile: Profile,
+}
+
+impl RenameReport {
+    pub(crate) fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+
+    pub(crate) fn to_human(&self) -> String {
+        format!("Renamed {} to {}.", self.from, self.to)
+    }
+}
+
 impl AuthReport {
     pub(crate) fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
@@ -117,5 +139,22 @@ pub(crate) fn list() -> Result<AuthReport, AppError> {
             .into_iter()
             .filter(|profile| profile.provider == Provider::Codex)
             .collect(),
+    })
+}
+
+pub(crate) fn rename_codex(old_alias: &str, new_alias: &str) -> Result<RenameReport, AppError> {
+    let registry = Registry::discover()?;
+    let from = format!("codex@{old_alias}");
+    let (profile, changed) = registry.rename(Provider::Codex, old_alias, new_alias)?;
+    let to = profile.reference();
+    Ok(RenameReport {
+        schema_version: 1,
+        command: "auth",
+        ok: true,
+        action: "rename",
+        changed,
+        from,
+        to,
+        profile,
     })
 }

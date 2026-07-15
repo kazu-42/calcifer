@@ -45,6 +45,9 @@ calcifer auth list
 # Bind a profile created by an earlier Calcifer release without logging in again.
 calcifer auth verify codex@work
 
+# Change only a local display alias; no browser or provider process is used.
+calcifer auth rename codex@work client-a
+
 # Read every idle registered profile, or one idle profile, without changing the global login.
 calcifer status
 calcifer status codex@work
@@ -65,6 +68,16 @@ calcifer resume
 ```
 
 Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes authentication, project trust, and session state there, so exiting Calcifer does not discard the conversation. Before publication, Calcifer version-gates the installed Codex `0.144.4` adapter and derives an installation-private HMAC fingerprint from the effective ChatGPT account/workspace scope in the provider-owned credential file. A second local alias for the same scope is rejected without displaying or storing the raw scope outside `auth.json`; different scopes are not claimed to guarantee independent provider quota. Profiles created by earlier releases remain usable for explicit operations and become failover-eligible only after an explicit, non-interactive `auth verify` succeeds. Calcifer accepts supported Codex project-trust updates semantically while continuing to require profile-local file storage for both Codex account and MCP OAuth credentials and reject profile/provider routing overrides, including MCP OAuth callback URL and port overrides. Managed Codex role configuration is currently unsupported: both a top-level `agents` table and any auto-discovered `CODEX_HOME/agents` node fail closed because role files can add indirect complete configuration layers. `calcifer resume codex@work` remains the explicit official `codex resume --last` convenience; bare `calcifer resume` resolves Calcifer's exact tracked workspace thread and never falls back to `--last`.
+
+Profile aliases are mutable local display metadata. `auth rename` atomically
+changes only the alias in Calcifer's private registry while holding the same
+profile lease used by run, resume, and status. The opaque profile ID, managed
+directory, `CODEX_HOME`, authentication, provider-identity marker, and session
+state remain unchanged. Rename is offline: it neither resolves nor starts the
+provider executable, opens a browser, refreshes a token, nor contacts a
+network service. If registry durability becomes uncertain after its atomic
+visibility point, Calcifer reports `registry_commit_uncertain`; read back
+`auth list` instead of retrying blindly.
 
 Before interactive `run` and `resume`, Calcifer canonicalizes the working directory and checks every repository-local `.codex` layer from the nearest real `.git` root to that directory. Any `.codex/agents` filesystem node fails closed even when `config.toml` is absent; otherwise only a Codex 0.144.4-scoped set of repository settings that do not own managed authentication, provider routing, dynamic features, or state locations is accepted. Unknown keys, ambiguous filesystem nodes, invalid TOML, and files larger than 1 MiB fail before Codex starts. In a linked worktree, Codex 0.144.4 can additionally merge only `hooks` from the primary checkout; Calcifer does not resolve that external hook source, and repository hooks remain outside its sandbox guarantee. This preflight protects Calcifer's account-routing boundary, but it does not make repository hooks, plugins, tools, or code safe.
 
@@ -118,7 +131,18 @@ Example JSON envelope:
 }
 ```
 
-For structured `doctor`, `auth list`, `auth verify`, and `status` results, `--json` emits one JSON document on stdout. Interactive `auth add`, `run`, and `resume` reject `--json` because the official provider owns the terminal and mixing its stream with a Calcifer JSON document would break the contract. Identity JSON contains only Calcifer-local profile metadata and never the private fingerprint, identity-key ID, or provider account scope. Usage failures emit one redacted JSON document on stderr with exit code `2`. Clap's standard `--help` and `--version` output remains text even when `--json` is present. Within schema version 1, existing field names and meanings will remain stable; new fields may be added.
+For structured `doctor`, `auth list`, `auth verify`, `auth rename`, and `status` results,
+`--json` emits one JSON document on stdout. Rename reports `action: "rename"`,
+whether the alias changed, the old and new local references, and the existing
+non-secret profile record. Interactive `auth add`, `run`, and `resume` reject
+`--json` because the official provider owns the terminal and mixing its stream
+with a Calcifer JSON document would break the contract. Identity JSON contains
+only Calcifer-local profile metadata and never the private fingerprint,
+identity-key ID, or provider account scope. Usage failures emit one redacted
+JSON document on stderr with exit code `2`. Clap's standard `--help` and
+`--version` output remains text even when `--json` is present. Within schema
+version 1, existing field names and meanings will remain stable; new fields may
+be added.
 
 ## Planned interface
 

@@ -98,7 +98,7 @@ impl StatusReport {
         let executable = resolve_codex();
         let statuses = profiles
             .into_iter()
-            .map(|profile| inspect_profile(&registry, &profile, executable.as_deref()))
+            .map(|profile| inspect_profile(&registry, &profile, alias, executable.as_deref()))
             .collect::<Result<Vec<_>, _>>()?;
         let ok = statuses.iter().all(|profile| profile.error.is_none());
         Ok(Self {
@@ -211,62 +211,66 @@ impl ProfileStatus {
 fn inspect_profile(
     registry: &Registry,
     profile: &Profile,
+    expected_alias: Option<&str>,
     executable: Result<&std::path::Path, &crate::executable::ExecutableError>,
 ) -> Result<ProfileStatus, AppError> {
-    let result = executable
-        .map_err(|error| {
+    let mut current_profile = profile.clone();
+    let result = (|| {
+        let (locked_profile, _lease) = registry
+            .lock_profile_current(profile, expected_alias)
+            .map_err(|error| {
+                InspectionFailure::local(StatusFailure {
+                    code: error.code(),
+                    message: "Profile is busy, missing, or failed validation",
+                })
+            })?;
+        current_profile = locked_profile;
+        let executable = executable.map_err(|error| {
             InspectionFailure::local(StatusFailure {
                 code: error.code(),
                 message: error.safe_message(),
             })
-        })
-        .and_then(|executable| {
-            let _lease = registry.lock_profile(profile).map_err(|error| {
-                InspectionFailure::local(StatusFailure {
-                    code: error.code(),
-                    message: "Profile is busy or failed validation",
-                })
-            })?;
-            let home = registry.profile_home(profile).map_err(|_| {
-                InspectionFailure::local(StatusFailure {
-                    code: "unsafe_profile_state",
-                    message: "Managed profile storage failed validation",
-                })
-            })?;
-            let neutral_working_directory = registry.neutral_working_directory().map_err(|_| {
-                InspectionFailure::local(StatusFailure {
-                    code: "unsafe_profile_state",
-                    message: "Managed neutral working directory failed validation",
-                })
-            })?;
-            // The account app-server is a bounded, no-turn probe. Let only its
-            // provider-side lease survive exec so a killed status parent cannot
-            // briefly admit a second credential writer before stdio EOF stops
-            // the app-server.
-            #[cfg(unix)]
-            let _provider_lock_inheritance = _lease.inherit_provider_lock().map_err(|_| {
-                InspectionFailure::local(StatusFailure {
-                    code: "unsafe_profile_state",
-                    message: "Managed profile lease failed validation",
-                })
-            })?;
-            read_account_usage(
-                executable,
-                &home,
-                &neutral_working_directory,
-                STATUS_TIMEOUT,
-            )
-            .map_err(|failure| InspectionFailure {
-                status: status_failure(failure.kind()),
-                codex_version: failure.codex_version().map(str::to_owned),
-                compatibility: failure.compatibility(),
+        })?;
+        let home = registry.profile_home(&current_profile).map_err(|_| {
+            InspectionFailure::local(StatusFailure {
+                code: "unsafe_profile_state",
+                message: "Managed profile storage failed validation",
             })
-        });
+        })?;
+        let neutral_working_directory = registry.neutral_working_directory().map_err(|_| {
+            InspectionFailure::local(StatusFailure {
+                code: "unsafe_profile_state",
+                message: "Managed neutral working directory failed validation",
+            })
+        })?;
+        // The account app-server is a bounded, no-turn probe. Let only its
+        // provider-side lease survive exec so a killed status parent cannot
+        // briefly admit a second credential writer before stdio EOF stops
+        // the app-server.
+        #[cfg(unix)]
+        let _provider_lock_inheritance = _lease.inherit_provider_lock().map_err(|_| {
+            InspectionFailure::local(StatusFailure {
+                code: "unsafe_profile_state",
+                message: "Managed profile lease failed validation",
+            })
+        })?;
+        read_account_usage(
+            executable,
+            &home,
+            &neutral_working_directory,
+            STATUS_TIMEOUT,
+        )
+        .map_err(|failure| InspectionFailure {
+            status: status_failure(failure.kind()),
+            codex_version: failure.codex_version().map(str::to_owned),
+            compatibility: failure.compatibility(),
+        })
+    })();
 
     let observed_at = current_timestamp()?;
     Ok(match result {
         Ok(observation) => ProfileStatus {
-            profile: profile.reference(),
+            profile: current_profile.reference(),
             provider: "codex",
             availability: classify(&observation.usage),
             observed_at,
@@ -279,7 +283,7 @@ fn inspect_profile(
             error: None,
         },
         Err(failure) => ProfileStatus {
-            profile: profile.reference(),
+            profile: current_profile.reference(),
             provider: "codex",
             availability: Availability::Unknown,
             observed_at,
@@ -478,6 +482,53 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_status_rejects_a_stale_alias_before_provider_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "calcifer-status-stale-alias-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_codex_registration("work")?;
+        let mut auth = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(pending.home().join("auth.json"))?;
+        let account_scope = uuid::Uuid::new_v4().to_string();
+        auth.write_all(
+            serde_json::to_string(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": { "account_id": account_scope }
+            }))?
+            .as_bytes(),
+        )?;
+        auth.sync_all()?;
+        let stale = pending.commit(crate::providers::codex::CodexIdentityAdapter::for_test())?;
+        registry.rename(Provider::Codex, "work", "client-a")?;
+
+        let report = inspect_profile(
+            &registry,
+            &stale,
+            Some("work"),
+            Ok(std::path::Path::new("/synthetic/provider-must-not-run")),
+        )?;
+
+        assert_eq!(report.profile, "codex@work");
+        assert_eq!(
+            report.error.as_ref().map(|error| error.code),
+            Some("profile_not_found")
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     fn window(used_percent: u32) -> RateLimitWindow {
         RateLimitWindow {
