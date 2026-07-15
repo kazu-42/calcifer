@@ -2807,11 +2807,27 @@ fn validate_opened_removal_entry(
 #[cfg(unix)]
 fn stat_identity(stat: &rustix::fs::Stat) -> Result<FileSystemIdentity, ProfileError> {
     Ok(FileSystemIdentity {
-        device: u64::try_from(stat.st_dev).map_err(|_| {
-            ProfileError::UnsafeState("managed filesystem identity is invalid".to_owned())
-        })?,
+        device: normalize_stat_device(stat.st_dev)?,
         inode: stat.st_ino,
     })
+}
+
+#[cfg(unix)]
+fn normalize_stat_device<T>(device: T) -> Result<u64, ProfileError>
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(device)
+        .map_err(|_| ProfileError::UnsafeState("managed filesystem identity is invalid".to_owned()))
+}
+
+#[cfg(unix)]
+fn normalize_stat_mode<T>(mode: T) -> Result<u32, ProfileError>
+where
+    u32: TryFrom<T>,
+{
+    u32::try_from(mode)
+        .map_err(|_| ProfileError::UnsafeState("managed filesystem mode is invalid".to_owned()))
 }
 
 #[cfg(unix)]
@@ -2822,16 +2838,21 @@ fn validate_removal_stat(
 ) -> Result<(), ProfileError> {
     let actual_kind = removal_entry_kind(stat);
     let mode_is_safe = match actual_kind {
-        RemovalEntryKind::Directory => removal_directory_mode_is_safe(stat.st_mode.into()),
-        RemovalEntryKind::RegularFile => removal_descendant_mode_is_safe(stat.st_mode.into()),
+        RemovalEntryKind::Directory => {
+            removal_directory_mode_is_safe(normalize_stat_mode(stat.st_mode)?)
+        }
+        RemovalEntryKind::RegularFile => {
+            removal_descendant_mode_is_safe(normalize_stat_mode(stat.st_mode)?)
+        }
         RemovalEntryKind::NonFollowingLeaf => true,
     };
     let link_count_is_safe = actual_kind == RemovalEntryKind::Directory || stat.st_nlink == 1;
+    let actual_device = normalize_stat_device(stat.st_dev)?;
     if actual_kind != expected_kind
         || stat.st_uid != rustix::process::getuid().as_raw()
         || !mode_is_safe
         || !link_count_is_safe
-        || u64::try_from(stat.st_dev).ok() != Some(expected_device)
+        || actual_device != expected_device
     {
         return Err(ProfileError::UnsafeState(
             "managed profile tree changed during cleanup".to_owned(),
@@ -4363,6 +4384,18 @@ fn refuse_orphaned_staging(provider_root: &Path) -> Result<(), ProfileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_mode_normalization_is_checked_for_signed_unix_modes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(normalize_stat_mode(0o700_u16)?, 0o700);
+        let error = normalize_stat_mode(-1_i32)
+            .err()
+            .ok_or("a negative signed Unix mode must fail closed")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        Ok(())
+    }
 
     #[cfg(not(unix))]
     #[test]
