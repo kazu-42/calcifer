@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod handoff_compat;
+#[cfg(unix)]
+mod remote;
 
 /// Capability proving that the installed Codex process passed the exact
 /// identity-adapter initialize/home/version gate.

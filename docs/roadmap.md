@@ -69,7 +69,9 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [x] Decide that successful automatic failover continues the same user-visible conversation; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
 - [ ] Model one logical conversation as a lineage of profile-local provider threads
 - [ ] Bind every lineage generation to profile, canonical cwd, trust domain, thread ID, and exact rollout path
-- [ ] Version-gate Codex's experimental `thread/fork.path` field and remote TUI contract with `codex app-server generate-json-schema --experimental --out <dir>` drift checks plus a synthetic runtime smoke test
+- [x] Version-gate Codex's experimental `thread/fork.path` field and remote TUI contract with `codex app-server generate-json-schema --experimental --out <dir>` drift checks plus a synthetic runtime smoke test
+- [x] Extract a bounded, observe-only readiness relay with separate synthetic-fork and exact-resume policies; keep it internal and opaque after readiness (issue #48 and [ADR 0003](adr/0003-supervised-codex-session.md))
+- [ ] Build the guardian-owned App Server/TUI lifecycle, persistent typed monitor, PTY input gate, and terminal disposition protocol from ADR 0003
 - [ ] Canonical containment, hard-link/symlink/owner/mode validation, serialized handoff, and complete source-to-target integration
 - [x] Linux/macOS no-gap verified target reservation and one-shot guardian provider-lease transfer; internal and unused until supervised handoff integration
 - [ ] Stop and reap the old TUI and App Server before reading its rollout under the target profile

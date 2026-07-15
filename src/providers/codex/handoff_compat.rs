@@ -7,8 +7,6 @@ use std::time::Duration;
 use serde_json::Value;
 
 #[cfg(unix)]
-mod proxy;
-#[cfg(unix)]
 mod runtime;
 
 /// Capability proving that an exact Codex build passed schema, fork, and

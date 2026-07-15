@@ -150,7 +150,7 @@ The separate schema-v1 `conversations.json` contains opaque local IDs, versions,
 
 Bare `calcifer resume` reads and releases the workspace-head lock, acquires the immutable source profile by UUID, and revalidates the same binding under the profile lease before executing `codex resume <exact-uuid>`. If a guardian crash left a pending launch, the command first reacquires both profile locks and reconciles its before/after inventory; one candidate becomes `interrupted` or `unknown_crash`, while ambiguity stops. Bare and explicit exact resume look up an already-bound immutable `{profile_id, thread_id, canonical_cwd}` directly even when pending or needs-selection state hides the mutable workspace head. A clean pre-launch rollout observation cannot erase its persisted interrupted or unknown-crash marker; only lifecycle readback after the provider completes may clear that uncertainty. Retryable authentication, spawn, timeout, transport, or provider availability failures retain the pending launch without destroying the previous ready head; malformed protocol, unsupported schema/version, missing/archive, immutable profile/cwd ownership conflicts, or deleted-baseline results atomically clear the pending launch and require explicit selection. Restored state is the persisted conversation transcript; a dead process, stream, in-flight tool call, prompt, command, approval, or tool action is not restarted or replayed.
 
-Stable `thread/resume` lookup is scoped to the current `CODEX_HOME`. Codex 0.144.4 also exposes experimental external rollout paths for resume and fork, but Calcifer does not enable them for user state yet. A private compatibility gate exercises fork-by-path and official remote-TUI resume only against isolated synthetic homes and rollouts; it receives no profile, credential, conversation registry, or user rollout. The accepted production design uses a target-profile App Server to fork validated source history into a new target-profile rollout. It requires same-trust-domain policy, source-profile provenance, canonical containment under a Calcifer-managed sessions root, one writer per lineage generation, version gating, and no prompt replay; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
+Stable `thread/resume` lookup is scoped to the current `CODEX_HOME`. Codex 0.144.4 also exposes experimental external rollout paths for resume and fork, but Calcifer does not enable them for user state yet. A private compatibility gate exercises fork-by-path and official remote-TUI resume only against isolated synthetic homes and rollouts; it receives no profile, credential, conversation registry, or user rollout. The accepted production design uses a target-profile App Server to fork validated source history into a new target-profile rollout. It requires same-trust-domain policy, source-profile provenance, canonical containment under a Calcifer-managed sessions root, one writer per lineage generation, version gating, and no prompt replay; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md). The staged same-profile supervisor and guardian-loss policy are defined by [ADR 0003](adr/0003-supervised-codex-session.md).
 
 That compatibility gate starts each command from an empty environment and adds
 only fixed process basics plus synthetic `CODEX_HOME`, home, XDG, and temporary
@@ -177,11 +177,12 @@ the TUI parsed and followed the fork lineage after resume. Readiness is not
 emitted until that error has been forwarded back to the TUI.
 
 The local App Server and readiness sockets are protected by their retained
-owner-only mode-`0700` scratch directory; the gate does not mutate or promise a
-`0600` socket mode after bind, and it requires the App Server socket to remain
-current-user-owned. Cleanup records the proxy socket's device/inode and checks
-it before pathname unlink, but the check and unlink are not atomic against a
-hostile same-user process.
+owner-only mode-`0700` scratch directory. The readiness relay additionally sets
+its socket to mode `0600`, reads back UID/type/mode, and records the pathname
+device/inode. Cleanup unlinks only that matching socket; collisions and
+replacements fail closed. The provider-created App Server socket is validated
+separately. Path inspection and unlink are not atomic against a hostile
+same-user process, which remains outside the local threat guarantee.
 The proxy's atomic `RUNNING`/`DISCONNECTED`/`STOPPING` lifecycle, active
 poll-hangup plus non-consuming `PEEK` health checks, and checked shutdown prevent
 an unexpected EOF from being relabelled as normal teardown. Every probe child
@@ -220,6 +221,10 @@ The one-shot probe cannot inspect a profile while its `run` or `resume` child ow
 The verified upstream versions, exact fields, and source links are recorded in [Provider compatibility notes](provider-compatibility.md).
 
 ## Planned supervised failover and conversation handoff
+
+The staged process topology, separate lifecycle/lease-transfer channels,
+readiness contract, macOS guardian-loss constraint, and public release gates
+are specified in [ADR 0003](adr/0003-supervised-codex-session.md).
 
 ```text
 resolve pinned profile or explicit pool
@@ -402,8 +407,12 @@ The current process launcher:
 - make the `--` provider-argument boundary explicit;
 - delegate interactive launch to a coordinator plus provider guardian, each holding one side of a fixed-order split lease for the entire official provider lifetime;
 - keep both interactive lease descriptors out of the provider process tree, so provider-started background tools cannot pin the profile after Codex exits;
-- retain the provider-side lease if the coordinator is selectively killed, and retain the coordinator-side lease while tracking the exact provider PID if the guardian is selectively killed;
-- fail closed by retaining the coordinator lease when a guardian disappears in the narrow ambiguous interval between spawn authorization and its provider-PID report;
+- retain the provider-side lease if the coordinator is selectively killed, and
+  retain the coordinator-side lease if the guardian is selectively killed;
+- treat provider PIDs and process groups only as containment handles: the
+  supervised path releases after the live guardian reports trusted terminal
+  child dispositions and is exactly waited, while unexpected guardian loss
+  parks with the coordinator lease held;
 - let every Calcifer wrapper layer catch terminal termination signals while the official provider receives its normal process-group delivery, so a provider that handles `SIGINT` remains attached to the foreground wrapper and cannot outlive every lease owner;
 - preserve ordinary child exit codes; polished cross-platform signal forwarding and job-control semantics remain release gates;
 - avoid persisting child stdout or stderr by default;
@@ -486,10 +495,13 @@ but never to infer lease ownership or authorize another writer.
 
 ## Open design work
 
-Before the first stable release, the project still needs reviewed ADRs for:
+Before the first stable release, the project still needs reviewed decisions or
+completed implementations for:
 
 - deliberate all-profile re-key recovery after identity-key loss;
-- process/PTY supervision on Linux, macOS, and Windows;
+- the Linux/macOS process/PTY supervision staged in
+  [ADR 0003](adr/0003-supervised-codex-session.md), plus a separate Windows
+  design;
 - additional Codex version/schema gates and observation cache TTL/backoff;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);

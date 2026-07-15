@@ -266,29 +266,38 @@ relative components, opens every directory component with descriptor-relative
 The provider cannot turn a schema or rollout component into a followed symlink
 between pathname validation and readback.
 
-The bind-created App Server and readiness-proxy Unix sockets live inside the
-retained, current-user-owned mode-`0700` scratch root. Calcifer deliberately
-performs no post-bind pathname `chmod`, so it does not claim a `0600` mode for
-either socket; directory search permissions are the privacy boundary. The App
-Server socket must still be owned by the current user. The proxy records its
-own socket's device/inode and unlinks only after an `lstat` identity match. That
-check and `unlink` are not one atomic operation: a hostile same-user process
-that already has scratch-directory access can race them and have a replacement
-directory entry unlinked. Cleanup never follows a replacement symlink target,
-but this same-UID namespace race is outside the gate's guarantee.
+The bind-created App Server and readiness-relay Unix sockets live inside the
+retained, current-user-owned mode-`0700` scratch root. The extracted relay sets
+its own socket to mode `0600`, reads back its owner, type, and mode, records its
+pathname device/inode, and unlinks it only after an identity match. A collision,
+symlink, mode change, or pathname replacement is preserved and fails closed.
+The separately provider-created App Server socket is also validated before use.
+AF_UNIX descriptor metadata is not a portable identity for its bound pathname,
+so the relay instead verifies its local address, the private parent, and the
+pathname repeatedly. A hostile process already running as the same UID can
+still race pathname operations; this same-UID namespace race is outside the
+gate's guarantee.
 
-The proxy has a 16 KiB WebSocket handshake limit, a 1 MiB message limit, a
-256-byte target-thread-ID limit, a bounded event channel, and the caller's
-overall deadline. It validates framing, mask direction, fragmentation,
-request/response order, IDs, errors, target identity, and effective settings
-only until readiness, then becomes an opaque byte relay. Forwarding and
-observation are serialized so the TUI cannot issue resume based on a response
-before Calcifer has recorded that response. An atomic `RUNNING`, `DISCONNECTED`,
-or `STOPPING` relay lifecycle distinguishes peer loss from intentional
-shutdown. The final health check actively polls both retained stream endpoints
-for error/hangup and uses non-consuming, non-blocking `PEEK` reads to detect
-EOF; checked shutdown fails if the relay disconnected before it entered
-`STOPPING`. TUI output is also capped at 1 MiB.
+The relay has a 16 KiB WebSocket handshake limit, a 1 MiB message and frame
+buffer limit, 256-byte thread/method/request-ID limits, a 32-event synchronous
+backpressure channel, and the caller's overall deadline. It rejects duplicate
+JSON keys and validates framing, mask direction, fragmentation,
+request/response order, resume-source precedence, IDs, errors, lineage, target
+identity, and effective settings only until readiness, then becomes an opaque
+byte relay. Provider requests are classified and forwarded but never answered
+by Calcifer. Forwarding and observation are serialized so the TUI cannot issue
+resume based on a response before Calcifer has recorded that response. An
+atomic `RUNNING`, `DISCONNECTED`, or `STOPPING` relay lifecycle distinguishes
+peer loss from intentional shutdown. The final health check actively polls both
+retained stream endpoints for error/hangup and uses non-consuming, non-blocking
+`PEEK` reads to detect EOF; checked shutdown fails if the relay disconnected
+before it entered `STOPPING`. TUI output is also capped at 1 MiB.
+
+Issue #48 adds a separate same-profile exact-resume readiness policy and typed
+effective-setting projection. It does not add the persistent monitor, App
+Server/process owner, lease lifecycle, terminal bridge, usage polling, or a
+public command required by the supervised-session design in
+[ADR 0003](adr/0003-supervised-codex-session.md).
 
 Every provider subprocess is its own process-group leader. Calcifer observes a
 leader exit with non-reaping `waitid(..., WNOWAIT)`, kills the process group so
