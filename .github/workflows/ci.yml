@@ -210,7 +210,9 @@ jobs:
 
           test -n "$test_binary"
           test -x "$test_binary"
-          "$test_binary" --list | grep -Fqx "$test_name: test"
+          # Consume the complete list. `grep -q` can close the pipe after an
+          # early match and make libtest fail with BrokenPipe under pipefail.
+          "$test_binary" --list | grep -Fx "$test_name: test" >/dev/null
 
           sudo -n unshare \
             --mount \
