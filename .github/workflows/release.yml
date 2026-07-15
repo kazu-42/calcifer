@@ -575,6 +575,19 @@ jobs:
             latest_flag="--latest=false"
           fi
 
+          if ! immutable_release_settings="$(gh api --method GET \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases")"; then
+            echo "Unable to verify that immutable releases are enabled." >&2
+            exit 1
+          fi
+          if ! jq -e \
+            'type == "object" and .enabled == true' \
+            <<<"${immutable_release_settings}" >/dev/null; then
+            echo "Immutable releases must be enabled before publishing ${TAG}." >&2
+            exit 1
+          fi
+
           current_tag_ref="$(gh api --method GET \
             -H "X-GitHub-Api-Version: 2026-03-10" \
             "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" \

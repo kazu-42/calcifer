@@ -34,10 +34,11 @@ The release workflow enforces these boundaries:
 - The workflow creates a draft, uploads every asset, and compares the GitHub
   API name, size, upload state, and SHA-256 readback with the local bundle.
 - Only an exact draft is published. The workflow then requires an immutable
-  API readback and verifies that the release attestation binds the exact asset
-  set, tag, and pinned raw tag-ref digest before verifying every local asset.
-  For the documented annotated tags, the raw tag-object SHA is distinct from
-  the peeled source commit; the workflow pins and rechecks both.
+  repository-setting preflight before publication, requires an immutable API
+  readback afterward, and verifies that the release attestation binds the exact
+  asset set, tag, and pinned raw tag-ref digest before verifying every local
+  asset. For the documented annotated tags, the raw tag-object SHA is distinct
+  from the peeled source commit; the workflow pins and rechecks both.
 - The active [Immutable release tags ruleset](https://github.com/kazu-42/calcifer/rules/18956764)
   has no bypass actors and blocks updates and deletions for every `v*` tag. The
   workflow also verifies both the raw tag ref and peeled commit immediately
@@ -148,11 +149,12 @@ Makefile also run the release matrix without any write or OIDC permissions.
 
 ## Failure and recovery boundaries
 
-The draft is intentionally the only mutable phase. If upload or draft readback
-fails, the workflow stops without publishing. It also refuses to reuse that
-existing draft on a rerun. A maintainer must inspect the failure, delete only
-the unpublished draft after confirming that no valid release exists, and then
-rerun from the unchanged reviewed tag.
+The draft is intentionally the only mutable phase. If upload, draft readback,
+or the live immutable-release setting preflight fails, the workflow stops
+without publishing. It also refuses to reuse that existing draft on a rerun. A
+maintainer must inspect the failure, delete only the unpublished draft after
+confirming that no valid release exists, and then rerun from the unchanged
+reviewed tag.
 
 After publication, the release and tag are immutable. A failed post-publication
 readback can be retried manually with `gh release verify` and
