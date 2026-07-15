@@ -7,6 +7,7 @@ on:
       - .github/workflows/release.yml
       - Cargo.lock
       - Cargo.toml
+      - build.rs
       - Makefile
       - scripts/package_release.py
       - scripts/publish_release.py

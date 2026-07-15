@@ -28,6 +28,7 @@ Untrusted inputs:
 - provider CLI output and exit status
 - quota observations
 - filesystem state after interruption or a crash
+- public GitHub release metadata, redirects, manifests, and checksums
 ```
 
 A repository-local file must never be able to select an account or failover pool. Account routing is user-level security policy because changing profile may change the organization that receives source code, prompts, and conversation history.
@@ -46,6 +47,7 @@ A repository-local file must never be able to select an account or failover pool
 | Selector | Choose one profile from an explicit pool | Cross trust domains or loop indefinitely |
 | Process supervisor | Own the profile App Server, attach the official TUI, observe events, forward signals, and preserve exit semantics | Replay prompts or commands, or answer provider approval requests |
 | Observation cache | Record bounded, timestamped usage state | Treat stale or unknown data as exhaustion |
+| Update verifier | Select one immutable strict-channel release and verify local manifest/checksum bytes for the exact compile target | Read credentials/config, follow arbitrary redirects, substitute an ABI, or claim an un-downloaded archive is verified |
 
 ## Normative invariants
 
@@ -67,6 +69,7 @@ Future code that violates one of these invariants requires an architecture decis
 14. **Resume is not replay.** Restoring persisted conversation history never resubmits an interrupted prompt, command, or tool action.
 15. **Repository configuration cannot route accounts.** Interactive launch accepts only version-reviewed repository settings and binds the final provider to the canonical working directory that was inspected.
 16. **Provider identity stays private.** A bounded provider-owned scope is immediately reduced to an installation-local HMAC fingerprint; raw scopes, fingerprints, and identity-key IDs never enter public DTOs or diagnostics.
+17. **Update evidence stays precise.** An update recommendation requires an immutable release and canonical v1 manifest/checksum agreement for the exact compile target. Published attestation evidence and locally verified bytes are reported separately; an un-downloaded archive is never called verified.
 
 ## Codex profile model
 
