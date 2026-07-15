@@ -18,6 +18,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   retain cross-profile-safe in-flight ownership until the provider exits.
 - Version-scoped private Codex provider-identity binding during registration and
   explicit `calcifer auth verify codex@<alias>` migration for legacy profiles.
+- Versioned deterministic release manifests with archive and in-archive binary
+  digests for all five supported native targets.
+- Draft-staged immutable releases with a read-first maintainer-local publisher
+  that binds the single publication write to an exact numeric release ID.
 
 ### Changed
 
@@ -42,6 +46,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Raw provider identifiers, fingerprints, and local key IDs remain outside the
   registry and all human/JSON diagnostics; key loss and credential drift fail
   closed for identity-dependent selection.
+- Release publication now revalidates bounded archive bodies, canonical
+  manifest semantics, artifact-attested raw and peeled source-tag identity,
+  no-bypass repository controls, assembled-asset attestations, and the
+  immutable release attestation before reporting success.
+- Documented coordinated vulnerability disclosure, including patched-release
+  ordering, urgent-notification exceptions, and audited emergency release
+  removal under the no-bypass release-tag ruleset.
 
 ## [0.1.0-alpha.3] - 2026-07-15
 
