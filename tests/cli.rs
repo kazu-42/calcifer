@@ -3000,9 +3000,11 @@ config_file = "{sensitive_role_path}"
         ])
         .output()?;
     let held_version_elapsed = held_version_started.elapsed();
-    let held_version_stderr = String::from_utf8(held_version_stdout.stderr)?;
-    assert_eq!(held_version_stdout.status.code(), Some(1));
-    assert!(held_version_stderr.contains("temporarily unavailable"));
+    assert!(
+        held_version_stdout.status.success(),
+        "{}",
+        String::from_utf8(held_version_stdout.stderr)?
+    );
     assert!(
         held_version_elapsed < std::time::Duration::from_secs(4),
         "version probe exceeded its wall-clock bound: {held_version_elapsed:?}"
@@ -3012,8 +3014,8 @@ config_file = "{sensitive_role_path}"
         .strip_prefix(&log_before_held_version_stdout)
         .ok_or_else(|| std::io::Error::other("provider log was replaced"))?;
     assert!(held_version_delta.contains("--version"));
-    assert!(!held_version_delta.contains("app-server"));
-    assert!(!held_version_delta.contains("resume 01900000-0000-7000-8000-000000000001"));
+    assert!(held_version_delta.contains("app-server"));
+    assert!(held_version_delta.contains("resume 01900000-0000-7000-8000-000000000001"));
 
     let rollout = managed_rollout;
     std::fs::set_permissions(&managed_sessions, std::fs::Permissions::from_mode(0o755))?;

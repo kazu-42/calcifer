@@ -56,6 +56,124 @@ jobs:
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Run tests
         run: cargo +1.96.0 test --all-targets --all-features --locked
+      - name: Probe pinned Codex handoff compatibility
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CODEX_RELEASE_TAG: rust-v0.144.4
+          CODEX_VERSION: 0.144.4
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          platform="$(uname -s)-$(uname -m)"
+          case "${platform}" in
+            Linux-x86_64)
+              target="x86_64-unknown-linux-musl"
+              expected_sha256="37c985be9d89e8c4f43b3aa0594c1213eac212d30ae2b95221f08fec807515d1"
+              ;;
+            Linux-aarch64 | Linux-arm64)
+              target="aarch64-unknown-linux-musl"
+              expected_sha256="4d07243ef4ae6786b8b321d7aea3f9be4e1d2c597ae5407e7c1b9873334082b2"
+              ;;
+            Darwin-x86_64)
+              target="x86_64-apple-darwin"
+              expected_sha256="274ea4931246621d477ad61d61ea3303527878e77fa910087df52153f5e6188e"
+              ;;
+            Darwin-arm64 | Darwin-aarch64)
+              target="aarch64-apple-darwin"
+              expected_sha256="77c8969a481302f9db1d9ea2a6c21c083abae3f1a8fc8a7275dc38323699391e"
+              ;;
+            *)
+              echo "No pinned Codex package is configured for ${platform}." >&2
+              exit 1
+              ;;
+          esac
+
+          scratch="$(mktemp -d "${RUNNER_TEMP:?}/calcifer-codex-handoff.XXXXXX")"
+          cleanup() {
+            rm -rf "${scratch}"
+          }
+          trap cleanup EXIT
+
+          archive="${scratch}/codex-${target}.tar.gz"
+          release_url="https://github.com/openai/codex/releases/download/${CODEX_RELEASE_TAG}/codex-${target}.tar.gz"
+          curl \
+            --fail \
+            --location \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --tlsv1.2 \
+            --connect-timeout 20 \
+            --max-time 300 \
+            --retry 3 \
+            --retry-delay 2 \
+            --show-error \
+            --silent \
+            --output "${archive}" \
+            "${release_url}"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual_sha256="$(sha256sum "${archive}" | awk '{print $1}')"
+          elif command -v shasum >/dev/null 2>&1; then
+            actual_sha256="$(shasum -a 256 "${archive}" | awk '{print $1}')"
+          else
+            echo "Neither sha256sum nor shasum is available." >&2
+            exit 1
+          fi
+          if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+            echo "Codex package SHA-256 mismatch for ${target}." >&2
+            echo "Expected: ${expected_sha256}" >&2
+            echo "Actual:   ${actual_sha256}" >&2
+            exit 1
+          fi
+
+          expected_entry="codex-${target}"
+          archive_entries="${scratch}/archive-entries.txt"
+          tar -tzf "${archive}" > "${archive_entries}"
+          entry_count="$(awk 'END { print NR + 0 }' "${archive_entries}")"
+          IFS= read -r archive_entry < "${archive_entries}" || true
+          if [[ "${entry_count}" != "1" || "${archive_entry:-}" != "${expected_entry}" ]]; then
+            echo "Codex package must contain exactly ${expected_entry}." >&2
+            exit 1
+          fi
+
+          archive_details="${scratch}/archive-details.txt"
+          tar -tvzf "${archive}" > "${archive_details}"
+          detail_count="$(awk 'END { print NR + 0 }' "${archive_details}")"
+          IFS= read -r archive_detail < "${archive_details}" || true
+          if [[ "${detail_count}" != "1" || "${archive_detail:-}" != -* ]]; then
+            echo "Codex package entry must be a regular file." >&2
+            exit 1
+          fi
+
+          extract_dir="${scratch}/extract"
+          mkdir "${extract_dir}"
+          binary="${extract_dir}/${expected_entry}"
+          (umask 077; tar -xOzf "${archive}" "${expected_entry}" > "${binary}")
+          if [[ ! -f "${binary}" || -L "${binary}" || ! -s "${binary}" ]]; then
+            echo "Codex package did not produce one regular binary." >&2
+            exit 1
+          fi
+          chmod 0700 "${binary}"
+
+          actual_version="$("${binary}" --version)"
+          if [[ "${actual_version}" != "codex-cli ${CODEX_VERSION}" ]]; then
+            echo "Unexpected Codex package version: ${actual_version}" >&2
+            exit 1
+          fi
+
+          test_name='providers::codex::handoff_compat::tests::packaged_codex_0_144_4_passes_the_complete_handoff_probe'
+          CALCIFER_CODEX_COMPAT_BINARY="${binary}" \
+            cargo +1.96.0 test \
+              --lib \
+              --all-features \
+              --locked \
+              "${test_name}" \
+              -- \
+              --exact \
+              --ignored \
+              --nocapture
       - name: Test Linux mount-boundary enforcement
         if: runner.os == 'Linux'
         shell: bash

@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, and structured on-demand status are implemented. The cross-profile conversation handoff design is accepted; its supervisor and automatic failover implementation remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, and a synthetic Codex 0.144.4 handoff compatibility gate are implemented. The production cross-profile handoff supervisor and automatic failover implementation remain future work.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -149,7 +149,50 @@ The separate schema-v1 `conversations.json` contains opaque local IDs, versions,
 
 Bare `calcifer resume` reads and releases the workspace-head lock, acquires the immutable source profile by UUID, and revalidates the same binding under the profile lease before executing `codex resume <exact-uuid>`. If a guardian crash left a pending launch, the command first reacquires both profile locks and reconciles its before/after inventory; one candidate becomes `interrupted` or `unknown_crash`, while ambiguity stops. Bare and explicit exact resume look up an already-bound immutable `{profile_id, thread_id, canonical_cwd}` directly even when pending or needs-selection state hides the mutable workspace head. A clean pre-launch rollout observation cannot erase its persisted interrupted or unknown-crash marker; only lifecycle readback after the provider completes may clear that uncertainty. Retryable authentication, spawn, timeout, transport, or provider availability failures retain the pending launch without destroying the previous ready head; malformed protocol, unsupported schema/version, missing/archive, immutable profile/cwd ownership conflicts, or deleted-baseline results atomically clear the pending launch and require explicit selection. Restored state is the persisted conversation transcript; a dead process, stream, in-flight tool call, prompt, command, approval, or tool action is not restarted or replayed.
 
-Stable `thread/resume` lookup is scoped to the current `CODEX_HOME`. Codex 0.144.4 also exposes experimental external rollout paths for resume and fork, but Calcifer does not enable them yet. The accepted cross-profile design uses a target-profile App Server to fork validated source history into a new target-profile rollout. It requires same-trust-domain policy, source-profile provenance, canonical containment under a Calcifer-managed sessions root, one writer per lineage generation, version gating, and no prompt replay; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
+Stable `thread/resume` lookup is scoped to the current `CODEX_HOME`. Codex 0.144.4 also exposes experimental external rollout paths for resume and fork, but Calcifer does not enable them for user state yet. A private compatibility gate exercises fork-by-path and official remote-TUI resume only against isolated synthetic homes and rollouts; it receives no profile, credential, conversation registry, or user rollout. The accepted production design uses a target-profile App Server to fork validated source history into a new target-profile rollout. It requires same-trust-domain policy, source-profile provenance, canonical containment under a Calcifer-managed sessions root, one writer per lineage generation, version gating, and no prompt replay; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
+
+That compatibility gate starts each command from an empty environment and adds
+only fixed process basics plus synthetic `CODEX_HOME`, home, XDG, and temporary
+paths. It binds the original canonical executable to safe mode/identity
+metadata and SHA-256, creates a byte-identical mode-`0500` staged executable
+inside the retained private scratch tree, and runs every probe phase from that
+copy. This prevents a legitimate installer path replacement from mixing builds;
+both staged and original binaries are fully rehashed before the original-bound
+capability is minted, so an update during the probe fails closed. Default and
+experimental protocol output must match the reviewed fork, resume, and
+thread-response projections; only the separate `JSONRPCError` and
+`JSONRPCErrorError` documents are required to equal their complete pinned
+schemas. Private directory descriptors are retained while config, catalog,
+schema, and source/target rollout files are reached by a component-wise
+descriptor-relative `O_NOFOLLOW` walk. The synthetic fork's source and target
+fingerprints remain live through the remote-TUI proof.
+
+Remote readiness requires the official TUI to complete three ordered exchanges:
+successful target `thread/read`, successful target `thread/resume` with the
+fork's effective model/provider/cwd/approval/reviewer/sandbox settings, and an
+exact source-parent `thread/read` with `includeTurns` absent. The source parent
+does not exist in the target home, so the final expected error response proves
+the TUI parsed and followed the fork lineage after resume. Readiness is not
+emitted until that error has been forwarded back to the TUI.
+
+The local App Server and readiness sockets are protected by their retained
+owner-only mode-`0700` scratch directory; the gate does not mutate or promise a
+`0600` socket mode after bind, and it requires the App Server socket to remain
+current-user-owned. Cleanup records the proxy socket's device/inode and checks
+it before pathname unlink, but the check and unlink are not atomic against a
+hostile same-user process.
+The proxy's atomic `RUNNING`/`DISCONNECTED`/`STOPPING` lifecycle, active
+poll-hangup plus non-consuming `PEEK` health checks, and checked shutdown prevent
+an unexpected EOF from being relabelled as normal teardown. Every probe child
+is a separate process-group leader. Non-reaping `WNOWAIT` observation preserves
+an exited leader until Calcifer has killed the group and can wait for that
+direct child, so descendants cannot indefinitely hold a pipe or PTY drain open.
+Explicit cleanup propagates group-kill, direct-wait, reader-join, pump, and
+cleanup errors. macOS zombie-only group `EPERM` is accepted only after the
+leader was observed exited; live-tree `EPERM` remains fatal. These are synthetic
+compatibility proofs only: production leases, transition journaling and
+recovery, pool policy, authoritative exhaustion selection, and user-state
+handoff remain unimplemented.
 
 ## Implemented Codex usage observation
 
@@ -380,7 +423,7 @@ Before the first stable release, the project still needs reviewed ADRs for:
 
 - deliberate all-profile re-key recovery after identity-key loss;
 - process/PTY supervision on Linux, macOS, and Windows;
-- supported Codex version/schema gates and observation cache TTL/backoff;
+- additional Codex version/schema gates and observation cache TTL/backoff;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
 - OS credential-store support for Claude setup tokens;
