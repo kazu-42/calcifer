@@ -12,6 +12,20 @@ keywords = ["cli", "codex", "claude", "profiles", "automation"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
 
+[features]
+default = []
+internal-supervisor-fixture = []
+
+[[bin]]
+name = "calcifer-supervisor-fixture"
+path = "src/bin/calcifer-supervisor-fixture.rs"
+required-features = ["internal-supervisor-fixture"]
+
+[[test]]
+name = "supervisor"
+path = "tests/supervisor.rs"
+required-features = ["internal-supervisor-fixture"]
+
 [workspace]
 members = ["crates/calcifer-macos-acl", "crates/calcifer-unix-child-fd"]
 default-members = [".", "crates/calcifer-macos-acl", "crates/calcifer-unix-child-fd"]

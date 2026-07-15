@@ -24,6 +24,21 @@ const HUMAN_USAGE_ERROR: &str =
 const HUMAN_INTERNAL_ERROR: &str = "error: Calcifer could not render or write diagnostic output.";
 const JSON_INTERNAL_ERROR: &str = r#"{"schema_version":1,"command":null,"ok":false,"error":{"code":"internal_error","message":"Calcifer could not render or write output"}}"#;
 
+/// Runs the non-shipping supervisor process fixture used by Calcifer's
+/// cross-process fault-injection tests.
+#[cfg(feature = "internal-supervisor-fixture")]
+#[doc(hidden)]
+pub fn run_internal_supervisor_fixture() -> ExitCode {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        providers::codex::run_internal_fixture(std::env::args_os())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        ExitCode::FAILURE
+    }
+}
+
 /// Runs Calcifer with an explicit argument iterator.
 ///
 /// This boundary keeps process-global argument handling out of command logic and

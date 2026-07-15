@@ -404,7 +404,7 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 3. **Implemented:** exact same-profile thread capture, crash reconciliation, no-argument cold restore, and journaled local profile removal. Safe reauth/re-key flows remain.
 4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
-6. Add version-gated cross-profile conversation handoff as the default successful failover path; the no-gap Linux/macOS target-reservation primitive is complete, while supervisor, journal, and fork integration remain pending. Preserve one profile-local writer per lineage generation.
+6. Add version-gated cross-profile conversation handoff as the default successful failover path; the no-gap Linux/macOS target-reservation primitive and default-unused fake-child supervisor authority foundation are complete, while real provider/PTY/monitor, journal, and fork integration remain pending. Preserve one profile-local writer per lineage generation.
 7. Add Claude only through provider-supported authentication and usage-observation surfaces.
 
 Detailed gates and non-goals are tracked in [docs/roadmap.md](docs/roadmap.md).

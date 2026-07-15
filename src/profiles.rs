@@ -1284,15 +1284,17 @@ impl Registry {
     pub(crate) fn lock_profile_coordinator(
         &self,
         profile: &Profile,
-    ) -> Result<ProfileLease, ProfileError> {
+    ) -> Result<CoordinatorProfileLease, ProfileError> {
         let profile_dir = self.profile_directory(profile)?;
         let coordinator = lock_profile_file(
             &profile_dir.join(COORDINATOR_LOCK_FILE),
             &profile.reference(),
         )?;
-        Ok(ProfileLease {
-            coordinator: Some(coordinator),
-            provider: None,
+        Ok(CoordinatorProfileLease {
+            lease: ProfileLease {
+                coordinator: Some(coordinator),
+                provider: None,
+            },
         })
     }
 
@@ -3140,6 +3142,14 @@ pub(crate) struct ProfileLease {
     provider: Option<File>,
 }
 
+/// An A-only profile authority returned by the fixed-order coordinator lock.
+///
+/// Keeping this distinct from [`ProfileLease`] prevents fail-closed recovery
+/// code from accidentally accepting a provider-only or combined lease.
+pub(crate) struct CoordinatorProfileLease {
+    lease: ProfileLease,
+}
+
 pub(crate) struct VerifiedProviderIdentityLease {
     _lease: ProfileLease,
     profile: Profile,
@@ -3210,6 +3220,21 @@ impl VerifiedTargetReservation {
                 error,
             })),
         }
+    }
+}
+
+impl CoordinatorProfileLease {
+    /// Borrows the coordinator-side lock for one audited authority check.
+    ///
+    /// This does not expose ownership or permit callers to unlock the file.
+    /// Long-running supervisor code must continue to acquire A before B and
+    /// must retain this lease object for the complete coordinator lifetime.
+    #[allow(dead_code)] // First consumed by the default-off supervisor in issue #50.
+    pub(crate) fn lock_file(&self) -> Result<&File, ProfileError> {
+        self.lease
+            .coordinator
+            .as_ref()
+            .ok_or_else(|| ProfileError::UnsafeState("coordinator lock is not held".to_owned()))
     }
 }
 

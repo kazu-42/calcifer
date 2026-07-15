@@ -8,10 +8,108 @@
 #![cfg(unix)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::fmt;
+use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
+
+const MAX_DESCRIPTOR_SCAN_ENTRIES: usize = 4_096;
+
+/// Path-free device/inode identity returned by `fstat(2)`.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct DescriptorIdentity {
+    /// Device containing the descriptor's underlying object.
+    pub device: u64,
+    /// Inode of the descriptor's underlying object.
+    pub inode: u64,
+}
+
+impl fmt::Debug for DescriptorIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (self.device, self.inode);
+        formatter.write_str("DescriptorIdentity(<redacted>)")
+    }
+}
+
+/// Reads one open descriptor's path-free filesystem identity.
+pub fn descriptor_identity(descriptor: BorrowedFd<'_>) -> io::Result<DescriptorIdentity> {
+    descriptor_identity_raw(descriptor.as_raw_fd())
+}
+
+/// Counts open descriptors with an exact path-free identity.
+///
+/// This bounded scanner exists for real-exec inheritance assertions. It never
+/// takes ownership of, duplicates, closes, or renders any inspected descriptor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn count_open_descriptors_with_identity(expected: DescriptorIdentity) -> io::Result<usize> {
+    if expected.inode == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor identity inode is zero",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let descriptor_directory = "/proc/self/fd";
+    #[cfg(target_os = "macos")]
+    let descriptor_directory = "/dev/fd";
+
+    let mut descriptors = Vec::new();
+    for entry in fs::read_dir(descriptor_directory)? {
+        if descriptors.len() == MAX_DESCRIPTOR_SCAN_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "descriptor scan exceeded its entry limit",
+            ));
+        }
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Ok(raw_descriptor) = name.parse::<RawFd>() {
+            descriptors.push(raw_descriptor);
+        }
+    }
+
+    let mut matches = 0_usize;
+    for raw_descriptor in descriptors {
+        match descriptor_identity_raw(raw_descriptor) {
+            Ok(identity) if identity == expected => matches += 1,
+            Ok(_) => {}
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::EBADF) | Some(libc::ENOENT)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(matches)
+}
+
+fn descriptor_identity_raw(raw_descriptor: RawFd) -> io::Result<DescriptorIdentity> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `status` points to writable storage for one `libc::stat` and
+    // `fstat` does not take ownership of or close the integer descriptor. An
+    // invalid/raced descriptor is reported as an ordinary errno.
+    let result = unsafe { libc::fstat(raw_descriptor, status.as_mut_ptr()) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful `fstat` initialized the complete output structure.
+    let status = unsafe { status.assume_init() };
+    #[cfg(target_os = "macos")]
+    // Darwin exposes `dev_t` through a signed 32-bit C type. Its high bit is
+    // part of an opaque kernel identity, not a semantic negative value. Keep
+    // the exact bit pattern so two `fstat(2)` results remain comparable.
+    let device = u64::from(status.st_dev as u32);
+    #[cfg(target_os = "linux")]
+    let device = status.st_dev;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let device = status.st_dev as u64;
+    Ok(DescriptorIdentity {
+        device,
+        inode: status.st_ino,
+    })
+}
 
 /// Spawns one command whose child-side copy of `descriptor` survives `exec`.
 ///
@@ -196,6 +294,60 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn bounded_identity_scan_counts_regular_files_and_unix_sockets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "calcifer-fd-identity-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let file_clone = file.try_clone()?;
+        let file_identity = descriptor_identity(file.as_fd())?;
+        assert_ne!(file_identity.inode, 0);
+        assert_eq!(count_open_descriptors_with_identity(file_identity)?, 2);
+
+        let (socket, peer) = UnixStream::pair()?;
+        let socket_identity = descriptor_identity(socket.as_fd())?;
+        assert_ne!(socket_identity.inode, 0);
+        assert_eq!(count_open_descriptors_with_identity(socket_identity)?, 1);
+
+        drop(peer);
+        drop(socket);
+        drop(file_clone);
+        drop(file);
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_scan_rejects_a_zero_inode() {
+        assert!(matches!(
+            count_open_descriptors_with_identity(DescriptorIdentity {
+                device: 0,
+                inode: 0,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn descriptor_identity_debug_is_redacted() -> Result<(), Box<dyn std::error::Error>> {
+        let (socket, _peer) = UnixStream::pair()?;
+        let identity = descriptor_identity(socket.as_fd())?;
+        let rendered = format!("{identity:?}");
+
+        assert_eq!(rendered, "DescriptorIdentity(<redacted>)");
+        assert!(!rendered.contains(&identity.device.to_string()));
+        assert!(!rendered.contains(&identity.inode.to_string()));
+        Ok(())
+    }
 
     #[test]
     fn source_descriptor_stays_close_on_exec_during_the_child_callback()
