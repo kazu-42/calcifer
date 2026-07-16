@@ -623,10 +623,11 @@ impl TerminalSnapshot {
         })
     }
 
-    /// Restores the exact captured termios state with `TCSANOW` and performs a
-    /// semantic readback. It intentionally does not restore the window size:
-    /// Calcifer never mutates the outer tty size, and a user resize during a
-    /// session must not be overwritten by cleanup.
+    /// Discards input queued through the final restoration flush, restores the
+    /// exact captured termios state with `TCSANOW`, and performs a semantic
+    /// readback. It intentionally does not restore the window size: Calcifer
+    /// never mutates the outer tty size, and a user resize during a session
+    /// must not be overwritten by cleanup.
     pub(super) fn restore<Fd: AsFd>(
         &self,
         descriptor: Fd,
@@ -643,6 +644,11 @@ impl TerminalSnapshot {
         if read_foreground_process_group(descriptor)? != self.foreground_process_group {
             return Err(TerminalError::NotForegroundProcessGroup);
         }
+        // The input pump is already quiescent, but keystrokes can still reach
+        // the tty while cleanup runs. Never let those unread bytes become a
+        // command in the invoking shell after Calcifer restores canonical mode.
+        rustix::termios::tcflush(descriptor, rustix::termios::QueueSelector::IFlush)
+            .map_err(|_| TerminalError::InputFlush)?;
         rustix::termios::tcsetattr(
             descriptor,
             rustix::termios::OptionalActions::Now,
@@ -654,6 +660,15 @@ impl TerminalSnapshot {
         if !termios_semantically_equal(&self.attributes, &readback) {
             return Err(TerminalError::RestoreMismatch);
         }
+        self.verify_identity(descriptor)?;
+        if read_foreground_process_group(descriptor)? != self.foreground_process_group {
+            return Err(TerminalError::NotForegroundProcessGroup);
+        }
+        // Close the remaining arrival window from the first flush through the
+        // attribute readback. The foreground check above prevents discarding a
+        // successor job's input; checks below bind the proof to the same owner.
+        rustix::termios::tcflush(descriptor, rustix::termios::QueueSelector::IFlush)
+            .map_err(|_| TerminalError::InputFlush)?;
         self.verify_identity(descriptor)?;
         if read_foreground_process_group(descriptor)? != self.foreground_process_group {
             return Err(TerminalError::NotForegroundProcessGroup);
@@ -720,7 +735,9 @@ impl fmt::Debug for RawTerminalProof {
     }
 }
 
-/// Proof that exact snapshot restoration was semantically read back.
+/// Proof that exact snapshot restoration was semantically read back and the
+/// final input flush succeeded on the captured tty identity and foreground
+/// owner.
 #[must_use = "restoration proof must precede terminal recovery disarm"]
 pub(super) struct RestoredTerminalProof {
     descriptor_identity: calcifer_unix_child_fd::DescriptorIdentity,
@@ -1602,6 +1619,11 @@ mod tests {
 
     const CHILD_HELPER_ENV: &str = "CALCIFER_TERMINAL_CHILD_HELPER";
     const CHILD_MARKER: &[u8] = b"calcifer-terminal-child-ok";
+    const RESTORE_FLUSH_HELPER_ENV: &str = "CALCIFER_TERMINAL_RESTORE_FLUSH_HELPER";
+    const RESTORE_FLUSH_READY: &[u8] = b"calcifer-terminal-restore-flush-ready";
+    const RESTORE_FLUSH_RESTORED: &[u8] = b"calcifer-terminal-restore-flush-restored";
+    const RESTORE_FLUSH_SENTINEL: &[u8] = b"calcifer-queued-input-sentinel";
+    const RESTORE_FLUSH_PROBE: &[u8] = b"\n";
 
     #[test]
     fn pty_pair_is_cloexec_and_preserves_initial_size() -> Result<(), Box<dyn Error>> {
@@ -1640,11 +1662,17 @@ mod tests {
             .env(CHILD_HELPER_ENV, "1");
         let owner = PtyOwner::open(TerminalSize::new(41, 117))?;
         let mut master = owner.configure_child(&mut command)?;
+        // Keep an independent master reference until the exact child wait is
+        // complete. The drainer may observe the final marker before the child
+        // executes its success exit; dropping the last master in that window
+        // sends SIGHUP to the controlling session on Linux.
+        let master_keepalive = master.descriptor.try_clone()?;
         let mut child = command.spawn()?;
         drop(command);
         let drainer = std::thread::spawn(move || drain_for_marker(&mut master, CHILD_MARKER));
 
         let status = child.wait()?;
+        drop(master_keepalive);
         let saw_marker = drainer
             .join()
             .map_err(|_| "terminal child drainer panicked")??;
@@ -1782,6 +1810,97 @@ mod tests {
         };
         if outer_tty.try_write(&mut marker).ok() != Some(TerminalWrite::Complete) {
             std::process::exit(75);
+        }
+        // Make the parent-side master-lifetime contract deterministic: the
+        // child must remain attached briefly after publishing its last byte.
+        std::thread::sleep(Duration::from_millis(50));
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn restore_discards_input_queued_after_pump_quiescence() -> Result<(), Box<dyn Error>> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "providers::codex::supervisor::terminal::tests::restore_flush_child_helper",
+                "--nocapture",
+            ])
+            .env(RESTORE_FLUSH_HELPER_ENV, "1");
+        let owner = PtyOwner::open(TerminalSize::new(24, 80))?;
+        let mut master = owner.configure_child(&mut command)?;
+        let mut child = command.spawn()?;
+        drop(command);
+
+        assert!(drain_for_marker(&mut master, RESTORE_FLUSH_READY)?);
+        let mut sentinel_buffer = TerminalBuffer::new();
+        let mut sentinel = sentinel_buffer.load(RESTORE_FLUSH_SENTINEL)?;
+        assert_eq!(master.try_write(&mut sentinel)?, TerminalWrite::Complete);
+
+        assert!(drain_for_marker(&mut master, RESTORE_FLUSH_RESTORED)?);
+        let mut probe_buffer = TerminalBuffer::new();
+        let mut probe = probe_buffer.load(RESTORE_FLUSH_PROBE)?;
+        assert_eq!(master.try_write(&mut probe)?, TerminalWrite::Complete);
+
+        // Retain the sole master through exact wait. The child must verify the
+        // slave queue after restoration before this descriptor can close.
+        let status = child.wait()?;
+        assert!(status.success(), "terminal child exit was {status:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn restore_flush_child_helper() {
+        if std::env::var_os(RESTORE_FLUSH_HELPER_ENV).is_none() {
+            return;
+        }
+
+        if claim_controlling_terminal_from_stdin().is_err() {
+            std::process::exit(101);
+        }
+        let Ok(snapshot) = TerminalSnapshot::capture(io::stdin()) else {
+            std::process::exit(102);
+        };
+        let Ok(outer_tty) = TerminalTty::open_independent(io::stdin()) else {
+            std::process::exit(103);
+        };
+        if snapshot.enter_raw_after_input_flush(io::stdin()).is_err() {
+            std::process::exit(104);
+        }
+
+        let mut ready_buffer = TerminalBuffer::new();
+        let Ok(mut ready) = ready_buffer.load(RESTORE_FLUSH_READY) else {
+            std::process::exit(105);
+        };
+        if outer_tty.try_write(&mut ready).ok() != Some(TerminalWrite::Complete) {
+            std::process::exit(106);
+        }
+
+        let stdin = io::stdin();
+        if !wait_for_input(&stdin, Duration::from_secs(2)) {
+            std::process::exit(108);
+        }
+
+        if snapshot.restore(&stdin).is_err() {
+            std::process::exit(109);
+        }
+        let mut restored_buffer = TerminalBuffer::new();
+        let Ok(mut restored) = restored_buffer.load(RESTORE_FLUSH_RESTORED) else {
+            std::process::exit(110);
+        };
+        if outer_tty.try_write(&mut restored).ok() != Some(TerminalWrite::Complete) {
+            std::process::exit(110);
+        }
+
+        if !wait_for_input(&stdin, Duration::from_secs(2)) {
+            std::process::exit(111);
+        }
+        let mut received = TerminalBuffer::new();
+        if !matches!(
+            received.read_from(&mut io::stdin()),
+            Ok(TerminalRead::Data(chunk)) if chunk.matches(RESTORE_FLUSH_PROBE)
+        ) {
+            std::process::exit(112);
         }
         std::process::exit(0);
     }
@@ -2332,6 +2451,42 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn wait_for_input<Fd: AsFd>(descriptor: Fd, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let Ok(timeout) = rustix::event::Timespec::try_from(remaining) else {
+                return false;
+            };
+            let mut descriptors = [rustix::event::PollFd::new(
+                &descriptor,
+                rustix::event::PollFlags::IN,
+            )];
+            match rustix::event::poll(&mut descriptors, Some(&timeout)) {
+                Ok(1) => {
+                    let events = descriptors[0].revents();
+                    if events.intersects(
+                        rustix::event::PollFlags::ERR
+                            | rustix::event::PollFlags::HUP
+                            | rustix::event::PollFlags::NVAL,
+                    ) {
+                        return false;
+                    }
+                    if events.contains(rustix::event::PollFlags::IN) {
+                        return true;
+                    }
+                }
+                Ok(0) => return false,
+                Ok(_) => return false,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(_) => return false,
             }
         }
     }

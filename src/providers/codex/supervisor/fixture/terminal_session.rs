@@ -64,6 +64,18 @@ impl SignalFlag {
     fn clear(&self) {
         self.pending.store(false, Ordering::Release);
     }
+
+    fn wait_until(&self, deadline: Instant) -> bool {
+        loop {
+            if self.take() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(EVENT_POLL);
+        }
+    }
 }
 
 impl Drop for SignalFlag {
@@ -145,8 +157,8 @@ impl TerminalSignalFlags {
         self.cont.clear();
     }
 
-    fn take_continue(&self) -> bool {
-        self.cont.take()
+    fn wait_for_continue(&self, deadline: Instant) -> bool {
+        self.cont.wait_until(deadline)
     }
 }
 
@@ -603,6 +615,12 @@ pub(super) fn run_fake_tui(scenario: Scenario) -> Result<ExitCode, FixtureError>
     loop {
         signal_flags.observe(&mut signal_state)?;
         if scenario == Scenario::PtyTuiExitBeforeResumeGate && signal_state.continue_seen {
+            // This scenario proves the post-resume, pre-input-gate failure
+            // boundary. Keep the TUI alive until the coordinator has accepted
+            // the guardian's typed `Resumed` event and published that the new
+            // gate is still closed; otherwise scheduler order can turn the
+            // fixture into a different pre-resume early-exit case.
+            wait_for_exact_marker("coordinator.resume-gate-held", b"held\n")?;
             write_marker("tui.pre-resume-gate-exit", b"exiting\n")?;
             return Ok(ExitCode::from(23));
         }
@@ -826,7 +844,9 @@ impl TuiSignalFlags {
         let handles_interactive = scenario == Scenario::PtySignals;
         let handles_job_control = matches!(
             scenario,
-            Scenario::PtySuspendResume | Scenario::PtyTuiExitBeforeResumeGate
+            Scenario::PtySuspendResume
+                | Scenario::PtyResumeFailure
+                | Scenario::PtyTuiExitBeforeResumeGate
         );
         let ignores_terminate = scenario == Scenario::PtyOutputBackpressure;
         let flags = Self {
@@ -1683,6 +1703,33 @@ impl GuardianPumpState {
 }
 
 #[cfg(test)]
+mod signal_flag_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_wait_accepts_a_continue_flag_published_after_the_thread_resumes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pending = Arc::new(AtomicBool::new(false));
+        let flag = SignalFlag {
+            pending: Arc::clone(&pending),
+            registration: None,
+        };
+        assert!(!flag.take());
+
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            pending.store(true, Ordering::Release);
+        });
+        assert!(flag.wait_until(Instant::now() + Duration::from_millis(250)));
+        publisher
+            .join()
+            .map_err(|_| io::Error::other("signal flag publisher panicked"))?;
+        assert!(!flag.take());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod pump_tests {
     use super::*;
     use std::sync::Barrier;
@@ -2053,7 +2100,11 @@ fn suspend_and_resume_coordinator(
     signal_hook::low_level::emulate_default_handler(signal_hook::consts::signal::SIGTSTP)
         .map_err(|_| FixtureError::Process)?;
 
-    if !flags.take_continue() {
+    // Returning from the default stop handler proves that the process was
+    // continued, but the SIGCONT flag handler may run a few scheduler turns
+    // later. Wait for its bounded typed proof instead of sampling once and
+    // misclassifying a valid resume as an invariant failure.
+    if !flags.wait_for_continue(phase_deadline()) {
         return Err(FixtureError::Invariant);
     }
     if rustix::termios::tcgetpgrp(io::stdin()).map_err(|_| FixtureError::Process)?
@@ -2078,15 +2129,21 @@ fn suspend_and_resume_coordinator(
         .map_err(|_| FixtureError::Protocol)?;
     send_coordinator_command(&mut &*lifecycle, resume, phase_deadline())
         .map_err(|_| FixtureError::Channel)?;
-    if receiver
+    match receiver
         .receive(phase_deadline())
         .map_err(|_| FixtureError::Protocol)?
-        != (GuardianEvent::Resumed {
-            rows: size.rows(),
-            cols: size.columns(),
-        })
     {
-        return Err(FixtureError::Protocol);
+        GuardianEvent::Resumed { rows, cols } if rows == size.rows() && cols == size.columns() => {}
+        GuardianEvent::Failed { .. } => {
+            // `Failed` is a valid transition from AwaitResumed. Keep the fresh
+            // input gate closed and let the normal terminal-quiescence path
+            // perform exact cleanup instead of retaining the coordinator as a
+            // false protocol-invariant failure.
+            write_marker("coordinator.resume-failed-accepted", b"accepted\n")?;
+            drop(raw);
+            return Ok(CoordinatorControlOutcome::FailedAwaitQuiescence);
+        }
+        _ => return Err(FixtureError::Protocol),
     }
     let readiness = receiver
         .take_verified_ready()
@@ -4946,6 +5003,29 @@ fn run_active_guardian(
                 suspended = true;
             }
             Ok(CoordinatorCommand::Resume { rows, cols }) if suspended => {
+                if scenario == Scenario::PtyResumeFailure {
+                    let failure = if write_marker("guardian.resume-failure-injected", b"injected\n")
+                        .is_ok()
+                    {
+                        (Phase::Signal, FailureCode::Signal)
+                    } else {
+                        (Phase::Signal, FailureCode::Internal)
+                    };
+                    return finish_terminal_guardian_with_failure_quiescence_barrier(
+                        endpoint,
+                        commands,
+                        provider_lease,
+                        recovery,
+                        snapshot,
+                        runtime,
+                        worker,
+                        Some(app),
+                        Some(tui),
+                        pump.take().map(GuardianPumpState::Duplex),
+                        Some(failure),
+                        true,
+                    );
+                }
                 let outcome = match pump.as_mut() {
                     Some(pump) => resume_active_guardian(
                         endpoint, commands, &mut app, &mut tui, pump, rows, cols,

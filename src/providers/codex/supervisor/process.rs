@@ -161,12 +161,6 @@ impl ForwardedTuiSignal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum JobState {
-    Stopped,
-    Continued,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TuiShutdownMode {
     StartWithTerm,
     SignalAlreadyForwarded(TerminalShutdownSignal),
@@ -247,9 +241,6 @@ pub(super) enum ProcessError {
     SuspendTimeout {
         role: ChildRole,
     },
-    ResumeTimeout {
-        role: ChildRole,
-    },
     Wait {
         role: ChildRole,
     },
@@ -296,7 +287,6 @@ impl fmt::Display for ProcessError {
                 "forwarded shutdown signal did not match the supervised TUI"
             }
             Self::SuspendTimeout { .. } => "supervised child suspend exceeded its deadline",
-            Self::ResumeTimeout { .. } => "supervised child resume exceeded its deadline",
             Self::Wait { .. } => "supervised child wait failed",
             Self::WaitTimeout { .. } => "supervised child wait exceeded its deadline",
             Self::RoleMismatch { .. } => "supervised child role mismatched its shutdown slot",
@@ -1011,54 +1001,66 @@ impl ManagedGroupChild {
             StopAction::None,
             graceful_deadline,
         )?;
-        let _leader_observed_after_tstp =
-            self.wait_for_job_state(JobState::Stopped, graceful_deadline)?;
+        let leader_stopped_after_tstp = self.wait_for_stopped(graceful_deadline)?;
         self.signal_group(
             rustix::process::Signal::STOP,
             StopAction::None,
             forced_deadline,
         )?;
-        if self.wait_for_job_state(JobState::Stopped, forced_deadline)? {
+        // A graceful STOPPED notification is consumed before the mandatory
+        // descendant sweep. Waiting for another leader notification in that
+        // case would require an implementation-specific duplicate. When the
+        // leader ignored SIGTSTP, however, the SIGSTOP notification is the
+        // required proof that the forced fallback took effect.
+        if leader_stopped_after_tstp || self.wait_for_stopped(forced_deadline)? {
             Ok(())
         } else {
             Err(ProcessError::SuspendTimeout { role: self.role })
         }
     }
 
-    /// Continues a previously stopped TUI and observes the direct child before
-    /// the input gate can be reopened.
+    /// Continues a previously stopped TUI and rejects an already-exited direct
+    /// child before the input gate can be reopened.
+    ///
+    /// A successful `SIGCONT` to the identity-pinned process group performs the
+    /// continuation action even when the kernel coalesces its advisory
+    /// `CLD_CONTINUED` wait notification. Requiring that edge notification can
+    /// therefore turn a live resumed TUI into a false timeout. Exact exit wait
+    /// authority remains unconsumed and the higher-level gate rechecks liveness
+    /// immediately before ingress starts.
     pub(super) fn resume(&mut self, deadline: Instant) -> Result<(), ProcessError> {
         self.role_matches(ChildRole::Tui)?;
         self.signal_group(rustix::process::Signal::CONT, StopAction::None, deadline)?;
-        if self.wait_for_job_state(JobState::Continued, deadline)? {
-            Ok(())
-        } else {
-            Err(ProcessError::ResumeTimeout { role: self.role })
+        if self.observe_exit_without_reaping(Instant::now())? {
+            let disposition = self.contain_and_reap_observed_exit(deadline)?;
+            return Err(ProcessError::EarlyExit {
+                role: self.role,
+                disposition,
+            });
         }
+        Ok(())
     }
 
-    fn wait_for_job_state(
-        &mut self,
-        expected: JobState,
-        deadline: Instant,
-    ) -> Result<bool, ProcessError> {
+    fn wait_for_stopped(&mut self, deadline: Instant) -> Result<bool, ProcessError> {
         loop {
-            let options = match expected {
-                JobState::Stopped => {
-                    rustix::process::WaitIdOptions::STOPPED | rustix::process::WaitIdOptions::EXITED
-                }
-                JobState::Continued => {
-                    rustix::process::WaitIdOptions::CONTINUED
-                        | rustix::process::WaitIdOptions::EXITED
-                }
-            } | rustix::process::WaitIdOptions::NOHANG
+            let options = rustix::process::WaitIdOptions::STOPPED
+                | rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
                 | rustix::process::WaitIdOptions::NOWAIT;
             match rustix::process::waitid(rustix::process::WaitId::Pid(self.pid), options) {
-                Ok(Some(status)) if status.stopped() && expected == JobState::Stopped => {
-                    return Ok(true);
-                }
-                Ok(Some(status)) if status.continued() && expected == JobState::Continued => {
-                    return Ok(true);
+                Ok(Some(status)) if status.stopped() => {
+                    // Consume only the nonterminal job-control notification.
+                    // Exit authority remains with the exact `Child` handle.
+                    let consumed = rustix::process::waitid(
+                        rustix::process::WaitId::Pid(self.pid),
+                        rustix::process::WaitIdOptions::STOPPED
+                            | rustix::process::WaitIdOptions::NOHANG,
+                    );
+                    return match consumed {
+                        Ok(Some(consumed)) if consumed.stopped() => Ok(true),
+                        Ok(Some(_)) | Ok(None) => Err(ProcessError::Wait { role: self.role }),
+                        Err(_) => Err(ProcessError::Wait { role: self.role }),
+                    };
                 }
                 Ok(Some(status)) if status.exited() || status.killed() || status.dumped() => {
                     self.observed_exit = true;
@@ -1070,9 +1072,13 @@ impl ManagedGroupChild {
                 Ok(Some(_)) | Ok(None) if Instant::now() < deadline => {
                     sleep_until_next_poll(deadline);
                 }
-                Ok(Some(_)) | Ok(None) => return Ok(false),
+                Ok(Some(_)) | Ok(None) => {
+                    return Ok(false);
+                }
                 Err(rustix::io::Errno::INTR) if Instant::now() < deadline => {}
-                Err(rustix::io::Errno::INTR) => return Ok(false),
+                Err(rustix::io::Errno::INTR) => {
+                    return Ok(false);
+                }
                 Err(_) => return Err(ProcessError::Wait { role: self.role }),
             }
         }
@@ -1779,7 +1785,6 @@ const fn process_error_role(error: ProcessError) -> ChildRole {
         | ProcessError::Signal { role, .. }
         | ProcessError::ForwardedSignalMismatch { role }
         | ProcessError::SuspendTimeout { role }
-        | ProcessError::ResumeTimeout { role }
         | ProcessError::Wait { role }
         | ProcessError::WaitTimeout { role } => role,
         ProcessError::RoleMismatch { actual, .. } => actual,
@@ -2139,6 +2144,7 @@ mod tests {
         let mut signals = signal_hook::iterator::Signals::new([
             signal_hook::consts::signal::SIGHUP,
             signal_hook::consts::signal::SIGTERM,
+            signal_hook::consts::signal::SIGTSTP,
         ])?;
         fs::write(&path, b"R")?;
         loop {
@@ -2146,6 +2152,7 @@ mod tests {
                 let marker = match signal {
                     signal_hook::consts::signal::SIGHUP => b'H',
                     signal_hook::consts::signal::SIGTERM => b'T',
+                    signal_hook::consts::signal::SIGTSTP => b'S',
                     _ => return Err("unexpected registered signal".into()),
                 };
                 OpenOptions::new()
@@ -2859,6 +2866,89 @@ mod tests {
         );
 
         child.resume(Instant::now() + TEST_DEADLINE)?;
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn suspend_forces_a_tstp_ignoring_tui_group_to_stop() -> Result<(), Box<dyn Error>> {
+        let log = SignalLog::new("suspend-fallback")?;
+        let mut child =
+            ManagedGroupChild::spawn(ChildRole::Tui, signal_counting_command(&log)?, false)?;
+        wait_for_signal_log(&log, b"R")?;
+        let started_at = Instant::now();
+
+        child.suspend(
+            started_at + Duration::from_millis(100),
+            started_at + TEST_DEADLINE,
+        )?;
+        assert_eq!(log.contents()?, b"RS");
+        assert_eq!(
+            child.poll_liveness(Instant::now() + TEST_DEADLINE)?,
+            ChildLiveness::Running
+        );
+
+        child.resume(Instant::now() + TEST_DEADLINE)?;
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_suspend_resume_cycles_do_not_reuse_nonterminal_wait_notifications()
+    -> Result<(), Box<dyn Error>> {
+        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+
+        for _ in 0..2 {
+            let started_at = Instant::now();
+            child.suspend(
+                started_at + Duration::from_millis(100),
+                started_at + TEST_DEADLINE,
+            )?;
+            child.resume(Instant::now() + TEST_DEADLINE)?;
+        }
+
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_does_not_require_a_distinct_continued_wait_notification() -> Result<(), Box<dyn Error>>
+    {
+        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let started_at = Instant::now();
+        child.suspend(
+            started_at + Duration::from_millis(100),
+            started_at + TEST_DEADLINE,
+        )?;
+
+        // Consume the kernel's one advisory CLD_CONTINUED notification before
+        // the reviewed resume entrypoint runs. Linux may coalesce that exact
+        // notification during real group-stop races, while a successful
+        // SIGCONT still performs the required continuation action.
+        rustix::process::kill_process_group(child.pgid, rustix::process::Signal::CONT)?;
+        let deadline = Instant::now() + TEST_DEADLINE;
+        loop {
+            match rustix::process::waitid(
+                rustix::process::WaitId::Pid(child.pid),
+                rustix::process::WaitIdOptions::CONTINUED | rustix::process::WaitIdOptions::NOHANG,
+            ) {
+                Ok(Some(status)) if status.continued() => break,
+                Ok(Some(_)) | Ok(None) if Instant::now() < deadline => {
+                    sleep_until_next_poll(deadline);
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    return Err("continued notification was not observable".into());
+                }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+        }
+
+        child.resume(Instant::now() + Duration::from_millis(100))?;
         let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         Ok(())

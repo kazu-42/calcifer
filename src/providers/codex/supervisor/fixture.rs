@@ -93,6 +93,7 @@ enum Scenario {
     PtyTrailingFrame,
     PtyTuiEarlyExit,
     PtyTuiExitBeforeGate,
+    PtyResumeFailure,
     PtyTuiExitBeforeResumeGate,
     PtyReadyNoAck,
     PtyWorkerFailure,
@@ -136,6 +137,7 @@ impl Scenario {
             "pty-trailing-frame" => Ok(Self::PtyTrailingFrame),
             "pty-tui-early-exit" => Ok(Self::PtyTuiEarlyExit),
             "pty-tui-exit-before-gate" => Ok(Self::PtyTuiExitBeforeGate),
+            "pty-resume-failure" => Ok(Self::PtyResumeFailure),
             "pty-tui-exit-before-resume-gate" => Ok(Self::PtyTuiExitBeforeResumeGate),
             "pty-ready-no-ack" => Ok(Self::PtyReadyNoAck),
             "pty-worker-failure" => Ok(Self::PtyWorkerFailure),
@@ -180,6 +182,7 @@ impl Scenario {
             Self::PtyTrailingFrame => "pty-trailing-frame",
             Self::PtyTuiEarlyExit => "pty-tui-early-exit",
             Self::PtyTuiExitBeforeGate => "pty-tui-exit-before-gate",
+            Self::PtyResumeFailure => "pty-resume-failure",
             Self::PtyTuiExitBeforeResumeGate => "pty-tui-exit-before-resume-gate",
             Self::PtyReadyNoAck => "pty-ready-no-ack",
             Self::PtyWorkerFailure => "pty-worker-failure",
@@ -212,6 +215,7 @@ impl Scenario {
                 | Self::PtyTrailingFrame
                 | Self::PtyTuiEarlyExit
                 | Self::PtyTuiExitBeforeGate
+                | Self::PtyResumeFailure
                 | Self::PtyTuiExitBeforeResumeGate
                 | Self::PtyReadyNoAck
                 | Self::PtyWorkerFailure

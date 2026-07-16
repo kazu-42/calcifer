@@ -274,8 +274,11 @@ impl OuterPtyChild {
             kill_marker: fixture.markers.join("test.kill-coordinator"),
             retained_resolution_marker: (scenario == "pty-foreground-reclaim")
                 .then(|| fixture.markers.join("test.resolve-foreground-reclaim")),
-            failure_quiescence_release_marker: (scenario == "pty-tui-exit-before-gate")
-                .then(|| fixture.markers.join("test.release-quiescence")),
+            failure_quiescence_release_marker: matches!(
+                scenario,
+                "pty-tui-exit-before-gate" | "pty-resume-failure"
+            )
+            .then(|| fixture.markers.join("test.release-quiescence")),
             master,
             master_closed: false,
             capture: FixedPtyCapture::new(),
@@ -2826,6 +2829,92 @@ fn gated_pty_suspend_restores_and_resume_requires_a_fresh_gate() -> TestResult {
     fixture.assert_marker("guardian.cleaned", b"complete\n")?;
     fixture.assert_marker_payloads_exclude(&[SUSPENDED_SENTINEL, POST_READY_SENTINEL])?;
     fixture.assert_no_runtime()?;
+    fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn gated_pty_resume_failure_is_typed_and_cleans_up_without_retention() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("pty-resume-failure")?;
+    let mut coordinator = OuterPtyChild::spawn(&fixture, "pty-resume-failure")?;
+    fixture.release_test_capability("test.release-ready")?;
+    coordinator.wait_for_marker(&fixture, "gate.open", b"open\n", PROCESS_TIMEOUT)?;
+    let guardian = fixture.read_pid_marker("guardian.pid")?;
+    let app = fixture.read_pid_marker("app.pid")?;
+    let tui = fixture.read_pid_marker("tui.pid")?;
+    fixture.wait_for_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+
+    fixture.release_test_capability("test.signal-tstp")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "tui.leader-self-stop",
+        b"stopping\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.coordinator-stopped",
+        b"stopped\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "terminal.suspended-restored",
+        b"restored\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.assert_restored()?;
+    coordinator.write_bytes(SUSPENDED_SENTINEL, CONTENDER_TIMEOUT)?;
+    coordinator.resize(43, 125)?;
+
+    fixture.release_test_capability("test.signal-cont")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.resume-failure-injected",
+        b"injected\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "coordinator.resume-failed-accepted",
+        b"accepted\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.failure-announced-held",
+        b"held\n",
+        PROCESS_TIMEOUT,
+    )?;
+    fixture.release_test_capability("test.release-quiescence")?;
+    let status = coordinator.wait(PROCESS_TIMEOUT)?;
+    assert_status_code(status, Some(EXIT_FAILURE))?;
+    coordinator.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+    coordinator.wait_until_restored(CONTENDER_TIMEOUT)?;
+    coordinator.assert_restored()?;
+    wait_pid_gone(guardian, guardian, CONTENDER_TIMEOUT)?;
+    wait_pid_gone(app, app, CONTENDER_TIMEOUT)?;
+    wait_pid_gone(tui, tui, CONTENDER_TIMEOUT)?;
+
+    fixture.assert_marker("terminal.restored", b"restored\n")?;
+    fixture.assert_marker("guardian.cleaned", b"complete\n")?;
+    fixture.assert_marker("coordinator.failed", b"clean\n")?;
+    for absent in [
+        "gate.reopened",
+        "coordinator.completed",
+        "coordinator.retained",
+    ] {
+        fixture.assert_marker_absent(absent)?;
+    }
+    if coordinator.capture().occurrences(SUSPENDED_SENTINEL) != 0 {
+        return Err(io::Error::other("suspended input crossed a failed fresh gate").into());
+    }
+    fixture.assert_marker_payloads_exclude(&[SUSPENDED_SENTINEL])?;
+    fixture.assert_no_runtime()?;
+    fixture.wait_for_provider_contender(0, CONTENDER_TIMEOUT)?;
     fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
     fixture.assert_provider_untouched()?;
     Ok(())
