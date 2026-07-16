@@ -5,17 +5,37 @@
 
 use std::fmt;
 use std::io::Read;
+use std::os::fd::BorrowedFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::protocol::{ChildDisposition, ChildRole, StopAction};
+use super::protocol::{ChildDisposition, ChildRole, StopAction, UnixSignal};
 
 const READINESS_SENTINEL: u8 = b'R';
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SPAWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+static NEXT_CHILD_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local identity that cannot be reconstructed from a reported PID or
+/// process-group number. It binds one-shot signal proofs to one direct child
+/// handle even after the operating system reuses numeric process identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChildAuthority(u64);
+
+impl ChildAuthority {
+    fn next() -> Self {
+        match NEXT_CHILD_AUTHORITY.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        }) {
+            Ok(authority) => Self(authority),
+            Err(_) => std::process::abort(),
+        }
+    }
+}
 
 /// Bounded process identity published only for containment attempts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +100,78 @@ pub(super) enum ChildLiveness {
     Exited,
 }
 
+/// A terminal signal that starts shutdown instead of returning to `Active`.
+///
+/// Keeping this narrower than [`UnixSignal`] prevents the checked shutdown
+/// entrypoint from being armed by an interactive `INT` or `QUIT` forwarding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TerminalShutdownSignal {
+    Hup,
+    Term,
+}
+
+/// An interactive terminal signal that never begins checked shutdown.
+///
+/// The protocol carries all four forwarded signals in one wire enum, but the
+/// direct-child authority boundary accepts only this narrower type. `HUP` and
+/// `TERM` must use [`TerminalShutdownSignal`] and return a shutdown proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InteractiveTerminalSignal {
+    Int,
+    Quit,
+}
+
+impl InteractiveTerminalSignal {
+    /// Narrows the wire-level allow-list after the guardian has already split
+    /// shutdown signals from interactive signals.
+    pub(super) const fn from_unix_signal(signal: UnixSignal) -> Option<Self> {
+        match signal {
+            UnixSignal::Int => Some(Self::Int),
+            UnixSignal::Quit => Some(Self::Quit),
+            UnixSignal::Hup | UnixSignal::Term => None,
+        }
+    }
+}
+
+/// Proof that shutdown forwarding completed for this exact TUI process group.
+///
+/// The private fields make the capability constructible only after a
+/// successful direct-child signal operation in this module (including a
+/// disappeared group whose direct child is confirmed exited). The checked
+/// shutdown entrypoint consumes it and verifies the bounded process identity
+/// before suppressing its normal TUI `TERM` start.
+#[must_use = "forwarded TUI shutdown proof must be consumed by checked shutdown"]
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct ForwardedTuiSignal {
+    signal: TerminalShutdownSignal,
+    containment: ContainmentMetadata,
+    authority: ChildAuthority,
+}
+
+impl ForwardedTuiSignal {
+    pub(super) const fn signal(&self) -> TerminalShutdownSignal {
+        self.signal
+    }
+
+    fn matches(&self, child: &ManagedGroupChild) -> bool {
+        self.containment == child.containment()
+            && self.authority == child.authority
+            && child.role == ChildRole::Tui
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiShutdownMode {
+    StartWithTerm,
+    SignalAlreadyForwarded(TerminalShutdownSignal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionIdentityObservation {
+    Pending,
+    Exact,
+}
+
 impl ReapedChildren {
     pub(super) const fn tui(self) -> ChildDisposition {
         self.tui
@@ -105,7 +197,19 @@ pub(super) enum ProcessError {
     ProcessGroupMismatch {
         role: ChildRole,
     },
+    SessionReadback {
+        role: ChildRole,
+    },
+    SessionMismatch {
+        role: ChildRole,
+    },
+    SessionStartupTimeout {
+        role: ChildRole,
+    },
     SpawnCleanupTimeout {
+        role: ChildRole,
+    },
+    SpawnContainmentUnconfirmed {
         role: ChildRole,
     },
     ReadinessUnavailable {
@@ -131,6 +235,12 @@ pub(super) enum ProcessError {
         role: ChildRole,
         action: StopAction,
     },
+    ForwardedSignalMismatch {
+        role: ChildRole,
+    },
+    SuspendTimeout {
+        role: ChildRole,
+    },
     Wait {
         role: ChildRole,
     },
@@ -153,8 +263,16 @@ impl fmt::Display for ProcessError {
             Self::ProcessGroupMismatch { .. } => {
                 "supervised child process-group identity mismatched"
             }
+            Self::SessionReadback { .. } => "supervised child session readback failed",
+            Self::SessionMismatch { .. } => "supervised child session identity mismatched",
+            Self::SessionStartupTimeout { .. } => {
+                "supervised child did not claim its session before the deadline"
+            }
             Self::SpawnCleanupTimeout { .. } => {
                 "supervised child spawn cleanup exceeded its deadline"
+            }
+            Self::SpawnContainmentUnconfirmed { .. } => {
+                "supervised child spawn containment remained unconfirmed"
             }
             Self::ReadinessUnavailable { .. } => "supervised child has no readiness channel",
             Self::ParentLivenessUnavailable { .. } => {
@@ -165,6 +283,10 @@ impl fmt::Display for ProcessError {
             Self::InvalidReadiness { .. } => "supervised child readiness was invalid",
             Self::EarlyExit { .. } => "supervised child exited before readiness",
             Self::Signal { .. } => "supervised child process-group signal failed",
+            Self::ForwardedSignalMismatch { .. } => {
+                "forwarded shutdown signal did not match the supervised TUI"
+            }
+            Self::SuspendTimeout { .. } => "supervised child suspend exceeded its deadline",
             Self::Wait { .. } => "supervised child wait failed",
             Self::WaitTimeout { .. } => "supervised child wait exceeded its deadline",
             Self::RoleMismatch { .. } => "supervised child role mismatched its shutdown slot",
@@ -216,8 +338,11 @@ impl SpawnCleanupProof {
 
 struct FailedSpawnChild {
     child: Child,
-    expected_group: rustix::process::Pid,
+    expected_group: Option<rustix::process::Pid>,
+    containment_swept: bool,
     drop_deadline: Option<Instant>,
+    #[cfg(test)]
+    force_group_sweep_failure: bool,
 }
 
 /// A spawn failure that preserves the direct child handle until exact reap.
@@ -242,13 +367,20 @@ impl SpawnFailure {
         }
     }
 
-    fn started(error: ProcessError, child: Child, expected_group: rustix::process::Pid) -> Self {
+    fn started(
+        error: ProcessError,
+        child: Child,
+        expected_group: Option<rustix::process::Pid>,
+    ) -> Self {
         Self {
             error,
             child: Some(FailedSpawnChild {
                 child,
                 expected_group,
+                containment_swept: false,
                 drop_deadline: None,
+                #[cfg(test)]
+                force_group_sweep_failure: false,
             }),
             disposition: None,
             started: true,
@@ -260,11 +392,14 @@ impl SpawnFailure {
     }
 
     pub(super) const fn state(&self) -> SpawnFailureState {
-        match (self.started, self.disposition, self.child.is_some()) {
-            (false, _, _) => SpawnFailureState::NotStarted,
-            (true, Some(_), false) => SpawnFailureState::ReapedUnannounced,
-            (true, None, true) => SpawnFailureState::LiveUnannouncedChild,
-            (true, None, false) | (true, Some(_), true) => SpawnFailureState::LiveUnannouncedChild,
+        if !self.started {
+            return SpawnFailureState::NotStarted;
+        }
+        match (self.disposition, self.child.is_some()) {
+            (Some(_), false) => SpawnFailureState::ReapedUnannounced,
+            (Some(_), true) | (None, true) | (None, false) => {
+                SpawnFailureState::LiveUnannouncedChild
+            }
         }
     }
 
@@ -276,21 +411,43 @@ impl SpawnFailure {
                 kind: SpawnCleanupKind::NotStarted,
             });
         }
-        if let Some(disposition) = self.disposition {
-            return Ok(SpawnCleanupProof {
-                error: self.error,
-                kind: SpawnCleanupKind::ReapedUnannounced(disposition),
-            });
+        if self.child.is_none() {
+            if let Some(disposition) = self.disposition {
+                return Ok(SpawnCleanupProof {
+                    error: self.error,
+                    kind: SpawnCleanupKind::ReapedUnannounced(disposition),
+                });
+            }
         }
         let Some(mut failed_child) = self.child.take() else {
             return Err(self);
         };
         failed_child.drop_deadline = None;
 
-        let _ = rustix::process::kill_process_group(
-            failed_child.expected_group,
-            rustix::process::Signal::KILL,
-        );
+        // A consumed direct wait can no longer pin the process-group leader's
+        // numeric identity. Never signal retained PGID metadata from such an
+        // impossible state; only fail closed.
+        if self.disposition.is_some() {
+            self.child = Some(failed_child);
+            return Err(self);
+        }
+
+        if !failed_child.containment_swept {
+            failed_child.containment_swept = sweep_failed_spawn_group(&failed_child);
+        }
+        if !failed_child.containment_swept {
+            // Best-effort stop the leader, but deliberately do not wait. The
+            // unreaped direct child pins its PID/PGID against reuse, retaining
+            // safe group-signal authority for a later explicit retry.
+            let _ = failed_child.child.kill();
+            failed_child.drop_deadline = Some(deadline);
+            self.error = ProcessError::SpawnContainmentUnconfirmed {
+                role: process_error_role(self.error),
+            };
+            self.child = Some(failed_child);
+            return Err(self);
+        }
+
         let _ = failed_child.child.kill();
         loop {
             match failed_child.child.try_wait() {
@@ -344,36 +501,80 @@ impl Drop for SpawnFailure {
         let Some(failed_child) = self.child.as_mut() else {
             return;
         };
-        let _ = rustix::process::kill_process_group(
-            failed_child.expected_group,
-            rustix::process::Signal::KILL,
-        );
-        let _ = failed_child.child.kill();
+        if self.disposition.is_some() {
+            unreaped_drop_is_fatal();
+        }
+        if !failed_child.containment_swept {
+            failed_child.containment_swept = sweep_failed_spawn_group(failed_child);
+        }
         let deadline = match failed_child.drop_deadline {
             Some(deadline) => deadline,
             None => {
                 let Some(deadline) = Instant::now().checked_add(DROP_CLEANUP_TIMEOUT) else {
-                    return;
+                    unreaped_drop_is_fatal();
                 };
                 deadline
             }
         };
-        loop {
-            match failed_child.child.try_wait() {
-                Ok(Some(status)) => {
-                    self.disposition = Some(project_disposition(status, StopAction::Kill));
-                    return;
+
+        if self.disposition.is_none() {
+            let _ = failed_child.child.kill();
+            loop {
+                match failed_child.child.try_wait() {
+                    Ok(Some(status)) => {
+                        self.disposition = Some(project_disposition(status, StopAction::Kill));
+                        break;
+                    }
+                    Ok(None) if Instant::now() < deadline => sleep_until_next_poll(deadline),
+                    Ok(None) | Err(_) => unreaped_drop_is_fatal(),
                 }
-                Ok(None) if Instant::now() < deadline => sleep_until_next_poll(deadline),
-                Ok(None) | Err(_) => return,
             }
         }
+
+        if failed_child.containment_swept {
+            return;
+        }
+        unreaped_drop_is_fatal();
     }
+}
+
+fn sweep_failed_spawn_group(failed_child: &FailedSpawnChild) -> bool {
+    #[cfg(test)]
+    if failed_child.force_group_sweep_failure {
+        return false;
+    }
+    let Some(expected_group) = failed_child.expected_group else {
+        return false;
+    };
+    // This helper is called only while the direct child remains unreaped, so
+    // its leader PID cannot be reused. A missing group is therefore positive
+    // absence proof, while every other signal error preserves uncertainty.
+    match rustix::process::kill_process_group(expected_group, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => true,
+        #[cfg(target_os = "macos")]
+        Err(rustix::io::Errno::PERM) => failed_spawn_leader_exit_is_observed(failed_child),
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn failed_spawn_leader_exit_is_observed(failed_child: &FailedSpawnChild) -> bool {
+    let pid = rustix::process::Pid::from_child(&failed_child.child);
+    rustix::process::waitid(
+        rustix::process::WaitId::Pid(pid),
+        rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOHANG
+            | rustix::process::WaitIdOptions::NOWAIT,
+    )
+    .is_ok_and(|status| {
+        status.is_some_and(|status| status.exited() || status.killed() || status.dumped())
+    })
 }
 
 /// A guardian-owned direct child whose leader starts a distinct process group.
 pub(super) struct ManagedGroupChild {
     role: ChildRole,
+    authority: ChildAuthority,
     child: Child,
     readiness_stdout: Option<ChildStdout>,
     pid: rustix::process::Pid,
@@ -407,6 +608,125 @@ impl ManagedGroupChild {
         readiness_stdout: bool,
     ) -> Result<Self, SpawnFailure> {
         Self::spawn_inner(role, command, readiness_stdout, true)
+    }
+
+    /// Spawns a reviewed launcher that claims a new session after `exec`.
+    ///
+    /// The caller must have already attached PTY slave descriptors to the
+    /// command. Unlike [`Self::spawn`], this function deliberately does not
+    /// call `process_group(0)`: a process-group leader cannot subsequently
+    /// call `setsid(2)`. The child is not published until the guardian reads
+    /// back both `PGID == PID` and `SID == PID` through its direct-child
+    /// identity. A failure before that proof is cleaned through the exact
+    /// [`Child`] handle and never signals an unconfirmed numeric group.
+    pub(super) fn spawn_session_leader(
+        role: ChildRole,
+        mut command: Command,
+        deadline: Instant,
+    ) -> Result<Self, SpawnFailure> {
+        let child = command
+            .spawn()
+            .map_err(|_| SpawnFailure::not_started(ProcessError::Spawn { role }))?;
+        Self::publish_session_leader(role, child, deadline)
+    }
+
+    /// Spawns the reviewed session launcher with one child-only readiness fd.
+    ///
+    /// The descriptor stays close-on-exec in the guardian. The audited support
+    /// crate gives only this exec a dynamically numbered duplicate and exports
+    /// that number through its fixed environment key. Publication still waits
+    /// for the exact `PID == PGID == SID` proof, and every failure retains or
+    /// exactly reaps the direct child handle just like [`Self::spawn_session_leader`].
+    pub(super) fn spawn_session_leader_with_inherited_fd(
+        role: ChildRole,
+        command: Command,
+        inherited_fd: BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> Result<Self, SpawnFailure> {
+        let child = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
+            command,
+            inherited_fd,
+        ) {
+            Ok(child) => child,
+            Err(error) => match error.into_started_child() {
+                Some(child) => {
+                    return Err(cleanup_unconfirmed_session(
+                        child.into_child(),
+                        ProcessError::Spawn { role },
+                    ));
+                }
+                None => return Err(SpawnFailure::not_started(ProcessError::Spawn { role })),
+            },
+        };
+        Self::publish_session_leader(role, child, deadline)
+    }
+
+    fn publish_session_leader(
+        role: ChildRole,
+        child: Child,
+        deadline: Instant,
+    ) -> Result<Self, SpawnFailure> {
+        Self::publish_session_leader_with_probe(role, child, deadline, |pid| {
+            observe_session_identity(pid, role)
+        })
+    }
+
+    fn publish_session_leader_with_probe<F>(
+        role: ChildRole,
+        mut child: Child,
+        deadline: Instant,
+        mut probe: F,
+    ) -> Result<Self, SpawnFailure>
+    where
+        F: FnMut(rustix::process::Pid) -> Result<SessionIdentityObservation, ProcessError>,
+    {
+        let pid = rustix::process::Pid::from_child(&child);
+
+        loop {
+            match probe(pid) {
+                Ok(SessionIdentityObservation::Exact) => {
+                    return Ok(Self {
+                        role,
+                        authority: ChildAuthority::next(),
+                        child,
+                        readiness_stdout: None,
+                        pid,
+                        pgid: pid,
+                        observed_exit: false,
+                        containment_swept: false,
+                        stop_action: StopAction::None,
+                        disposition: None,
+                        drop_deadline: None,
+                    });
+                }
+                Ok(SessionIdentityObservation::Pending) => {}
+                Err(error) => return Err(cleanup_unconfirmed_session(child, error)),
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(SpawnFailure {
+                        error: ProcessError::SessionMismatch { role },
+                        child: None,
+                        disposition: Some(project_disposition(status, StopAction::None)),
+                        started: true,
+                    });
+                }
+                Err(_) => {
+                    return Err(cleanup_unconfirmed_session(
+                        child,
+                        ProcessError::Wait { role },
+                    ));
+                }
+                Ok(None) if Instant::now() < deadline => sleep_until_next_poll(deadline),
+                Ok(None) => {
+                    return Err(cleanup_unconfirmed_session(
+                        child,
+                        ProcessError::SessionStartupTimeout { role },
+                    ));
+                }
+            }
+        }
     }
 
     fn spawn_inner(
@@ -476,6 +796,7 @@ impl ManagedGroupChild {
 
         Ok(Self {
             role,
+            authority: ChildAuthority::next(),
             child,
             readiness_stdout,
             pid,
@@ -608,6 +929,161 @@ impl ManagedGroupChild {
         }
     }
 
+    /// Forwards one typed interactive signal through the guardian's still-live
+    /// direct-child authority.
+    pub(super) fn forward_interactive_terminal_signal(
+        &mut self,
+        signal: InteractiveTerminalSignal,
+        deadline: Instant,
+    ) -> Result<ChildLiveness, ProcessError> {
+        self.role_matches(ChildRole::Tui)?;
+        let signal = match signal {
+            InteractiveTerminalSignal::Int => rustix::process::Signal::INT,
+            InteractiveTerminalSignal::Quit => rustix::process::Signal::QUIT,
+        };
+        self.signal_group(signal, StopAction::None, deadline)?;
+        self.poll_liveness(deadline)
+    }
+
+    /// Forwards one `HUP` or `TERM` and returns identity-bound shutdown proof.
+    ///
+    /// Successful forwarding deliberately leaves [`Self::stop_action`] as
+    /// [`StopAction::None`]. If the TUI exits from this original signal, exact
+    /// wait projection therefore preserves that disposition. A later forced
+    /// containment sweep changes the action to [`StopAction::Kill`] only when
+    /// the direct child is still live.
+    pub(super) fn forward_terminal_shutdown_signal(
+        &mut self,
+        signal: TerminalShutdownSignal,
+        deadline: Instant,
+    ) -> Result<ForwardedTuiSignal, ProcessError> {
+        self.role_matches(ChildRole::Tui)?;
+        let forwarded_signal = signal;
+        let unix_signal = match signal {
+            TerminalShutdownSignal::Hup => rustix::process::Signal::HUP,
+            TerminalShutdownSignal::Term => rustix::process::Signal::TERM,
+        };
+        self.signal_group(unix_signal, StopAction::None, deadline)?;
+        Ok(ForwardedTuiSignal {
+            signal: forwarded_signal,
+            containment: self.containment(),
+            authority: self.authority,
+        })
+    }
+
+    /// Publishes a terminal resize only after the PTY size itself was updated.
+    pub(super) fn notify_terminal_resize(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<ChildLiveness, ProcessError> {
+        self.role_matches(ChildRole::Tui)?;
+        self.signal_group(rustix::process::Signal::WINCH, StopAction::None, deadline)?;
+        self.poll_liveness(deadline)
+    }
+
+    /// Stops the complete TUI process group and observes the direct child in a
+    /// stopped state without consuming exact exit wait authority.
+    ///
+    /// `SIGTSTP` preserves normal job-control semantics, but a descendant may
+    /// ignore it even after the direct leader reports `STOPPED`. Therefore an
+    /// uncatchable group-wide `SIGSTOP` sweep is mandatory before success.
+    pub(super) fn suspend(
+        &mut self,
+        graceful_deadline: Instant,
+        forced_deadline: Instant,
+    ) -> Result<(), ProcessError> {
+        self.role_matches(ChildRole::Tui)?;
+        if forced_deadline < graceful_deadline {
+            return Err(ProcessError::Deadline);
+        }
+        self.signal_group(
+            rustix::process::Signal::TSTP,
+            StopAction::None,
+            graceful_deadline,
+        )?;
+        let leader_stopped_after_tstp = self.wait_for_stopped(graceful_deadline)?;
+        self.signal_group(
+            rustix::process::Signal::STOP,
+            StopAction::None,
+            forced_deadline,
+        )?;
+        // A graceful STOPPED notification is consumed before the mandatory
+        // descendant sweep. Waiting for another leader notification in that
+        // case would require an implementation-specific duplicate. When the
+        // leader ignored SIGTSTP, however, the SIGSTOP notification is the
+        // required proof that the forced fallback took effect.
+        if leader_stopped_after_tstp || self.wait_for_stopped(forced_deadline)? {
+            Ok(())
+        } else {
+            Err(ProcessError::SuspendTimeout { role: self.role })
+        }
+    }
+
+    /// Continues a previously stopped TUI and rejects an already-exited direct
+    /// child before the input gate can be reopened.
+    ///
+    /// A successful `SIGCONT` to the identity-pinned process group performs the
+    /// continuation action even when the kernel coalesces its advisory
+    /// `CLD_CONTINUED` wait notification. Requiring that edge notification can
+    /// therefore turn a live resumed TUI into a false timeout. Exact exit wait
+    /// authority remains unconsumed and the higher-level gate rechecks liveness
+    /// immediately before ingress starts.
+    pub(super) fn resume(&mut self, deadline: Instant) -> Result<(), ProcessError> {
+        self.role_matches(ChildRole::Tui)?;
+        self.signal_group(rustix::process::Signal::CONT, StopAction::None, deadline)?;
+        if self.observe_exit_without_reaping(Instant::now())? {
+            let disposition = self.contain_and_reap_observed_exit(deadline)?;
+            return Err(ProcessError::EarlyExit {
+                role: self.role,
+                disposition,
+            });
+        }
+        Ok(())
+    }
+
+    fn wait_for_stopped(&mut self, deadline: Instant) -> Result<bool, ProcessError> {
+        loop {
+            let options = rustix::process::WaitIdOptions::STOPPED
+                | rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT;
+            match rustix::process::waitid(rustix::process::WaitId::Pid(self.pid), options) {
+                Ok(Some(status)) if status.stopped() => {
+                    // Consume only the nonterminal job-control notification.
+                    // Exit authority remains with the exact `Child` handle.
+                    let consumed = rustix::process::waitid(
+                        rustix::process::WaitId::Pid(self.pid),
+                        rustix::process::WaitIdOptions::STOPPED
+                            | rustix::process::WaitIdOptions::NOHANG,
+                    );
+                    return match consumed {
+                        Ok(Some(consumed)) if consumed.stopped() => Ok(true),
+                        Ok(Some(_)) | Ok(None) => Err(ProcessError::Wait { role: self.role }),
+                        Err(_) => Err(ProcessError::Wait { role: self.role }),
+                    };
+                }
+                Ok(Some(status)) if status.exited() || status.killed() || status.dumped() => {
+                    self.observed_exit = true;
+                    return Err(ProcessError::EarlyExit {
+                        role: self.role,
+                        disposition: observed_waitid_disposition(status),
+                    });
+                }
+                Ok(Some(_)) | Ok(None) if Instant::now() < deadline => {
+                    sleep_until_next_poll(deadline);
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    return Ok(false);
+                }
+                Err(rustix::io::Errno::INTR) if Instant::now() < deadline => {}
+                Err(rustix::io::Errno::INTR) => {
+                    return Ok(false);
+                }
+                Err(_) => return Err(ProcessError::Wait { role: self.role }),
+            }
+        }
+    }
+
     fn observe_exit_for_readiness(&mut self, deadline: Instant) -> Result<bool, ProcessError> {
         match self.observe_exit_without_reaping(deadline) {
             Err(ProcessError::WaitTimeout { .. }) => {
@@ -634,7 +1110,14 @@ impl ManagedGroupChild {
                     | rustix::process::WaitIdOptions::NOWAIT,
             ) {
                 Ok(status) => {
-                    self.observed_exit = status.is_some();
+                    // Darwin may surface a pending stopped/continued child
+                    // status even when this non-consuming query requests
+                    // `EXITED` only. Job-control state is still live process
+                    // authority, so classify only terminal wait states as an
+                    // observed exit.
+                    self.observed_exit = status.is_some_and(|status| {
+                        status.exited() || status.killed() || status.dumped()
+                    });
                     return Ok(self.observed_exit);
                 }
                 Err(rustix::io::Errno::INTR) => {}
@@ -752,7 +1235,7 @@ impl Drop for ManagedGroupChild {
             Some(deadline) => deadline,
             None => {
                 let Some(deadline) = Instant::now().checked_add(DROP_CLEANUP_TIMEOUT) else {
-                    return;
+                    unreaped_drop_is_fatal();
                 };
                 deadline
             }
@@ -763,12 +1246,18 @@ impl Drop for ManagedGroupChild {
         if !observed {
             self.stop_action = StopAction::Kill;
         }
-        if self
-            .signal_group(rustix::process::Signal::KILL, StopAction::Kill, deadline)
-            .is_ok()
+        if !self.containment_swept
+            && self
+                .signal_group(rustix::process::Signal::KILL, StopAction::Kill, deadline)
+                .is_ok()
         {
             self.containment_swept = true;
         }
+        // Even after a failed group sweep, kill and reap the direct child as a
+        // best-effort leak prevention step. Exact leader reap alone is not a
+        // containment proof, though: descendants may still retain the process
+        // group and inherited resources, so Drop must fail closed below rather
+        // than release authority as if cleanup had completed.
         let _ = self.child.kill();
 
         loop {
@@ -776,13 +1265,56 @@ impl Drop for ManagedGroupChild {
                 Ok(Some(status)) => {
                     self.disposition = Some(project_disposition(status, self.stop_action));
                     self.observed_exit = true;
-                    return;
+                    if self.containment_swept {
+                        return;
+                    }
+                    unreaped_drop_is_fatal();
                 }
-                Err(_) => return,
+                Err(_) => unreaped_drop_is_fatal(),
                 Ok(None) if Instant::now() < deadline => sleep_until_next_poll(deadline),
-                Ok(None) => return,
+                Ok(None) => unreaped_drop_is_fatal(),
             }
         }
+    }
+}
+
+fn observe_session_identity(
+    pid: rustix::process::Pid,
+    role: ChildRole,
+) -> Result<SessionIdentityObservation, ProcessError> {
+    // These syscalls cannot be sampled atomically. A launcher may execute
+    // `setsid(2)` between them, so only the positive PID == PGID == SID tuple
+    // is publishable. Every other live/transient tuple remains pending until
+    // the direct-child wait authority or the caller's deadline resolves it.
+    classify_session_identity(
+        pid,
+        rustix::process::getpgid(Some(pid)),
+        rustix::process::getsid(Some(pid)),
+        role,
+    )
+}
+
+fn classify_session_identity(
+    pid: rustix::process::Pid,
+    process_group: Result<rustix::process::Pid, rustix::io::Errno>,
+    session: Result<rustix::process::Pid, rustix::io::Errno>,
+    role: ChildRole,
+) -> Result<SessionIdentityObservation, ProcessError> {
+    let process_group = match process_group {
+        Ok(process_group) => process_group,
+        Err(rustix::io::Errno::SRCH) => return Ok(SessionIdentityObservation::Pending),
+        Err(_) => return Err(ProcessError::ProcessGroupReadback { role }),
+    };
+    let session = match session {
+        Ok(session) => session,
+        Err(rustix::io::Errno::SRCH) => return Ok(SessionIdentityObservation::Pending),
+        Err(_) => return Err(ProcessError::SessionReadback { role }),
+    };
+
+    if process_group == pid && session == pid {
+        Ok(SessionIdentityObservation::Exact)
+    } else {
+        Ok(SessionIdentityObservation::Pending)
     }
 }
 
@@ -792,6 +1324,7 @@ pub(super) struct UnreapedChildren {
     error: ProcessError,
     tui: Option<ManagedGroupChild>,
     app_server: Option<ManagedGroupChild>,
+    tui_shutdown_mode: TuiShutdownMode,
     resolved: bool,
 }
 
@@ -814,6 +1347,7 @@ impl UnreapedChildren {
             self.app_server.take(),
             grace,
             forced,
+            self.tui_shutdown_mode,
             Some(self.error),
         ) {
             Ok(outcome) => {
@@ -847,6 +1381,7 @@ impl fmt::Debug for UnreapedChildren {
             .field("error", &self.error)
             .field("tui_owned", &self.tui.is_some())
             .field("app_server_owned", &self.app_server.is_some())
+            .field("tui_shutdown_mode", &self.tui_shutdown_mode)
             .field("resolved", &self.resolved)
             .finish()
     }
@@ -867,7 +1402,45 @@ pub(super) fn shutdown_pair(
     grace: Duration,
     forced: Duration,
 ) -> Result<ShutdownOutcome, Box<UnreapedChildren>> {
-    shutdown_pair_inner(tui, app_server, grace, forced, None)
+    shutdown_pair_inner(
+        tui,
+        app_server,
+        grace,
+        forced,
+        TuiShutdownMode::StartWithTerm,
+        None,
+    )
+}
+
+/// Shuts down after an identity-checked TUI `HUP` or `TERM` was forwarded.
+///
+/// Unlike [`shutdown_pair`], this entrypoint never starts another `TERM` on
+/// the proven TUI. It still starts the App Server with `TERM`, observes both
+/// direct children until both exit or the grace deadline, performs a
+/// process-group `KILL` containment sweep, and requires exact waits before
+/// returning proof. If a deadline expires, [`UnreapedChildren::retry`]
+/// retains this mode.
+pub(super) fn shutdown_pair_after_forwarded_tui_signal(
+    tui: ManagedGroupChild,
+    app_server: Option<ManagedGroupChild>,
+    forwarded: ForwardedTuiSignal,
+    grace: Duration,
+    forced: Duration,
+) -> Result<ShutdownOutcome, Box<UnreapedChildren>> {
+    let (mode, first_error) = if forwarded.matches(&tui) {
+        (
+            TuiShutdownMode::SignalAlreadyForwarded(forwarded.signal()),
+            None,
+        )
+    } else {
+        (
+            TuiShutdownMode::StartWithTerm,
+            Some(ProcessError::ForwardedSignalMismatch {
+                role: ChildRole::Tui,
+            }),
+        )
+    };
+    shutdown_pair_inner(Some(tui), app_server, grace, forced, mode, first_error)
 }
 
 fn shutdown_pair_inner(
@@ -875,6 +1448,7 @@ fn shutdown_pair_inner(
     mut app_server: Option<ManagedGroupChild>,
     grace: Duration,
     forced: Duration,
+    tui_shutdown_mode: TuiShutdownMode,
     mut first_error: Option<ProcessError>,
 ) -> Result<ShutdownOutcome, Box<UnreapedChildren>> {
     clear_drop_deadline(&mut tui);
@@ -887,6 +1461,7 @@ fn shutdown_pair_inner(
             app_server,
             ProcessError::Deadline,
             None,
+            tui_shutdown_mode,
         ));
     };
     let Some(hard_deadline) = grace_deadline.checked_add(forced) else {
@@ -895,12 +1470,15 @@ fn shutdown_pair_inner(
             app_server,
             ProcessError::Deadline,
             None,
+            tui_shutdown_mode,
         ));
     };
 
     validate_child_role(&tui, ChildRole::Tui, &mut first_error);
     validate_child_role(&app_server, ChildRole::AppServer, &mut first_error);
-    begin_child_termination(&mut tui, grace_deadline, &mut first_error);
+    if matches!(tui_shutdown_mode, TuiShutdownMode::StartWithTerm) {
+        begin_child_termination(&mut tui, grace_deadline, &mut first_error);
+    }
     begin_child_termination(&mut app_server, grace_deadline, &mut first_error);
 
     loop {
@@ -943,16 +1521,33 @@ fn shutdown_pair_inner(
             app_server,
             error,
             Some(hard_deadline),
+            tui_shutdown_mode,
         ));
     }
 
     let tui_disposition = match reaped_disposition(&tui, ChildRole::Tui) {
         Ok(disposition) => disposition,
-        Err(error) => return Err(unreaped_children(tui, app_server, error, None)),
+        Err(error) => {
+            return Err(unreaped_children(
+                tui,
+                app_server,
+                error,
+                None,
+                tui_shutdown_mode,
+            ));
+        }
     };
     let app_server_disposition = match reaped_disposition(&app_server, ChildRole::AppServer) {
         Ok(disposition) => disposition,
-        Err(error) => return Err(unreaped_children(tui, app_server, error, None)),
+        Err(error) => {
+            return Err(unreaped_children(
+                tui,
+                app_server,
+                error,
+                None,
+                tui_shutdown_mode,
+            ));
+        }
     };
     let children = ReapedChildren {
         tui: tui_disposition,
@@ -1031,6 +1626,7 @@ fn unreaped_children(
     mut app_server: Option<ManagedGroupChild>,
     error: ProcessError,
     drop_deadline: Option<Instant>,
+    tui_shutdown_mode: TuiShutdownMode,
 ) -> Box<UnreapedChildren> {
     if let Some(child) = tui.as_mut() {
         child.drop_deadline = drop_deadline;
@@ -1042,6 +1638,7 @@ fn unreaped_children(
         error,
         tui,
         app_server,
+        tui_shutdown_mode,
         resolved: false,
     })
 }
@@ -1106,7 +1703,7 @@ fn cleanup_failed_spawn(
     expected_group: rustix::process::Pid,
     original_error: ProcessError,
 ) -> SpawnFailure {
-    let failure = SpawnFailure::started(original_error, child, expected_group);
+    let failure = SpawnFailure::started(original_error, child, Some(expected_group));
     let Some(deadline) = Instant::now().checked_add(SPAWN_CLEANUP_TIMEOUT) else {
         return failure;
     };
@@ -1124,9 +1721,46 @@ fn cleanup_failed_spawn(
             }
         }
         Err(mut failure) => {
-            failure.error = ProcessError::SpawnCleanupTimeout {
-                role: process_error_role(original_error),
+            if !matches!(
+                failure.error,
+                ProcessError::SpawnContainmentUnconfirmed { .. }
+            ) {
+                failure.error = ProcessError::SpawnCleanupTimeout {
+                    role: process_error_role(original_error),
+                };
+            }
+            failure
+        }
+    }
+}
+
+fn cleanup_unconfirmed_session(child: Child, original_error: ProcessError) -> SpawnFailure {
+    let failure = SpawnFailure::started(original_error, child, None);
+    let Some(deadline) = Instant::now().checked_add(SPAWN_CLEANUP_TIMEOUT) else {
+        return failure;
+    };
+    match failure.cleanup(deadline) {
+        Ok(reaped) => {
+            let disposition = match reaped.kind {
+                SpawnCleanupKind::NotStarted => ChildDisposition::NotStarted,
+                SpawnCleanupKind::ReapedUnannounced(disposition) => disposition,
             };
+            SpawnFailure {
+                error: reaped.error,
+                child: None,
+                disposition: Some(disposition),
+                started: true,
+            }
+        }
+        Err(mut failure) => {
+            if !matches!(
+                failure.error,
+                ProcessError::SpawnContainmentUnconfirmed { .. }
+            ) {
+                failure.error = ProcessError::SpawnCleanupTimeout {
+                    role: process_error_role(original_error),
+                };
+            }
             failure
         }
     }
@@ -1137,7 +1771,11 @@ const fn process_error_role(error: ProcessError) -> ChildRole {
         ProcessError::Spawn { role }
         | ProcessError::ProcessGroupReadback { role }
         | ProcessError::ProcessGroupMismatch { role }
+        | ProcessError::SessionReadback { role }
+        | ProcessError::SessionMismatch { role }
+        | ProcessError::SessionStartupTimeout { role }
         | ProcessError::SpawnCleanupTimeout { role }
+        | ProcessError::SpawnContainmentUnconfirmed { role }
         | ProcessError::ReadinessUnavailable { role }
         | ProcessError::ParentLivenessUnavailable { role }
         | ProcessError::ReadinessTimeout { role }
@@ -1145,6 +1783,8 @@ const fn process_error_role(error: ProcessError) -> ChildRole {
         | ProcessError::InvalidReadiness { role }
         | ProcessError::EarlyExit { role, .. }
         | ProcessError::Signal { role, .. }
+        | ProcessError::ForwardedSignalMismatch { role }
+        | ProcessError::SuspendTimeout { role }
         | ProcessError::Wait { role }
         | ProcessError::WaitTimeout { role } => role,
         ProcessError::RoleMismatch { actual, .. } => actual,
@@ -1163,6 +1803,20 @@ fn project_disposition(status: ExitStatus, stop_action: StopAction) -> ChildDisp
         signal: bounded_signal(status.signal()),
         core_dumped: status.core_dumped(),
         stop_action,
+    }
+}
+
+fn observed_waitid_disposition(status: rustix::process::WaitIdStatus) -> ChildDisposition {
+    if status.exited() {
+        return ChildDisposition::Exited {
+            code: bounded_exit_code(status.exit_status().unwrap_or_default()),
+            stop_action: StopAction::None,
+        };
+    }
+    ChildDisposition::Signaled {
+        signal: bounded_signal(status.terminating_signal()),
+        core_dumped: status.dumped(),
+        stop_action: StopAction::None,
     }
 }
 
@@ -1188,13 +1842,256 @@ fn sleep_until_next_poll(deadline: Instant) {
     }
 }
 
+/// A Drop fallback cannot return while it still owns an unreaped direct child:
+/// doing so would detach the only wait authority and permit a zombie or live
+/// descendant to outlive the guardian's lease. Structured shutdown returns the
+/// handle for retry; Drop has no such return channel and therefore fails closed.
+fn unreaped_drop_is_fatal() -> ! {
+    std::process::abort()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::error::Error;
+    use std::fs::{self, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_DEADLINE: Duration = Duration::from_secs(3);
+    const SESSION_HELPER_ENV: &str = "CALCIFER_PROCESS_SESSION_HELPER";
+    const SESSION_INHERITED_FD_HELPER_ENV: &str = "CALCIFER_PROCESS_SESSION_INHERITED_FD_HELPER";
+    const SIGNAL_COUNTING_HELPER_ENV: &str = "CALCIFER_PROCESS_SIGNAL_COUNTING_HELPER";
+    const SIGNAL_LOG_ENV: &str = "CALCIFER_PROCESS_SIGNAL_LOG";
+    const UNREAPED_DROP_ABORT_HELPER_ENV: &str = "CALCIFER_PROCESS_UNREAPED_DROP_ABORT_HELPER";
+    static SIGNAL_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn externally_kill_and_reap(pid: rustix::process::Pid) -> Result<(), Box<dyn Error>> {
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+        loop {
+            match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()) {
+                Ok(Some((reaped, _))) if reaped == pid => return Ok(()),
+                Err(rustix::io::Errno::INTR) => {}
+                Ok(Some(_)) | Ok(None) | Err(_) => {
+                    return Err("external direct-child reap failed".into());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unreaped_drop_abort_child_helper() -> Result<(), Box<dyn Error>> {
+        let Some(case) = std::env::var_os(UNREAPED_DROP_ABORT_HELPER_ENV) else {
+            return Ok(());
+        };
+        match case.to_str() {
+            Some("spawn-failure") => {
+                let child = sleep_command("5").spawn()?;
+                let pid = rustix::process::Pid::from_child(&child);
+                externally_kill_and_reap(pid)?;
+
+                // Deliberately retain a std Child after another safe waitpid
+                // authority consumed the kernel wait state. Drop must hit
+                // ECHILD and abort instead of treating it as exact reap proof.
+                let failure = SpawnFailure::started(
+                    ProcessError::Spawn {
+                        role: ChildRole::Tui,
+                    },
+                    child,
+                    None,
+                );
+                drop(failure);
+            }
+            Some("spawn-failure-no-group") => {
+                let child = sleep_command("5").spawn()?;
+                let failure = SpawnFailure::started(
+                    ProcessError::Spawn {
+                        role: ChildRole::Tui,
+                    },
+                    child,
+                    None,
+                );
+                drop(failure);
+            }
+            Some("spawn-failure-group-drift") => {
+                let child = sleep_command("5").spawn()?;
+                let expected_group = rustix::process::Pid::from_child(&child);
+                let mut failure = SpawnFailure::started(
+                    ProcessError::Spawn {
+                        role: ChildRole::Tui,
+                    },
+                    child,
+                    Some(expected_group),
+                );
+                failure
+                    .child
+                    .as_mut()
+                    .ok_or("spawn failure lost its direct child")?
+                    .force_group_sweep_failure = true;
+                drop(failure);
+            }
+            Some("managed-child") => {
+                let mut child =
+                    ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+                // Avoid re-signalling an externally reaped numeric group in
+                // this deterministic Drop test; the production safety net
+                // already considers a completed containment sweep sufficient.
+                child.containment_swept = true;
+                externally_kill_and_reap(child.pid)?;
+                drop(child);
+            }
+            Some("managed-child-group-drift") => {
+                let mut child =
+                    ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+                child.pgid = rustix::process::Pid::from_raw(i32::MAX)
+                    .ok_or("the drifted process-group identity was invalid")?;
+                assert!(matches!(
+                    child.signal_group(
+                        rustix::process::Signal::KILL,
+                        StopAction::Kill,
+                        Instant::now() + TEST_DEADLINE,
+                    ),
+                    Err(ProcessError::Signal {
+                        role: ChildRole::Tui,
+                        action: StopAction::Kill,
+                    })
+                ));
+                drop(child);
+            }
+            _ => return Err("unknown unreaped Drop helper case".into()),
+        }
+        Err("Drop detached an externally reaped direct-child authority".into())
+    }
+
+    #[test]
+    fn direct_child_drop_fallbacks_abort_instead_of_detaching_wait_authority()
+    -> Result<(), Box<dyn Error>> {
+        for case in [
+            "spawn-failure",
+            "spawn-failure-no-group",
+            "spawn-failure-group-drift",
+            "managed-child",
+            "managed-child-group-drift",
+        ] {
+            let status = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "providers::codex::supervisor::process::tests::unreaped_drop_abort_child_helper",
+                    "--nocapture",
+                ])
+                .env(UNREAPED_DROP_ABORT_HELPER_ENV, case)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            assert_eq!(
+                status.signal(),
+                Some(rustix::process::Signal::ABORT.as_raw()),
+                "{case} Drop did not abort"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_cleanup_retains_an_unreaped_leader_when_group_sweep_is_unconfirmed()
+    -> Result<(), Box<dyn Error>> {
+        let child = sleep_command("5").spawn()?;
+        let expected_group = rustix::process::Pid::from_child(&child);
+        let mut failure = SpawnFailure::started(
+            ProcessError::Spawn {
+                role: ChildRole::Tui,
+            },
+            child,
+            Some(expected_group),
+        );
+        failure
+            .child
+            .as_mut()
+            .ok_or("spawn failure lost its direct child")?
+            .force_group_sweep_failure = true;
+
+        let mut failure = failure
+            .cleanup(Instant::now() + TEST_DEADLINE)
+            .err()
+            .ok_or("an unconfirmed group sweep must not return cleanup proof")?;
+        assert_eq!(failure.state(), SpawnFailureState::LiveUnannouncedChild);
+        assert_eq!(
+            failure.error(),
+            ProcessError::SpawnContainmentUnconfirmed {
+                role: ChildRole::Tui,
+            }
+        );
+        let retained = failure
+            .child
+            .as_ref()
+            .ok_or("unreaped child authority and group metadata were discarded")?;
+        assert_eq!(retained.expected_group, Some(expected_group));
+        assert!(failure.disposition.is_none());
+        assert!(!retained.containment_swept);
+        assert!(!matches!(
+            rustix::process::waitid(
+                rustix::process::WaitId::Pid(expected_group),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ),
+            Err(rustix::io::Errno::CHILD)
+        ));
+
+        // Remove only the deterministic injected fault. The still-unreaped
+        // child pins the expected group, so a real retry can safely resolve
+        // containment and consume the exact wait authority.
+        failure
+            .child
+            .as_mut()
+            .ok_or("spawn failure lost retained retry authority")?
+            .force_group_sweep_failure = false;
+        let proof = failure.cleanup(Instant::now() + TEST_DEADLINE).map_err(
+            |failure| -> Box<dyn Error> { format!("cleanup remained live: {failure}").into() },
+        )?;
+        assert!(proof.started_unannounced());
+        Ok(())
+    }
+
+    struct SignalLog(PathBuf);
+
+    impl SignalLog {
+        fn new(label: &str) -> Result<Self, Box<dyn Error>> {
+            let sequence = SIGNAL_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "calcifer-process-signal-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn contents(&self) -> Result<Vec<u8>, Box<dyn Error>> {
+            match fs::read(&self.0) {
+                Ok(bytes) => Ok(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+
+    impl Drop for SignalLog {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
 
     fn sleep_command(seconds: &str) -> Command {
         let mut command = Command::new("/bin/sleep");
@@ -1208,6 +2105,65 @@ mod tests {
         command
     }
 
+    fn signal_counting_command(log: &SignalLog) -> Result<Command, Box<dyn Error>> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "providers::codex::supervisor::process::tests::signal_counting_child_helper",
+                "--nocapture",
+            ])
+            .env(SIGNAL_COUNTING_HELPER_ENV, "1")
+            .env(SIGNAL_LOG_ENV, log.path());
+        Ok(command)
+    }
+
+    fn wait_for_signal_log(log: &SignalLog, expected: &[u8]) -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now() + TEST_DEADLINE;
+        loop {
+            let contents = log.contents()?;
+            if contents == expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "signal log did not reach {expected:?}; observed {contents:?}"
+                )
+                .into());
+            }
+            sleep_until_next_poll(deadline);
+        }
+    }
+
+    #[test]
+    fn signal_counting_child_helper() -> Result<(), Box<dyn Error>> {
+        if std::env::var_os(SIGNAL_COUNTING_HELPER_ENV).is_none() {
+            return Ok(());
+        }
+        let path = std::env::var_os(SIGNAL_LOG_ENV).ok_or("missing signal log path")?;
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::signal::SIGHUP,
+            signal_hook::consts::signal::SIGTERM,
+            signal_hook::consts::signal::SIGTSTP,
+        ])?;
+        fs::write(&path, b"R")?;
+        loop {
+            for signal in signals.pending() {
+                let marker = match signal {
+                    signal_hook::consts::signal::SIGHUP => b'H',
+                    signal_hook::consts::signal::SIGTERM => b'T',
+                    signal_hook::consts::signal::SIGTSTP => b'S',
+                    _ => return Err("unexpected registered signal".into()),
+                };
+                OpenOptions::new()
+                    .append(true)
+                    .open(&path)?
+                    .write_all(&[marker])?;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
     fn assert_no_wait_authority(pid: i32) -> Result<(), Box<dyn Error>> {
         let pid = rustix::process::Pid::from_raw(pid).ok_or("pid must be positive")?;
         match rustix::process::waitid(
@@ -1219,6 +2175,194 @@ mod tests {
             Ok(None) => Err("child remained live after exact reap".into()),
             Err(error) => Err(std::io::Error::from(error).into()),
         }
+    }
+
+    #[test]
+    fn session_child_helper() -> Result<(), Box<dyn Error>> {
+        if std::env::var_os(SESSION_HELPER_ENV).is_none() {
+            return Ok(());
+        }
+        let inherited = if std::env::var_os(SESSION_INHERITED_FD_HELPER_ENV).is_some() {
+            Some(calcifer_unix_child_fd::take_inherited_readiness_fd()?)
+        } else {
+            None
+        };
+        let session = rustix::process::setsid()?;
+        let process = rustix::process::getpid();
+        if session != process
+            || rustix::process::getpgrp() != process
+            || rustix::process::getsid(Some(process))? != process
+        {
+            return Err("session helper did not become its own session leader".into());
+        }
+        if let Some(inherited) = inherited {
+            let mut readiness = UnixStream::from(inherited);
+            readiness.write_all(&[READINESS_SENTINEL])?;
+            readiness.shutdown(std::net::Shutdown::Write)?;
+        }
+        std::thread::sleep(Duration::from_secs(30));
+        Ok(())
+    }
+
+    #[test]
+    fn session_launcher_is_published_only_after_pid_pgid_sid_match() -> Result<(), Box<dyn Error>> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "providers::codex::supervisor::process::tests::session_child_helper",
+                "--nocapture",
+            ])
+            .env(SESSION_HELPER_ENV, "1");
+        let child = ManagedGroupChild::spawn_session_leader(
+            ChildRole::Tui,
+            command,
+            Instant::now() + TEST_DEADLINE,
+        )?;
+        let identity = child.containment();
+        let pid = rustix::process::Pid::from_raw(identity.pid()).ok_or("invalid child PID")?;
+        assert_eq!(identity.pid(), identity.pgid());
+        assert_eq!(rustix::process::getsid(Some(pid))?, pid);
+
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        assert_no_wait_authority(identity.pid())
+    }
+
+    #[test]
+    fn a_mixed_session_identity_snapshot_is_pending_instead_of_mismatched() {
+        let pid = rustix::process::getpid();
+        let prior_group = rustix::process::getppid().unwrap_or(pid);
+
+        assert_eq!(
+            classify_session_identity(pid, Ok(prior_group), Ok(pid), ChildRole::Tui),
+            Ok(SessionIdentityObservation::Pending)
+        );
+    }
+
+    #[test]
+    fn session_publication_retries_a_pending_observation() -> Result<(), Box<dyn Error>> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "providers::codex::supervisor::process::tests::session_child_helper",
+                "--nocapture",
+            ])
+            .env(SESSION_HELPER_ENV, "1");
+        let child = command.spawn()?;
+        let mut observations = 0_usize;
+
+        let child = ManagedGroupChild::publish_session_leader_with_probe(
+            ChildRole::Tui,
+            child,
+            Instant::now() + TEST_DEADLINE,
+            |pid| {
+                observations += 1;
+                if observations == 1 {
+                    Ok(SessionIdentityObservation::Pending)
+                } else {
+                    observe_session_identity(pid, ChildRole::Tui)
+                }
+            },
+        )?;
+
+        assert!(observations >= 2);
+        let identity = child.containment();
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        assert_no_wait_authority(identity.pid())
+    }
+
+    #[test]
+    fn inherited_fd_session_launcher_publishes_only_after_pid_pgid_sid_match()
+    -> Result<(), Box<dyn Error>> {
+        let (mut readiness, inherited) = UnixStream::pair()?;
+        readiness.set_read_timeout(Some(TEST_DEADLINE))?;
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "providers::codex::supervisor::process::tests::session_child_helper",
+                "--nocapture",
+            ])
+            .env(SESSION_HELPER_ENV, "1")
+            .env(SESSION_INHERITED_FD_HELPER_ENV, "1");
+
+        let child = ManagedGroupChild::spawn_session_leader_with_inherited_fd(
+            ChildRole::Tui,
+            command,
+            inherited.as_fd(),
+            Instant::now() + TEST_DEADLINE,
+        )?;
+        drop(inherited);
+
+        let mut marker = [0_u8; 1];
+        readiness.read_exact(&mut marker)?;
+        assert_eq!(marker, [READINESS_SENTINEL]);
+        let mut trailing = [0_u8; 1];
+        assert_eq!(readiness.read(&mut trailing)?, 0);
+        let identity = child.containment();
+        let pid = rustix::process::Pid::from_raw(identity.pid()).ok_or("invalid child PID")?;
+        assert_eq!(identity.pid(), identity.pgid());
+        assert_eq!(rustix::process::getsid(Some(pid))?, pid);
+
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        assert_no_wait_authority(identity.pid())
+    }
+
+    #[test]
+    fn inherited_fd_session_failure_retains_unreaped_authority_without_a_safe_group()
+    -> Result<(), Box<dyn Error>> {
+        let (_observer, inherited) = UnixStream::pair()?;
+        let mut failure = ManagedGroupChild::spawn_session_leader_with_inherited_fd(
+            ChildRole::Tui,
+            sleep_command("5"),
+            inherited.as_fd(),
+            Instant::now() + Duration::from_millis(30),
+        )
+        .err()
+        .ok_or("a child that never calls setsid must not be published")?;
+        assert_eq!(
+            failure.error(),
+            ProcessError::SpawnContainmentUnconfirmed {
+                role: ChildRole::Tui
+            }
+        );
+        assert_eq!(failure.state(), SpawnFailureState::LiveUnannouncedChild);
+        let failed_child = failure
+            .child
+            .as_ref()
+            .ok_or("unconfirmed session failure lost direct wait authority")?;
+        assert_eq!(failed_child.expected_group, None);
+        assert!(!failed_child.containment_swept);
+        assert!(failure.disposition.is_none());
+        let pid = rustix::process::Pid::from_child(&failed_child.child);
+        assert!(!matches!(
+            rustix::process::waitid(
+                rustix::process::WaitId::Pid(pid),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ),
+            Err(rustix::io::Errno::CHILD)
+        ));
+
+        // This synthetic child is known to have no descendants. Mark only the
+        // test fixture as contained so its pinned direct wait can be consumed
+        // without exercising the production Drop-abort path.
+        failure
+            .child
+            .as_mut()
+            .ok_or("unconfirmed session failure lost test cleanup authority")?
+            .containment_swept = true;
+        let proof = failure.cleanup(Instant::now() + TEST_DEADLINE).map_err(
+            |failure| -> Box<dyn Error> { format!("cleanup remained live: {failure}").into() },
+        )?;
+        assert!(proof.started_unannounced());
+        assert_no_wait_authority(pid.as_raw_pid())?;
+        Ok(())
     }
 
     #[test]
@@ -1360,7 +2504,10 @@ mod tests {
 
     #[test]
     fn await_ready_distinguishes_early_exit_from_timeout() -> Result<(), Box<dyn Error>> {
-        let command = Command::new("/usr/bin/true");
+        // Keep the readiness pipe open in a same-group descendant so pipe EOF
+        // cannot race the direct child's waitid-visible exit. The guardian must
+        // still report the leader's clean early exit and sweep the descendant.
+        let command = shell_command("/bin/sleep 1 & exec /bin/sleep 0.2");
         let mut child = ManagedGroupChild::spawn(ChildRole::Tui, command, true)?;
 
         let error = child
@@ -1434,6 +2581,236 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_hup_or_term_shutdown_does_not_term_signal_the_tui_again()
+    -> Result<(), Box<dyn Error>> {
+        for (label, signal, expected_log) in [
+            ("hup", TerminalShutdownSignal::Hup, b"RH".as_slice()),
+            ("term", TerminalShutdownSignal::Term, b"RT".as_slice()),
+        ] {
+            let log = SignalLog::new(label)?;
+            let mut tui =
+                ManagedGroupChild::spawn(ChildRole::Tui, signal_counting_command(&log)?, false)?;
+            wait_for_signal_log(&log, b"R")?;
+            let app = ManagedGroupChild::spawn(ChildRole::AppServer, sleep_command("5"), false)?;
+
+            let forwarded =
+                tui.forward_terminal_shutdown_signal(signal, Instant::now() + TEST_DEADLINE)?;
+            wait_for_signal_log(&log, expected_log)?;
+            let outcome = shutdown_pair_after_forwarded_tui_signal(
+                tui,
+                Some(app),
+                forwarded,
+                Duration::from_millis(100),
+                TEST_DEADLINE,
+            )?;
+
+            assert_eq!(log.contents()?, expected_log);
+            assert!(matches!(
+                outcome.children().tui(),
+                ChildDisposition::Signaled {
+                    signal: 9,
+                    stop_action: StopAction::Kill,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                outcome.children().app_server(),
+                ChildDisposition::Signaled {
+                    signal: 15,
+                    stop_action: StopAction::Term,
+                    ..
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_hup_or_term_disposition_survives_exact_reap() -> Result<(), Box<dyn Error>> {
+        for (signal, expected_signal) in [
+            (TerminalShutdownSignal::Hup, 1),
+            (TerminalShutdownSignal::Term, 15),
+        ] {
+            let mut tui = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+            let forwarded =
+                tui.forward_terminal_shutdown_signal(signal, Instant::now() + TEST_DEADLINE)?;
+            let deadline = Instant::now() + TEST_DEADLINE;
+            while tui.poll_liveness(deadline)? != ChildLiveness::Exited {
+                sleep_until_next_poll(deadline);
+            }
+
+            let outcome = shutdown_pair_after_forwarded_tui_signal(
+                tui,
+                None,
+                forwarded,
+                Duration::from_millis(100),
+                TEST_DEADLINE,
+            )?;
+            assert_eq!(outcome.failure(), None);
+            assert_eq!(
+                outcome.children().tui(),
+                ChildDisposition::Signaled {
+                    signal: expected_signal,
+                    core_dumped: false,
+                    stop_action: StopAction::None,
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_tui_shutdown_mode_and_wait_ownership_survive_retry() -> Result<(), Box<dyn Error>>
+    {
+        let log = SignalLog::new("retry-term")?;
+        let mut tui =
+            ManagedGroupChild::spawn(ChildRole::Tui, signal_counting_command(&log)?, false)?;
+        wait_for_signal_log(&log, b"R")?;
+        let tui_pid = tui.containment().pid();
+        let app = ManagedGroupChild::spawn(ChildRole::AppServer, sleep_command("5"), false)?;
+        let app_pid = app.containment().pid();
+        let forwarded = tui.forward_terminal_shutdown_signal(
+            TerminalShutdownSignal::Term,
+            Instant::now() + TEST_DEADLINE,
+        )?;
+        wait_for_signal_log(&log, b"RT")?;
+
+        let mut unreaped = shutdown_pair_after_forwarded_tui_signal(
+            tui,
+            Some(app),
+            forwarded,
+            Duration::MAX,
+            Duration::ZERO,
+        )
+        .err()
+        .ok_or("overflowing deadline must retain both child handles")?;
+        assert_eq!(unreaped.error(), ProcessError::Deadline);
+        assert!(format!("{unreaped:?}").contains("tui_owned: true"));
+        assert!(format!("{unreaped:?}").contains("app_server_owned: true"));
+
+        let outcome = unreaped.retry(Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(log.contents()?, b"RT");
+        assert!(matches!(
+            outcome.children().tui(),
+            ChildDisposition::Signaled {
+                signal: 9,
+                stop_action: StopAction::Kill,
+                ..
+            }
+        ));
+        assert!(matches!(
+            outcome.children().app_server(),
+            ChildDisposition::Signaled {
+                signal: 15,
+                stop_action: StopAction::Term,
+                ..
+            }
+        ));
+        assert_no_wait_authority(tui_pid)?;
+        assert_no_wait_authority(app_pid)?;
+        assert_eq!(
+            unreaped.retry(Duration::ZERO, Duration::ZERO),
+            Err(ProcessError::RetryAfterResolution)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_shutdown_proof_requires_process_local_child_authority()
+    -> Result<(), Box<dyn Error>> {
+        let first = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let second = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+
+        // Reproduce the strongest numeric spoof available inside this module:
+        // metadata matches the target exactly, but the unforgeable generation
+        // remains bound to a different direct Child handle.
+        let mismatched = ForwardedTuiSignal {
+            signal: TerminalShutdownSignal::Term,
+            containment: second.containment(),
+            authority: first.authority,
+        };
+        let outcome = shutdown_pair_after_forwarded_tui_signal(
+            second,
+            None,
+            mismatched,
+            Duration::from_millis(100),
+            TEST_DEADLINE,
+        )?;
+        assert!(matches!(
+            outcome,
+            ShutdownOutcome::Failed {
+                error: ProcessError::ForwardedSignalMismatch {
+                    role: ChildRole::Tui
+                },
+                ..
+            }
+        ));
+
+        let cleanup = shutdown_pair(Some(first), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(cleanup.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_control_authority_rejects_an_app_server_child() -> Result<(), Box<dyn Error>> {
+        let mut app = ManagedGroupChild::spawn(ChildRole::AppServer, sleep_command("5"), false)?;
+        let deadline = Instant::now() + TEST_DEADLINE;
+
+        assert_eq!(
+            app.notify_terminal_resize(deadline),
+            Err(ProcessError::RoleMismatch {
+                expected: ChildRole::Tui,
+                actual: ChildRole::AppServer,
+            })
+        );
+        assert_eq!(
+            app.forward_interactive_terminal_signal(InteractiveTerminalSignal::Int, deadline),
+            Err(ProcessError::RoleMismatch {
+                expected: ChildRole::Tui,
+                actual: ChildRole::AppServer,
+            })
+        );
+        assert_eq!(
+            app.suspend(deadline, deadline),
+            Err(ProcessError::RoleMismatch {
+                expected: ChildRole::Tui,
+                actual: ChildRole::AppServer,
+            })
+        );
+        assert_eq!(
+            app.resume(deadline),
+            Err(ProcessError::RoleMismatch {
+                expected: ChildRole::Tui,
+                actual: ChildRole::AppServer,
+            })
+        );
+
+        let outcome = shutdown_pair(None, Some(app), Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_signal_narrowing_rejects_shutdown_signals() {
+        assert_eq!(
+            InteractiveTerminalSignal::from_unix_signal(UnixSignal::Int),
+            Some(InteractiveTerminalSignal::Int)
+        );
+        assert_eq!(
+            InteractiveTerminalSignal::from_unix_signal(UnixSignal::Quit),
+            Some(InteractiveTerminalSignal::Quit)
+        );
+        assert_eq!(
+            InteractiveTerminalSignal::from_unix_signal(UnixSignal::Hup),
+            None
+        );
+        assert_eq!(
+            InteractiveTerminalSignal::from_unix_signal(UnixSignal::Term),
+            None
+        );
+    }
+
+    #[test]
     fn dropping_a_live_child_best_effort_kills_and_reaps_its_leader() -> Result<(), Box<dyn Error>>
     {
         let child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
@@ -1447,7 +2824,9 @@ mod tests {
     #[test]
     fn liveness_poll_observes_exit_without_consuming_exact_wait_authority()
     -> Result<(), Box<dyn Error>> {
-        let command = Command::new("/usr/bin/true");
+        // An instant exit can legitimately race the mandatory PGID readback during
+        // spawn; this fixture instead exits just after containment is published.
+        let command = sleep_command("0.2");
         let mut child = ManagedGroupChild::spawn(ChildRole::Tui, command, false)?;
         let deadline = Instant::now() + TEST_DEADLINE;
 
@@ -1469,6 +2848,109 @@ mod tests {
                 stop_action: StopAction::None,
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_poll_keeps_stopped_tui_classified_as_running() -> Result<(), Box<dyn Error>> {
+        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let started_at = Instant::now();
+        child.suspend(
+            started_at + Duration::from_millis(100),
+            started_at + TEST_DEADLINE,
+        )?;
+
+        assert_eq!(
+            child.poll_liveness(Instant::now() + TEST_DEADLINE)?,
+            ChildLiveness::Running
+        );
+
+        child.resume(Instant::now() + TEST_DEADLINE)?;
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn suspend_forces_a_tstp_ignoring_tui_group_to_stop() -> Result<(), Box<dyn Error>> {
+        let log = SignalLog::new("suspend-fallback")?;
+        let mut child =
+            ManagedGroupChild::spawn(ChildRole::Tui, signal_counting_command(&log)?, false)?;
+        wait_for_signal_log(&log, b"R")?;
+        let started_at = Instant::now();
+
+        child.suspend(
+            started_at + Duration::from_millis(100),
+            started_at + TEST_DEADLINE,
+        )?;
+        assert_eq!(log.contents()?, b"RS");
+        assert_eq!(
+            child.poll_liveness(Instant::now() + TEST_DEADLINE)?,
+            ChildLiveness::Running
+        );
+
+        child.resume(Instant::now() + TEST_DEADLINE)?;
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_suspend_resume_cycles_do_not_reuse_nonterminal_wait_notifications()
+    -> Result<(), Box<dyn Error>> {
+        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+
+        for _ in 0..2 {
+            let started_at = Instant::now();
+            child.suspend(
+                started_at + Duration::from_millis(100),
+                started_at + TEST_DEADLINE,
+            )?;
+            child.resume(Instant::now() + TEST_DEADLINE)?;
+        }
+
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_does_not_require_a_distinct_continued_wait_notification() -> Result<(), Box<dyn Error>>
+    {
+        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let started_at = Instant::now();
+        child.suspend(
+            started_at + Duration::from_millis(100),
+            started_at + TEST_DEADLINE,
+        )?;
+
+        // Consume the kernel's one advisory CLD_CONTINUED notification before
+        // the reviewed resume entrypoint runs. Linux may coalesce that exact
+        // notification during real group-stop races, while a successful
+        // SIGCONT still performs the required continuation action.
+        rustix::process::kill_process_group(child.pgid, rustix::process::Signal::CONT)?;
+        let deadline = Instant::now() + TEST_DEADLINE;
+        loop {
+            match rustix::process::waitid(
+                rustix::process::WaitId::Pid(child.pid),
+                rustix::process::WaitIdOptions::CONTINUED | rustix::process::WaitIdOptions::NOHANG,
+            ) {
+                Ok(Some(status)) if status.continued() => break,
+                Ok(Some(_)) | Ok(None) if Instant::now() < deadline => {
+                    sleep_until_next_poll(deadline);
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    return Err("continued notification was not observable".into());
+                }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+        }
+
+        child.resume(Instant::now() + Duration::from_millis(100))?;
+        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
         Ok(())
     }
 

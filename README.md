@@ -290,7 +290,7 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Codex usage observation | Implemented on demand for idle profiles | Structured app-server response; active profiles need the planned supervisor |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
 | Opt-in profile pools | Design | Same provider and trust domain; bounded selection |
-| Cross-profile conversation handoff | Internal Linux/macOS target reservation and guardian lease-transfer primitive implemented | Supervisor transaction and user-visible switching remain disabled; the planned version-gated fork creates a target-profile thread in one logical conversation |
+| Cross-profile conversation handoff | Internal Linux/macOS target reservation, guardian authority, and readiness-gated PTY foundations implemented | Real Codex/monitor integration, the supervisor transaction, and user-visible switching remain disabled; the planned version-gated fork creates a target-profile thread in one logical conversation |
 | Claude setup-token profiles | Experimental plan | OS credential store where officially supported |
 | Claude subscription OAuth replication | Not planned for MVP | No undocumented OAuth endpoint or Keychain-name emulation |
 | Mid-session account hot-swap or command replay | Non-goal | Unsafe side-effect semantics |
@@ -390,10 +390,15 @@ rustup toolchain install 1.85.0 --profile minimal
 make fmt
 make lint
 make test
+make supervisor-msrv
 make check
 ```
 
-The CI contract covers formatting and Clippy on Rust 1.96, tests on Linux/macOS/Windows, deterministic archive-package tests, and an MSRV check on Rust 1.85. See [CONTRIBUTING.md](CONTRIBUTING.md) for security-sensitive review expectations.
+The CI contract covers checksum-pinned GitHub Actions linting, formatting and
+Clippy on Rust 1.96, the stable Linux/macOS/Windows all-feature test matrix,
+deterministic archive-package tests, an MSRV compile check, and the full
+default-unused supervisor fixture on Linux and macOS at Rust 1.85. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for security-sensitive review expectations.
 
 ## Roadmap
 
@@ -404,7 +409,7 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 3. **Implemented:** exact same-profile thread capture, crash reconciliation, no-argument cold restore, and journaled local profile removal. Safe reauth/re-key flows remain.
 4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
-6. Add version-gated cross-profile conversation handoff as the default successful failover path; the no-gap Linux/macOS target-reservation primitive and default-unused fake-child supervisor authority foundation are complete, while real provider/PTY/monitor, journal, and fork integration remain pending. Preserve one profile-local writer per lineage generation.
+6. Add version-gated cross-profile conversation handoff as the default successful failover path; the no-gap Linux/macOS target-reservation primitive and default-unused fake-child process/readiness-gated PTY foundations are complete, while real provider/monitor, journal, and fork integration remain pending. Preserve one profile-local writer per lineage generation.
 7. Add Claude only through provider-supported authentication and usage-observation surfaces.
 
 Detailed gates and non-goals are tracked in [docs/roadmap.md](docs/roadmap.md).

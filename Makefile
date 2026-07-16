@@ -1,7 +1,7 @@
 PREFIX ?= $(HOME)/.local
 MSRV ?= 1.85.0
 
-.PHONY: fmt fmt-check lint test release-package-test docs msrv check install-local
+.PHONY: fmt fmt-check lint test supervisor-msrv release-package-test docs msrv check install-local
 
 fmt:
 	cargo fmt --all
@@ -14,6 +14,9 @@ lint:
 
 test:
 	cargo test --all-targets --all-features --locked
+
+supervisor-msrv:
+	cargo +$(MSRV) test --test supervisor --all-features --locked -- --test-threads=1
 
 release-package-test:
 	python3 -m unittest discover -s scripts -p 'test_*.py'

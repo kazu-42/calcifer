@@ -11,11 +11,235 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::marker::PhantomData;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const MAX_DESCRIPTOR_SCAN_ENTRIES: usize = 4_096;
+const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CHILD_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Fixed, private environment key carrying the dynamically selected child fd.
+///
+/// The value is installed only on a command passed to
+/// [`spawn_with_inherited_readiness_fd`]. It is never exported into the parent
+/// process environment.
+pub const READINESS_FD_ENV: &str = "CALCIFER_SUPERVISOR_READINESS_FD";
+
+static READINESS_FD_TAKEN: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static SIGTTOU_BLOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A calling-thread-only `SIGTTOU` mask guard.
+///
+/// The previous complete signal mask is private and is restored on drop. The
+/// guard is deliberately neither `Send` nor `Sync`, so restoration cannot move
+/// to a different thread. Nested guards must be dropped in reverse acquisition
+/// order; violating that linear order or encountering an impossible restore
+/// failure aborts instead of silently leaving a guardian with the wrong mask.
+#[must_use = "dropping the guard restores the calling thread's prior signal mask"]
+pub struct SigttouBlockGuard {
+    previous_mask: libc::sigset_t,
+    depth: usize,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl fmt::Debug for SigttouBlockGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SigttouBlockGuard(<active>)")
+    }
+}
+
+impl Drop for SigttouBlockGuard {
+    fn drop(&mut self) {
+        let in_order = SIGTTOU_BLOCK_DEPTH.with(|depth| depth.get() == self.depth);
+        if !in_order {
+            std::process::abort();
+        }
+
+        // SAFETY: `previous_mask` was fully initialized by the successful
+        // pthread_sigmask call that created this same-thread guard. The null
+        // output pointer requests no additional write.
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous_mask, std::ptr::null_mut())
+        };
+        if result != 0 {
+            std::process::abort();
+        }
+        SIGTTOU_BLOCK_DEPTH.with(|depth| depth.set(self.depth - 1));
+    }
+}
+
+/// Blocks `SIGTTOU` only in the calling thread until the returned guard drops.
+///
+/// This is intended for a background guardian's bounded terminal restoration:
+/// POSIX terminal ioctls may otherwise stop the guardian before it can publish
+/// recovery evidence. The complete prior mask is restored exactly, including
+/// when the guarded scope exits through `?` or unwinding.
+///
+/// Keep the guard in one short lexical scope. It must not be forgotten, and
+/// that scope must not create a thread, fork, or exec: those operations can
+/// inherit the temporarily blocked mask without this process-local guard.
+///
+/// ```compile_fail
+/// let guard = calcifer_unix_child_fd::block_sigttou_for_current_thread().unwrap();
+/// std::thread::spawn(move || drop(guard));
+/// ```
+pub fn block_sigttou_for_current_thread() -> io::Result<SigttouBlockGuard> {
+    let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `blocked` points to writable storage for one sigset, which
+    // sigemptyset fully initializes on success.
+    if unsafe { libc::sigemptyset(blocked.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: sigemptyset initialized the set and SIGTTOU is a valid signal on
+    // the Unix targets supported by this crate.
+    if unsafe { libc::sigaddset(blocked.as_mut_ptr(), libc::SIGTTOU) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the two successful calls above initialized the complete set.
+    let blocked = unsafe { blocked.assume_init() };
+
+    let mut previous_mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `blocked` is initialized and immutable, while `previous_mask`
+    // points to writable output storage. pthread_sigmask affects only this
+    // calling thread and returns an errno value directly.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, previous_mask.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    // SAFETY: successful pthread_sigmask initialized the complete prior mask.
+    let previous_mask = unsafe { previous_mask.assume_init() };
+    let depth = SIGTTOU_BLOCK_DEPTH.with(|depth| {
+        let next = depth
+            .get()
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        depth.set(next);
+        next
+    });
+    Ok(SigttouBlockGuard {
+        previous_mask,
+        depth,
+        _not_send_or_sync: PhantomData,
+    })
+}
+
+/// A child-fd spawn failure that distinguishes pre-spawn failure from a
+/// started child whose direct wait authority must still be consumed.
+///
+/// Debug and display output deliberately omit the command and raw I/O error.
+/// If a started child is not extracted, dropping this value performs the same
+/// bounded, fail-closed kill-and-`try_wait` fallback as the legacy inheritance
+/// API.
+#[must_use = "a started child may still require exact cleanup"]
+pub struct InheritedFdSpawnError {
+    cause: Option<io::Error>,
+    child: Option<StartedChild>,
+}
+
+impl InheritedFdSpawnError {
+    fn not_started(cause: io::Error) -> Self {
+        Self {
+            cause: Some(cause),
+            child: None,
+        }
+    }
+
+    fn started(cause: io::Error, child: Child) -> Self {
+        Self {
+            cause: Some(cause),
+            child: Some(StartedChild { child: Some(child) }),
+        }
+    }
+
+    /// Returns whether the failed operation created a direct child.
+    pub fn child_started(&self) -> bool {
+        self.child.is_some()
+    }
+
+    /// Transfers the direct child handle to a bounded cleanup authority.
+    pub fn into_started_child(mut self) -> Option<StartedChild> {
+        self.child.take()
+    }
+}
+
+impl fmt::Debug for InheritedFdSpawnError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InheritedFdSpawnError")
+            .field("child_started", &self.child_started())
+            .finish()
+    }
+}
+
+impl fmt::Display for InheritedFdSpawnError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.child_started() {
+            formatter.write_str("inherited descriptor spawn failed after child start")
+        } else {
+            formatter.write_str("inherited descriptor spawn failed before child start")
+        }
+    }
+}
+
+impl std::error::Error for InheritedFdSpawnError {}
+
+/// Exact direct-child authority returned only for a post-spawn failure.
+///
+/// A caller may transfer the underlying [`Child`] into a stronger supervisor
+/// contract with [`Self::into_child`]. If this value is instead dropped, it
+/// performs bounded kill-and-`try_wait` cleanup. Failure to reap within that
+/// bound aborts, because returning while silently discarding direct wait
+/// authority could leave an untracked live child.
+#[must_use = "started child authority must be transferred or exactly reaped"]
+pub struct StartedChild {
+    child: Option<Child>,
+}
+
+impl StartedChild {
+    /// Transfers the direct child handle into the caller's bounded supervisor.
+    pub fn into_child(mut self) -> Child {
+        match self.child.take() {
+            Some(child) => child,
+            None => std::process::abort(),
+        }
+    }
+}
+
+impl fmt::Debug for StartedChild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StartedChild(<direct-wait-authority>)")
+    }
+}
+
+impl Drop for StartedChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            if !terminate_spawned_child(child) {
+                std::process::abort();
+            }
+        }
+    }
+}
+
+/// Removes a consumed or stale readiness advertisement from a later exec.
+///
+/// Every command spawned after [`take_inherited_readiness_fd`] must pass
+/// through this helper. Descriptor sealing prevents resource inheritance;
+/// scrubbing the key also prevents a later executable from interpreting a
+/// recycled fd number as a new readiness capability.
+pub fn scrub_readiness_fd_env(command: &mut Command) {
+    command.env_remove(READINESS_FD_ENV);
+}
 
 /// Path-free device/inode identity returned by `fstat(2)`.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -85,6 +309,157 @@ pub fn count_open_descriptors_with_identity(expected: DescriptorIdentity) -> io:
     Ok(matches)
 }
 
+/// Atomically replaces inherited stdin with a close-on-exec `/dev/null` while
+/// preserving exactly one already-created duplicate of `expected`.
+///
+/// This is an exec-entry operation for Calcifer's still-single-threaded
+/// guardian. The caller must first create one close-on-exec duplicate and end
+/// every `BorrowedFd` lifetime for fd 0. The identity is revalidated before
+/// replacement, so a raced standard stream is never silently accepted.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn replace_inherited_stdin_with_dev_null(expected: DescriptorIdentity) -> io::Result<()> {
+    replace_inherited_standard_stream_with_dev_null(libc::STDIN_FILENO, libc::O_RDONLY, expected)
+}
+
+/// Atomically replaces inherited stdout with a close-on-exec `/dev/null`
+/// while preserving exactly one already-created duplicate of `expected`.
+///
+/// See [`replace_inherited_stdin_with_dev_null`] for the single-threaded
+/// exec-entry and identity-pinning contract.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn replace_inherited_stdout_with_dev_null(expected: DescriptorIdentity) -> io::Result<()> {
+    replace_inherited_standard_stream_with_dev_null(libc::STDOUT_FILENO, libc::O_WRONLY, expected)
+}
+
+/// Atomically replaces inherited stderr with a close-on-exec `/dev/null`
+/// while preserving exactly one already-created duplicate of `expected`.
+///
+/// See [`replace_inherited_stdin_with_dev_null`] for the single-threaded
+/// exec-entry and identity-pinning contract.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn replace_inherited_stderr_with_dev_null(expected: DescriptorIdentity) -> io::Result<()> {
+    replace_inherited_standard_stream_with_dev_null(libc::STDERR_FILENO, libc::O_WRONLY, expected)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn replace_inherited_standard_stream_with_dev_null(
+    standard_stream: RawFd,
+    access_mode: libc::c_int,
+    expected: DescriptorIdentity,
+) -> io::Result<()> {
+    if expected.inode == 0
+        || !matches!(
+            standard_stream,
+            libc::STDIN_FILENO | libc::STDOUT_FILENO | libc::STDERR_FILENO
+        )
+        || !matches!(access_mode, libc::O_RDONLY | libc::O_WRONLY)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid inherited standard-stream replacement request",
+        ));
+    }
+    if descriptor_identity_raw(standard_stream)? != expected
+        || count_open_descriptors_with_identity(expected)? != 2
+    {
+        return Err(io::Error::other(
+            "inherited standard-stream identity was not exclusive",
+        ));
+    }
+
+    let dev_null = open_dev_null(access_mode)?;
+    if !descriptor_is_character_device(dev_null.as_raw_fd())? {
+        return Err(io::Error::other(
+            "dev-null descriptor was not a character device",
+        ));
+    }
+    let dev_null_identity = descriptor_identity(dev_null.as_fd())?;
+    if dev_null_identity == expected {
+        return Err(io::Error::other(
+            "dev-null identity overlapped inherited standard stream",
+        ));
+    }
+
+    duplicate_to_standard_stream(dev_null.as_raw_fd(), standard_stream)?;
+    let flags = descriptor_flags(standard_stream)?;
+    set_close_on_exec(standard_stream, flags)?;
+    if descriptor_flags(standard_stream)? & libc::FD_CLOEXEC == 0
+        || descriptor_status_flags(standard_stream)? & libc::O_ACCMODE != access_mode
+        || descriptor_identity_raw(standard_stream)? != dev_null_identity
+        || descriptor_identity_raw(standard_stream)? == expected
+        || count_open_descriptors_with_identity(expected)? != 1
+    {
+        return Err(io::Error::other(
+            "inherited standard stream could not be safely replaced",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_dev_null(access_mode: libc::c_int) -> io::Result<OwnedFd> {
+    let flags = access_mode | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    loop {
+        // SAFETY: the byte string is a fixed NUL-terminated path and `flags`
+        // contains no variadic create mode. Successful ownership is moved into
+        // exactly one `OwnedFd` below.
+        let raw_descriptor = unsafe { libc::open(c"/dev/null".as_ptr(), flags) };
+        if raw_descriptor >= 0 {
+            // SAFETY: `open` returned one fresh owned descriptor.
+            return Ok(unsafe { OwnedFd::from_raw_fd(raw_descriptor) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn duplicate_to_standard_stream(source: RawFd, target: RawFd) -> io::Result<()> {
+    loop {
+        // SAFETY: both integers name live descriptors at this single-threaded
+        // exec-entry boundary. `dup2` atomically replaces `target`, so no
+        // reusable closed standard-stream hole is exposed.
+        let duplicated = unsafe { libc::dup2(source, target) };
+        if duplicated == target {
+            return Ok(());
+        }
+        if duplicated >= 0 {
+            return Err(io::Error::other(
+                "standard-stream duplication returned an unexpected descriptor",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn descriptor_status_flags(raw_descriptor: RawFd) -> io::Result<libc::c_int> {
+    // SAFETY: `F_GETFL` reads status flags without taking ownership.
+    let flags = unsafe { libc::fcntl(raw_descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(flags)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn descriptor_is_character_device(raw_descriptor: RawFd) -> io::Result<bool> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `status` is writable storage for one complete `stat` value.
+    if unsafe { libc::fstat(raw_descriptor, status.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful `fstat` initialized the complete value.
+    let status = unsafe { status.assume_init() };
+    Ok(status.st_mode & libc::S_IFMT == libc::S_IFCHR)
+}
+
 fn descriptor_identity_raw(raw_descriptor: RawFd) -> io::Result<DescriptorIdentity> {
     let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `status` points to writable storage for one `libc::stat` and
@@ -123,34 +498,151 @@ fn descriptor_identity_raw(raw_descriptor: RawFd) -> io::Result<DescriptorIdenti
 /// reaped before an error is returned.
 pub fn spawn_with_inherited_fd(command: Command, descriptor: BorrowedFd<'_>) -> io::Result<Child> {
     #[cfg(test)]
+    let result = spawn_with_inherited_fd_inner(command, descriptor, false, None);
+    #[cfg(not(test))]
+    let result = spawn_with_inherited_fd_inner(command, descriptor, false);
+    result.map_err(collapse_spawn_error)
+}
+
+/// Spawns one reviewed child with a one-shot readiness fd advertised through
+/// [`READINESS_FD_ENV`].
+///
+/// The parent descriptor must already be close-on-exec. A fresh, dynamically
+/// numbered duplicate is made inheritable only inside this child's audited
+/// post-fork callback; unrelated concurrent execs cannot inherit it. The exec'd
+/// program must call [`take_inherited_readiness_fd`] before starting threads or
+/// spawning another process.
+pub fn spawn_with_inherited_readiness_fd(
+    command: Command,
+    descriptor: BorrowedFd<'_>,
+) -> Result<Child, InheritedFdSpawnError> {
+    #[cfg(test)]
     {
-        spawn_with_inherited_fd_inner(command, descriptor, None)
+        spawn_with_inherited_fd_inner(command, descriptor, true, None)
     }
     #[cfg(not(test))]
     {
-        spawn_with_inherited_fd_inner(command, descriptor)
+        spawn_with_inherited_fd_inner(command, descriptor, true)
     }
+}
+
+/// Takes the one readiness fd installed by
+/// [`spawn_with_inherited_readiness_fd`] and immediately restores
+/// `FD_CLOEXEC`.
+///
+/// This is a safe, one-shot exec-entry API: it accepts only a non-stdio fd from
+/// the fixed private environment key, requires that the child-only inheritance
+/// flag is still clear, atomically rejects a second take, and restores and
+/// verifies close-on-exec.
+///
+/// The returned owner is a fresh close-on-exec duplicate. The environment is
+/// process input and cannot prove that its raw fd is not already owned by a
+/// safe Rust wrapper, so this function never adopts or closes that number. The
+/// sealed bootstrap fd remains open until the next exec or process exit. This
+/// costs one bounded descriptor but keeps the safe API sound even if the
+/// environment entry is stale or spoofed. The raw environment value is never
+/// included in an error.
+///
+/// Callers must pass every later [`Command`] through
+/// [`scrub_readiness_fd_env`]. If peer-observed EOF is part of the one-shot
+/// protocol, use a full-duplex socket and shut down its write half after the
+/// final write: dropping only the returned duplicate cannot close the sealed
+/// bootstrap fd.
+pub fn take_inherited_readiness_fd() -> io::Result<OwnedFd> {
+    let raw_descriptor = parse_inherited_readiness_fd()?;
+    if READINESS_FD_TAKEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "the inherited readiness descriptor was already taken",
+        ));
+    }
+
+    take_inherited_readiness_fd_inner(raw_descriptor)
+}
+
+fn parse_inherited_readiness_fd() -> io::Result<RawFd> {
+    let value = std::env::var_os(READINESS_FD_ENV).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the inherited readiness descriptor was not advertised",
+        )
+    })?;
+    let value = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the inherited readiness descriptor was not valid UTF-8",
+        )
+    })?;
+    let raw_descriptor = value.parse::<RawFd>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the inherited readiness descriptor was invalid",
+        )
+    })?;
+    if raw_descriptor < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the inherited readiness descriptor overlapped standard I/O",
+        ));
+    }
+    Ok(raw_descriptor)
+}
+
+fn take_inherited_readiness_fd_inner(raw_descriptor: RawFd) -> io::Result<OwnedFd> {
+    let flags = descriptor_flags(raw_descriptor)?;
+    if flags & libc::FD_CLOEXEC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the inherited readiness descriptor was already close-on-exec",
+        ));
+    }
+    set_close_on_exec(raw_descriptor, flags)?;
+    if descriptor_flags(raw_descriptor)? & libc::FD_CLOEXEC == 0 {
+        return Err(io::Error::other(
+            "the inherited readiness descriptor could not be resealed",
+        ));
+    }
+    let inherited_identity = descriptor_identity_raw(raw_descriptor)?;
+    let owned_descriptor = duplicate_for_child(raw_descriptor)?;
+    if descriptor_identity_raw(raw_descriptor)? != inherited_identity
+        || descriptor_identity(owned_descriptor.as_fd())? != inherited_identity
+    {
+        return Err(io::Error::other(
+            "the inherited readiness descriptor changed while it was resealed",
+        ));
+    }
+    Ok(owned_descriptor)
 }
 
 fn spawn_with_inherited_fd_inner(
     mut command: Command,
     descriptor: BorrowedFd<'_>,
+    advertise_readiness_fd: bool,
     #[cfg(test)] pre_exec_barrier: Option<PreExecBarrier>,
-) -> io::Result<Child> {
+) -> Result<Child, InheritedFdSpawnError> {
     let source_descriptor = descriptor.as_raw_fd();
-    let parent_flags = descriptor_flags(source_descriptor)?;
+    let parent_flags =
+        descriptor_flags(source_descriptor).map_err(InheritedFdSpawnError::not_started)?;
     if parent_flags & libc::FD_CLOEXEC == 0 {
-        return Err(io::Error::new(
+        return Err(InheritedFdSpawnError::not_started(io::Error::new(
             io::ErrorKind::InvalidInput,
             "inherited descriptor is not close-on-exec in the parent",
-        ));
+        )));
     }
 
     // Duplicate atomically with close-on-exec and keep the child-facing number
     // outside the standard streams. Rust configures stdio before `pre_exec`, so
     // passing source fd 0, 1, or 2 directly could otherwise be overwritten.
-    let child_descriptor = duplicate_for_child(source_descriptor)?;
+    let child_descriptor =
+        duplicate_for_child(source_descriptor).map_err(InheritedFdSpawnError::not_started)?;
     let child_raw_descriptor = child_descriptor.as_raw_fd();
+    scrub_readiness_fd_env(&mut command);
+    if advertise_readiness_fd {
+        command.env(READINESS_FD_ENV, child_raw_descriptor.to_string());
+    }
 
     // SAFETY: `child_raw_descriptor` remains valid through the one immediate
     // spawn because `child_descriptor` is held below. The command is consumed
@@ -168,7 +660,9 @@ fn spawn_with_inherited_fd_inner(
         });
     }
 
-    let mut child = command.spawn()?;
+    let child = command
+        .spawn()
+        .map_err(InheritedFdSpawnError::not_started)?;
     let parent_source_flags = descriptor_flags(source_descriptor);
     let parent_child_flags = descriptor_flags(child_raw_descriptor);
     drop(child_descriptor);
@@ -178,16 +672,22 @@ fn spawn_with_inherited_fd_inner(
         {
             Ok(child)
         }
-        (Ok(_), Ok(_)) => {
-            terminate_spawned_child(&mut child);
-            Err(io::Error::other(
-                "child spawn changed the parent descriptor inheritance flag",
-            ))
-        }
-        (Err(error), _) | (_, Err(error)) => {
-            terminate_spawned_child(&mut child);
-            Err(error)
-        }
+        (Ok(_), Ok(_)) => Err(InheritedFdSpawnError::started(
+            io::Error::other("child spawn changed the parent descriptor inheritance flag"),
+            child,
+        )),
+        (Err(error), _) | (_, Err(error)) => Err(InheritedFdSpawnError::started(error, child)),
+    }
+}
+
+fn collapse_spawn_error(mut error: InheritedFdSpawnError) -> io::Error {
+    // The legacy API cannot return post-spawn authority. Dropping the typed
+    // owner performs bounded cleanup and aborts fail-closed if exact reap could
+    // not be confirmed.
+    drop(error.child.take());
+    match error.cause.take() {
+        Some(cause) => cause,
+        None => io::Error::other("inherited descriptor spawn failed"),
     }
 }
 
@@ -273,13 +773,45 @@ fn clear_close_on_exec_in_child(raw_descriptor: RawFd) -> io::Result<()> {
     }
 }
 
-fn terminate_spawned_child(child: &mut Child) {
+fn set_close_on_exec(raw_descriptor: RawFd, flags: libc::c_int) -> io::Result<()> {
+    // SAFETY: `F_SETFD` changes only descriptor flags on the live descriptor
+    // and uses no pointer. The caller read `flags` from this exact fd.
+    let result = unsafe { libc::fcntl(raw_descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn terminate_spawned_child(child: &mut Child) -> bool {
     let _ = child.kill();
+    let Some(deadline) = Instant::now().checked_add(CHILD_CLEANUP_TIMEOUT) else {
+        return false;
+    };
+    poll_child_until_reaped(deadline, || child.try_wait())
+}
+
+fn poll_child_until_reaped(
+    deadline: Instant,
+    mut try_wait: impl FnMut() -> io::Result<Option<std::process::ExitStatus>>,
+) -> bool {
     loop {
-        match child.wait() {
+        match try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Ok(_) | Err(_) => return,
+            Err(_) => return false,
         }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(CHILD_CLEANUP_POLL_INTERVAL),
+        );
     }
 }
 
@@ -292,8 +824,388 @@ mod tests {
     use std::os::fd::AsFd;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::UnixStream;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const TAKE_READINESS_HELPER_ENV: &str = "CALCIFER_TEST_TAKE_READINESS_FD";
+    const RESEALED_GRANDCHILD_HELPER_ENV: &str = "CALCIFER_TEST_RESEALED_READINESS_FD";
+    const RESEALED_IDENTITY_ENV: &str = "CALCIFER_TEST_RESEALED_READINESS_IDENTITY";
+    const INVALID_READINESS_HELPER_ENV: &str = "CALCIFER_TEST_INVALID_READINESS_FD";
+    const SIGTTOU_LIFO_ABORT_HELPER_ENV: &str = "CALCIFER_TEST_SIGTTOU_LIFO_ABORT";
+
+    #[test]
+    fn child_reap_poll_returns_at_its_deadline_without_a_blocking_wait() {
+        let mut attempts = 0_usize;
+        let started_at = Instant::now();
+
+        let reaped = poll_child_until_reaped(Instant::now(), || {
+            attempts += 1;
+            Ok(None)
+        });
+
+        assert!(!reaped);
+        assert_eq!(attempts, 1);
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+    }
+
+    fn set_signal_blocked_for_test(signal: libc::c_int, blocked: bool) -> io::Result<()> {
+        let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: `signals` points to writable storage for one sigset, which
+        // `sigemptyset` initializes on success.
+        if unsafe { libc::sigemptyset(signals.as_mut_ptr()) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `sigemptyset` initialized the set and callers pass one valid
+        // platform signal constant.
+        if unsafe { libc::sigaddset(signals.as_mut_ptr(), signal) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both successful calls above initialized the full set.
+        let signals = unsafe { signals.assume_init() };
+        let how = if blocked {
+            libc::SIG_BLOCK
+        } else {
+            libc::SIG_UNBLOCK
+        };
+        // SAFETY: `signals` is initialized, the output pointer is null, and
+        // pthread_sigmask changes only the calling test thread.
+        let result = unsafe { libc::pthread_sigmask(how, &signals, std::ptr::null_mut()) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(result))
+        }
+    }
+
+    fn signal_is_blocked_for_test(signal: libc::c_int) -> io::Result<bool> {
+        let mut current = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: a null input set queries without changing the calling
+        // thread's mask, and `current` is valid writable output storage.
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), current.as_mut_ptr())
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        // SAFETY: successful pthread_sigmask initialized the complete set.
+        let current = unsafe { current.assume_init() };
+        // SAFETY: `current` is initialized and callers pass one valid platform
+        // signal constant.
+        match unsafe { libc::sigismember(&current, signal) } {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    fn set_sigttou_blocked_for_test(blocked: bool) -> io::Result<()> {
+        set_signal_blocked_for_test(libc::SIGTTOU, blocked)
+    }
+
+    fn sigttou_is_blocked_for_test() -> io::Result<bool> {
+        signal_is_blocked_for_test(libc::SIGTTOU)
+    }
+
+    #[test]
+    fn sigttou_block_is_scoped_and_restores_the_previous_mask()
+    -> Result<(), Box<dyn std::error::Error>> {
+        thread::spawn(|| -> io::Result<()> {
+            set_sigttou_blocked_for_test(false)?;
+            set_signal_blocked_for_test(libc::SIGUSR1, true)?;
+            assert!(!sigttou_is_blocked_for_test()?);
+            assert!(signal_is_blocked_for_test(libc::SIGUSR1)?);
+            {
+                let guard = block_sigttou_for_current_thread()?;
+                assert!(sigttou_is_blocked_for_test()?);
+                assert_eq!(format!("{guard:?}"), "SigttouBlockGuard(<active>)");
+                set_signal_blocked_for_test(libc::SIGUSR1, false)?;
+                assert!(!signal_is_blocked_for_test(libc::SIGUSR1)?);
+            }
+            assert!(!sigttou_is_blocked_for_test()?);
+            assert!(signal_is_blocked_for_test(libc::SIGUSR1)?);
+            Ok(())
+        })
+        .join()
+        .map_err(|_| io::Error::other("SIGTTOU scope test thread panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn sigttou_block_nesting_restores_each_exact_prior_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        thread::spawn(|| -> io::Result<()> {
+            set_sigttou_blocked_for_test(false)?;
+            let outer = block_sigttou_for_current_thread()?;
+            assert!(sigttou_is_blocked_for_test()?);
+            {
+                let _inner = block_sigttou_for_current_thread()?;
+                assert!(sigttou_is_blocked_for_test()?);
+            }
+            assert!(sigttou_is_blocked_for_test()?);
+            drop(outer);
+            assert!(!sigttou_is_blocked_for_test()?);
+
+            set_sigttou_blocked_for_test(true)?;
+            {
+                let _already_blocked = block_sigttou_for_current_thread()?;
+            }
+            assert!(sigttou_is_blocked_for_test()?);
+            Ok(())
+        })
+        .join()
+        .map_err(|_| io::Error::other("nested SIGTTOU test thread panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn sigttou_block_restores_during_error_and_unwind_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        thread::spawn(|| -> io::Result<()> {
+            set_sigttou_blocked_for_test(false)?;
+            let failed_scope = (|| -> io::Result<()> {
+                let _guard = block_sigttou_for_current_thread()?;
+                assert!(sigttou_is_blocked_for_test()?);
+                Err(io::Error::other("injected scoped failure"))
+            })();
+            assert!(failed_scope.is_err());
+            assert!(!sigttou_is_blocked_for_test()?);
+
+            let unwound = std::panic::catch_unwind(|| {
+                let _guard = match block_sigttou_for_current_thread() {
+                    Ok(guard) => guard,
+                    Err(error) => panic!("SIGTTOU guard setup failed: {error}"),
+                };
+                panic!("injected scoped unwind");
+            });
+            assert!(unwound.is_err());
+            assert!(!sigttou_is_blocked_for_test()?);
+            Ok(())
+        })
+        .join()
+        .map_err(|_| io::Error::other("SIGTTOU failure test thread panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn sigttou_block_changes_only_the_calling_thread_mask() -> Result<(), Box<dyn std::error::Error>>
+    {
+        thread::spawn(|| -> io::Result<()> {
+            set_sigttou_blocked_for_test(false)?;
+            let entered = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let worker_entered = Arc::clone(&entered);
+            let worker_release = Arc::clone(&release);
+            let worker = thread::spawn(move || -> io::Result<()> {
+                assert!(!sigttou_is_blocked_for_test()?);
+                let _guard = block_sigttou_for_current_thread()?;
+                assert!(sigttou_is_blocked_for_test()?);
+                worker_entered.wait();
+                worker_release.wait();
+                Ok(())
+            });
+
+            entered.wait();
+            assert!(!sigttou_is_blocked_for_test()?);
+            release.wait();
+            worker
+                .join()
+                .map_err(|_| io::Error::other("SIGTTOU worker thread panicked"))??;
+            assert!(!sigttou_is_blocked_for_test()?);
+            Ok(())
+        })
+        .join()
+        .map_err(|_| io::Error::other("SIGTTOU locality test thread panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn sigttou_lifo_abort_child_helper() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(SIGTTOU_LIFO_ABORT_HELPER_ENV).is_none() {
+            return Ok(());
+        }
+        let outer = block_sigttou_for_current_thread()?;
+        let inner = block_sigttou_for_current_thread()?;
+        drop(outer);
+        drop(inner);
+        Err("out-of-order SIGTTOU guard drop did not abort".into())
+    }
+
+    #[test]
+    fn sigttou_block_aborts_on_out_of_order_drop() -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::sigttou_lifo_abort_child_helper",
+                "--nocapture",
+            ])
+            .env(SIGTTOU_LIFO_ABORT_HELPER_ENV, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        assert_eq!(status.signal(), Some(libc::SIGABRT));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_readiness_fd_child_helper() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(case) = std::env::var_os(INVALID_READINESS_HELPER_ENV) else {
+            return Ok(());
+        };
+        let case = case.into_string().map_err(|_| "invalid test case")?;
+        let error = take_inherited_readiness_fd()
+            .err()
+            .ok_or("invalid readiness descriptor must fail")?;
+        match case.as_str() {
+            "missing" => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+            "malformed" | "stdio" => assert_eq!(error.kind(), io::ErrorKind::InvalidData),
+            _ => return Err("unknown invalid readiness descriptor test case".into()),
+        }
+        assert!(!format!("{error:?}").contains("credential-sentinel"));
+        assert!(!error.to_string().contains("credential-sentinel"));
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_fd_environment_input_is_strict_and_redacted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (case, value) in [
+            ("missing", None),
+            ("malformed", Some("credential-sentinel")),
+            ("stdio", Some("1")),
+        ] {
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "tests::invalid_readiness_fd_child_helper",
+                    "--nocapture",
+                ])
+                .env(INVALID_READINESS_HELPER_ENV, case)
+                .env_remove(READINESS_FD_ENV);
+            if let Some(value) = value {
+                command.env(READINESS_FD_ENV, value);
+            }
+            if !command.status()?.success() {
+                return Err(io::Error::other("invalid readiness fd case failed").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_readiness_fd_child_helper() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(TAKE_READINESS_HELPER_ENV).is_none() {
+            return Ok(());
+        }
+
+        let expected_raw: RawFd = std::env::var(READINESS_FD_ENV)?.parse()?;
+        let inherited = take_inherited_readiness_fd()?;
+        assert_ne!(inherited.as_raw_fd(), expected_raw);
+        assert!(descriptor_flags(expected_raw)? & libc::FD_CLOEXEC != 0);
+        assert!(descriptor_flags(inherited.as_raw_fd())? & libc::FD_CLOEXEC != 0);
+        assert!(matches!(
+            take_inherited_readiness_fd(),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        let identity = descriptor_identity(inherited.as_fd())?;
+
+        let mut grandchild = Command::new(std::env::current_exe()?);
+        scrub_readiness_fd_env(&mut grandchild);
+        let grandchild_status = grandchild
+            .args([
+                "--exact",
+                "tests::resealed_readiness_fd_is_absent_after_another_exec",
+                "--nocapture",
+            ])
+            .env_remove(TAKE_READINESS_HELPER_ENV)
+            .env(RESEALED_GRANDCHILD_HELPER_ENV, "1")
+            .env(
+                RESEALED_IDENTITY_ENV,
+                format!("{}:{}", identity.device, identity.inode),
+            )
+            .status()?;
+        if !grandchild_status.success() {
+            return Err(io::Error::other("resealed descriptor leaked across exec").into());
+        }
+
+        let mut inherited = UnixStream::from(inherited);
+        inherited.write_all(b"R")?;
+        inherited.shutdown(std::net::Shutdown::Write)?;
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_take_duplicates_instead_of_adopting_an_existing_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut existing_owner, mut peer) = UnixStream::pair()?;
+        let existing_raw = existing_owner.as_raw_fd();
+        clear_close_on_exec_in_child(existing_raw)?;
+
+        let inherited = take_inherited_readiness_fd_inner(existing_raw)?;
+        assert_ne!(inherited.as_raw_fd(), existing_raw);
+        assert_eq!(
+            descriptor_identity(inherited.as_fd())?,
+            descriptor_identity(existing_owner.as_fd())?
+        );
+        assert!(descriptor_flags(existing_raw)? & libc::FD_CLOEXEC != 0);
+        assert!(descriptor_flags(inherited.as_raw_fd())? & libc::FD_CLOEXEC != 0);
+
+        drop(inherited);
+        existing_owner.write_all(b"S")?;
+        let mut marker = [0_u8; 1];
+        peer.read_exact(&mut marker)?;
+        assert_eq!(marker, [b'S']);
+        Ok(())
+    }
+
+    #[test]
+    fn resealed_readiness_fd_is_absent_after_another_exec() -> Result<(), Box<dyn std::error::Error>>
+    {
+        if std::env::var_os(RESEALED_GRANDCHILD_HELPER_ENV).is_none() {
+            return Ok(());
+        }
+        assert!(std::env::var_os(READINESS_FD_ENV).is_none());
+        let identity = std::env::var(RESEALED_IDENTITY_ENV)?;
+        let (device, inode) = identity
+            .split_once(':')
+            .ok_or("resealed descriptor identity was malformed")?;
+        let identity = DescriptorIdentity {
+            device: device.parse()?,
+            inode: inode.parse()?,
+        };
+        assert_eq!(count_open_descriptors_with_identity(identity)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_fd_is_advertised_dynamically_and_resealed_after_exec()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut observer, inherited) = UnixStream::pair()?;
+        observer.set_read_timeout(Some(Duration::from_secs(10)))?;
+        assert!(descriptor_flags(inherited.as_raw_fd())? & libc::FD_CLOEXEC != 0);
+
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "tests::inherited_readiness_fd_child_helper",
+                "--nocapture",
+            ])
+            .env(TAKE_READINESS_HELPER_ENV, "1");
+        let mut child = spawn_with_inherited_readiness_fd(command, inherited.as_fd())?;
+        drop(inherited);
+
+        let mut marker = [0_u8; 1];
+        observer.read_exact(&mut marker)?;
+        assert_eq!(marker, [b'R']);
+        let mut trailing = [0_u8; 1];
+        assert_eq!(observer.read(&mut trailing)?, 0);
+        assert!(child.wait()?.success());
+        Ok(())
+    }
 
     #[test]
     fn bounded_identity_scan_counts_regular_files_and_unix_sockets()
@@ -375,6 +1287,7 @@ mod tests {
                 spawn_with_inherited_fd_inner(
                     command,
                     source_ref.as_fd(),
+                    true,
                     Some(PreExecBarrier {
                         ready: ready_child.as_raw_fd(),
                         release: release_child.as_raw_fd(),
@@ -430,7 +1343,7 @@ mod tests {
             let worker_result = worker.join();
             let child_result = match worker_result {
                 Ok(Ok(mut child)) => child.wait(),
-                Ok(Err(error)) => Err(error),
+                Ok(Err(error)) => Err(collapse_spawn_error(error)),
                 Err(_) => Err(io::Error::other("spawn worker panicked")),
             };
 
@@ -447,6 +1360,73 @@ mod tests {
         test_result?;
         cleanup_result?;
         Ok(())
+    }
+
+    #[test]
+    fn readiness_spawn_returns_started_child_authority_after_parent_readback_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (source, _peer) = UnixStream::pair()?;
+        let source_ref = &source;
+        assert!(descriptor_flags(source.as_raw_fd())? & libc::FD_CLOEXEC != 0);
+
+        let (mut ready_parent, ready_child) = UnixStream::pair()?;
+        let (mut release_parent, release_child) = UnixStream::pair()?;
+        ready_parent.set_read_timeout(Some(Duration::from_secs(10)))?;
+        release_parent.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+        thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let worker = scope.spawn(move || {
+                let mut command = Command::new("/bin/sleep");
+                command.arg("5");
+                spawn_with_inherited_fd_inner(
+                    command,
+                    source_ref.as_fd(),
+                    true,
+                    Some(PreExecBarrier {
+                        ready: ready_child.as_raw_fd(),
+                        release: release_child.as_raw_fd(),
+                    }),
+                )
+            });
+
+            let mutation = (|| -> io::Result<()> {
+                let mut ready = [0_u8; 1];
+                ready_parent.read_exact(&mut ready)?;
+                if ready != [1] {
+                    return Err(io::Error::other("pre-exec barrier marker was invalid"));
+                }
+                clear_close_on_exec_in_child(source_ref.as_raw_fd())
+            })();
+            let release = release_parent.write_all(&[1]);
+            drop(release_parent);
+            let worker_result = worker.join();
+
+            let current_flags = descriptor_flags(source_ref.as_raw_fd())?;
+            set_close_on_exec(source_ref.as_raw_fd(), current_flags)?;
+            mutation?;
+            release?;
+
+            let failure = match worker_result {
+                Ok(Err(failure)) => failure,
+                Ok(Ok(mut child)) => {
+                    terminate_spawned_child(&mut child);
+                    return Err("parent readback mutation did not fail the spawn".into());
+                }
+                Err(_) => return Err("spawn worker panicked".into()),
+            };
+            assert!(failure.child_started());
+            assert_eq!(
+                format!("{failure:?}"),
+                "InheritedFdSpawnError { child_started: true }"
+            );
+
+            let mut child = failure
+                .into_started_child()
+                .ok_or("started child authority was missing")?
+                .into_child();
+            assert!(terminate_spawned_child(&mut child));
+            Ok(())
+        })
     }
 
     #[test]

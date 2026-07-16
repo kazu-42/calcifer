@@ -25,15 +25,23 @@ use super::channel::{
     LifecycleEndpoint, LifecyclePair, bootstrap_guardian_from_stdin,
     spawn_guardian_with_lifecycle_stdin,
 };
-use super::process::{ChildLiveness, ManagedGroupChild, SpawnFailureState, shutdown_pair};
+use super::process::{
+    ChildLiveness, ForwardedTuiSignal, InteractiveTerminalSignal, ManagedGroupChild,
+    ReapedChildren, SpawnFailureState, TerminalShutdownSignal, UnreapedChildren, shutdown_pair,
+    shutdown_pair_after_forwarded_tui_signal,
+};
 use super::protocol::{
     ChildDisposition, ChildRole, CleanupStatus, CoordinatorCommand, CoordinatorReceiver,
     FailureCode, GuardianCommandReceiver, GuardianEvent, Phase, ProtocolError, SessionStatus,
-    StopAction, WorkerJoinStatus, send_coordinator_command, send_guardian_event,
+    StopAction, UnixSignal, WorkerJoinStatus, send_coordinator_command,
+    send_fixture_malformed_guardian_frame, send_fixture_trailing_terminal_armed,
+    send_guardian_event,
 };
-use super::runtime::{PrivateRuntime, RuntimeCleanupFailure};
+use super::runtime::{PrivateRuntime, RuntimeCleanupFailure, RuntimeCreateFailure};
 use super::transfer::TransferChannelPair;
 use crate::profiles::{CoordinatorProfileLease, Profile, ProfileLease, Provider, Registry};
+
+mod terminal_session;
 
 const PROFILE_ALIAS: &str = "work";
 const MARKER_ROOT_ENV: &str = "CALCIFER_SUPERVISOR_FIXTURE_MARKER_ROOT";
@@ -42,6 +50,7 @@ const GUARDIAN_FORBIDDEN_ENV: &str = "CALCIFER_SUPERVISOR_FIXTURE_GUARDIAN_FDS";
 const GUARDIAN_LIFECYCLE_ENV: &str = "CALCIFER_SUPERVISOR_FIXTURE_LIFECYCLE_FD";
 const CHILD_FORBIDDEN_ENV: &str = "CALCIFER_SUPERVISOR_FIXTURE_CHILD_FDS";
 const DESCENDANT_MARKER_ENV: &str = "CALCIFER_SUPERVISOR_FIXTURE_DESCENDANT_MARKER";
+const MAX_DESCRIPTOR_IDENTITIES: usize = 16;
 
 const IO_TIMEOUT: Duration = Duration::from_millis(50);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -67,6 +76,33 @@ enum Scenario {
     MalformedFrame,
     BarrierViolation,
     TrailingFrame,
+    PtyNormal,
+    PtyReadinessTimeout,
+    PtyGuardianDeath,
+    PtyCoordinatorDeath,
+    PtySignals,
+    PtyHup,
+    PtyTerm,
+    PtySuspendResume,
+    PtyExitNonzero,
+    PtySnapshotMismatch,
+    PtyArmAckTimeout,
+    PtyArmAckDisconnect,
+    PtyWrongOrder,
+    PtyMalformedFrame,
+    PtyTrailingFrame,
+    PtyTuiEarlyExit,
+    PtyTuiExitBeforeGate,
+    PtyResumeFailure,
+    PtyTuiExitBeforeResumeGate,
+    PtyReadyNoAck,
+    PtyWorkerFailure,
+    PtyTerminalChannelEof,
+    PtySlaveCloseWhileLive,
+    PtyOutputBackpressure,
+    PtyForegroundReclaim,
+    PtyRestoreIdentityMismatch,
+    PtyCleanupMismatch,
 }
 
 impl Scenario {
@@ -84,6 +120,33 @@ impl Scenario {
             "malformed-frame" => Ok(Self::MalformedFrame),
             "barrier-violation" => Ok(Self::BarrierViolation),
             "trailing-frame" => Ok(Self::TrailingFrame),
+            "pty-normal" => Ok(Self::PtyNormal),
+            "pty-readiness-timeout" => Ok(Self::PtyReadinessTimeout),
+            "pty-guardian-death" => Ok(Self::PtyGuardianDeath),
+            "pty-coordinator-death" => Ok(Self::PtyCoordinatorDeath),
+            "pty-signals" => Ok(Self::PtySignals),
+            "pty-hup" => Ok(Self::PtyHup),
+            "pty-term" => Ok(Self::PtyTerm),
+            "pty-suspend-resume" => Ok(Self::PtySuspendResume),
+            "pty-exit-nonzero" => Ok(Self::PtyExitNonzero),
+            "pty-snapshot-mismatch" => Ok(Self::PtySnapshotMismatch),
+            "pty-arm-ack-timeout" => Ok(Self::PtyArmAckTimeout),
+            "pty-arm-ack-disconnect" => Ok(Self::PtyArmAckDisconnect),
+            "pty-wrong-order" => Ok(Self::PtyWrongOrder),
+            "pty-malformed-frame" => Ok(Self::PtyMalformedFrame),
+            "pty-trailing-frame" => Ok(Self::PtyTrailingFrame),
+            "pty-tui-early-exit" => Ok(Self::PtyTuiEarlyExit),
+            "pty-tui-exit-before-gate" => Ok(Self::PtyTuiExitBeforeGate),
+            "pty-resume-failure" => Ok(Self::PtyResumeFailure),
+            "pty-tui-exit-before-resume-gate" => Ok(Self::PtyTuiExitBeforeResumeGate),
+            "pty-ready-no-ack" => Ok(Self::PtyReadyNoAck),
+            "pty-worker-failure" => Ok(Self::PtyWorkerFailure),
+            "pty-terminal-channel-eof" => Ok(Self::PtyTerminalChannelEof),
+            "pty-slave-close-while-live" => Ok(Self::PtySlaveCloseWhileLive),
+            "pty-output-backpressure" => Ok(Self::PtyOutputBackpressure),
+            "pty-foreground-reclaim" => Ok(Self::PtyForegroundReclaim),
+            "pty-restore-identity-mismatch" => Ok(Self::PtyRestoreIdentityMismatch),
+            "pty-cleanup-mismatch" => Ok(Self::PtyCleanupMismatch),
             _ => Err(FixtureError::Arguments),
         }
     }
@@ -102,16 +165,91 @@ impl Scenario {
             Self::MalformedFrame => "malformed-frame",
             Self::BarrierViolation => "barrier-violation",
             Self::TrailingFrame => "trailing-frame",
+            Self::PtyNormal => "pty-normal",
+            Self::PtyReadinessTimeout => "pty-readiness-timeout",
+            Self::PtyGuardianDeath => "pty-guardian-death",
+            Self::PtyCoordinatorDeath => "pty-coordinator-death",
+            Self::PtySignals => "pty-signals",
+            Self::PtyHup => "pty-hup",
+            Self::PtyTerm => "pty-term",
+            Self::PtySuspendResume => "pty-suspend-resume",
+            Self::PtyExitNonzero => "pty-exit-nonzero",
+            Self::PtySnapshotMismatch => "pty-snapshot-mismatch",
+            Self::PtyArmAckTimeout => "pty-arm-ack-timeout",
+            Self::PtyArmAckDisconnect => "pty-arm-ack-disconnect",
+            Self::PtyWrongOrder => "pty-wrong-order",
+            Self::PtyMalformedFrame => "pty-malformed-frame",
+            Self::PtyTrailingFrame => "pty-trailing-frame",
+            Self::PtyTuiEarlyExit => "pty-tui-early-exit",
+            Self::PtyTuiExitBeforeGate => "pty-tui-exit-before-gate",
+            Self::PtyResumeFailure => "pty-resume-failure",
+            Self::PtyTuiExitBeforeResumeGate => "pty-tui-exit-before-resume-gate",
+            Self::PtyReadyNoAck => "pty-ready-no-ack",
+            Self::PtyWorkerFailure => "pty-worker-failure",
+            Self::PtyTerminalChannelEof => "pty-terminal-channel-eof",
+            Self::PtySlaveCloseWhileLive => "pty-slave-close-while-live",
+            Self::PtyOutputBackpressure => "pty-output-backpressure",
+            Self::PtyForegroundReclaim => "pty-foreground-reclaim",
+            Self::PtyRestoreIdentityMismatch => "pty-restore-identity-mismatch",
+            Self::PtyCleanupMismatch => "pty-cleanup-mismatch",
         }
+    }
+
+    const fn uses_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::PtyNormal
+                | Self::PtyReadinessTimeout
+                | Self::PtyGuardianDeath
+                | Self::PtyCoordinatorDeath
+                | Self::PtySignals
+                | Self::PtyHup
+                | Self::PtyTerm
+                | Self::PtySuspendResume
+                | Self::PtyExitNonzero
+                | Self::PtySnapshotMismatch
+                | Self::PtyArmAckTimeout
+                | Self::PtyArmAckDisconnect
+                | Self::PtyWrongOrder
+                | Self::PtyMalformedFrame
+                | Self::PtyTrailingFrame
+                | Self::PtyTuiEarlyExit
+                | Self::PtyTuiExitBeforeGate
+                | Self::PtyResumeFailure
+                | Self::PtyTuiExitBeforeResumeGate
+                | Self::PtyReadyNoAck
+                | Self::PtyWorkerFailure
+                | Self::PtyTerminalChannelEof
+                | Self::PtySlaveCloseWhileLive
+                | Self::PtyOutputBackpressure
+                | Self::PtyForegroundReclaim
+                | Self::PtyRestoreIdentityMismatch
+                | Self::PtyCleanupMismatch
+        )
+    }
+
+    const fn is_pre_arm_protocol_fault(self) -> bool {
+        matches!(
+            self,
+            Self::PtyWrongOrder | Self::PtyMalformedFrame | Self::PtyTrailingFrame
+        )
+    }
+
+    const fn is_post_arm_ack_fault(self) -> bool {
+        matches!(self, Self::PtyArmAckTimeout | Self::PtyArmAckDisconnect)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FixtureRole {
+    TerminalAnchor,
     Coordinator,
     Guardian,
     Child(ChildRole),
+    DetachedTui,
+    TstpHeartbeatDescendant,
     Contender,
+    ProviderContender,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,21 +302,25 @@ fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<ExitCode, F
         .and_then(|value| value.into_string().ok())
         .ok_or(FixtureError::Arguments)?;
     let (role, scenario) = match role.as_str() {
-        "coordinator" | "guardian" => {
+        "terminal-anchor" | "coordinator" | "guardian" => {
             let scenario = arguments
                 .next()
                 .and_then(|value| value.into_string().ok())
                 .ok_or(FixtureError::Arguments)?;
-            let role = if role == "coordinator" {
-                FixtureRole::Coordinator
-            } else {
-                FixtureRole::Guardian
+            let role = match role.as_str() {
+                "terminal-anchor" => FixtureRole::TerminalAnchor,
+                "coordinator" => FixtureRole::Coordinator,
+                "guardian" => FixtureRole::Guardian,
+                _ => unreachable!("role was matched above"),
             };
             (role, Some(Scenario::parse(&scenario)?))
         }
         "app" => (FixtureRole::Child(ChildRole::AppServer), None),
         "tui" => (FixtureRole::Child(ChildRole::Tui), None),
+        "detached-tui" => (FixtureRole::DetachedTui, None),
+        "tstp-heartbeat-descendant" => (FixtureRole::TstpHeartbeatDescendant, None),
         "contender" => (FixtureRole::Contender, None),
+        "provider-contender" => (FixtureRole::ProviderContender, None),
         _ => return Err(FixtureError::Arguments),
     };
     if arguments.next().is_some() {
@@ -186,11 +328,31 @@ fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<ExitCode, F
     }
 
     match (role, scenario) {
+        (FixtureRole::TerminalAnchor, Some(scenario)) if scenario.uses_terminal() => {
+            terminal_session::run_terminal_anchor(scenario)
+        }
         (FixtureRole::Coordinator, Some(scenario)) => run_coordinator(scenario),
         (FixtureRole::Guardian, Some(scenario)) => run_guardian(scenario),
         (FixtureRole::Child(role), None) => run_fake_child(role),
+        (FixtureRole::DetachedTui, None) => run_detached_tui(),
+        (FixtureRole::TstpHeartbeatDescendant, None) => {
+            terminal_session::run_tstp_heartbeat_descendant()
+        }
         (FixtureRole::Contender, None) => run_contender(),
+        (FixtureRole::ProviderContender, None) => run_provider_contender(),
         _ => Err(FixtureError::Arguments),
+    }
+}
+
+fn run_detached_tui() -> Result<ExitCode, FixtureError> {
+    if rustix::termios::isatty(io::stdin())
+        || rustix::termios::isatty(io::stdout())
+        || rustix::termios::isatty(io::stderr())
+    {
+        return Err(FixtureError::Invariant);
+    }
+    loop {
+        thread::park();
     }
 }
 
@@ -218,7 +380,7 @@ impl IdentitySet {
         }
         let mut identities = Vec::new();
         for item in encoded.split(';') {
-            if identities.len() == 8 {
+            if identities.len() == MAX_DESCRIPTOR_IDENTITIES {
                 return Err(FixtureError::Environment);
             }
             let (device, inode) = item.split_once(',').ok_or(FixtureError::Environment)?;
@@ -235,7 +397,9 @@ impl IdentitySet {
     }
 
     fn encode(identities: &[DescriptorIdentity]) -> Result<String, FixtureError> {
-        if identities.len() > 8 || identities.iter().any(|identity| identity.inode == 0) {
+        if identities.len() > MAX_DESCRIPTOR_IDENTITIES
+            || identities.iter().any(|identity| identity.inode == 0)
+        {
             return Err(FixtureError::Descriptor);
         }
         let mut encoded = String::new();
@@ -387,6 +551,15 @@ fn run_contender() -> Result<ExitCode, FixtureError> {
     }
 }
 
+fn run_provider_contender() -> Result<ExitCode, FixtureError> {
+    let (registry, profile) = profile()?;
+    match registry.lock_profile_provider(&profile) {
+        Ok(_lease) => Ok(ExitCode::SUCCESS),
+        Err(error) if error.code() == "profile_busy" => Ok(ExitCode::from(EXIT_BUSY)),
+        Err(_) => Err(FixtureError::Profile),
+    }
+}
+
 fn run_fake_child(role: ChildRole) -> Result<ExitCode, FixtureError> {
     let scenario = env::var("CALCIFER_SUPERVISOR_FIXTURE_SCENARIO")
         .map_err(|_| FixtureError::Environment)
@@ -406,6 +579,19 @@ fn run_fake_child(role: ChildRole) -> Result<ExitCode, FixtureError> {
         rustix::process::getpid().as_raw_pid(),
     )?;
     IdentitySet::parse_environment(CHILD_FORBIDDEN_ENV)?.assert_absent()?;
+    if scenario.uses_terminal() {
+        write_marker(
+            match role {
+                ChildRole::AppServer => "app.fd-scan",
+                ChildRole::Tui => "tui.fd-scan",
+            },
+            b"verified\n",
+        )?;
+    }
+
+    if scenario.uses_terminal() && role == ChildRole::Tui {
+        return terminal_session::run_fake_tui(scenario);
+    }
 
     if (scenario == Scenario::AppEarlyExit && role == ChildRole::AppServer)
         || (scenario == Scenario::TuiEarlyExit && role == ChildRole::Tui)
@@ -461,6 +647,9 @@ impl RetainedCoordinatorState {
 // process-lifetime state. The receiver itself intentionally owns no resource.
 #[allow(clippy::drop_non_drop)]
 fn run_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError> {
+    if scenario.uses_terminal() {
+        return terminal_session::run_coordinator(scenario);
+    }
     let (registry, profile) = profile()?;
     let coordinator_lease = registry
         .lock_profile_coordinator(&profile)
@@ -686,7 +875,15 @@ fn run_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError> {
             }
             GuardianEvent::Failed { .. } => {}
             GuardianEvent::ChildrenReaped { session, .. } => break session,
-            GuardianEvent::LeaseCommitted => {
+            GuardianEvent::LeaseCommitted
+            | GuardianEvent::TerminalArmed { .. }
+            | GuardianEvent::InputGateOpened
+            | GuardianEvent::SignalForwarded { .. }
+            | GuardianEvent::ResizeApplied { .. }
+            | GuardianEvent::Suspended
+            | GuardianEvent::Resumed { .. }
+            | GuardianEvent::TerminalQuiesced
+            | GuardianEvent::TerminalRecoveryDisarmed => {
                 drop(receiver);
                 retain_after_guardian_loss(
                     coordinator_lease,
@@ -881,6 +1078,7 @@ fn park_retained_coordinator(
     // published only after fixed output is flushed so killing the deliberately
     // parked coordinator cannot observe a partial diagnostic.
     let _ = write_marker("coordinator.retained", b"retained\n");
+    let _ = write_marker("coordinator.retention-reason", reason.code().as_bytes());
     RetainedCoordinatorState {
         authority: RetainedCoordinatorLease::new(coordinator_lease, reason),
         guardian,
@@ -913,6 +1111,20 @@ struct FixtureWorker {
     handle: Option<JoinHandle<WorkerResult>>,
 }
 
+struct RetainedFixtureWorkerStartupState {
+    worker: FixtureWorker,
+}
+
+impl RetainedFixtureWorkerStartupState {
+    fn park(self) -> ! {
+        let _ = self.worker.handle.is_some();
+        std::mem::forget(self);
+        loop {
+            thread::park();
+        }
+    }
+}
+
 struct RetainedGuardianWorkerState {
     provider_lease: ProfileLease,
     runtime: PrivateRuntime,
@@ -936,6 +1148,24 @@ impl RetainedGuardianWorkerState {
 struct RetainedGuardianCleanupState {
     provider_lease: ProfileLease,
     cleanup: RuntimeCleanupFailure,
+}
+
+struct RetainedGuardianRuntimeCreationState {
+    failure: RuntimeCreateFailure,
+}
+
+impl RetainedGuardianRuntimeCreationState {
+    fn park(self) -> ! {
+        let _ = (
+            self.failure.error(),
+            self.failure.cleanup_error(),
+            self.failure.has_created_path(),
+        );
+        std::mem::forget(self);
+        loop {
+            thread::park();
+        }
+    }
 }
 
 impl RetainedGuardianCleanupState {
@@ -970,22 +1200,50 @@ impl FixtureWorker {
                 if marker.is_err() || scenario == Scenario::WorkerFailure {
                     WorkerResult::Failed
                 } else if stop_receiver.recv().is_ok() {
-                    WorkerResult::Clean
+                    if scenario == Scenario::PtyWorkerFailure {
+                        let observed_restore = marker_path("terminal.restored")
+                            .and_then(|path| fs::read(path).map_err(|_| FixtureError::Storage))
+                            .is_ok_and(|value| value == b"restored\n")
+                            && write_marker("worker.restore-observed", b"restored-before-join\n")
+                                .is_ok();
+                        let _ = observed_restore;
+                        WorkerResult::Failed
+                    } else {
+                        WorkerResult::Clean
+                    }
                 } else {
                     WorkerResult::Failed
                 }
             })
             .map_err(|_| FixtureError::Worker)?;
-        if !started_receiver
-            .recv_timeout(PHASE_TIMEOUT)
-            .map_err(|_| FixtureError::Worker)?
-        {
-            return Err(FixtureError::Worker);
-        }
-        Ok(Self {
+        // Construct the owner immediately after `spawn`: every later failure
+        // must stop and exactly join this handle or retain it forever. In
+        // particular, `JoinHandle` drop is not a cleanup proof because it
+        // detaches a potentially live worker.
+        Self {
             stop: stop_sender,
             handle: Some(handle),
-        })
+        }
+        .finish_startup(started_receiver, PHASE_TIMEOUT)
+    }
+
+    fn finish_startup(
+        self,
+        started_receiver: mpsc::Receiver<bool>,
+        timeout: Duration,
+    ) -> Result<Self, FixtureError> {
+        if matches!(started_receiver.recv_timeout(timeout), Ok(true)) {
+            return Ok(self);
+        }
+        match self.join_bounded() {
+            Ok(_) => Err(FixtureError::Worker),
+            Err(worker) => {
+                // This non-returning state also keeps the caller frame alive.
+                // The guardian's provider lease and runtime therefore cannot
+                // unwind while the worker's exact join authority is unresolved.
+                RetainedFixtureWorkerStartupState { worker }.park()
+            }
+        }
     }
 
     fn join_bounded(mut self) -> Result<WorkerJoinStatus, Self> {
@@ -1009,11 +1267,15 @@ impl FixtureWorker {
         let Some(handle) = self.handle.take() else {
             return Ok(WorkerJoinStatus::JoinedPanicked);
         };
-        Ok(match handle.join() {
+        let status = match handle.join() {
             Ok(WorkerResult::Clean) => WorkerJoinStatus::JoinedClean,
             Ok(WorkerResult::Failed) => WorkerJoinStatus::JoinedFailed,
             Err(_) => WorkerJoinStatus::JoinedPanicked,
-        })
+        };
+        if status == WorkerJoinStatus::JoinedFailed {
+            let _ = write_marker("worker.joined-failed", b"joined-failed\n");
+        }
+        Ok(status)
     }
 }
 
@@ -1083,7 +1345,19 @@ fn receive_start<R: io::Read>(
 fn create_fixture_runtime(
     _authorization: &StartAuthorization,
 ) -> Result<PrivateRuntime, FixtureError> {
-    PrivateRuntime::create(&marker_root()?).map_err(|_| FixtureError::Storage)
+    match PrivateRuntime::create(&marker_root()?) {
+        Ok(runtime) => Ok(runtime),
+        Err(failure) if !failure.has_created_path() => Err(FixtureError::Storage),
+        Err(failure) => match failure.cleanup_created() {
+            // Exact removal proves that the failed creation left no runtime
+            // behind, so the caller may safely unwind its lease authority.
+            Ok(_clean) => Err(FixtureError::Storage),
+            // Unknown identity or cleanup mismatch is not recoverable. Parking
+            // keeps both this created-path capability and the caller frame's
+            // provider lease alive instead of orphaning the runtime.
+            Err(failure) => RetainedGuardianRuntimeCreationState { failure }.park(),
+        },
+    }
 }
 
 fn fake_child_command(
@@ -1131,6 +1405,9 @@ fn spawn_managed_child(
 }
 
 fn run_guardian(scenario: Scenario) -> Result<ExitCode, FixtureError> {
+    if scenario.uses_terminal() {
+        return terminal_session::run_guardian(scenario);
+    }
     let endpoint = bootstrap_guardian_from_stdin().map_err(|_| FixtureError::Channel)?;
     configure_endpoint(&endpoint)?;
     let guardian_forbidden = IdentitySet::parse_environment(GUARDIAN_FORBIDDEN_ENV)?;
@@ -1548,4 +1825,42 @@ const fn disposition_required_kill(disposition: ChildDisposition) -> bool {
             ..
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::error::Error;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn worker_startup_failure_stops_and_joins_the_spawned_thread_before_returning()
+    -> Result<(), Box<dyn Error>> {
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let handle = thread::spawn(move || {
+            let _ = started_sender.send(false);
+            if stop_receiver.recv().is_ok() {
+                worker_stopped.store(true, Ordering::Release);
+                WorkerResult::Clean
+            } else {
+                WorkerResult::Failed
+            }
+        });
+        let worker = FixtureWorker {
+            stop: stop_sender,
+            handle: Some(handle),
+        };
+
+        assert!(matches!(
+            worker.finish_startup(started_receiver, Duration::from_millis(50)),
+            Err(FixtureError::Worker)
+        ));
+        assert!(stopped.load(Ordering::Acquire));
+        Ok(())
+    }
 }
