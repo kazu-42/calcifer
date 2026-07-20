@@ -1550,6 +1550,72 @@ mod tests {
     }
 
     #[test]
+    fn real_worker_routes_one_usage_limit_without_diagnostic_identifier_leaks()
+    -> Result<(), Box<dyn Error>> {
+        let home = TestDirectory::new()?;
+        let (client, server) = UnixStream::pair()?;
+        let server_home = home.path().to_path_buf();
+        let server = spawn_server(server, move |websocket| {
+            assert_eq!(read_json(websocket)?, initialize_request());
+            send_json(websocket, initialize_response(&server_home))?;
+            assert_eq!(read_json(websocket)?, json!({ "method": "initialized" }));
+            assert_eq!(read_json(websocket)?, usage_read(1));
+            send_json(websocket, usage_response(1, 73))?;
+            send_json(
+                websocket,
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": THREAD_ID,
+                        "turn": {
+                            "id": TURN_ID,
+                            "status": "failed",
+                            "items": [],
+                            "error": {
+                                "message": "provider detail must not escape",
+                                "codexErrorInfo": "usageLimitExceeded"
+                            }
+                        }
+                    }
+                }),
+            )?;
+            wait_for_disconnect(websocket)
+        });
+
+        let mut monitor = connected_monitor(client, home.path())?;
+        monitor.wait_until_ready()?;
+        assert_eq!(log::STATIC_MAX_LEVEL, log::LevelFilter::Off);
+        let worker_debug = format!("{monitor:?}");
+        let deadline = checked_deadline(Duration::from_secs(1))?;
+        let signal = loop {
+            match monitor.take_usage_limit()? {
+                Some(signal) => break signal,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                None => return Err("worker did not route the usage-limit signal".into()),
+            }
+        };
+        assert_eq!(signal.thread_id(), THREAD_ID);
+        assert_eq!(signal.turn_id(), TURN_ID);
+        assert!(monitor.take_usage_limit()?.is_none());
+
+        for debug in [
+            worker_debug,
+            format!("{signal:?}"),
+            format!("{:?}", Some(signal.clone())),
+            format!("{:?}", Ok::<_, MonitorTransportError>(signal.clone())),
+        ] {
+            assert!(!debug.contains(THREAD_ID));
+            assert!(!debug.contains(TURN_ID));
+            assert!(!debug.contains("provider detail"));
+        }
+
+        monitor.ensure_live()?;
+        let _ = monitor.shutdown(shutdown_deadline()?)?;
+        join_server(server)?;
+        Ok(())
+    }
+
+    #[test]
     fn ping_is_ponged_with_exact_payload_and_monitor_remains_live() -> Result<(), Box<dyn Error>> {
         let home = TestDirectory::new()?;
         let (client, server) = UnixStream::pair()?;

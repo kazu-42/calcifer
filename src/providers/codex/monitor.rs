@@ -1042,9 +1042,11 @@ mod tests {
     const TARGET_THREAD_ID: &str = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
     const OTHER_THREAD_ID: &str = "019c6e27-e55b-73d1-87d8-4e01f1f75044";
     const TURN_ID: &str = "019c7714-3b77-74d1-9866-e1f484aae2ab";
+    const OTHER_TURN_ID: &str = "019c7714-3b77-74d1-9866-e1f484aae2ac";
 
     #[test]
-    fn usage_limit_debug_surfaces_redact_provider_identifiers() {
+    fn usage_limit_debug_surfaces_redact_provider_identifiers()
+    -> Result<(), Box<dyn std::error::Error>> {
         let signal = SessionUsageLimitSignal {
             thread_id: TARGET_THREAD_ID.to_owned(),
             turn_id: TURN_ID.to_owned(),
@@ -1058,10 +1060,59 @@ mod tests {
         let action_debug = format!("{action:?}");
         assert_eq!(signal_debug, "SessionUsageLimitSignal(<redacted>)");
         assert_eq!(action_debug, "UsageLimitExceeded(<redacted>)");
-        for debug in [signal_debug, action_debug] {
+        let option_debug = format!("{:?}", Some(signal.clone()));
+        let result_debug = format!("{:?}", Err::<(), _>(signal.clone()));
+        let action_collection_debug = format!("{:?}", vec![action.clone()]);
+
+        let assertion = std::panic::catch_unwind(|| {
+            assert_eq!(
+                signal,
+                SessionUsageLimitSignal {
+                    thread_id: OTHER_THREAD_ID.to_owned(),
+                    turn_id: OTHER_TURN_ID.to_owned(),
+                }
+            );
+        });
+        let assertion_debug = match assertion {
+            Ok(()) => return Err("different usage-limit signals compared equal".into()),
+            Err(payload) => payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .ok_or("assertion panic did not carry a textual diagnostic")?
+                .to_owned(),
+        };
+
+        let (_home, mut monitor) = observing_monitor()?;
+        let published = monitor.receive(&serde_json::to_vec(&json!({
+            "id": 1,
+            "result": usage_result(73, 2)
+        }))?)?;
+        let published_debug = format!(
+            "{:?}",
+            published
+                .first()
+                .ok_or("usage response did not publish a monitor action")?
+        );
+        assert_eq!(published_debug, "PublishUsage(<redacted>)");
+
+        for debug in [
+            signal_debug,
+            action_debug,
+            option_debug,
+            result_debug,
+            action_collection_debug,
+            published_debug,
+            assertion_debug,
+        ] {
             assert!(!debug.contains(TARGET_THREAD_ID));
+            assert!(!debug.contains(OTHER_THREAD_ID));
             assert!(!debug.contains(TURN_ID));
+            assert!(!debug.contains(OTHER_TURN_ID));
         }
+        assert_eq!(signal, signal.clone());
+        assert_eq!(action, action.clone());
+        Ok(())
     }
 
     #[test]

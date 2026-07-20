@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -8560,43 +8560,34 @@ fn package_private_read_retries_only_same_inode_append_progress() -> Result<(), 
     )?;
     assert_eq!(rewrite.kind(), std::io::ErrorKind::InvalidData);
 
-    let restored_mtime_path = scratch.root.join("same-length-rewrite-restored-mtime");
-    write_private_new(&restored_mtime_path, b"before")?;
-    let restored_before = fs::metadata(&restored_mtime_path)?;
-    let restored_modified = restored_before.modified()?;
-    let mut restored_after = None;
-    for _ in 0..100 {
-        let mut rewritten = OpenOptions::new().write(true).open(&restored_mtime_path)?;
-        rewritten.write_all(b"rewrit")?;
-        rewritten.set_times(fs::FileTimes::new().set_modified(restored_modified))?;
-        let candidate = rewritten.metadata()?;
-        if (candidate.ctime(), candidate.ctime_nsec())
-            != (restored_before.ctime(), restored_before.ctime_nsec())
-        {
-            restored_after = Some(candidate);
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    let restored_after = restored_after.ok_or("change time did not advance during rewrite")?;
-    assert_eq!(restored_before.modified()?, restored_after.modified()?);
-    let restored_rewrite = require_rejected_test_result(
-        validate_private_bounded_read_completion(
-            &restored_before,
-            &restored_after,
-            b"rewrit".len(),
-            128,
-        ),
-        "same-length rewrite with restored mtime was accepted as stable",
-    )?;
-    assert_eq!(restored_rewrite.kind(), std::io::ErrorKind::InvalidData);
-
     let oversized = require_rejected_test_result(
         validate_private_bounded_read_completion(&after, &after, 129, 128),
         "an oversized private read was accepted as progress",
     )?;
     assert_eq!(oversized.kind(), std::io::ErrorKind::InvalidData);
     scratch.cleanup()
+}
+
+#[test]
+fn package_private_read_rejects_restored_mtime_when_change_time_differs()
+-> Result<(), Box<dyn Error>> {
+    let before = PrivateBoundedReadVersion {
+        length: b"before".len(),
+        modified: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        change_time: (41, 7),
+    };
+    let rewritten = PrivateBoundedReadVersion {
+        length: before.length,
+        modified: before.modified,
+        change_time: (41, 8),
+    };
+
+    let error = require_rejected_test_result(
+        validate_private_bounded_read_version(before, rewritten, before.length, 128),
+        "same-length rewrite with restored mtime was accepted as stable",
+    )?;
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    Ok(())
 }
 
 fn write_package_pty_input(
@@ -14844,23 +14835,36 @@ fn read_private_bounded(path: &Path, maximum: usize) -> std::io::Result<Vec<u8>>
     Ok(bytes)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrivateBoundedReadVersion {
+    length: usize,
+    modified: SystemTime,
+    change_time: (i64, i64),
+}
+
+impl PrivateBoundedReadVersion {
+    fn capture(metadata: &fs::Metadata) -> std::io::Result<Self> {
+        let length = usize::try_from(metadata.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "package smoke private file length was invalid after read",
+            )
+        })?;
+        Ok(Self {
+            length,
+            modified: metadata.modified()?,
+            change_time: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
 fn validate_private_bounded_read_completion(
     before: &fs::Metadata,
     after: &fs::Metadata,
     bytes_read: usize,
     maximum: usize,
 ) -> std::io::Result<()> {
-    let (Ok(before_length), Ok(after_length)) =
-        (usize::try_from(before.len()), usize::try_from(after.len()))
-    else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "package smoke private file length was invalid after read",
-        ));
-    };
-    if bytes_read > maximum
-        || after_length > maximum
-        || !after.file_type().is_file()
+    if !after.file_type().is_file()
         || after.uid() != before.uid()
         || (after.permissions().mode() & 0o7777) != (before.permissions().mode() & 0o7777)
         || after.nlink() != before.nlink()
@@ -14872,8 +14876,28 @@ fn validate_private_bounded_read_completion(
             "package smoke private file identity was invalid after read",
         ));
     }
-    if after_length > before_length {
-        if bytes_read < before_length || bytes_read > after_length {
+    validate_private_bounded_read_version(
+        PrivateBoundedReadVersion::capture(before)?,
+        PrivateBoundedReadVersion::capture(after)?,
+        bytes_read,
+        maximum,
+    )
+}
+
+fn validate_private_bounded_read_version(
+    before: PrivateBoundedReadVersion,
+    after: PrivateBoundedReadVersion,
+    bytes_read: usize,
+    maximum: usize,
+) -> std::io::Result<()> {
+    if bytes_read > maximum || after.length > maximum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "package smoke private file length was invalid after read",
+        ));
+    }
+    if after.length > before.length {
+        if bytes_read < before.length || bytes_read > after.length {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "package smoke private file did not grow monotonically while read",
@@ -14884,10 +14908,10 @@ fn validate_private_bounded_read_completion(
             "package smoke private file append progressed while read",
         ));
     }
-    if after_length < before_length
-        || before.modified()? != after.modified()?
-        || (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
-        || after_length != bytes_read
+    if after.length < before.length
+        || before.modified != after.modified
+        || before.change_time != after.change_time
+        || after.length != bytes_read
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
