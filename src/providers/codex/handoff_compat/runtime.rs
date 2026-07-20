@@ -1,11 +1,10 @@
 use std::ffi::{CString, OsStr};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::ops::Deref;
 use std::os::fd::AsFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -3415,14 +3414,7 @@ impl PtyChild {
             .map_err(|error| pty_spawn_error("fcntl_setfd", error))?;
         rustix::pty::grantpt(&master).map_err(|error| pty_spawn_error("grantpt", error))?;
         rustix::pty::unlockpt(&master).map_err(|error| pty_spawn_error("unlockpt", error))?;
-        let slave_name = rustix::pty::ptsname(&master, Vec::new())
-            .map_err(|error| pty_spawn_error("ptsname", error))?;
-        let slave_path = Path::new(OsStr::from_bytes(slave_name.to_bytes()));
-        let slave = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(slave_path)
-            .map_err(|error| pty_spawn_error("open slave", error))?;
+        let slave = open_pty_slave(&master)?;
         rustix::termios::tcsetwinsize(
             &slave,
             rustix::termios::Winsize {
@@ -3517,6 +3509,22 @@ impl PtyChild {
     }
 }
 
+fn open_pty_slave(master: &impl AsFd) -> Result<File, CodexHandoffError> {
+    let slave_name = rustix::pty::ptsname(master, Vec::new())
+        .map_err(|error| pty_spawn_error("ptsname", error))?;
+    rustix::fs::open(
+        slave_name.as_c_str(),
+        // A supervisor started as a session leader may not let this parent
+        // acquire the probe PTY as its controlling terminal. Otherwise the
+        // separately grouped TUI becomes a background job and can stop on its
+        // first terminal read before opening the readiness WebSocket.
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| pty_spawn_error("open slave", error))
+}
+
 impl Drop for PtyChild {
     fn drop(&mut self) {
         if !self.reaped {
@@ -3573,11 +3581,18 @@ fn drain_pty(reader: &mut File) -> PtyDrain {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, OsString};
+    use std::fs::OpenOptions;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
     use super::*;
+
+    const PTY_SESSION_LEADER_HELPER_ENV: &str = "CALCIFER_TEST_PTY_SESSION_LEADER_HELPER";
+    const PTY_SESSION_LEADER_HELPER_TEST: &str = concat!(
+        "providers::codex::handoff_compat::runtime::tests::",
+        "pty_slave_open_session_leader_helper"
+    );
 
     fn cleanup_test_scratch(scratch: ScratchRoot) -> Result<(), CodexHandoffError> {
         scratch
@@ -4218,6 +4233,55 @@ mod tests {
                 .windows(b"calcifer-pty-ok".len())
                 .any(|window| window == b"calcifer-pty-ok")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pty_slave_open_session_leader_helper() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(PTY_SESSION_LEADER_HELPER_ENV).is_none() {
+            return Ok(());
+        }
+        let process = rustix::process::getpid();
+        let session = rustix::process::setsid()?;
+        if session != process
+            || rustix::process::getpgrp() != process
+            || rustix::process::getsid(Some(process))? != process
+        {
+            return Err("PTY helper did not become its own session leader".into());
+        }
+        if OpenOptions::new().read(true).open("/dev/tty").is_ok() {
+            return Err("PTY helper unexpectedly began with a controlling terminal".into());
+        }
+
+        let master =
+            rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)?;
+        rustix::pty::grantpt(&master)?;
+        rustix::pty::unlockpt(&master)?;
+        let _slave = open_pty_slave(&master)?;
+
+        if OpenOptions::new().read(true).open("/dev/tty").is_ok() {
+            return Err("opening the PTY slave claimed a controlling terminal".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pty_slave_open_never_claims_a_controlling_terminal() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args(["--exact", PTY_SESSION_LEADER_HELPER_TEST, "--nocapture"])
+            .env(PTY_SESSION_LEADER_HELPER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn()?;
+        wait_for_success(
+            &mut child,
+            Instant::now()
+                .checked_add(Duration::from_secs(2))
+                .ok_or("deadline overflow")?,
+        )?;
         Ok(())
     }
 

@@ -462,13 +462,36 @@ def _observe_loopback_network() -> dict[str, int]:
     return flags
 
 
-def _enable_and_verify_loopback_network(*, ip_path: str) -> None:
-    status, _output = _run_ip([ip_path, "link", "set", "dev", "lo", "up"])
+def _enable_and_verify_loopback_network(
+    *,
+    ip_path: str,
+    command_runner: Callable[[Sequence[str]], tuple[int, str]] = _run_ip,
+    network_observer: Callable[[], Mapping[str, int]] = _observe_loopback_network,
+) -> None:
+    initial_flags = dict(network_observer())
+    initial_loopback_flags = initial_flags.get("lo")
+    if initial_loopback_flags is None:
+        raise ValueError("network namespace had no loopback interface")
+    if initial_loopback_flags & IFF_LOOPBACK != IFF_LOOPBACK:
+        raise ValueError("loopback interface was not a loopback device")
+    fallback_interfaces = set(initial_flags) - {"lo"}
+    if not fallback_interfaces <= KERNEL_FALLBACK_TUNNEL_INTERFACES:
+        # Do not mutate an unknown interface into an apparently safe state.
+        raise ValueError("network namespace had an unexpected non-loopback interface")
+    for interface in sorted(fallback_interfaces):
+        status, _output = command_runner(
+            [ip_path, "link", "set", "dev", interface, "down"]
+        )
+        if status != 0:
+            raise ValueError("fallback interface could not be disabled")
+    status, _output = command_runner([ip_path, "link", "set", "dev", "lo", "up"])
     if status != 0:
         raise ValueError("loopback interface could not be enabled")
-    flags = _observe_loopback_network()
+    flags = dict(network_observer())
     verify_loopback_only_network(
-        interface_flags=flags, ip_path=ip_path
+        interface_flags=flags,
+        ip_path=ip_path,
+        command_runner=command_runner,
     )
 
 

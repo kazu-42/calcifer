@@ -3105,9 +3105,10 @@ impl fmt::Debug for StartupCleanupReport {
 mod tests {
     use std::cell::Cell;
     use std::fs;
-    use std::io::Cursor;
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::{Cursor, Write};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3126,6 +3127,7 @@ mod tests {
     const TEST_APP_READINESS_BOUND: Duration = Duration::from_secs(5);
     const TEST_APP_GROUP_READINESS_BOUND: Duration = Duration::from_secs(5);
     const TEST_APP_CONTAINMENT_BOUND: Duration = Duration::from_secs(5);
+    const TEST_APP_DESCRIPTOR_SCAN_BOUND: Duration = Duration::from_secs(10);
     const TEST_COOPERATIVE_APP_HELPER_ENV: &str = "CALCIFER_STARTUP_COOPERATIVE_APP_HELPER";
     const TEST_COOPERATIVE_APP_READY_ENV: &str = "CALCIFER_STARTUP_COOPERATIVE_APP_READY";
     const TEST_COOPERATIVE_APP_HELPER_TEST: &str =
@@ -3604,6 +3606,13 @@ mod tests {
         let runtime = PrivateRuntime::create(&runtime_parent)?;
         let (reservation, route) = runtime.reserve_supervised_layout()?.into_parts();
         drop(route);
+        // Complete every fallible PTY setup step before the fail-closed App
+        // owner exists. Otherwise a fixture error would unwind through
+        // `ManagedGroupChild::drop` and abort instead of reporting the error.
+        let (endpoint, terminal_peer, recovery, snapshot, _, _terminal_master_keepalive) =
+            startup_failure_terminal_for_test()?;
+        let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
+        terminal.validate()?;
         let command = build.app_server_command_for_reservation(
             &reservation,
             Instant::now() + Duration::from_secs(1),
@@ -3638,16 +3647,13 @@ mod tests {
             events: Vec::new(),
             fail_on: None,
         };
-        let (endpoint, terminal_peer, recovery, snapshot, _) = startup_failure_terminal_for_test()?;
-        let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
-        terminal.validate()?;
         let observed = verify_app_descriptor_inventory(
             &mut child,
             &build,
             &reservation,
             &terminal,
             &reporter,
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + TEST_APP_DESCRIPTOR_SCAN_BOUND,
         )
         .err();
 
@@ -3689,8 +3695,14 @@ mod tests {
         let runtime_parent = sandbox.private_directory("runtime")?;
         let runtime = PrivateRuntime::create(&runtime_parent)?;
         let runtime_path = runtime.path().to_path_buf();
-        let (endpoint, terminal_peer, recovery, snapshot, recovery_identity) =
-            startup_failure_terminal_for_test()?;
+        let (
+            endpoint,
+            terminal_peer,
+            recovery,
+            snapshot,
+            recovery_identity,
+            _terminal_master_keepalive,
+        ) = startup_failure_terminal_for_test()?;
         let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
         terminal.validate()?;
 
@@ -3743,38 +3755,85 @@ mod tests {
         let runtime_path = runtime.path().to_path_buf();
         let (reservation, route) = runtime.reserve_supervised_layout()?.into_parts();
         drop(route);
+        // Prepare and validate recovery authority before creating the
+        // fail-closed child owner; no fallible fixture setup may unwind across
+        // a live App.
+        let (
+            endpoint,
+            terminal_peer,
+            recovery,
+            snapshot,
+            recovery_identity,
+            _terminal_master_keepalive,
+        ) = startup_failure_terminal_for_test()?;
+        let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
+        terminal.validate()?;
         let command = build.app_server_command_for_reservation(
             &reservation,
             Instant::now() + Duration::from_secs(1),
         )?;
         let (mut child, reservation) = command
             .launch_with_reservation(reservation, Instant::now() + Duration::from_secs(1))?;
-        wait_for_test_app_ready(&ready_marker, Instant::now() + TEST_APP_READINESS_BOUND)?;
+        if let Err(readiness_error) =
+            wait_for_test_app_ready(&ready_marker, Instant::now() + TEST_APP_READINESS_BOUND)
+        {
+            let failure = child.retain_descriptor_isolation_failure(
+                reservation,
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ObservationFailed,
+            );
+            let contained = contain_test_app_adoption_failure(failure)?;
+            let _drain =
+                cleanup_test_app_socket(contained, "lifecycle App readiness cleanup failed")?;
+            drop((terminal, terminal_peer));
+            cleanup_test_build(build, "lifecycle App build cleanup failed")?;
+            return Err(readiness_error);
+        }
         let containment = child.containment();
         let mut reporter = FakeReporter {
             events: Vec::new(),
             fail_on: Some(0),
         };
-        let (endpoint, terminal_peer, recovery, snapshot, recovery_identity) =
-            startup_failure_terminal_for_test()?;
-        let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
-        terminal.validate()?;
-        let descriptor_isolation = verify_app_descriptor_inventory(
+        let descriptor_isolation = match verify_app_descriptor_inventory(
             &mut child,
             &build,
             &reservation,
             &terminal,
             &reporter,
-            Instant::now() + Duration::from_secs(1),
-        )?;
-        let (child, reservation) = report_child_started_or_retain(
+            Instant::now() + TEST_APP_DESCRIPTOR_SCAN_BOUND,
+        ) {
+            Ok(proof) => proof,
+            Err(error) => {
+                let failure = child.retain_descriptor_isolation_failure(reservation, error);
+                let contained = contain_test_app_adoption_failure(failure)?;
+                let _drain =
+                    cleanup_test_app_socket(contained, "lifecycle App scan cleanup failed")?;
+                drop((terminal, terminal_peer));
+                cleanup_test_build(build, "lifecycle App build cleanup failed")?;
+                return Err(format!("lifecycle App descriptor scan failed: {error:?}").into());
+            }
+        };
+        let (child, reservation) = match report_child_started_or_retain(
             (child, reservation),
             containment,
             &mut reporter,
             Instant::now() + Duration::from_secs(1),
-        )
-        .err()
-        .ok_or("the fixed lifecycle fault unexpectedly reported App started")?;
+        ) {
+            Err(owner) => owner,
+            Ok((child, reservation)) => {
+                let failure = child.retain_descriptor_isolation_failure(
+                    reservation,
+                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ObservationFailed,
+                );
+                let contained = contain_test_app_adoption_failure(failure)?;
+                let _drain = cleanup_test_app_socket(
+                    contained,
+                    "unexpected lifecycle success cleanup failed",
+                )?;
+                drop((descriptor_isolation, terminal, terminal_peer));
+                cleanup_test_build(build, "lifecycle App build cleanup failed")?;
+                return Err("the fixed lifecycle fault unexpectedly reported App started".into());
+            }
+        };
         let app = match child.adopt_socket(
             reservation,
             descriptor_isolation,
@@ -3832,36 +3891,116 @@ mod tests {
         }
 
         let sandbox = Sandbox::new()?;
-        let build = pinned_build(&sandbox, b"#!/bin/sh\nsleep 0.05\nexit 17\n")?;
+        let exit_gate = sandbox.path().join("app-exit.fifo");
+        let exit_ready = sandbox.path().join("app-exit-ready");
+        let fifo_status = Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(&exit_gate)
+            .status()?;
+        let fifo_metadata = fs::symlink_metadata(&exit_gate)?;
+        if !fifo_status.success()
+            || !fifo_metadata.file_type().is_fifo()
+            || fifo_metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err("test App exit FIFO was not created privately".into());
+        }
+        let quoted_exit_gate = shell_quote_test_value(
+            exit_gate
+                .to_str()
+                .ok_or("test App exit FIFO path is not UTF-8")?,
+        )?;
+        let quoted_exit_ready = shell_quote_test_value(
+            exit_ready
+                .to_str()
+                .ok_or("test App exit readiness path is not UTF-8")?,
+        )?;
+        let body = format!(
+            "#!/bin/sh\nexec 3<> {quoted_exit_gate}\n: > {quoted_exit_ready}\nIFS= read -r _ <&3\nexit 17\n"
+        );
+        let build = pinned_build(&sandbox, body.as_bytes())?;
         let staged_runtime = build.runtime_path_for_test().to_path_buf();
         let runtime_parent = sandbox.private_directory("runtime")?;
         let runtime = PrivateRuntime::create(&runtime_parent)?;
         let runtime_path = runtime.path().to_path_buf();
         let (reservation, route) = runtime.reserve_supervised_layout()?.into_parts();
         drop(route);
+        // Prepare and validate recovery authority before creating the
+        // fail-closed child owner; no fallible fixture setup may unwind across
+        // a live App.
+        let (
+            endpoint,
+            terminal_peer,
+            recovery,
+            snapshot,
+            recovery_identity,
+            _terminal_master_keepalive,
+        ) = startup_failure_terminal_for_test()?;
+        let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
+        terminal.validate()?;
         let command = build.app_server_command_for_reservation(
             &reservation,
             Instant::now() + Duration::from_secs(1),
         )?;
         let (mut child, reservation) = command
             .launch_with_reservation(reservation, Instant::now() + Duration::from_secs(1))?;
+        if let Err(readiness_error) =
+            wait_for_test_app_ready(&exit_ready, Instant::now() + TEST_APP_READINESS_BOUND)
+        {
+            let failure = child.retain_descriptor_isolation_failure(
+                reservation,
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ObservationFailed,
+            );
+            let contained = contain_test_app_adoption_failure(failure)?;
+            let _drain = cleanup_test_app_socket(contained, "early App readiness cleanup failed")?;
+            drop((terminal, terminal_peer));
+            cleanup_test_build(build, "early App build cleanup failed")?;
+            return Err(readiness_error);
+        }
+        let mut exit_writer = match rustix::fs::open(
+            &exit_gate,
+            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(descriptor) => fs::File::from(descriptor),
+            Err(open_error) => {
+                let failure = child.retain_descriptor_isolation_failure(
+                    reservation,
+                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ObservationFailed,
+                );
+                let contained = contain_test_app_adoption_failure(failure)?;
+                let _drain = cleanup_test_app_socket(contained, "early App writer cleanup failed")?;
+                drop((terminal, terminal_peer));
+                cleanup_test_build(build, "early App build cleanup failed")?;
+                return Err(format!(
+                    "early App exit writer failed: {:?}",
+                    std::io::Error::from(open_error).kind()
+                )
+                .into());
+            }
+        };
         let containment = child.containment();
         let mut reporter = FakeReporter {
             events: Vec::new(),
             fail_on: None,
         };
-        let (endpoint, terminal_peer, recovery, snapshot, recovery_identity) =
-            startup_failure_terminal_for_test()?;
-        let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
-        terminal.validate()?;
-        let descriptor_isolation = verify_app_descriptor_inventory(
+        let descriptor_isolation = match verify_app_descriptor_inventory(
             &mut child,
             &build,
             &reservation,
             &terminal,
             &reporter,
-            Instant::now() + Duration::from_secs(1),
-        )?;
+            Instant::now() + TEST_APP_DESCRIPTOR_SCAN_BOUND,
+        ) {
+            Ok(proof) => proof,
+            Err(error) => {
+                let failure = child.retain_descriptor_isolation_failure(reservation, error);
+                let contained = contain_test_app_adoption_failure(failure)?;
+                let _drain = cleanup_test_app_socket(contained, "early App scan cleanup failed")?;
+                drop((terminal, terminal_peer));
+                cleanup_test_build(build, "early App build cleanup failed")?;
+                return Err(format!("early App descriptor scan failed: {error:?}").into());
+            }
+        };
         let (child, reservation) = match report_child_started_or_retain(
             (child, reservation),
             containment,
@@ -3869,21 +4008,37 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         ) {
             Ok(owner) => owner,
-            Err(owner) => {
+            Err((child, reservation)) => {
                 // This branch is impossible for the fixed successful fake.
-                // If that invariant regresses, park the live child/reservation
-                // pair instead of aborting while trying to report the test
-                // failure through `ManagedGroupChild::drop`.
-                std::mem::forget(owner);
+                // Resolve every exact owner before reporting the regression;
+                // unwinding through the live child would correctly abort.
+                let failure = child.retain_descriptor_isolation_failure(
+                    reservation,
+                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ObservationFailed,
+                );
+                let contained = contain_test_app_adoption_failure(failure)?;
+                let _drain = cleanup_test_app_socket(contained, "early App report cleanup failed")?;
+                drop((descriptor_isolation, terminal, terminal_peer));
+                cleanup_test_build(build, "early App build cleanup failed")?;
                 return Err("the successful lifecycle reporter lost App ownership".into());
             }
         };
-        std::thread::sleep(Duration::from_millis(100));
+        if let Err(write_error) = exit_writer.write_all(b"exit\n") {
+            let failure = child.retain_descriptor_isolation_failure(
+                reservation,
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ObservationFailed,
+            );
+            let contained = contain_test_app_adoption_failure(failure)?;
+            let _drain = cleanup_test_app_socket(contained, "early App trigger cleanup failed")?;
+            drop((descriptor_isolation, terminal, terminal_peer));
+            cleanup_test_build(build, "early App build cleanup failed")?;
+            return Err(format!("early App exit trigger failed: {:?}", write_error.kind()).into());
+        }
         let adoption = child
             .adopt_socket(
                 reservation,
                 descriptor_isolation,
-                Instant::now() + Duration::from_millis(100),
+                Instant::now() + Duration::from_secs(1),
             )
             .err()
             .ok_or("an exited App child unexpectedly produced a live socket session")?;
@@ -3955,8 +4110,14 @@ mod tests {
             )
             .err()
             .ok_or("the fixed relay start fault unexpectedly became ready")?;
-        let (endpoint, terminal_peer, recovery, snapshot, recovery_identity) =
-            startup_failure_terminal_for_test()?;
+        let (
+            endpoint,
+            terminal_peer,
+            recovery,
+            snapshot,
+            recovery_identity,
+            _terminal_master_keepalive,
+        ) = startup_failure_terminal_for_test()?;
         let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
         terminal.validate()?;
         let failure = partial_failure(

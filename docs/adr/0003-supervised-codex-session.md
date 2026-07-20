@@ -469,19 +469,25 @@ operation.
   It requests guardian recovery before touching the exact coordinator child,
   wakes that child only when a fresh UID/PID/PGID/state readback proves it is
   stopped, waits the full healthy lifecycle budget, and only then may use its
-  retained `Child` handle for TERM/KILL fallback. Exact retained evidence
-  instead parks the coordinator `Child`, completion receiver, PTY, backend, and
-  scratch immediately, before TERM/KILL fallback, completion proof, or the
-  four-proof deletion gate. A failed recovery send proves only a consumed
-  attempt, not a confirmed write-half close. Scratch deletion still needs four
+  retained `Child` handle for TERM/KILL fallback. Exact retained or otherwise
+  unproved evidence in this `cfg(test)` package harness emits one fixed,
+  redacted subtype and terminates libtest with a fixed nonzero
+  `_exit`-equivalent status while the coordinator `Child`, completion receiver,
+  PTY, backend, and scratch Rust owners remain live. It runs no destructors,
+  unproved TERM/KILL fallback, completion proof, four-proof deletion, or
+  cleanup-success publication and produces no signal-driven core dump. This
+  test-only exit closes the libtest descriptor table and replaces the former
+  unbounded package-test park; a bounded regression parent first observes a
+  fixed readiness handshake and then kills/reaps only its deliberately parked
+  exact helper. Production guardian/anchor retained owners continue to park
+  their concrete typed authority. Neither the test exit nor the later CI
+  watchdog grants authority over escaped descendants, and no process-tree
+  cleanup claim is made. A failed recovery send proves only a consumed attempt,
+  not a confirmed write-half close. Scratch deletion still needs four
   independent proofs: exact coordinator-child wait; the exact provider-release-
   only `CFCMP\x01\r\n` record followed by EOF, which is not session or shell
-  success; absence of every reported known process group; and an identity-
-  checked empty runtime with zero retained FD and socket references. The CI
-  watchdog is a later test-parent
-  fence, not escaped-descendant authority; children that create another
-  session remain delegated to ephemeral-runner teardown on catastrophic test
-  timeout, and no process-tree cleanup claim is made.
+  success; absence of every reported known process group; and an
+  identity-checked empty runtime with zero retained FD and socket references.
 
 There is no in-process recovery after both authorities receive uncatchable
 `SIGKILL` while the tty is raw. The invoking shell or terminal emulator is the
@@ -707,9 +713,11 @@ recovery. It must not exit and accidentally release A.
     produces no ACK/proof/disposition, and cannot survive terminal restoration.
 21. `CFRET\x01\r\n` plus EOF is distinct terminal retained evidence. It cannot
     mint or substitute for provider release, cannot return a shell status, and
-    causes both production-anchor and package owners to park their exact
-    retained authorities. Publication is one-shot even when write or shutdown
-    fails.
+    causes production guardian/anchor owners to park their exact retained
+    authorities. The `cfg(test)` package owner instead emits a fixed redacted
+    failure subtype and terminates libtest with a fixed nonzero
+    `_exit`-equivalent status without claiming cleanup, deletion, or descendant
+    containment. Publication is one-shot even when write or shutdown fails.
 
 ## Bounds and backpressure
 

@@ -1519,6 +1519,7 @@ mod tests {
     #[test]
     fn stable_snapshot_validator_rejects_fd_replacement_and_pid_reuse() {
         let limits = ScanLimits::PRODUCTION;
+        let effective_uid = unsafe { libc::geteuid() };
         let first_fd = [DescriptorObservation {
             descriptor: 7,
             kind: 1,
@@ -1537,13 +1538,13 @@ mod tests {
         let first_member = [ProcessIdentity {
             pid: 41,
             process_group: 41,
-            uid: 501,
+            uid: effective_uid,
             birth: [1, 2, 3],
         }];
         let reused_member = [ProcessIdentity {
             pid: 41,
             process_group: 41,
-            uid: 501,
+            uid: effective_uid,
             birth: [2, 2, 3],
         }];
         assert_eq!(
@@ -1554,7 +1555,7 @@ mod tests {
         let wrong_user = [ProcessIdentity {
             pid: i32::try_from(std::process::id()).unwrap_or(41),
             process_group: i32::try_from(std::process::id()).unwrap_or(41),
-            uid: unsafe { libc::geteuid() }.wrapping_add(1),
+            uid: effective_uid.wrapping_add(1),
             birth: [1, 2, 3],
         }];
         assert_eq!(

@@ -419,12 +419,22 @@ The package generation records one internal monotonic fence before spawn. Its
 cleanup path polls for normal completion, sends the one recovery request, wakes
 the exact coordinator only after a fresh stopped-state readback, waits the
 healthy lifecycle budget, and uses retained-`Child` TERM/KILL fallback only
-after that grace. Exact retained evidence interrupts this sequence immediately:
-the exact coordinator `Child`, completion receiver, PTY, backend, and scratch
-are parked, with no TERM/KILL fallback, completion proof, or deletion attempt.
-A recovery-send error records only a consumed attempt with an unknown boundary;
-it does not claim write-half closure. Deletion still requires four independent
-proofs: exact coordinator-child wait; the exact provider-release-only
+after that grace. Exact retained or otherwise unproved evidence interrupts this
+sequence immediately in the `cfg(test)` package harness: it emits a fixed,
+redacted failure subtype and terminates libtest with a fixed nonzero
+`_exit`-equivalent status while the exact coordinator `Child`, completion
+receiver, PTY, backend, and scratch Rust owners are still live. It runs no
+destructors, unproved TERM/KILL fallback, completion proof, deletion, or
+cleanup-success publication and produces no signal-driven core dump. This
+test-only exit closes the libtest descriptor table and makes hosted CI fail
+promptly; it is not production retained-owner behavior and proves nothing about
+descendants in another session. A bounded regression parent observes the parked
+helper's fixed readiness handshake before killing and reaping only that exact
+child. Production guardian/anchor retained owners continue to park concrete
+typed authority. A recovery-send error records only a consumed attempt with an
+unknown boundary; it does not claim write-half closure. Deletion still requires
+four independent proofs: exact coordinator-child wait; the exact
+provider-release-only
 `CFCMP\x01\r\n` record followed by EOF, which is not session or shell success;
 absence of every reported known process group; and an identity-checked empty
 runtime with zero retained FD and socket references. This is the full #55

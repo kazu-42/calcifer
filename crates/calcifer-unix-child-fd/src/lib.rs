@@ -53,6 +53,22 @@ thread_local! {
     static SIGCONT_BLOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Terminates the complete Unix process without running Rust/C destructors or
+/// producing a signal-driven core dump.
+///
+/// This is the safe, audited `_exit(2)` boundary for a fail-closed process that
+/// must not unwind or run cleanup code. Callers are responsible for writing and
+/// flushing any required diagnostic first. A zero status is technically
+/// accepted by the kernel, so callers that report failure must pass a fixed
+/// nonzero value.
+pub fn exit_process_without_destructors(status: u8) -> ! {
+    // SAFETY: `_exit` accepts every integer status, does not dereference
+    // pointers, and never returns. Restricting the public input to `u8` avoids
+    // target-specific truncation while keeping the unsafe libc call confined
+    // to this audited crate.
+    unsafe { libc::_exit(i32::from(status)) }
+}
+
 /// A calling-thread-only `SIGTTOU` mask guard.
 ///
 /// The previous complete signal mask is private and is restored on drop. The

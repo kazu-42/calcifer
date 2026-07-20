@@ -1035,10 +1035,13 @@ impl RecoveryTty {
 
 /// Builds the smallest physical terminal authority used by startup rollback
 /// tests. The production constructors remain unchanged: this fixture opens a
-/// real PTY, snapshots the exact slave identity, drops every reference except
-/// the one recovery descriptor, and pairs it with a real terminal byte
-/// channel. Normal coordinator-proof tests never use the synthetic foreground
-/// field to restore; they use it only to exercise the post-proof disarm gate.
+/// real PTY, snapshots the exact slave identity, drops every slave reference
+/// except the one recovery descriptor, and pairs it with a real terminal byte
+/// channel. The returned master keepalive is a different descriptor identity;
+/// it must remain open because Linux changes the disconnected slave's
+/// observable identity after the final master closes. Normal
+/// coordinator-proof tests never use the synthetic foreground field to
+/// restore; they use it only to exercise the post-proof disarm gate.
 #[cfg(test)]
 pub(super) fn startup_failure_terminal_for_test() -> Result<
     (
@@ -1047,11 +1050,12 @@ pub(super) fn startup_failure_terminal_for_test() -> Result<
         RecoveryTty,
         TerminalSnapshot,
         calcifer_unix_child_fd::DescriptorIdentity,
+        File,
     ),
     TerminalError,
 > {
-    let owner = PtyOwner::open(TerminalSize::new(24, 80))?;
-    let descriptor = owner.slave.as_fd();
+    let PtyOwner { master, slave } = PtyOwner::open(TerminalSize::new(24, 80))?;
+    let descriptor = slave.as_fd();
     let descriptor_identity = read_descriptor_identity(descriptor)?;
     let snapshot = TerminalSnapshot {
         descriptor_identity,
@@ -1062,13 +1066,20 @@ pub(super) fn startup_failure_terminal_for_test() -> Result<
     };
     let recovery = RecoveryTty::duplicate(descriptor)?;
     let (peer, endpoint) = TerminalChannelPair::new()?.split();
-    drop(owner);
+    drop(slave);
     let open = calcifer_unix_child_fd::count_open_descriptors_with_identity(descriptor_identity)
         .map_err(|_| TerminalError::RecoveryAuthorityMismatch)?;
     if open != 1 {
         return Err(TerminalError::RecoveryAuthorityMismatch);
     }
-    Ok((endpoint, peer, recovery, snapshot, descriptor_identity))
+    Ok((
+        endpoint,
+        peer,
+        recovery,
+        snapshot,
+        descriptor_identity,
+        master,
+    ))
 }
 
 fn classify_closed_recovery(

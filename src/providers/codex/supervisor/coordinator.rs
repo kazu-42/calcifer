@@ -1808,6 +1808,12 @@ mod tests {
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+    const TEST_PROCESS_GROUP_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+    // The parent observes a child that may perform two independently bounded
+    // ten-second process-group scans before publishing its first control
+    // line. Its fixture deadline must dominate that complete child path while
+    // the production coordinator keeps its own two-second operation bounds.
+    const TEST_PRODUCTION_MATRIX_PARENT_TIMEOUT: Duration = Duration::from_secs(25);
     const PRODUCTION_MATRIX_HELPER_ENV: &str = "CALCIFER_COORDINATOR_MATRIX_HELPER";
     const PRODUCTION_MATRIX_OUTPUT: &[u8] = b"calcifer-production-coordinator-output";
 
@@ -2502,6 +2508,7 @@ mod tests {
     }
 
     fn run_matrix_parent(case: ProductionMatrixCase) -> Result<(), Box<dyn std::error::Error>> {
+        let parent_deadline = Instant::now() + TEST_PRODUCTION_MATRIX_PARENT_TIMEOUT;
         let mut command = Command::new(std::env::current_exe()?);
         command
             .args([
@@ -2515,6 +2522,10 @@ mod tests {
         let initial_termios = rustix::termios::tcgetattr(&master)?;
         command.stderr(Stdio::piped());
         let mut child = command.spawn()?;
+        // `Command` is reusable and retains its configured PTY slave handles
+        // after `spawn`. Linux therefore cannot report master EOF until this
+        // parent-side configuration owner is dropped.
+        drop(command);
         let raw_pid = i32::try_from(child.id())?;
         let pid = rustix::process::Pid::from_raw(raw_pid).ok_or("invalid helper PID")?;
         let stderr = child.stderr.take().ok_or("missing matrix helper stderr")?;
@@ -2535,29 +2546,34 @@ mod tests {
             expect_matrix_line(
                 &line_receiver,
                 "descriptor-isolation-observation-failure:stage=TargetProcessGroup, error=ForbiddenDescriptor",
+                parent_deadline,
             )?;
-            expect_matrix_line(&line_receiver, "coordinator-a-leak-rejected")?;
+            expect_matrix_line(
+                &line_receiver,
+                "coordinator-a-leak-rejected",
+                parent_deadline,
+            )?;
             let (drain_sender, drain_receiver) = mpsc::channel();
             let drainer = std::thread::spawn(move || {
-                let result = drain_matrix_master(master, Instant::now() + TEST_TIMEOUT);
+                let result = drain_matrix_master(master, parent_deadline);
                 let _ = drain_sender.send(result);
             });
-            let status = child.wait_before(Instant::now() + TEST_TIMEOUT)?;
+            let status = child.wait_before(parent_deadline)?;
             if !status.success() {
                 return Err(format!("A-leak helper exited as {status}").into());
             }
             drain_receiver
-                .recv_timeout(TEST_TIMEOUT)
+                .recv_timeout(matrix_parent_remaining(parent_deadline)?)
                 .map_err(|_| "A-leak PTY drainer timed out")??;
             drainer.join().map_err(|_| "A-leak PTY drainer panicked")?;
             reader_done_receiver
-                .recv_timeout(TEST_TIMEOUT)
+                .recv_timeout(matrix_parent_remaining(parent_deadline)?)
                 .map_err(|_| "A-leak stderr reader did not observe EOF")?;
             reader.join().map_err(|_| "A-leak stderr reader panicked")?;
             return Ok(());
         }
 
-        expect_matrix_line(&line_receiver, "coordinator-active")?;
+        expect_matrix_line(&line_receiver, "coordinator-active", parent_deadline)?;
         match case {
             ProductionMatrixCase::ForwardedHup => {
                 rustix::process::kill_process(pid, rustix::process::Signal::HUP)?;
@@ -2567,7 +2583,7 @@ mod tests {
             }
             ProductionMatrixCase::SuspendResume => {
                 rustix::process::kill_process(pid, rustix::process::Signal::TSTP)?;
-                wait_for_matrix_stop(pid, Instant::now() + TEST_TIMEOUT)?;
+                wait_for_matrix_stop(pid, parent_deadline)?;
                 let stopped_termios = rustix::termios::tcgetattr(&master)?;
                 if !termios_semantically_equal(&initial_termios, &stopped_termios) {
                     return Err("suspend did not restore the exact outer terminal".into());
@@ -2600,13 +2616,9 @@ mod tests {
         }
 
         if case == ProductionMatrixCase::DataThenEof {
-            wait_for_matrix_output(
-                &master,
-                PRODUCTION_MATRIX_OUTPUT,
-                Instant::now() + TEST_TIMEOUT,
-            )?;
+            wait_for_matrix_output(&master, PRODUCTION_MATRIX_OUTPUT, parent_deadline)?;
         }
-        expect_matrix_line(&line_receiver, "coordinator-finished")?;
+        expect_matrix_line(&line_receiver, "coordinator-finished", parent_deadline)?;
         if case == ProductionMatrixCase::SuspendResume {
             let final_termios = rustix::termios::tcgetattr(&master)?;
             if !termios_semantically_equal(&initial_termios, &final_termios) {
@@ -2616,19 +2628,19 @@ mod tests {
 
         let (drain_sender, drain_receiver) = mpsc::channel();
         let drainer = std::thread::spawn(move || {
-            let result = drain_matrix_master(master, Instant::now() + TEST_TIMEOUT);
+            let result = drain_matrix_master(master, parent_deadline);
             let _ = drain_sender.send(result);
         });
-        let status = child.wait_before(Instant::now() + TEST_TIMEOUT)?;
+        let status = child.wait_before(parent_deadline)?;
         if !status.success() {
             return Err(format!("matrix helper {case:?} exited as {status}").into());
         }
         drain_receiver
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(matrix_parent_remaining(parent_deadline)?)
             .map_err(|_| "matrix PTY drainer timed out")??;
         drainer.join().map_err(|_| "matrix PTY drainer panicked")?;
         reader_done_receiver
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(matrix_parent_remaining(parent_deadline)?)
             .map_err(|_| "matrix stderr reader did not observe EOF")?;
         reader.join().map_err(|_| "matrix stderr reader panicked")?;
         Ok(())
@@ -3025,14 +3037,24 @@ mod tests {
     fn expect_matrix_line(
         receiver: &Receiver<Result<String, std::io::Error>>,
         expected: &str,
+        deadline: Instant,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let line = receiver
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(matrix_parent_remaining(deadline)?)
             .map_err(|_| "matrix helper control line timed out")??;
         if line == expected {
             Ok(())
         } else {
             Err(format!("expected matrix line {expected:?}, received {line:?}").into())
+        }
+    }
+
+    fn matrix_parent_remaining(deadline: Instant) -> Result<Duration, Box<dyn std::error::Error>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err("matrix parent deadline expired".into())
+        } else {
+            Ok(remaining)
         }
     }
 
@@ -3128,22 +3150,42 @@ mod tests {
         let child = command.spawn()?;
         let raw_pid = i32::try_from(child.id())?;
         let group = MatrixScanGroup { child, raw_pid };
-        let deadline = Instant::now() + TEST_TIMEOUT;
+        let deadline = Instant::now() + TEST_PROCESS_GROUP_SCAN_TIMEOUT;
         let empty_forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+        let mut last_transient_error = None;
         loop {
-            let stable = marker.is_file()
-                && calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
+            let stable = if marker.is_file() {
+                match calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
                     raw_pid,
                     &empty_forbidden,
                     deadline,
-                )
-                .is_ok_and(|proof| proof.member_count() == 2);
+                ) {
+                    Ok(proof) => proof.member_count() == 2,
+                    Err(
+                        error @ (calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+                        | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged),
+                    ) => {
+                        last_transient_error = Some(error);
+                        false
+                    }
+                    Err(error) => {
+                        return Err(
+                            format!("matrix process group scan failed: {error:?}").into()
+                        );
+                    }
+                }
+            } else {
+                false
+            };
             if stable {
                 std::fs::remove_file(&marker)?;
                 return Ok(group);
             }
             if Instant::now() >= deadline {
-                return Err("matrix process group did not become ready".into());
+                return Err(format!(
+                    "matrix process group did not become ready: {last_transient_error:?}"
+                )
+                .into());
             }
             std::thread::sleep(Duration::from_millis(1));
         }

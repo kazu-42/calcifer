@@ -712,6 +712,10 @@ mod tests {
         // terminal data path under test. stdin/stdout remain the same PTY.
         command.stderr(Stdio::piped());
         let mut child = command.spawn()?;
+        // A reusable `Command` retains its configured PTY slave handles.
+        // Release that parent-side owner so Linux can observe master EOF once
+        // the exact helper exits.
+        drop(command);
         let stderr = child.stderr.take().ok_or("missing helper stderr")?;
         let mut child = BoundedTestChild::new(child);
         let (line_sender, line_receiver) = mpsc::channel();

@@ -296,12 +296,20 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   references.
   These Calcifer-owned direct-child/known-group and identity proofs are the #55
   zero-residue scope; escaped `setsid(2)` descendants remain issue #56. Exact
-  retained evidence instead parks the coordinator `Child`, completion receiver,
-  PTY, backend, and scratch immediately; it runs no TERM/KILL fallback or
-  completion/four-proof deletion step. A recovery-send error proves only that
-  the one-shot attempt was consumed, not that write-half shutdown reached the
-  kernel boundary. The later CI watchdog bounds the cargo/libtest parent group
-  only; it is not
+  retained or otherwise unproved cleanup evidence in the `cfg(test)` package
+  harness emits one fixed, redacted subtype and terminates libtest with a fixed
+  nonzero `_exit`-equivalent status while its Rust owners remain live. It runs
+  no destructors, unproved TERM/KILL fallback, completion proof, deletion step,
+  or cleanup-success publication, and it produces no signal-driven core dump.
+  This test-only exit closes the libtest descriptor table so hosted CI fails
+  promptly instead of parking until its outer timeout; it does not prove
+  descendant cleanup or grant authority over a process that created another
+  session. A bounded regression parent observes a fixed readiness handshake
+  from a deliberately parked helper before killing and reaping only that exact
+  child. Production guardian/anchor retained owners still park their concrete
+  typed authority. A recovery-send error proves only that the one-shot attempt
+  was consumed, not that write-half shutdown reached the kernel boundary. The
+  later CI watchdog bounds the cargo/libtest parent group only; it is not
   authority over descendants that create another session, and catastrophic
   runner-timeout cleanup is not reported as Calcifer process-tree proof.
   A separate non-ignored deterministic fixture is configured for startup

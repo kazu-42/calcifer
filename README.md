@@ -279,13 +279,23 @@ and its fourth namespace proof also requires the identity-checked private
 compatibility stage parent to be empty. All seven cases passed three consecutive
 local runs from that candidate source; the cross-platform CI readback remains pending.
 
-If package cleanup observes the exact retained record and EOF instead, it parks
-the retained coordinator `Child`, completion receiver, PTY, loopback backend,
-and private scratch immediately. It performs no coordinator TERM/KILL fallback,
-does not set the completion proof, and cannot enter the four-proof deletion
-gate. A failed recovery-request attempt is reported only as a consumed attempt
-with an unknown transport boundary; shutdown failure is not described as a
-confirmed write-half close.
+If the `cfg(test)` package harness observes exact retained evidence or otherwise
+cannot complete the four-proof cleanup gate, it emits one fixed, redacted
+failure subtype and terminates the libtest process with a fixed nonzero
+`_exit`-equivalent status while the Rust owners are still live. That test-only
+terminal failure runs no destructors, produces no signal-driven core dump, and
+closes the libtest descriptor table without running an unproved coordinator
+TERM/KILL fallback, setting a completion proof, deleting scratch, or reporting
+cleanup success. It replaces the former unbounded package-test park so hosted
+CI cannot hide the failure behind its job timeout; it is not production
+retained-owner behavior and grants no authority over descendants in another
+session. The regression test launches both an exiting helper and a deliberately
+parked helper behind a readiness handshake and bounded exact-child wait, then
+kills and reaps only that helper if the bound expires. Production
+guardian/anchor retained owners continue to park their concrete typed
+authority. A failed recovery-request attempt is reported only as a consumed
+attempt with an unknown transport boundary; shutdown failure is not described
+as a confirmed write-half close.
 
 Inference count is a closed scenario expectation. Early deterministic
 checkpoints require zero model requests; retained deterministic checkpoints and

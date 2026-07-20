@@ -5,13 +5,13 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -539,12 +539,14 @@ const PACKAGE_PS_PROCESS_FIELDS: &str = "pid=,pgid=,uid=,state=";
 // startup bound is deliberately wider than production's unchanged defaults.
 const PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(180);
 const PACKAGE_SUPERVISOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+const PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(10);
 // CI validates this fixed internal fence against a later per-command watchdog
 // and an even later dedicated-job timeout. One fence is recorded when the
 // package generation starts. Every exercise wait is capped at that fence's
 // fixed recovery start so drip progress cannot consume cleanup's reserved
 // budget or manufacture a fresh outer lifetime.
 const PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT: Duration = Duration::from_secs(25 * 60);
+const PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT: Duration = Duration::from_secs(60);
 // The backend starts slightly before the generation fence is recorded. Its
 // extra minute prevents its own EOF from becoming an earlier cleanup trigger;
 // the generation owner or the outer job remains the authoritative boundary.
@@ -567,6 +569,21 @@ const PACKAGE_CLEANUP_COORDINATOR_KILL_WAIT: Duration = Duration::from_secs(5);
 const PACKAGE_CLEANUP_COMPLETION_PROOF_TIMEOUT: Duration = Duration::from_secs(10);
 const PACKAGE_CLEANUP_GROUP_PROOF_TIMEOUT: Duration = Duration::from_secs(10);
 const PACKAGE_CLEANUP_EXTERNAL_OBSERVATION_MARGIN: Duration = Duration::from_secs(10);
+const PACKAGE_DETERMINISTIC_CLEANUP_HEALTHY_LIFECYCLE_GRACE: Duration = Duration::from_secs(15);
+const PACKAGE_DETERMINISTIC_CLEANUP_COORDINATOR_TERM_GRACE: Duration = Duration::from_secs(2);
+const PACKAGE_DETERMINISTIC_CLEANUP_COORDINATOR_KILL_WAIT: Duration = Duration::from_secs(2);
+const PACKAGE_DETERMINISTIC_CLEANUP_COMPLETION_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
+const PACKAGE_DETERMINISTIC_CLEANUP_GROUP_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
+const PACKAGE_DETERMINISTIC_CLEANUP_EXTERNAL_OBSERVATION_MARGIN: Duration = Duration::from_secs(5);
+const PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV: &str =
+    "CALCIFER_PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER";
+const PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_MODE: &str = "exit";
+const PACKAGE_UNPROVEN_CLEANUP_PARK_HELPER_MODE: &str = "park";
+const PACKAGE_UNPROVEN_CLEANUP_PARK_READY: &str = "package-unproven-cleanup-park-ready";
+const PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE: u8 = 86;
+const PACKAGE_UNPROVEN_CLEANUP_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
+const PACKAGE_UNPROVEN_CLEANUP_KILL_WAIT: Duration = Duration::from_secs(2);
+const PACKAGE_UNPROVEN_CLEANUP_DIAGNOSTIC_LIMIT: u64 = 4 * 1024;
 
 const PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES: [(RecoveryCheckpoint, &str); 7] = [
     (RecoveryCheckpoint::StartupQueued, "startup-queued-v1"),
@@ -1005,7 +1022,20 @@ fn package_guardian_build_cleanup_timeout_is_provider_target_aware() {
         official.build_cleanup_timeout,
         PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT
     );
+    assert_eq!(official.startup_timeout, PACKAGE_SUPERVISOR_STARTUP_TIMEOUT);
+    assert_eq!(
+        official.compatibility_timeout,
+        PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT
+    );
     assert!(official.build_cleanup_timeout >= Duration::from_secs(180));
+    assert_eq!(
+        deterministic.startup_timeout,
+        PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT
+    );
+    assert_eq!(
+        deterministic.compatibility_timeout,
+        PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT
+    );
     assert_eq!(deterministic.build_cleanup_timeout, Duration::from_secs(10));
 }
 
@@ -3880,7 +3910,7 @@ fn package_cleanup_does_not_repeat_an_already_consumed_recovery_request()
 }
 
 #[test]
-fn package_retained_outcome_parks_before_recovery_fallback_or_delete_proofs()
+fn package_retained_outcome_stops_before_recovery_fallback_or_delete_proofs()
 -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
     let fence = PackageGenerationDeadlineFence::starting_at(start)?;
@@ -4157,6 +4187,282 @@ fn package_cleanup_budget_is_monotonic_and_below_the_external_hard_timeout()
     assert!(cleanup_with_margin < fence.external_fence);
     assert!(deadlines.reported_groups_proof <= fence.cleanup_fence);
     Ok(())
+}
+
+#[test]
+fn deterministic_package_cleanup_budget_is_short_bounded_and_target_specific()
+-> Result<(), Box<dyn Error>> {
+    let origin = Instant::now();
+    let official = PackageGenerationDeadlineFence::starting_at_for_target(
+        origin,
+        PackageProviderTarget::Official,
+    )?;
+    let deterministic = PackageGenerationDeadlineFence::starting_at_for_target(
+        origin,
+        PackageProviderTarget::DeterministicFixture,
+    )?;
+
+    assert_eq!(
+        deterministic.recovery_start,
+        origin
+            .checked_add(PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT)
+            .ok_or("deterministic recovery start overflowed")?
+    );
+    assert_eq!(
+        deterministic.external_fence,
+        origin
+            .checked_add(PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT)
+            .ok_or("deterministic external fence overflowed")?
+    );
+    assert!(deterministic.recovery_start < official.recovery_start);
+    assert!(deterministic.external_fence < official.external_fence);
+
+    let deadlines =
+        PackageCleanupDeadlines::within_generation(deterministic, deterministic.recovery_start)?;
+    assert_eq!(
+        deadlines.healthy_lifecycle,
+        deadlines
+            .recovery_request
+            .checked_add(PACKAGE_DETERMINISTIC_CLEANUP_HEALTHY_LIFECYCLE_GRACE)
+            .ok_or("deterministic healthy lifecycle deadline overflowed")?
+    );
+    assert_eq!(
+        deadlines.reported_groups_proof,
+        deadlines
+            .completion_proof
+            .checked_add(PACKAGE_DETERMINISTIC_CLEANUP_GROUP_PROOF_TIMEOUT)
+            .ok_or("deterministic group proof deadline overflowed")?
+    );
+    assert!(
+        deadlines
+            .reported_groups_proof
+            .checked_add(PACKAGE_DETERMINISTIC_CLEANUP_EXTERNAL_OBSERVATION_MARGIN)
+            .ok_or("deterministic observation margin overflowed")?
+            < deterministic.external_fence
+    );
+    Ok(())
+}
+
+#[test]
+fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci()
+-> Result<(), Box<dyn Error>> {
+    if std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV)
+        .is_some_and(|mode| mode == PACKAGE_UNPROVEN_CLEANUP_PARK_HELPER_MODE)
+    {
+        {
+            let mut stderr = io::stderr().lock();
+            if writeln!(stderr, "{PACKAGE_UNPROVEN_CLEANUP_PARK_READY}")
+                .and_then(|()| stderr.flush())
+                .is_err()
+            {
+                calcifer_unix_child_fd::exit_process_without_destructors(
+                    PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE,
+                );
+            }
+        }
+        loop {
+            thread::park();
+        }
+    }
+    if std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV)
+        .is_some_and(|mode| mode == PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_MODE)
+    {
+        let (_output_sender, output_result) = mpsc::sync_channel(1);
+        let mut harness = OfficialTuiPackageHarness {
+            scratch: None,
+            backend: None,
+            coordinator: None,
+            completion: None,
+            provider_target: PackageProviderTarget::DeterministicFixture,
+            inference_expectation: PackageInferenceExpectation::Zero,
+            recovery_checkpoint: None,
+            recovery_request_state: PackageRecoveryRequestState::Available,
+            generation_cleanup: None,
+            generation_deadline_fence: None,
+            master: None,
+            initial_termios: None,
+            output_cancel: None,
+            output_result,
+            startup_sentinel_observed: None,
+            response_sentinel_observed: None,
+            output_worker: None,
+            output_finished: true,
+            last_fixed_failure_detail: None,
+            last_fixed_cleanup_failure_detail: None,
+        };
+        harness.fail_closed_unproven_generation_cleanup();
+    }
+
+    let parked = run_bounded_unproven_cleanup_child(
+        PACKAGE_UNPROVEN_CLEANUP_PARK_HELPER_MODE,
+        Duration::from_millis(100),
+    )?;
+    assert!(parked.timed_out, "the parked helper escaped its test bound");
+    assert_eq!(
+        parked.status.signal(),
+        Some(rustix::process::Signal::KILL.as_raw()),
+        "the parked helper was not exactly killed and reaped"
+    );
+    assert!(
+        parked
+            .diagnostic
+            .contains(PACKAGE_UNPROVEN_CLEANUP_PARK_READY)
+    );
+
+    let output = run_bounded_unproven_cleanup_child(
+        PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_MODE,
+        PACKAGE_UNPROVEN_CLEANUP_CHILD_TIMEOUT,
+    )?;
+    assert!(!output.timed_out, "unproven package cleanup did not exit");
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE)),
+        "unproven package cleanup did not exit with its fixed status"
+    );
+    assert_eq!(output.status.signal(), None);
+    assert!(output.diagnostic.contains(
+        "package-generation-cleanup-unproven:phase=scratch-missing,failure=unclassified"
+    ));
+    assert!(
+        !output
+            .diagnostic
+            .contains(std::env::current_dir()?.to_string_lossy().as_ref())
+    );
+    Ok(())
+}
+
+struct BoundedUnprovenCleanupChild {
+    status: std::process::ExitStatus,
+    timed_out: bool,
+    diagnostic: String,
+}
+
+fn run_bounded_unproven_cleanup_child(
+    mode: &str,
+    timeout: Duration,
+) -> Result<BoundedUnprovenCleanupChild, Box<dyn Error>> {
+    let mut diagnostic_capture = create_unlinked_unproven_cleanup_capture()?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            "providers::codex::supervisor::packaged_smoke::unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV, mode)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(diagnostic_capture.try_clone()?));
+    let mut child = command.spawn()?;
+    drop(command);
+    let mut early_status = None;
+    if mode == PACKAGE_UNPROVEN_CLEANUP_PARK_HELPER_MODE {
+        let readiness_deadline = Instant::now()
+            .checked_add(PACKAGE_UNPROVEN_CLEANUP_CHILD_TIMEOUT)
+            .ok_or("unproven cleanup helper readiness deadline overflowed")?;
+        loop {
+            if diagnostic_capture.metadata()?.len() != 0 {
+                break;
+            }
+            if let Some(status) = child.try_wait()? {
+                early_status = Some(status);
+                break;
+            }
+            if Instant::now() >= readiness_deadline {
+                let _ = kill_and_reap_unproven_cleanup_child(&mut child)?;
+                return Err("parked unproven cleanup helper never published readiness".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("unproven cleanup child deadline overflowed")?;
+    let (status, timed_out) = if let Some(status) = early_status {
+        (status, false)
+    } else {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                break (status, false);
+            }
+            if Instant::now() >= deadline {
+                let status = kill_and_reap_unproven_cleanup_child(&mut child)?;
+                break (status, true);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    let length = diagnostic_capture.metadata()?.len();
+    if length > PACKAGE_UNPROVEN_CLEANUP_DIAGNOSTIC_LIMIT {
+        return Err("unproven cleanup diagnostic exceeded its fixed bound".into());
+    }
+    diagnostic_capture.seek(SeekFrom::Start(0))?;
+    let mut diagnostic = Vec::with_capacity(usize::try_from(length)?);
+    diagnostic_capture
+        .take(PACKAGE_UNPROVEN_CLEANUP_DIAGNOSTIC_LIMIT + 1)
+        .read_to_end(&mut diagnostic)?;
+    if u64::try_from(diagnostic.len())? > PACKAGE_UNPROVEN_CLEANUP_DIAGNOSTIC_LIMIT {
+        return Err("unproven cleanup diagnostic exceeded its fixed bound".into());
+    }
+
+    Ok(BoundedUnprovenCleanupChild {
+        status,
+        timed_out,
+        diagnostic: String::from_utf8(diagnostic)?,
+    })
+}
+
+fn kill_and_reap_unproven_cleanup_child(
+    child: &mut Child,
+) -> Result<std::process::ExitStatus, Box<dyn Error>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    match child.kill() {
+        Ok(()) => {
+            wait_for_package_child(child, Instant::now() + PACKAGE_UNPROVEN_CLEANUP_KILL_WAIT)
+        }
+        Err(error) => match child.try_wait()? {
+            Some(status) => Ok(status),
+            None => Err(error.into()),
+        },
+    }
+}
+
+fn create_unlinked_unproven_cleanup_capture() -> Result<File, Box<dyn Error>> {
+    let parent = fs::canonicalize("/tmp")?;
+    for _ in 0..PACKAGE_SCRATCH_CREATE_ATTEMPTS {
+        let path = parent.join(format!(
+            "calcifer-unproven-cleanup-{}.stderr",
+            Uuid::new_v4().simple()
+        ));
+        let capture = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(capture) => capture,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = capture.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o7777 != 0o600
+            || metadata.nlink() != 1
+            || metadata.len() != 0
+        {
+            fs::remove_file(path)?;
+            return Err("unproven cleanup diagnostic capture was not private".into());
+        }
+        fs::remove_file(path)?;
+        return Ok(capture);
+    }
+    Err("unproven cleanup diagnostic capture nonce attempts were exhausted".into())
 }
 
 #[test]
@@ -5204,40 +5510,106 @@ struct PackageCleanupDeadlines {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageCleanupBudget {
+    startup: Duration,
+    external: Duration,
+    normal_completion: Duration,
+    recovery_request: Duration,
+    healthy_lifecycle: Duration,
+    coordinator_term: Duration,
+    coordinator_kill: Duration,
+    completion_proof: Duration,
+    reported_groups_proof: Duration,
+    external_observation_margin: Duration,
+}
+
+impl PackageCleanupBudget {
+    const fn for_target(target: PackageProviderTarget) -> Self {
+        match target {
+            PackageProviderTarget::Official => Self {
+                startup: PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
+                external: PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT,
+                normal_completion: PACKAGE_CLEANUP_NORMAL_COMPLETION_RACE,
+                recovery_request: PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT,
+                healthy_lifecycle: PACKAGE_CLEANUP_HEALTHY_LIFECYCLE_GRACE,
+                coordinator_term: PACKAGE_CLEANUP_COORDINATOR_TERM_GRACE,
+                coordinator_kill: PACKAGE_CLEANUP_COORDINATOR_KILL_WAIT,
+                completion_proof: PACKAGE_CLEANUP_COMPLETION_PROOF_TIMEOUT,
+                reported_groups_proof: PACKAGE_CLEANUP_GROUP_PROOF_TIMEOUT,
+                external_observation_margin: PACKAGE_CLEANUP_EXTERNAL_OBSERVATION_MARGIN,
+            },
+            PackageProviderTarget::DeterministicFixture => Self {
+                startup: PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT,
+                external: PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT,
+                normal_completion: PACKAGE_CLEANUP_NORMAL_COMPLETION_RACE,
+                recovery_request: PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT,
+                healthy_lifecycle: PACKAGE_DETERMINISTIC_CLEANUP_HEALTHY_LIFECYCLE_GRACE,
+                coordinator_term: PACKAGE_DETERMINISTIC_CLEANUP_COORDINATOR_TERM_GRACE,
+                coordinator_kill: PACKAGE_DETERMINISTIC_CLEANUP_COORDINATOR_KILL_WAIT,
+                completion_proof: PACKAGE_DETERMINISTIC_CLEANUP_COMPLETION_PROOF_TIMEOUT,
+                reported_groups_proof: PACKAGE_DETERMINISTIC_CLEANUP_GROUP_PROOF_TIMEOUT,
+                external_observation_margin:
+                    PACKAGE_DETERMINISTIC_CLEANUP_EXTERNAL_OBSERVATION_MARGIN,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackageGenerationDeadlineFence {
     origin: Instant,
     recovery_start: Instant,
     external_fence: Instant,
     cleanup_fence: Instant,
+    cleanup_budget: PackageCleanupBudget,
 }
 
 impl PackageGenerationDeadlineFence {
     fn starting_at(origin: Instant) -> Result<Self, PackageCleanupFailure> {
-        Self::starting_at_with_timeout(origin, PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT)
+        Self::starting_at_with_budget(
+            origin,
+            PackageCleanupBudget::for_target(PackageProviderTarget::Official),
+        )
+    }
+
+    fn starting_at_for_target(
+        origin: Instant,
+        target: PackageProviderTarget,
+    ) -> Result<Self, PackageCleanupFailure> {
+        Self::starting_at_with_budget(origin, PackageCleanupBudget::for_target(target))
     }
 
     fn starting_at_with_timeout(
         origin: Instant,
         external_timeout: Duration,
     ) -> Result<Self, PackageCleanupFailure> {
+        let mut budget = PackageCleanupBudget::for_target(PackageProviderTarget::Official);
+        budget.external = external_timeout;
+        Self::starting_at_with_budget(origin, budget)
+    }
+
+    fn starting_at_with_budget(
+        origin: Instant,
+        budget: PackageCleanupBudget,
+    ) -> Result<Self, PackageCleanupFailure> {
         let recovery_start = origin
-            .checked_add(PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)
+            .checked_add(budget.startup)
             .ok_or(PackageCleanupFailure::Deadline)?;
         let external_fence = origin
-            .checked_add(external_timeout)
+            .checked_add(budget.external)
             .ok_or(PackageCleanupFailure::Deadline)?;
         let cleanup_fence = external_fence
-            .checked_sub(PACKAGE_CLEANUP_EXTERNAL_OBSERVATION_MARGIN)
+            .checked_sub(budget.external_observation_margin)
             .filter(|cleanup_fence| *cleanup_fence > recovery_start)
             .ok_or(PackageCleanupFailure::Deadline)?;
         let cleanup_reserve = [
-            PACKAGE_CLEANUP_NORMAL_COMPLETION_RACE,
-            PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT,
-            PACKAGE_CLEANUP_HEALTHY_LIFECYCLE_GRACE,
-            PACKAGE_CLEANUP_COORDINATOR_TERM_GRACE,
-            PACKAGE_CLEANUP_COORDINATOR_KILL_WAIT,
-            PACKAGE_CLEANUP_COMPLETION_PROOF_TIMEOUT,
-            PACKAGE_CLEANUP_GROUP_PROOF_TIMEOUT,
+            budget.normal_completion,
+            budget.recovery_request,
+            budget.healthy_lifecycle,
+            budget.coordinator_term,
+            budget.coordinator_kill,
+            budget.completion_proof,
+            budget.reported_groups_proof,
         ]
         .into_iter()
         .try_fold(Duration::ZERO, |total, duration| {
@@ -5256,6 +5628,7 @@ impl PackageGenerationDeadlineFence {
             recovery_start,
             external_fence,
             cleanup_fence,
+            cleanup_budget: budget,
         })
     }
 
@@ -5287,18 +5660,14 @@ impl PackageCleanupDeadlines {
                 .map(|candidate| candidate.min(fence.cleanup_fence))
                 .ok_or(PackageCleanupFailure::Deadline)
         };
-        let normal_completion = capped_add(cleanup_start, PACKAGE_CLEANUP_NORMAL_COMPLETION_RACE)?;
-        let recovery_request =
-            capped_add(normal_completion, PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT)?;
-        let healthy_lifecycle =
-            capped_add(recovery_request, PACKAGE_CLEANUP_HEALTHY_LIFECYCLE_GRACE)?;
-        let coordinator_term =
-            capped_add(healthy_lifecycle, PACKAGE_CLEANUP_COORDINATOR_TERM_GRACE)?;
-        let coordinator_kill = capped_add(coordinator_term, PACKAGE_CLEANUP_COORDINATOR_KILL_WAIT)?;
-        let completion_proof =
-            capped_add(coordinator_kill, PACKAGE_CLEANUP_COMPLETION_PROOF_TIMEOUT)?;
-        let reported_groups_proof =
-            capped_add(completion_proof, PACKAGE_CLEANUP_GROUP_PROOF_TIMEOUT)?;
+        let budget = fence.cleanup_budget;
+        let normal_completion = capped_add(cleanup_start, budget.normal_completion)?;
+        let recovery_request = capped_add(normal_completion, budget.recovery_request)?;
+        let healthy_lifecycle = capped_add(recovery_request, budget.healthy_lifecycle)?;
+        let coordinator_term = capped_add(healthy_lifecycle, budget.coordinator_term)?;
+        let coordinator_kill = capped_add(coordinator_term, budget.coordinator_kill)?;
+        let completion_proof = capped_add(coordinator_kill, budget.completion_proof)?;
+        let reported_groups_proof = capped_add(completion_proof, budget.reported_groups_proof)?;
         Ok(Self {
             normal_completion,
             recovery_request,
@@ -5566,9 +5935,11 @@ impl OfficialTuiPackageHarness {
 
             let (completion, transit) = CompletionPair::new()?.split();
             harness.completion = Some(completion);
-            let generation_deadline_fence =
-                PackageGenerationDeadlineFence::starting_at(Instant::now())
-                    .map_err(|_| "package generation deadline fence overflowed")?;
+            let generation_deadline_fence = PackageGenerationDeadlineFence::starting_at_for_target(
+                Instant::now(),
+                provider_target,
+            )
+            .map_err(|_| "package generation deadline fence overflowed")?;
             if generation_deadline_fence.external_fence
                 > harness
                     .backend
@@ -6681,14 +7052,14 @@ impl OfficialTuiPackageHarness {
                 false
             }
             (true, true, true) => {
-                self.finish_started_generation_cleanup_or_park();
+                self.finish_started_generation_cleanup_or_exit();
                 // A successful four-proof gate consumes this generation. This
                 // also makes explicit cleanup followed by Drop idempotent.
                 self.generation_cleanup.take();
                 self.generation_deadline_fence.take();
                 true
             }
-            _ => self.park_unproven_generation_cleanup(),
+            _ => self.fail_closed_unproven_generation_cleanup(),
         };
         let mut failures = PackageHarnessCleanupFailures::default();
         self.coordinator.take();
@@ -6783,29 +7154,29 @@ impl OfficialTuiPackageHarness {
         failures.finish()
     }
 
-    fn finish_started_generation_cleanup_or_park(&mut self) {
+    fn finish_started_generation_cleanup_or_exit(&mut self) {
         let Some(initial_evidence) = self.generation_cleanup else {
-            self.park_unproven_generation_cleanup();
+            self.fail_closed_unproven_generation_cleanup();
         };
         if initial_evidence.scratch_decision() == PackageScratchCleanupDecision::Delete {
             return;
         }
         let Some(fence) = self.generation_deadline_fence else {
-            self.park_unproven_generation_cleanup();
+            self.fail_closed_unproven_generation_cleanup();
         };
         let Ok(deadlines) = PackageCleanupDeadlines::within_generation(fence, Instant::now())
         else {
-            self.park_unproven_generation_cleanup();
+            self.fail_closed_unproven_generation_cleanup();
         };
         let Ok(driven_evidence) =
             drive_package_generation_cleanup(self, initial_evidence, deadlines)
         else {
-            self.park_unproven_generation_cleanup();
+            self.fail_closed_unproven_generation_cleanup();
         };
         if self.generation_cleanup != Some(driven_evidence)
             || driven_evidence.scratch_decision() != PackageScratchCleanupDecision::Delete
         {
-            self.park_unproven_generation_cleanup();
+            self.fail_closed_unproven_generation_cleanup();
         }
     }
 
@@ -6868,13 +7239,28 @@ impl OfficialTuiPackageHarness {
         ))
     }
 
-    fn park_unproven_generation_cleanup(&mut self) -> ! {
-        // Keeping this stack frame alive retains the exact child, completion
-        // receiver, PTY, backend, and private scratch. No marker-derived PID or
-        // PGID is ever signaled, and ambiguous state is never deleted.
-        loop {
-            thread::park();
+    fn fail_closed_unproven_generation_cleanup(&mut self) -> ! {
+        // This module exists only in a libtest build. Production retains the
+        // exact owners indefinitely; a test process must instead fail
+        // terminally while those owners are still live so a hosted job cannot
+        // hide the fixed diagnostic behind its outer timeout. The audited
+        // `_exit`/`_Exit` boundary runs no Rust or C destructors and produces
+        // no crash dump, authorizes no marker-derived signal or deletion, and
+        // closes this process's complete descriptor table at one kernel
+        // boundary.
+        {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "package-generation-cleanup-unproven:phase={},failure={}",
+                self.latest_fixed_phase(),
+                self.latest_fixed_failure_detail().unwrap_or("unclassified")
+            );
+            let _ = stderr.flush();
         }
+        calcifer_unix_child_fd::exit_process_without_destructors(
+            PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE,
+        );
     }
 }
 
@@ -7367,11 +7753,18 @@ fn replace_package_profile_config_after_admission(
 }
 
 fn package_guardian_bounds(provider_target: PackageProviderTarget) -> GuardianBounds {
+    let startup_timeout = match provider_target {
+        PackageProviderTarget::Official => PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
+        PackageProviderTarget::DeterministicFixture => PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT,
+    };
     GuardianBounds {
-        phase_timeout: PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
+        phase_timeout: startup_timeout,
         poll_interval: Duration::from_millis(20),
-        startup_timeout: PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
-        compatibility_timeout: PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT,
+        startup_timeout,
+        compatibility_timeout: match provider_target {
+            PackageProviderTarget::Official => PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT,
+            PackageProviderTarget::DeterministicFixture => PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT,
+        },
         relay_start_timeout: Duration::from_secs(15),
         containment_timeout: Duration::from_secs(15),
         tui_grace: Duration::from_secs(2),

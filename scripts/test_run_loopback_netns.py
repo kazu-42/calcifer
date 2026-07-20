@@ -573,6 +573,113 @@ NoNewPrivs:\t1
                 command_runner=lambda command: routed[tuple(command)],
             )
 
+    def test_root_network_setup_forces_only_allowlisted_fallback_devices_down(
+        self,
+    ) -> None:
+        ip_path = "/usr/libexec/iproute2/ip"
+        valid_loopback = run_loopback_netns.IFF_UP | run_loopback_netns.IFF_LOOPBACK
+        observations = (
+            {
+                "lo": run_loopback_netns.IFF_LOOPBACK,
+                "sit0": run_loopback_netns.IFF_UP,
+                "ip6tnl0": run_loopback_netns.IFF_UP,
+            },
+            {"lo": valid_loopback, "sit0": 0, "ip6tnl0": 0},
+        )
+        observer_calls = 0
+        commands: list[tuple[str, ...]] = []
+
+        def command_runner(command: list[str]) -> tuple[int, str]:
+            commands.append(tuple(command))
+            if "get" in command:
+                return 2, ""
+            return 0, ""
+
+        def network_observer() -> dict[str, int]:
+            nonlocal observer_calls
+            observation = observations[observer_calls]
+            observer_calls += 1
+            return observation
+
+        run_loopback_netns._enable_and_verify_loopback_network(
+            ip_path=ip_path,
+            command_runner=command_runner,
+            network_observer=network_observer,
+        )
+
+        self.assertEqual(observer_calls, 2)
+        self.assertEqual(
+            commands[:3],
+            [
+                (ip_path, "link", "set", "dev", "ip6tnl0", "down"),
+                (ip_path, "link", "set", "dev", "sit0", "down"),
+                (ip_path, "link", "set", "dev", "lo", "up"),
+            ],
+        )
+        for interface in ("ip6tnl0", "sit0"):
+            for family in ("-4", "-6"):
+                self.assertIn(
+                    (ip_path, family, "-o", "address", "show", "dev", interface),
+                    commands,
+                )
+                self.assertIn(
+                    (
+                        ip_path,
+                        family,
+                        "route",
+                        "show",
+                        "table",
+                        "all",
+                        "dev",
+                        interface,
+                    ),
+                    commands,
+                )
+        for family in ("-4", "-6"):
+            self.assertIn(
+                (ip_path, family, "route", "show", "table", "main"),
+                commands,
+            )
+        for family, address in run_loopback_netns.DOCUMENTATION_ADDRESSES:
+            self.assertIn(
+                (ip_path, family, "route", "get", address),
+                commands,
+            )
+
+        unknown_commands: list[tuple[str, ...]] = []
+
+        def unknown_runner(command: list[str]) -> tuple[int, str]:
+            unknown_commands.append(tuple(command))
+            return 0, ""
+
+        with self.assertRaisesRegex(ValueError, "unexpected non-loopback"):
+            run_loopback_netns._enable_and_verify_loopback_network(
+                ip_path=ip_path,
+                command_runner=unknown_runner,
+                network_observer=lambda: {
+                    "lo": valid_loopback,
+                    "eth0": run_loopback_netns.IFF_UP,
+                },
+            )
+        self.assertEqual(
+            unknown_commands,
+            [],
+        )
+
+        with self.assertRaisesRegex(ValueError, "could not be disabled"):
+            run_loopback_netns._enable_and_verify_loopback_network(
+                ip_path=ip_path,
+                command_runner=lambda command: (
+                    (1, "")
+                    if command[-2:] == ["sit0", "down"]
+                    else (0, "")
+                ),
+                network_observer=lambda: {
+                    "lo": valid_loopback,
+                    "sit0": run_loopback_netns.IFF_UP,
+                },
+            )
+
 
 class UserExecTests(unittest.TestCase):
     def test_user_exec_is_exact_prebuilt_libtest_invocation(self) -> None:
