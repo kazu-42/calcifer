@@ -393,10 +393,14 @@ The normal scenario passed twice consecutively and retained recovery passed once
 from the 2026-07-20 Issue #54 candidate source on Apple silicon; the Ubuntu 24.04/macOS matrix remains
 pending. Both OS lanes execute the same prebuilt, exactly discovered libtest.
 The Linux lane has no native fallback: it runs inside a fresh namespace after
-proving only loopback is present, then drops groups and every capability, sets
-`NoNewPrivs`, clears ambient environment authority, rejects inherited sockets,
-and revalidates those invariants before execution. The macOS lane is native
-functional evidence only.
+enumerating interfaces through the current network namespace rather than an
+inherited sysfs mount. It permits only `lo` plus the exact nine upstream Linux
+fallback-tunnel names, forces every present fallback down, rejects an unknown
+interface before mutation, and proves that the fallback devices have no address
+or route and that only loopback is up. It then drops groups and every capability,
+sets `NoNewPrivs`, clears ambient environment authority, rejects inherited
+sockets, and revalidates those invariants before execution. The macOS lane is
+native functional evidence only.
 
 A separate non-ignored, credential-free deterministic fixture is configured for
 all seven closed recovery checkpoints: startup queued, ready, active, suspended,

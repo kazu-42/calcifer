@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import json
 import os
 import pathlib
 import re
+import socket
 import stat
+import struct
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -39,20 +42,28 @@ LAUNCHER_BINARY_ENV = "CALCIFER_PACKAGE_TUI_LAUNCHER"
 
 MAX_PATH_BYTES = 4096
 MAX_TEST_NAME_BYTES = 1024
+MAX_NETWORK_INTERFACES = 64
 NETWORK_COMMAND_TIMEOUT_SECONDS = 10
 IFF_UP = 0x1
 IFF_LOOPBACK = 0x8
-# Linux documents these as the complete set of automatically created fallback
-# tunnels controlled by net.core.fb_tunnels_only_for_init_net.
+IFNAMSIZ = 16
+IFREQ_BUFFER_BYTES = 256
+SIOCGIFFLAGS = 0x8913
+# Linux creates only these exact fallback tunnels under the control of
+# net.core.fb_tunnels_only_for_init_net. The kernel documentation gives a
+# shorter non-exhaustive example; the VTI names come from the upstream
+# per-network-namespace initializers.
 KERNEL_FALLBACK_TUNNEL_INTERFACES = frozenset(
     {
         "tunl0",
         "gre0",
         "gretap0",
         "erspan0",
+        "ip_vti0",
         "sit0",
         "ip6tnl0",
         "ip6gre0",
+        "ip6_vti0",
     }
 )
 CAPABILITY_FIELDS = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
@@ -445,19 +456,67 @@ def verify_loopback_only_network(
             )
 
 
-def _observe_loopback_network() -> dict[str, int]:
+def _validate_interface_name(interface_name: object) -> tuple[str, bytes]:
+    if type(interface_name) is not str:
+        raise ValueError("network interface name was not text")
+    encoded = os.fsencode(interface_name)
+    if not encoded or len(encoded) >= IFNAMSIZ or b"\x00" in encoded:
+        raise ValueError("network interface name was invalid")
+    return interface_name, encoded
+
+
+def _read_interface_flags(interface_name: str) -> int:
+    _validated_name, encoded = _validate_interface_name(interface_name)
+    request = struct.pack(f"{IFREQ_BUFFER_BYTES}s", encoded)
     try:
-        names = set(os.listdir("/sys/class/net"))
-        flags = {
-            name: int(
-                pathlib.Path("/sys/class/net", name, "flags")
-                .read_text(encoding="ascii")
-                .strip(),
-                16,
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control_socket:
+            response = fcntl.ioctl(
+                control_socket.fileno(),
+                SIOCGIFFLAGS,
+                request,
             )
-            for name in names
-        }
-    except (OSError, UnicodeError, ValueError) as error:
+    except OSError as error:
+        raise ValueError("network interface flags could not be inspected") from error
+    if not isinstance(response, bytes) or len(response) < IFNAMSIZ + 2:
+        raise ValueError("network interface flags response was invalid")
+    return struct.unpack_from("=H", response, IFNAMSIZ)[0]
+
+
+def _observe_loopback_network(
+    *,
+    interface_enumerator: Callable[[], Sequence[tuple[int, str]]] | None = None,
+    flag_reader: Callable[[str], int] | None = None,
+) -> dict[str, int]:
+    try:
+        if interface_enumerator is None:
+            interface_enumerator = socket.if_nameindex
+        if flag_reader is None:
+            flag_reader = _read_interface_flags
+        entries = list(interface_enumerator())
+        if len(entries) > MAX_NETWORK_INTERFACES:
+            raise ValueError("network interface count exceeded the safety limit")
+        names: list[str] = []
+        indexes: set[int] = set()
+        seen_names: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise ValueError("network interface entry was invalid")
+            index, raw_name = entry
+            name, _encoded = _validate_interface_name(raw_name)
+            if type(index) is not int or index <= 0:
+                raise ValueError("network interface index was invalid")
+            if index in indexes or name in seen_names:
+                raise ValueError("network interface entry was ambiguous")
+            indexes.add(index)
+            seen_names.add(name)
+            names.append(name)
+        flags: dict[str, int] = {}
+        for name in names:
+            value = flag_reader(name)
+            if type(value) is not int or not 0 <= value <= 0xFFFF:
+                raise ValueError("network interface flags were invalid")
+            flags[name] = value
+    except (OSError, TypeError, UnicodeError, ValueError) as error:
         raise ValueError("loopback network state could not be inspected") from error
     return flags
 

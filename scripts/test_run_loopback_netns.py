@@ -2,6 +2,7 @@ import dataclasses
 import os
 import pathlib
 import stat
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -342,6 +343,195 @@ class ArgumentAndCommandTests(unittest.TestCase):
 
 
 class IsolationVerificationTests(unittest.TestCase):
+    def test_fallback_allowlist_matches_kernel_created_tunnel_devices(self) -> None:
+        self.assertEqual(
+            run_loopback_netns.KERNEL_FALLBACK_TUNNEL_INTERFACES,
+            frozenset(
+                {
+                    "tunl0",
+                    "gre0",
+                    "gretap0",
+                    "erspan0",
+                    "sit0",
+                    "ip6tnl0",
+                    "ip6gre0",
+                    "ip_vti0",
+                    "ip6_vti0",
+                }
+            ),
+        )
+
+    def test_network_observer_uses_current_netns_not_inherited_sysfs(self) -> None:
+        flag_reads: list[str] = []
+
+        def read_flags(interface_name: str) -> int:
+            flag_reads.append(interface_name)
+            return run_loopback_netns.IFF_LOOPBACK
+
+        with mock.patch.object(
+            os,
+            "listdir",
+            side_effect=AssertionError("inherited sysfs must not be observed"),
+        ):
+            observed = run_loopback_netns._observe_loopback_network(
+                interface_enumerator=lambda: [(1, "lo")],
+                flag_reader=read_flags,
+            )
+
+        self.assertEqual(observed, {"lo": run_loopback_netns.IFF_LOOPBACK})
+        self.assertEqual(flag_reads, ["lo"])
+
+    def test_network_observer_defaults_to_current_netns_kernel_apis(self) -> None:
+        with (
+            mock.patch.object(
+                os,
+                "listdir",
+                side_effect=AssertionError("inherited sysfs must not be observed"),
+            ),
+            mock.patch.object(
+                run_loopback_netns.socket,
+                "if_nameindex",
+                return_value=[(7, "lo")],
+            ) as interface_enumerator,
+            mock.patch.object(
+                run_loopback_netns,
+                "_read_interface_flags",
+                return_value=run_loopback_netns.IFF_LOOPBACK,
+            ) as flag_reader,
+        ):
+            observed = run_loopback_netns._observe_loopback_network()
+
+        self.assertEqual(observed, {"lo": run_loopback_netns.IFF_LOOPBACK})
+        interface_enumerator.assert_called_once_with()
+        flag_reader.assert_called_once_with("lo")
+
+    def test_network_observer_rejects_ambiguous_interface_entries(self) -> None:
+        invalid_entries = (
+            [(1, "lo"), (1, "sit0")],
+            [(1, "lo"), (2, "lo")],
+            [(0, "lo")],
+            [(1, "")],
+            [(1, "x" * 16)],
+            [(1, "lo\x00escape")],
+        )
+
+        for entries in invalid_entries:
+            with self.subTest(entries=entries):
+                with self.assertRaisesRegex(
+                    ValueError, "network state could not be inspected"
+                ):
+                    run_loopback_netns._observe_loopback_network(
+                        interface_enumerator=lambda entries=entries: entries,
+                        flag_reader=lambda _interface_name: 0,
+                    )
+
+    def test_network_observer_rejects_malformed_or_unbounded_kernel_results(
+        self,
+    ) -> None:
+        invalid_entries = (
+            ["not-a-tuple"],
+            [(1, "lo", "extra")],
+            [("1", "lo")],
+            [(1, 42)],
+            [
+                (index + 1, f"n{index}")
+                for index in range(
+                    run_loopback_netns.MAX_NETWORK_INTERFACES + 1
+                )
+            ],
+        )
+        for entries in invalid_entries:
+            with self.subTest(entries=entries):
+                with self.assertRaisesRegex(
+                    ValueError, "network state could not be inspected"
+                ):
+                    run_loopback_netns._observe_loopback_network(
+                        interface_enumerator=lambda entries=entries: entries,
+                        flag_reader=lambda _interface_name: 0,
+                    )
+
+        for flags in (None, True, -1, 0x10000):
+            with self.subTest(flags=flags):
+                with self.assertRaisesRegex(
+                    ValueError, "network state could not be inspected"
+                ):
+                    run_loopback_netns._observe_loopback_network(
+                        interface_enumerator=lambda: [(1, "lo")],
+                        flag_reader=lambda _interface_name, flags=flags: flags,
+                    )
+
+    def test_interface_flag_reader_uses_linux_ioctl_and_closes_socket(self) -> None:
+        expected_flags = run_loopback_netns.IFF_UP | run_loopback_netns.IFF_LOOPBACK
+        response = bytearray(256)
+        struct.pack_into("=H", response, 16, expected_flags)
+        socket_factory = mock.MagicMock()
+        control_socket = socket_factory.return_value.__enter__.return_value
+        control_socket.fileno.return_value = 41
+
+        with (
+            mock.patch.object(
+                run_loopback_netns.socket, "socket", socket_factory
+            ),
+            mock.patch.object(
+                run_loopback_netns.fcntl,
+                "ioctl",
+                return_value=bytes(response),
+            ) as ioctl,
+        ):
+            flags = run_loopback_netns._read_interface_flags("lo")
+
+        self.assertEqual(flags, expected_flags)
+        socket_factory.assert_called_once_with(
+            run_loopback_netns.socket.AF_INET,
+            run_loopback_netns.socket.SOCK_DGRAM,
+        )
+        control_socket.fileno.assert_called_once_with()
+        ioctl.assert_called_once()
+        descriptor, request_code, request = ioctl.call_args.args
+        self.assertEqual(descriptor, 41)
+        self.assertEqual(request_code, run_loopback_netns.SIOCGIFFLAGS)
+        self.assertEqual(len(request), 256)
+        self.assertEqual(request[:16], b"lo" + (b"\x00" * 14))
+        socket_factory.return_value.__exit__.assert_called_once()
+
+    def test_interface_flag_reader_rejects_invalid_or_failed_ioctl_results(
+        self,
+    ) -> None:
+        invalid_results = (bytearray(256), b"\x00" * 17)
+        for result in invalid_results:
+            with self.subTest(result_type=type(result).__name__, size=len(result)):
+                socket_factory = mock.MagicMock()
+                control_socket = socket_factory.return_value.__enter__.return_value
+                control_socket.fileno.return_value = 41
+                with (
+                    mock.patch.object(
+                        run_loopback_netns.socket, "socket", socket_factory
+                    ),
+                    mock.patch.object(
+                        run_loopback_netns.fcntl, "ioctl", return_value=result
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "flags response was invalid"
+                    ),
+                ):
+                    run_loopback_netns._read_interface_flags("lo")
+                socket_factory.return_value.__exit__.assert_called_once()
+
+        socket_factory = mock.MagicMock()
+        with (
+            mock.patch.object(
+                run_loopback_netns.socket, "socket", socket_factory
+            ),
+            mock.patch.object(
+                run_loopback_netns.fcntl,
+                "ioctl",
+                side_effect=OSError("injected"),
+            ),
+            self.assertRaisesRegex(ValueError, "flags could not be inspected"),
+        ):
+            run_loopback_netns._read_interface_flags("lo")
+        socket_factory.return_value.__exit__.assert_called_once()
+
     def test_proc_status_requires_ids_no_groups_caps_or_new_privileges(self) -> None:
         status = """\
 Uid:\t1001\t1001\t1001\t1001
@@ -508,7 +698,8 @@ NoNewPrivs:\t1
             (ip_path, "-4", "route", "get", "203.0.113.1"): (2, ""),
             (ip_path, "-6", "route", "get", "2001:db8::1"): (2, ""),
         }
-        for interface in ("sit0", "ip6tnl0"):
+        fallback_interfaces = ("sit0", "ip6tnl0", "ip_vti0", "ip6_vti0")
+        for interface in fallback_interfaces:
             for family in ("-4", "-6"):
                 command_results[
                     (ip_path, family, "-o", "address", "show", "dev", interface)
@@ -528,7 +719,10 @@ NoNewPrivs:\t1
         valid_loopback = run_loopback_netns.IFF_UP | run_loopback_netns.IFF_LOOPBACK
 
         run_loopback_netns.verify_loopback_only_network(
-            interface_flags={"lo": valid_loopback, "sit0": 0, "ip6tnl0": 0},
+            interface_flags={
+                "lo": valid_loopback,
+                **{interface: 0 for interface in fallback_interfaces},
+            },
             ip_path=ip_path,
             command_runner=lambda command: command_results[tuple(command)],
         )
@@ -583,8 +777,16 @@ NoNewPrivs:\t1
                 "lo": run_loopback_netns.IFF_LOOPBACK,
                 "sit0": run_loopback_netns.IFF_UP,
                 "ip6tnl0": run_loopback_netns.IFF_UP,
+                "ip_vti0": run_loopback_netns.IFF_UP,
+                "ip6_vti0": run_loopback_netns.IFF_UP,
             },
-            {"lo": valid_loopback, "sit0": 0, "ip6tnl0": 0},
+            {
+                "lo": valid_loopback,
+                "sit0": 0,
+                "ip6tnl0": 0,
+                "ip_vti0": 0,
+                "ip6_vti0": 0,
+            },
         )
         observer_calls = 0
         commands: list[tuple[str, ...]] = []
@@ -609,14 +811,16 @@ NoNewPrivs:\t1
 
         self.assertEqual(observer_calls, 2)
         self.assertEqual(
-            commands[:3],
+            commands[:5],
             [
+                (ip_path, "link", "set", "dev", "ip6_vti0", "down"),
                 (ip_path, "link", "set", "dev", "ip6tnl0", "down"),
+                (ip_path, "link", "set", "dev", "ip_vti0", "down"),
                 (ip_path, "link", "set", "dev", "sit0", "down"),
                 (ip_path, "link", "set", "dev", "lo", "up"),
             ],
         )
-        for interface in ("ip6tnl0", "sit0"):
+        for interface in ("ip6_vti0", "ip6tnl0", "ip_vti0", "sit0"):
             for family in ("-4", "-6"):
                 self.assertIn(
                     (ip_path, family, "-o", "address", "show", "dev", interface),
@@ -679,6 +883,45 @@ NoNewPrivs:\t1
                     "sit0": run_loopback_netns.IFF_UP,
                 },
             )
+
+    def test_root_network_setup_rejects_a_post_observation_unknown_interface(
+        self,
+    ) -> None:
+        ip_path = "/usr/libexec/iproute2/ip"
+        valid_loopback = run_loopback_netns.IFF_UP | run_loopback_netns.IFF_LOOPBACK
+        observations = iter(
+            (
+                {
+                    "lo": run_loopback_netns.IFF_LOOPBACK,
+                    "sit0": run_loopback_netns.IFF_UP,
+                },
+                {
+                    "lo": valid_loopback,
+                    "sit0": 0,
+                    "eth0": 0,
+                },
+            )
+        )
+        commands: list[tuple[str, ...]] = []
+
+        def command_runner(command: list[str]) -> tuple[int, str]:
+            commands.append(tuple(command))
+            return 0, ""
+
+        with self.assertRaisesRegex(ValueError, "unexpected non-loopback"):
+            run_loopback_netns._enable_and_verify_loopback_network(
+                ip_path=ip_path,
+                command_runner=command_runner,
+                network_observer=lambda: next(observations),
+            )
+
+        self.assertEqual(
+            commands,
+            [
+                (ip_path, "link", "set", "dev", "sit0", "down"),
+                (ip_path, "link", "set", "dev", "lo", "up"),
+            ],
+        )
 
 
 class UserExecTests(unittest.TestCase):

@@ -42,6 +42,19 @@ const WORKER_FAILED: u8 = 3;
 const WORKER_STOPPED: u8 = 4;
 const WORKER_FORCED_STOPPING: u8 = 5;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestUsageTransition {
+    Invalidated,
+    Published,
+}
+
+#[cfg(test)]
+struct TestUsageTransitionObserver {
+    transitions: SyncSender<TestUsageTransition>,
+    acknowledgements: Receiver<()>,
+}
+
 enum WorkerRunError {
     Stopped,
     Failed(MonitorTransportError),
@@ -136,6 +149,8 @@ struct MonitorShared {
     latest_usage: Mutex<Option<CodexUsage>>,
     usage_limit: Mutex<Option<UsageLimitSignal>>,
     failure: Mutex<Option<MonitorTransportError>>,
+    #[cfg(test)]
+    usage_transition_observer: Mutex<Option<TestUsageTransitionObserver>>,
 }
 
 impl MonitorShared {
@@ -145,7 +160,31 @@ impl MonitorShared {
             latest_usage: Mutex::new(None),
             usage_limit: Mutex::new(None),
             failure: Mutex::new(None),
+            #[cfg(test)]
+            usage_transition_observer: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn notify_usage_transition(
+        &self,
+        transition: TestUsageTransition,
+    ) -> Result<(), MonitorTransportError> {
+        let observer = self
+            .usage_transition_observer
+            .lock()
+            .map_err(|_| MonitorTransportError::Worker)?;
+        if let Some(observer) = observer.as_ref() {
+            observer
+                .transitions
+                .try_send(transition)
+                .map_err(|_| MonitorTransportError::Worker)?;
+            observer
+                .acknowledgements
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| MonitorTransportError::Worker)?;
+        }
+        Ok(())
     }
 
     fn claim_failure(&self, error: MonitorTransportError) -> WorkerRunError {
@@ -625,6 +664,29 @@ impl MonitorWorker {
         )
         .map_err(|(error, _)| error)
     }
+
+    fn observe_usage_transitions_for_test(
+        &self,
+        transitions: SyncSender<TestUsageTransition>,
+        acknowledgements: Receiver<()>,
+    ) -> Result<(), MonitorTransportError> {
+        if self.shared.lifecycle.load(Ordering::Acquire) != WORKER_STARTING {
+            return Err(MonitorTransportError::InvalidArgument);
+        }
+        let mut slot = self
+            .shared
+            .usage_transition_observer
+            .lock()
+            .map_err(|_| MonitorTransportError::Worker)?;
+        if slot.is_some() {
+            return Err(MonitorTransportError::InvalidArgument);
+        }
+        *slot = Some(TestUsageTransitionObserver {
+            transitions,
+            acknowledgements,
+        });
+        Ok(())
+    }
 }
 
 fn finalize_worker_run(
@@ -839,10 +901,19 @@ fn sync_authoritative_usage(
     protocol: &MonitorProtocol,
     shared: &MonitorShared,
 ) -> Result<(), MonitorTransportError> {
+    let snapshot = protocol.latest_usage().cloned();
+    #[cfg(test)]
+    let transition = if snapshot.is_some() {
+        TestUsageTransition::Published
+    } else {
+        TestUsageTransition::Invalidated
+    };
     *shared
         .latest_usage
         .lock()
-        .map_err(|_| MonitorTransportError::Worker)? = protocol.latest_usage().cloned();
+        .map_err(|_| MonitorTransportError::Worker)? = snapshot;
+    #[cfg(test)]
+    shared.notify_usage_transition(transition)?;
     Ok(())
 }
 
@@ -1789,6 +1860,8 @@ mod tests {
         let home = TestDirectory::new()?;
         let (client, server) = UnixStream::pair()?;
         let server_home = home.path().to_path_buf();
+        let (initial_read_sender, initial_read) = mpsc::sync_channel(1);
+        let (initial_release_sender, initial_release) = mpsc::sync_channel(1);
         let (poll_seen_sender, poll_seen) = mpsc::sync_channel(1);
         let (release_sender, release) = mpsc::sync_channel(1);
         let server = spawn_server(server, move |websocket| {
@@ -1796,42 +1869,61 @@ mod tests {
             send_json(websocket, initialize_response(&server_home))?;
             let _ = read_json(websocket)?;
             assert_eq!(read_json(websocket)?, usage_read(1));
+            initial_read_sender
+                .send(())
+                .map_err(|_| "initial-read observation channel closed".to_owned())?;
+            initial_release
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "initial-read release timed out".to_owned())?;
             send_json(websocket, usage_response(1, 10))?;
             assert_eq!(read_json(websocket)?, usage_read(2));
             poll_seen_sender
                 .send(())
                 .map_err(|_| "poll observation channel closed".to_owned())?;
             release
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(Duration::from_secs(5))
                 .map_err(|_| "poll release timed out".to_owned())?;
             send_json(websocket, usage_response(2, 80))?;
             wait_for_disconnect(websocket)
         });
 
         let mut monitor = connected_monitor(client, home.path())?;
+        initial_read.recv_timeout(Duration::from_secs(5))?;
+        let (transition_sender, transitions) = mpsc::sync_channel(4);
+        let (acknowledgement_sender, acknowledgements) = mpsc::sync_channel(1);
+        monitor.observe_usage_transitions_for_test(transition_sender, acknowledgements)?;
+        initial_release_sender.send(())?;
+        assert_eq!(
+            transitions.recv_timeout(Duration::from_secs(5))?,
+            TestUsageTransition::Published
+        );
+        acknowledgement_sender.send(())?;
         monitor.wait_until_ready()?;
-        poll_seen.recv_timeout(Duration::from_secs(1))?;
+        assert_eq!(
+            transitions.recv_timeout(Duration::from_secs(5))?,
+            TestUsageTransition::Invalidated
+        );
+        thread::sleep(Duration::from_millis(100));
         assert!(
             monitor.latest_usage().is_none(),
             "an in-flight poll must invalidate the older live snapshot"
         );
+        acknowledgement_sender.send(())?;
+        poll_seen.recv_timeout(Duration::from_secs(5))?;
         release_sender.send(())?;
-        let deadline = checked_deadline(Duration::from_secs(1))?;
-        loop {
-            let used = monitor
-                .latest_usage()
-                .and_then(|usage| usage.rate_limits)
-                .and_then(|limits| limits.primary)
-                .map(|window| window.used_percent);
-            if used == Some(80) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err("timer-driven usage refresh did not arrive".into());
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let _ = monitor.shutdown(shutdown_deadline()?)?;
+        assert_eq!(
+            transitions.recv_timeout(Duration::from_secs(5))?,
+            TestUsageTransition::Published
+        );
+        thread::sleep(Duration::from_millis(100));
+        let used = monitor
+            .latest_usage()
+            .and_then(|usage| usage.rate_limits)
+            .and_then(|limits| limits.primary)
+            .map(|window| window.used_percent);
+        assert_eq!(used, Some(80));
+        acknowledgement_sender.send(())?;
+        let _ = monitor.shutdown(checked_deadline(Duration::from_secs(5))?)?;
         join_server(server)?;
         Ok(())
     }

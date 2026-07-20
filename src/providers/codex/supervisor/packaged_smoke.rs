@@ -539,14 +539,19 @@ const PACKAGE_PS_PROCESS_FIELDS: &str = "pid=,pgid=,uid=,state=";
 // startup bound is deliberately wider than production's unchanged defaults.
 const PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(180);
 const PACKAGE_SUPERVISOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
-const PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(10);
+// The deterministic path still traverses compatibility, App, monitor, TUI
+// planning, and descriptor gates before the relay starts. Reserve one full
+// relay-duration for that pre-relay work. If it exceeds this reserve, the
+// absolute startup deadline still clamps the relay and fails closed.
+const PACKAGE_DETERMINISTIC_PRE_RELAY_STARTUP_RESERVE: Duration = Duration::from_secs(15);
+const PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(30);
 // CI validates this fixed internal fence against a later per-command watchdog
 // and an even later dedicated-job timeout. One fence is recorded when the
 // package generation starts. Every exercise wait is capped at that fence's
 // fixed recovery start so drip progress cannot consume cleanup's reserved
 // budget or manufacture a fresh outer lifetime.
 const PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT: Duration = Duration::from_secs(25 * 60);
-const PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT: Duration = Duration::from_secs(60);
+const PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT: Duration = Duration::from_secs(90);
 // The backend starts slightly before the generation fence is recorded. Its
 // extra minute prevents its own EOF from becoming an earlier cleanup trigger;
 // the generation owner or the outer job remains the authoritative boundary.
@@ -1037,6 +1042,13 @@ fn package_guardian_build_cleanup_timeout_is_provider_target_aware() {
         PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT
     );
     assert_eq!(deterministic.build_cleanup_timeout, Duration::from_secs(10));
+    let deterministic_minimum_startup = PACKAGE_DETERMINISTIC_PRE_RELAY_STARTUP_RESERVE
+        .checked_add(deterministic.relay_start_timeout);
+    assert!(
+        deterministic_minimum_startup
+            .is_some_and(|minimum| deterministic.startup_timeout >= minimum),
+        "the deterministic startup fence must reserve pre-relay work plus one relay phase"
+    );
 }
 
 #[test]

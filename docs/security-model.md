@@ -645,11 +645,15 @@ dispatcher does not execute the production
 anchor role. Two consecutive local normal runs and one local retained-recovery
 run passed on Apple silicon; the Ubuntu 24.04/macOS matrix remains pending. On
 Linux, compilation and exact libtest discovery happen before a mandatory fresh
-network namespace. The root stage enables and verifies only loopback, then
-drops to the runner UID/GID with no supplementary groups or capabilities and
-with `NoNewPrivs`; the user stage rechecks those facts, the exact environment,
-and absence of inherited socket FDs before directly executing the prebuilt
-libtest. There is no native-network fallback. macOS supplies native functional
+network namespace. The root stage enumerates the current namespace through
+kernel interface APIs rather than an inherited sysfs mount. Only `lo` and the
+exact nine upstream fallback-tunnel names are accepted; unknown interfaces fail
+before mutation, while present fallbacks are forced down and proved to have no
+address or route before only loopback is enabled. The root stage then drops to
+the runner UID/GID with no supplementary groups or capabilities and with
+`NoNewPrivs`; the user stage rechecks those facts, the exact environment, and
+absence of inherited socket FDs before directly executing the prebuilt libtest.
+There is no native-network fallback. macOS supplies native functional
 evidence and does not claim a comparable egress boundary. The detached probe is
 explicitly released before App shutdown, so it is FD/environment isolation
 evidence, not detached-descendant absence evidence. The complete
