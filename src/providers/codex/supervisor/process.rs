@@ -705,6 +705,13 @@ struct FailedSpawnChild {
     expected_group: Option<rustix::process::Pid>,
     containment_swept: bool,
     drop_deadline: Option<Instant>,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "read only by Darwin EPERM containment classification"
+        )
+    )]
     containment_policy: GroupContainmentPolicy,
     #[cfg(test)]
     force_group_sweep_failure: bool,
@@ -734,7 +741,7 @@ impl SpawnFailure {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn started(
         error: ProcessError,
         child: Child,
@@ -1026,6 +1033,13 @@ pub(super) struct ManagedGroupChild {
     disposition: Option<ChildDisposition>,
     app_graceful_drain: AppGracefulDrainState,
     drop_deadline: Option<Instant>,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "read only by Darwin EPERM containment classification"
+        )
+    )]
     containment_policy: GroupContainmentPolicy,
     #[cfg(test)]
     injected_app_shutdown_fault: Option<InjectedAppShutdownFault>,

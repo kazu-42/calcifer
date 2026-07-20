@@ -12,7 +12,9 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
+#[cfg(not(target_os = "linux"))]
+use rustix::io::fcntl_setfd;
+use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_getfd};
 use rustix::net::{AddressFamily, SendFlags, SocketType};
 
 /// Path-free descriptor identity whose diagnostic representation is always
@@ -404,6 +406,7 @@ fn create_socket_pair() -> Result<(UnixStream, UnixStream), ChannelError> {
     UnixStream::pair().map_err(|_| ChannelError::Create)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn set_and_verify_close_on_exec<Fd: AsFd>(descriptor: Fd) -> Result<(), ChannelError> {
     let flags = fcntl_getfd(&descriptor).map_err(|_| ChannelError::DescriptorFlags)?;
     fcntl_setfd(&descriptor, flags | FdFlags::CLOEXEC)
@@ -494,6 +497,13 @@ pub(super) enum ChannelError {
     InvalidSocketDomain,
     InvalidPeerDomain,
     MissingPeer,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "constructed only by the Darwin SO_NOSIGPIPE implementation"
+        )
+    )]
     SignalSafety,
     Shutdown,
     TimeoutConfiguration,

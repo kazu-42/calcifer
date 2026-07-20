@@ -361,10 +361,34 @@ jobs:
             --bin calcifer-supervisor-fixture \
             --all-features \
             --locked
-          fixture_directory="$(cd target/debug && pwd -P)"
-          fixture_binary="${fixture_directory}/calcifer-supervisor-fixture"
-          if [[ ! -f "${fixture_binary}" || -L "${fixture_binary}" || ! -x "${fixture_binary}" ]]; then
+          built_fixture_directory="$(cd target/debug && pwd -P)"
+          built_fixture="${built_fixture_directory}/calcifer-supervisor-fixture"
+          if [[ ! -f "${built_fixture}" || -L "${built_fixture}" || ! -x "${built_fixture}" ]]; then
             echo "The dedicated package TUI launcher fixture was not a canonical executable file." >&2
+            exit 1
+          fi
+
+          # Cargo may hard-link a top-level binary to target/debug/deps. The
+          # netns boundary correctly rejects multiply-linked executable
+          # authority, so stage the exact bytes into the existing private
+          # package root instead of weakening that validator.
+          launcher_directory="${CALCIFER_CODEX_PACKAGE_ROOT:?}/launcher"
+          mkdir -m 0700 "${launcher_directory}"
+          launcher_directory="$(cd "${launcher_directory}" && pwd -P)"
+          fixture_binary="${launcher_directory}/calcifer-supervisor-fixture"
+          (umask 077; cp "${built_fixture}" "${fixture_binary}")
+          chmod 0700 "${fixture_binary}"
+          if ! cmp -s "${built_fixture}" "${fixture_binary}"; then
+            echo "The staged package TUI launcher did not match the locked build." >&2
+            exit 1
+          fi
+          launcher_link_count="$(python3 -c 'import os, sys; print(os.lstat(sys.argv[1]).st_nlink)' "${fixture_binary}")"
+          if [[ "${launcher_link_count}" != 1 ]]; then
+            echo "The staged package TUI launcher was not singly linked." >&2
+            exit 1
+          fi
+          if [[ ! -f "${fixture_binary}" || -L "${fixture_binary}" || ! -O "${fixture_binary}" || ! -x "${fixture_binary}" ]]; then
+            echo "The staged package TUI launcher was not a private runner-owned executable." >&2
             exit 1
           fi
           echo "CALCIFER_PACKAGE_TUI_LAUNCHER=${fixture_binary}" >> "${GITHUB_ENV:?}"

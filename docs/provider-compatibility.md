@@ -358,14 +358,17 @@ release proof. The test-only package role dispatcher and outer-terminal harness
 do not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE`
 dispatcher/parser or persistent shell-anchor role, and these scenarios make no
 parser coverage claim. Those package roles remain libtest subprocesses, but the
-TUI launcher does not: the CI job is configured to build the ordinary
-`calcifer-supervisor-fixture` binary and pass its canonical path through a
-`cfg(test)`-only package seam so the
-launcher binary dispatches the production internal-launcher path before
-`exec`ing Codex. The seam fails closed unless the path is absolute and
-canonical, owner-matched, a non-empty regular file with one link, owner-
-executable, and neither set-ID nor group/other-writable. Production builds do
-not parse that override. Every `CALCIFER_*` value is removed by the managed-
+TUI launcher does not: the CI job builds the ordinary
+`calcifer-supervisor-fixture` binary, copies its exact bytes into an
+owner-private single-link staging path, verifies byte equality and file
+identity, and passes the canonical staged path through a `cfg(test)`-only
+package seam. This keeps Cargo's multiply-linked Linux output outside the
+launcher authority without weakening the runtime validator. The launcher
+binary then dispatches the production internal-launcher path before `exec`ing
+Codex. The seam fails closed unless the path is absolute and canonical,
+owner-matched, a non-empty regular file with one link, owner-executable, and
+neither set-ID nor group/other-writable. Production builds do not parse that
+override. Every `CALCIFER_*` value is removed by the managed-
 provider environment sanitizer, while sanitizer-approved ambient values are
 projected explicitly from an empty base. The launcher copies that sealed
 effective environment onto another empty base, so neither Calcifer authority

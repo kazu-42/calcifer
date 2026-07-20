@@ -3261,10 +3261,14 @@ fn validate_scratch_entry(
 ) -> Result<(), CodexHandoffError> {
     let kind = rustix::fs::FileType::from_raw_mode(stat.st_mode);
     let safe_links = !kind.is_file() || stat.st_nlink == 1;
-    if stat.st_dev as u64 != expected_device
+    #[cfg(target_os = "linux")]
+    let device = stat.st_dev;
+    #[cfg(target_os = "macos")]
+    let device = stat.st_dev as u64;
+    if device != expected_device
         || stat.st_uid != expected_uid
         || !safe_links
-        || (kind.is_dir() && stat.st_mode as u32 & 0o022 != 0)
+        || (kind.is_dir() && stat.st_mode & 0o022 != 0)
     {
         return Err(CodexHandoffError::Protocol);
     }

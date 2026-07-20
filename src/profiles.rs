@@ -3371,6 +3371,7 @@ impl CoordinatorProfileLease {
 
     /// Pins coordinator-only lease A into a child descriptor denyset without
     /// exposing the lock file or its raw descriptor outside this authority.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn append_forbidden_descriptor<'source>(
         &'source self,
         forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,

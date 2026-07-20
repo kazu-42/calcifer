@@ -9246,20 +9246,16 @@ where
     Ok(members)
 }
 
+#[cfg(target_os = "linux")]
 fn parse_package_process_snapshot_uid(value: &str) -> Result<u32, std::num::ParseIntError> {
-    match value.parse::<u32>() {
-        Ok(user) => Ok(user),
-        Err(_unsigned_error) => {
-            #[cfg(target_os = "macos")]
-            {
-                value.parse::<i32>().map(|user| user as u32)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err(_unsigned_error)
-            }
-        }
-    }
+    value.parse::<u32>()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_package_process_snapshot_uid(value: &str) -> Result<u32, std::num::ParseIntError> {
+    value
+        .parse::<u32>()
+        .or_else(|_| value.parse::<i32>().map(|user| user as u32))
 }
 
 fn validate_official_tui_group(

@@ -546,6 +546,45 @@ class WatchdogWorkflowTests(unittest.TestCase):
         )
         self.assertLess(metadata_cleanup_trap, first_metadata_create)
 
+    def test_launcher_is_staged_as_a_private_single_link_copy_before_export(
+        self,
+    ) -> None:
+        workflow = self._workflow()
+        launcher_step = workflow.split(
+            "      - name: Build and verify the package TUI launcher fixture\n", 1
+        )[1].split(
+            "      - name: Prepare the exact official Codex TUI libtest\n", 1
+        )[0]
+
+        build = launcher_step.index("cargo +1.96.0 build")
+        stage_directory = launcher_step.index(
+            'launcher_directory="${CALCIFER_CODEX_PACKAGE_ROOT:?}/launcher"'
+        )
+        copy = launcher_step.index(
+            '(umask 077; cp "${built_fixture}" "${fixture_binary}")'
+        )
+        compare = launcher_step.index(
+            'if ! cmp -s "${built_fixture}" "${fixture_binary}"; then'
+        )
+        single_link = launcher_step.index(
+            'if [[ "${launcher_link_count}" != 1 ]]; then'
+        )
+        export = launcher_step.index(
+            'CALCIFER_PACKAGE_TUI_LAUNCHER=${fixture_binary}'
+        )
+
+        self.assertLess(build, stage_directory)
+        self.assertLess(stage_directory, copy)
+        self.assertLess(copy, compare)
+        self.assertLess(compare, single_link)
+        self.assertLess(single_link, export)
+        self.assertIn('mkdir -m 0700 "${launcher_directory}"', launcher_step)
+        self.assertIn('chmod 0700 "${fixture_binary}"', launcher_step)
+        self.assertIn('! -O "${fixture_binary}"', launcher_step)
+        self.assertNotIn(
+            'CALCIFER_PACKAGE_TUI_LAUNCHER=${built_fixture}', launcher_step
+        )
+
     def test_linux_official_tui_is_fail_closed_inside_loopback_only_netns(
         self,
     ) -> None:
