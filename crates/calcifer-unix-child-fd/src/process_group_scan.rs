@@ -278,9 +278,12 @@ impl fmt::Debug for ProcessGroupDescriptorIsolationProof {
 /// any path-free identity in `forbidden`.
 ///
 /// Membership, process birth identity, complete fd-number/kind tables, and all
-/// supported descriptor identities are sampled twice. PID reuse, permission
-/// loss, a forbidden kind that cannot be identified, capacity saturation, or
-/// relevant concurrent membership/fd mutation fails closed.
+/// supported descriptor identities are sampled twice. PID reuse in the target
+/// group, permission loss, a forbidden kind that cannot be identified,
+/// capacity saturation, or relevant concurrent membership/fd mutation fails
+/// closed. On Linux, an observed non-target process group is discarded before
+/// sealing that unrelated PID's birth metadata, so host-wide churn cannot
+/// prevent a busy host from ever producing a target-group snapshot.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn verify_process_group_forbidden_descriptors_absent_before(
     process_group: i32,
@@ -581,11 +584,11 @@ fn platform_group_snapshot(
     });
     check_deadline(deadline)?;
     collect_linux_group_members(candidates, process_group, limits, deadline, |pid| {
-        linux_candidate_identity(pid, deadline)
+        linux_candidate_identity(pid, Some(process_group), deadline)
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn collect_linux_group_members<I, F>(
     candidates: I,
     process_group: i32,
@@ -611,9 +614,10 @@ where
             return Err(ProcessGroupDescriptorScanError::ProcessLimit);
         }
         let Some(identity) = inspect(pid)? else {
-            // A vanished unrelated candidate owns no descriptors. A vanished
-            // target member is also absent from this momentary snapshot; the
-            // complete second group snapshot catches later join/reuse drift.
+            // A vanished candidate owns no descriptors. Linux also returns
+            // None after observing a non-target pgrp in /proc/pid/stat,
+            // before an unrelated PID's birth metadata can race. Target pgrp
+            // candidates remain identity-sealed and propagate every race.
             continue;
         };
         if identity.process_group == process_group {
@@ -641,12 +645,14 @@ fn linux_process_identity(
     pid: i32,
     deadline: Instant,
 ) -> Result<ProcessIdentity, ProcessGroupDescriptorScanError> {
-    linux_candidate_identity(pid, deadline)?.ok_or(ProcessGroupDescriptorScanError::ProcessChanged)
+    linux_candidate_identity(pid, None, deadline)?
+        .ok_or(ProcessGroupDescriptorScanError::ProcessChanged)
 }
 
 #[cfg(target_os = "linux")]
 fn linux_candidate_identity(
     pid: i32,
+    expected_process_group: Option<i32>,
     deadline: Instant,
 ) -> Result<Option<ProcessIdentity>, ProcessGroupDescriptorScanError> {
     use std::fs;
@@ -708,6 +714,14 @@ fn linux_candidate_identity(
     let start_time = fields[19]
         .parse::<u64>()
         .map_err(|_| ProcessGroupDescriptorScanError::ObservationFailed)?;
+    if expected_process_group.is_some_and(|expected| process_group != expected) {
+        // The target-group scan does not need a stable birth identity for an
+        // observed non-member. Filtering here avoids turning unrelated host
+        // PID churn into target-group ProcessChanged retries. A process that
+        // was observed in the target pgrp continues through the full
+        // before/stat/after seal, so reuse or exit remains fail-closed.
+        return Ok(None);
+    }
     let after = match fs::metadata(&process_path) {
         Ok(metadata) => metadata,
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
@@ -1553,16 +1567,21 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn linux_candidate_collection_skips_vanished_processes_but_not_observation_errors() {
+    fn linux_candidate_collection_skips_absent_but_preserves_identity_races() {
         let member = ProcessIdentity {
             pid: 41,
             process_group: 41,
             uid: unsafe { libc::geteuid() },
             birth: [1, 2, 3],
         };
-        let candidates = vec![Ok(Some(40)), Ok(Some(41))];
+        let unrelated = ProcessIdentity {
+            pid: 42,
+            process_group: 99,
+            uid: unsafe { libc::geteuid() },
+            birth: [4, 5, 6],
+        };
+        let candidates = vec![Ok(Some(40)), Ok(Some(41)), Ok(Some(42))];
         let members = collect_linux_group_members(
             candidates,
             41,
@@ -1571,6 +1590,7 @@ mod tests {
             |pid| match pid {
                 40 => Ok(None),
                 41 => Ok(Some(member)),
+                42 => Ok(Some(unrelated)),
                 _ => Err(ProcessGroupDescriptorScanError::ObservationFailed),
             },
         )
@@ -1578,17 +1598,45 @@ mod tests {
         assert!(members == vec![member]);
         assert!(validate_group_snapshot(&members, 41, ScanLimits::PRODUCTION).is_ok());
 
-        let denied = collect_linux_group_members(
-            vec![Ok(Some(40))],
+        let inspector_race = collect_linux_group_members(
+            vec![Ok(Some(42))],
             41,
             ScanLimits::PRODUCTION,
             Instant::now() + Duration::from_secs(5),
-            |_| Err(ProcessGroupDescriptorScanError::PermissionDenied),
+            |_| Err(ProcessGroupDescriptorScanError::ProcessChanged),
         );
         assert!(matches!(
-            denied,
-            Err(ProcessGroupDescriptorScanError::PermissionDenied)
+            inspector_race,
+            Err(ProcessGroupDescriptorScanError::ProcessChanged)
         ));
+
+        let candidate_iterator_race = collect_linux_group_members(
+            vec![Err(ProcessGroupDescriptorScanError::ProcessChanged)],
+            41,
+            ScanLimits::PRODUCTION,
+            Instant::now() + Duration::from_secs(5),
+            |_| Ok(None),
+        );
+        assert!(matches!(
+            candidate_iterator_race,
+            Err(ProcessGroupDescriptorScanError::ProcessChanged)
+        ));
+
+        for terminal in [
+            ProcessGroupDescriptorScanError::DescriptorChanged,
+            ProcessGroupDescriptorScanError::PermissionDenied,
+            ProcessGroupDescriptorScanError::ObservationFailed,
+            ProcessGroupDescriptorScanError::Deadline,
+        ] {
+            let result = collect_linux_group_members(
+                vec![Ok(Some(40))],
+                41,
+                ScanLimits::PRODUCTION,
+                Instant::now() + Duration::from_secs(5),
+                |_| Err(terminal),
+            );
+            assert!(matches!(result, Err(error) if error == terminal));
+        }
     }
 
     #[test]

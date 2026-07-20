@@ -476,7 +476,7 @@ Prerequisites:
 ```console
 git clone https://github.com/kazu-42/calcifer.git
 cd calcifer
-cargo test --all-targets --all-features --locked
+cargo test --all-targets --all-features --locked -- --test-threads=1
 cargo run -- doctor
 ```
 
@@ -534,10 +534,12 @@ make check
 
 The CI workflow is configured for checksum-pinned GitHub Actions linting,
 formatting and Clippy on Rust 1.96, the stable Linux/macOS/Windows all-feature
-test matrix, deterministic archive-package tests, an MSRV compile check, and the
-full library unit suite plus `tests/supervisor.rs`, run serially twice on Linux
-and macOS at Rust 1.85. Linux and macOS jobs are additionally configured to
-download the architecture-specific official Codex `0.144.4` archive, verify its
+test matrix run serially because process, signal, environment, and PTY tests
+share process-global and kernel-mediated state, deterministic archive-package
+tests, an MSRV compile check, and the full library unit suite plus
+`tests/supervisor.rs`, run serially twice on Linux and macOS at Rust 1.85. Linux
+and macOS jobs are additionally configured to download the
+architecture-specific official Codex `0.144.4` archive, verify its
 pinned SHA-256 digest and single binary, and run three independently budgeted
 matrix scenarios. `contracts` runs the complete #28 handoff probe plus the #54
 live-turn one-`SIGTERM` App drain, `setsid(2)` descriptor/environment-isolation,

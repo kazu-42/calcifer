@@ -96,7 +96,7 @@ jobs:
         if: runner.os != 'Windows'
         run: rustup toolchain install 1.85.0 --profile minimal
       - name: Run tests
-        run: cargo +1.96.0 test --all-targets --all-features --locked
+        run: cargo +1.96.0 test --all-targets --all-features --locked -- --test-threads=1
       - name: Run repeated supervisor regression suites at MSRV
         if: runner.os != 'Windows'
         env:

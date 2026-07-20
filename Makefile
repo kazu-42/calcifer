@@ -14,7 +14,7 @@ lint:
 	cargo clippy --all-targets --all-features --locked -- -D warnings
 
 test:
-	cargo test --all-targets --all-features --locked
+	cargo test --all-targets --all-features --locked -- --test-threads=1
 
 supervisor-msrv:
 	@set -eu; \

@@ -42,6 +42,19 @@ MAX_TEST_NAME_BYTES = 1024
 NETWORK_COMMAND_TIMEOUT_SECONDS = 10
 IFF_UP = 0x1
 IFF_LOOPBACK = 0x8
+# Linux documents these as the complete set of automatically created fallback
+# tunnels controlled by net.core.fb_tunnels_only_for_init_net.
+KERNEL_FALLBACK_TUNNEL_INTERFACES = frozenset(
+    {
+        "tunl0",
+        "gre0",
+        "gretap0",
+        "erspan0",
+        "sit0",
+        "ip6tnl0",
+        "ip6gre0",
+    }
+)
 CAPABILITY_FIELDS = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
 DOCUMENTATION_ADDRESSES = (
     ("-4", "192.0.2.1"),
@@ -370,15 +383,48 @@ def _run_ip(command: Sequence[str]) -> tuple[int, str]:
 
 def verify_loopback_only_network(
     *,
-    interface_names: set[str],
-    loopback_flags: int,
+    interface_flags: Mapping[str, int],
     ip_path: str,
     command_runner: Callable[[Sequence[str]], tuple[int, str]] = _run_ip,
 ) -> None:
-    if interface_names != {"lo"}:
-        raise ValueError("network namespace had unexpected network interfaces")
+    loopback_flags = interface_flags.get("lo")
+    if loopback_flags is None:
+        raise ValueError("network namespace had no loopback interface")
     if loopback_flags & (IFF_UP | IFF_LOOPBACK) != IFF_UP | IFF_LOOPBACK:
         raise ValueError("loopback interface was not an up loopback device")
+    if any(
+        name != "lo" and flags & IFF_UP
+        for name, flags in interface_flags.items()
+    ):
+        raise ValueError("a non-loopback interface was up")
+    fallback_interfaces = set(interface_flags) - {"lo"}
+    if not fallback_interfaces <= KERNEL_FALLBACK_TUNNEL_INTERFACES:
+        raise ValueError("network namespace had an unexpected non-loopback interface")
+    for interface in sorted(fallback_interfaces):
+        for family in ("-4", "-6"):
+            status, output = command_runner(
+                [ip_path, family, "-o", "address", "show", "dev", interface]
+            )
+            if status != 0:
+                raise ValueError("fallback interface addresses could not be inspected")
+            if output.strip():
+                raise ValueError("a fallback interface had an assigned address")
+            status, output = command_runner(
+                [
+                    ip_path,
+                    family,
+                    "route",
+                    "show",
+                    "table",
+                    "all",
+                    "dev",
+                    interface,
+                ]
+            )
+            if status != 0:
+                raise ValueError("fallback interface routes could not be inspected")
+            if output.strip():
+                raise ValueError("a fallback interface had a route")
     for family in ("-4", "-6"):
         status, output = command_runner(
             [ip_path, family, "route", "show", "table", "main"]
@@ -399,32 +445,37 @@ def verify_loopback_only_network(
             )
 
 
-def _observe_loopback_network() -> tuple[set[str], int]:
+def _observe_loopback_network() -> dict[str, int]:
     try:
         names = set(os.listdir("/sys/class/net"))
-        flags_text = pathlib.Path("/sys/class/net/lo/flags").read_text(
-            encoding="ascii"
-        )
-        flags = int(flags_text.strip(), 16)
+        flags = {
+            name: int(
+                pathlib.Path("/sys/class/net", name, "flags")
+                .read_text(encoding="ascii")
+                .strip(),
+                16,
+            )
+            for name in names
+        }
     except (OSError, UnicodeError, ValueError) as error:
         raise ValueError("loopback network state could not be inspected") from error
-    return names, flags
+    return flags
 
 
 def _enable_and_verify_loopback_network(*, ip_path: str) -> None:
     status, _output = _run_ip([ip_path, "link", "set", "dev", "lo", "up"])
     if status != 0:
         raise ValueError("loopback interface could not be enabled")
-    names, flags = _observe_loopback_network()
+    flags = _observe_loopback_network()
     verify_loopback_only_network(
-        interface_names=names, loopback_flags=flags, ip_path=ip_path
+        interface_flags=flags, ip_path=ip_path
     )
 
 
 def _verify_current_loopback_network(*, ip_path: str) -> None:
-    names, flags = _observe_loopback_network()
+    flags = _observe_loopback_network()
     verify_loopback_only_network(
-        interface_names=names, loopback_flags=flags, ip_path=ip_path
+        interface_flags=flags, ip_path=ip_path
     )
 
 

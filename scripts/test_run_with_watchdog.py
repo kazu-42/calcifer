@@ -486,6 +486,28 @@ class WatchdogWorkflowTests(unittest.TestCase):
         repository = pathlib.Path(__file__).resolve().parent.parent
         return (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
+    def test_process_and_pty_suites_are_serial_in_ci_and_make(self) -> None:
+        repository = pathlib.Path(__file__).resolve().parent.parent
+        workflow = self._workflow()
+        run_tests = workflow.split("      - name: Run tests\n", 1)[1].split(
+            "      - name: Run repeated supervisor regression suites at MSRV\n",
+            1,
+        )[0]
+        self.assertIn(
+            "cargo +1.96.0 test --all-targets --all-features --locked -- "
+            "--test-threads=1",
+            run_tests,
+        )
+
+        makefile = (repository / "Makefile").read_text(encoding="utf-8")
+        test_recipe = makefile.split("test:\n", 1)[1].split(
+            "\nsupervisor-msrv:\n", 1
+        )[0]
+        self.assertIn(
+            "cargo test --all-targets --all-features --locked -- --test-threads=1",
+            test_recipe,
+        )
+
     def test_all_six_package_tests_keep_exact_discovery_and_execution(self) -> None:
         workflow = self._workflow()
         contract_step = workflow.split(

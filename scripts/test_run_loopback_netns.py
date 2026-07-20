@@ -413,16 +413,17 @@ NoNewPrivs:\t1
         valid_flags = run_loopback_netns.IFF_UP | run_loopback_netns.IFF_LOOPBACK
 
         run_loopback_netns.verify_loopback_only_network(
-            interface_names={"lo"},
-            loopback_flags=valid_flags,
+            interface_flags={"lo": valid_flags},
             ip_path=ip_path,
             command_runner=lambda command: command_results[tuple(command)],
         )
 
-        with self.assertRaisesRegex(ValueError, "unexpected network interfaces"):
+        with self.assertRaisesRegex(ValueError, "non-loopback interface was up"):
             run_loopback_netns.verify_loopback_only_network(
-                interface_names={"lo", "eth0"},
-                loopback_flags=valid_flags,
+                interface_flags={
+                    "lo": valid_flags,
+                    "eth0": run_loopback_netns.IFF_UP,
+                },
                 ip_path=ip_path,
                 command_runner=lambda command: command_results[tuple(command)],
             )
@@ -433,8 +434,7 @@ NoNewPrivs:\t1
             with self.subTest(incomplete_loopback_flags=flags):
                 with self.assertRaisesRegex(ValueError, "not an up loopback"):
                     run_loopback_netns.verify_loopback_only_network(
-                        interface_names={"lo"},
-                        loopback_flags=flags,
+                        interface_flags={"lo": flags},
                         ip_path=ip_path,
                         command_runner=lambda command: command_results[tuple(command)],
                     )
@@ -445,8 +445,7 @@ NoNewPrivs:\t1
         )
         with self.assertRaisesRegex(ValueError, "documentation address was routable"):
             run_loopback_netns.verify_loopback_only_network(
-                interface_names={"lo"},
-                loopback_flags=valid_flags,
+                interface_flags={"lo": valid_flags},
                 ip_path=ip_path,
                 command_runner=lambda command: routed[tuple(command)],
             )
@@ -468,8 +467,7 @@ NoNewPrivs:\t1
                 )
                 with self.assertRaisesRegex(ValueError, "route table was not empty"):
                     run_loopback_netns.verify_loopback_only_network(
-                        interface_names={"lo"},
-                        loopback_flags=valid_flags,
+                        interface_flags={"lo": valid_flags},
                         ip_path=ip_path,
                         command_runner=lambda command: nonempty[tuple(command)],
                     )
@@ -481,8 +479,7 @@ NoNewPrivs:\t1
         )
         with self.assertRaisesRegex(ValueError, "documentation address was routable"):
             run_loopback_netns.verify_loopback_only_network(
-                interface_names={"lo"},
-                loopback_flags=valid_flags,
+                interface_flags={"lo": valid_flags},
                 ip_path=ip_path,
                 command_runner=lambda command: ipv6_routed[tuple(command)],
             )
@@ -494,10 +491,86 @@ NoNewPrivs:\t1
         )
         with self.assertRaisesRegex(ValueError, "did not report unreachable"):
             run_loopback_netns.verify_loopback_only_network(
-                interface_names={"lo"},
-                loopback_flags=valid_flags,
+                interface_flags={"lo": valid_flags},
                 ip_path=ip_path,
                 command_runner=lambda command: failed_lookup[tuple(command)],
+            )
+
+    def test_network_verifier_accepts_only_down_non_loopback_fallback_devices(
+        self,
+    ) -> None:
+        ip_path = "/usr/libexec/iproute2/ip"
+        command_results = {
+            (ip_path, "-4", "route", "show", "table", "main"): (0, ""),
+            (ip_path, "-6", "route", "show", "table", "main"): (0, ""),
+            (ip_path, "-4", "route", "get", "192.0.2.1"): (2, ""),
+            (ip_path, "-4", "route", "get", "198.51.100.1"): (2, ""),
+            (ip_path, "-4", "route", "get", "203.0.113.1"): (2, ""),
+            (ip_path, "-6", "route", "get", "2001:db8::1"): (2, ""),
+        }
+        for interface in ("sit0", "ip6tnl0"):
+            for family in ("-4", "-6"):
+                command_results[
+                    (ip_path, family, "-o", "address", "show", "dev", interface)
+                ] = (0, "")
+                command_results[
+                    (
+                        ip_path,
+                        family,
+                        "route",
+                        "show",
+                        "table",
+                        "all",
+                        "dev",
+                        interface,
+                    )
+                ] = (0, "")
+        valid_loopback = run_loopback_netns.IFF_UP | run_loopback_netns.IFF_LOOPBACK
+
+        run_loopback_netns.verify_loopback_only_network(
+            interface_flags={"lo": valid_loopback, "sit0": 0, "ip6tnl0": 0},
+            ip_path=ip_path,
+            command_runner=lambda command: command_results[tuple(command)],
+        )
+
+        with self.assertRaisesRegex(ValueError, "non-loopback interface was up"):
+            run_loopback_netns.verify_loopback_only_network(
+                interface_flags={
+                    "lo": valid_loopback,
+                    "sit0": run_loopback_netns.IFF_UP,
+                },
+                ip_path=ip_path,
+                command_runner=lambda command: command_results[tuple(command)],
+            )
+
+        with self.assertRaisesRegex(ValueError, "unexpected non-loopback"):
+            run_loopback_netns.verify_loopback_only_network(
+                interface_flags={"lo": valid_loopback, "eth0": 0},
+                ip_path=ip_path,
+                command_runner=lambda command: command_results[tuple(command)],
+            )
+
+        addressed = dict(command_results)
+        addressed[(ip_path, "-4", "-o", "address", "show", "dev", "sit0")] = (
+            0,
+            "2: sit0 inet 192.0.2.2/32 scope global sit0",
+        )
+        with self.assertRaisesRegex(ValueError, "assigned address"):
+            run_loopback_netns.verify_loopback_only_network(
+                interface_flags={"lo": valid_loopback, "sit0": 0},
+                ip_path=ip_path,
+                command_runner=lambda command: addressed[tuple(command)],
+            )
+
+        routed = dict(command_results)
+        routed[
+            (ip_path, "-6", "route", "show", "table", "all", "dev", "ip6tnl0")
+        ] = (0, "2001:db8::/32 dev ip6tnl0")
+        with self.assertRaisesRegex(ValueError, "had a route"):
+            run_loopback_netns.verify_loopback_only_network(
+                interface_flags={"lo": valid_loopback, "ip6tnl0": 0},
+                ip_path=ip_path,
+                command_runner=lambda command: routed[tuple(command)],
             )
 
 
