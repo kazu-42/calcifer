@@ -124,10 +124,17 @@ pub(in crate::providers::codex) struct SessionMonitorShutdownFailure {
 /// Bounded thread/turn signal projected by the typed monitor. It is an
 /// observation only; this type carries no restart, reset-credit, or failover
 /// authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(in crate::providers::codex) struct SessionUsageLimitSignal {
     thread_id: String,
     turn_id: String,
+}
+
+impl fmt::Debug for SessionUsageLimitSignal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (&self.thread_id, &self.turn_id);
+        formatter.write_str("SessionUsageLimitSignal(<redacted>)")
+    }
 }
 
 impl SessionMonitorShutdownFailure {
@@ -257,11 +264,23 @@ const MAX_DECIMAL_BYTES: usize = 128;
 // make later rendering and ordering ambiguous across platforms.
 const MAX_PROVIDER_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(super) enum MonitorAction {
     Outbound(MonitorCommand),
     PublishUsage(Box<CodexUsage>),
     UsageLimitExceeded { thread_id: String, turn_id: String },
+}
+
+impl fmt::Debug for MonitorAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Outbound(command) => formatter.debug_tuple("Outbound").field(command).finish(),
+            Self::PublishUsage(_) => formatter.write_str("PublishUsage(<redacted>)"),
+            Self::UsageLimitExceeded { .. } => {
+                formatter.write_str("UsageLimitExceeded(<redacted>)")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1023,6 +1042,27 @@ mod tests {
     const TARGET_THREAD_ID: &str = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
     const OTHER_THREAD_ID: &str = "019c6e27-e55b-73d1-87d8-4e01f1f75044";
     const TURN_ID: &str = "019c7714-3b77-74d1-9866-e1f484aae2ab";
+
+    #[test]
+    fn usage_limit_debug_surfaces_redact_provider_identifiers() {
+        let signal = SessionUsageLimitSignal {
+            thread_id: TARGET_THREAD_ID.to_owned(),
+            turn_id: TURN_ID.to_owned(),
+        };
+        let action = MonitorAction::UsageLimitExceeded {
+            thread_id: TARGET_THREAD_ID.to_owned(),
+            turn_id: TURN_ID.to_owned(),
+        };
+
+        let signal_debug = format!("{signal:?}");
+        let action_debug = format!("{action:?}");
+        assert_eq!(signal_debug, "SessionUsageLimitSignal(<redacted>)");
+        assert_eq!(action_debug, "UsageLimitExceeded(<redacted>)");
+        for debug in [signal_debug, action_debug] {
+            assert!(!debug.contains(TARGET_THREAD_ID));
+            assert!(!debug.contains(TURN_ID));
+        }
+    }
 
     #[test]
     fn transport_error_categories_map_one_to_one_into_the_session_facade() {

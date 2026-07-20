@@ -693,6 +693,12 @@ monitoring and automatic failover require the remaining selector, pool,
 transition-journal, and cross-profile recovery transaction before they can be
 enabled.
 
+The typed monitor retains Codex thread and turn UUIDs only for bounded in-memory
+target matching and one-shot routing. Those UUIDs are provider identifiers, so
+transport, action, and session signal `Debug` surfaces use fixed payload-free
+representations; the values never enter display text, error chains, lifecycle
+evidence, logs, or persisted usage snapshots.
+
 Immediately before launch, Calcifer reports the local profile alias, provider, trust domain, and selection reason. It does not display email or stable provider account, workspace, or organization identifiers, and repository-local configuration cannot suppress this notice.
 
 ## Security-sensitive review areas

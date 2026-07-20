@@ -1193,6 +1193,20 @@ mod tests {
     use super::*;
 
     const THREAD_ID: &str = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
+    const TURN_ID: &str = "019c7714-3b77-74d1-9866-e1f484aae2ab";
+
+    #[test]
+    fn usage_limit_signal_debug_redacts_provider_identifiers() {
+        let signal = UsageLimitSignal {
+            thread_id: THREAD_ID.to_owned(),
+            turn_id: TURN_ID.to_owned(),
+        };
+
+        let debug = format!("{signal:?}");
+        assert_eq!(debug, "UsageLimitSignal(<redacted>)");
+        assert!(!debug.contains(THREAD_ID));
+        assert!(!debug.contains(TURN_ID));
+    }
 
     struct TraceCapture {
         messages: Mutex<Vec<String>>,

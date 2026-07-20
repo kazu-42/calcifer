@@ -8560,6 +8560,37 @@ fn package_private_read_retries_only_same_inode_append_progress() -> Result<(), 
     )?;
     assert_eq!(rewrite.kind(), std::io::ErrorKind::InvalidData);
 
+    let restored_mtime_path = scratch.root.join("same-length-rewrite-restored-mtime");
+    write_private_new(&restored_mtime_path, b"before")?;
+    let restored_before = fs::metadata(&restored_mtime_path)?;
+    let restored_modified = restored_before.modified()?;
+    let mut restored_after = None;
+    for _ in 0..100 {
+        let mut rewritten = OpenOptions::new().write(true).open(&restored_mtime_path)?;
+        rewritten.write_all(b"rewrit")?;
+        rewritten.set_times(fs::FileTimes::new().set_modified(restored_modified))?;
+        let candidate = rewritten.metadata()?;
+        if (candidate.ctime(), candidate.ctime_nsec())
+            != (restored_before.ctime(), restored_before.ctime_nsec())
+        {
+            restored_after = Some(candidate);
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let restored_after = restored_after.ok_or("change time did not advance during rewrite")?;
+    assert_eq!(restored_before.modified()?, restored_after.modified()?);
+    let restored_rewrite = require_rejected_test_result(
+        validate_private_bounded_read_completion(
+            &restored_before,
+            &restored_after,
+            b"rewrit".len(),
+            128,
+        ),
+        "same-length rewrite with restored mtime was accepted as stable",
+    )?;
+    assert_eq!(restored_rewrite.kind(), std::io::ErrorKind::InvalidData);
+
     let oversized = require_rejected_test_result(
         validate_private_bounded_read_completion(&after, &after, 129, 128),
         "an oversized private read was accepted as progress",
@@ -14855,6 +14886,7 @@ fn validate_private_bounded_read_completion(
     }
     if after_length < before_length
         || before.modified()? != after.modified()?
+        || (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
         || after_length != bytes_read
     {
         return Err(std::io::Error::new(
