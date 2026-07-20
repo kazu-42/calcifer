@@ -107,6 +107,7 @@ class LaunchConfig:
     launcher_binary: ArtifactIdentity
     interpreter: ArtifactIdentity
     script: ArtifactIdentity
+    ip_tool: ArtifactIdentity
     test_name: str
     runner_uid: int
     runner_gid: int
@@ -247,6 +248,8 @@ def _internal_arguments(config: LaunchConfig) -> list[str]:
         config.codex_binary.path,
         "--launcher-binary",
         config.launcher_binary.path,
+        "--ip-path",
+        config.ip_tool.path,
         "--runner-uid",
         str(config.runner_uid),
         "--runner-gid",
@@ -263,6 +266,8 @@ def _internal_arguments(config: LaunchConfig) -> list[str]:
         config.interpreter.encode(),
         "--script-identity",
         config.script.encode(),
+        "--ip-identity",
+        config.ip_tool.encode(),
     ]
 
 
@@ -367,6 +372,7 @@ def verify_loopback_only_network(
     *,
     interface_names: set[str],
     loopback_flags: int,
+    ip_path: str,
     command_runner: Callable[[Sequence[str]], tuple[int, str]] = _run_ip,
 ) -> None:
     if interface_names != {"lo"}:
@@ -374,13 +380,17 @@ def verify_loopback_only_network(
     if loopback_flags & (IFF_UP | IFF_LOOPBACK) != IFF_UP | IFF_LOOPBACK:
         raise ValueError("loopback interface was not an up loopback device")
     for family in ("-4", "-6"):
-        status, output = command_runner([IP, family, "route", "show", "table", "main"])
+        status, output = command_runner(
+            [ip_path, family, "route", "show", "table", "main"]
+        )
         if status != 0:
             raise ValueError("main route table could not be inspected")
         if output.strip():
             raise ValueError("main route table was not empty")
     for family, address in DOCUMENTATION_ADDRESSES:
-        status, _output = command_runner([IP, family, "route", "get", address])
+        status, _output = command_runner(
+            [ip_path, family, "route", "get", address]
+        )
         if status == 0:
             raise ValueError(f"documentation address was routable: {address}")
         if status != 2:
@@ -401,17 +411,21 @@ def _observe_loopback_network() -> tuple[set[str], int]:
     return names, flags
 
 
-def _enable_and_verify_loopback_network() -> None:
-    status, _output = _run_ip([IP, "link", "set", "dev", "lo", "up"])
+def _enable_and_verify_loopback_network(*, ip_path: str) -> None:
+    status, _output = _run_ip([ip_path, "link", "set", "dev", "lo", "up"])
     if status != 0:
         raise ValueError("loopback interface could not be enabled")
     names, flags = _observe_loopback_network()
-    verify_loopback_only_network(interface_names=names, loopback_flags=flags)
+    verify_loopback_only_network(
+        interface_names=names, loopback_flags=flags, ip_path=ip_path
+    )
 
 
-def _verify_current_loopback_network() -> None:
+def _verify_current_loopback_network(*, ip_path: str) -> None:
     names, flags = _observe_loopback_network()
-    verify_loopback_only_network(interface_names=names, loopback_flags=flags)
+    verify_loopback_only_network(
+        interface_names=names, loopback_flags=flags, ip_path=ip_path
+    )
 
 
 def verify_dropped_process_status(
@@ -504,6 +518,7 @@ def _verify_artifacts(config: LaunchConfig) -> None:
         label="netns helper script",
         require_executable=False,
     )
+    _verify_system_tool(config.ip_tool, label="ip")
 
 
 def _inspect_system_tool(path: str, *, label: str) -> None:
@@ -517,6 +532,39 @@ def _inspect_system_tool(path: str, *, label: str) -> None:
         # root-owned, non-writable regular files at fixed absolute paths.
         allow_privileged_bits=path == SUDO,
     )
+
+
+def _resolve_system_tool_alias(path: str, *, label: str) -> ArtifactIdentity:
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{label} alias path was empty")
+    if len(os.fsencode(path)) > MAX_PATH_BYTES:
+        raise ValueError(f"{label} alias path was oversized")
+    alias = pathlib.Path(path)
+    if not alias.is_absolute() or os.path.normpath(path) != path:
+        raise ValueError(f"{label} alias must use an absolute normalized path")
+    try:
+        canonical_target = alias.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"{label} alias could not be resolved") from error
+    return _inspect_artifact(
+        str(canonical_target),
+        allowed_uids={0},
+        label=label,
+        require_executable=True,
+        allow_privileged_bits=False,
+    )
+
+
+def _verify_system_tool(expected: ArtifactIdentity, *, label: str) -> None:
+    observed = _inspect_artifact(
+        expected.path,
+        allowed_uids={0},
+        label=label,
+        require_executable=True,
+        allow_privileged_bits=False,
+    )
+    if observed != expected:
+        raise ValueError(f"{label} changed after outer validation")
 
 
 def _assert_linux() -> None:
@@ -541,6 +589,16 @@ def _public_config(arguments: argparse.Namespace) -> LaunchConfig:
     test_name = validate_test_name(arguments.test_name)
     interpreter_path = str(pathlib.Path(sys.executable).resolve(strict=True))
     script_path = str(pathlib.Path(__file__).resolve(strict=True))
+    for tool, label in (
+        (SUDO, "sudo"),
+        (ENV, "env"),
+        (UNSHARE, "unshare"),
+        (SETPRIV, "setpriv"),
+    ):
+        _inspect_system_tool(tool, label=label)
+    # Ubuntu exposes ip through a distro-managed symlink. Resolve that fixed
+    # alias before sudo, then seal and execute only the canonical target.
+    ip_tool = _resolve_system_tool_alias(IP, label="ip")
     config = LaunchConfig(
         test_binary=inspect_runner_artifact(
             arguments.test_binary, runner_uid=uid, label="test binary"
@@ -563,19 +621,12 @@ def _public_config(arguments: argparse.Namespace) -> LaunchConfig:
             label="netns helper script",
             require_executable=False,
         ),
+        ip_tool=ip_tool,
         test_name=test_name,
         runner_uid=uid,
         runner_gid=gid,
         outer_netns=_read_netns_identity(),
     )
-    for tool, label in (
-        (SUDO, "sudo"),
-        (ENV, "env"),
-        (UNSHARE, "unshare"),
-        (SETPRIV, "setpriv"),
-        (IP, "ip"),
-    ):
-        _inspect_system_tool(tool, label=label)
     return config
 
 
@@ -589,6 +640,7 @@ def _internal_config(arguments: argparse.Namespace) -> LaunchConfig:
         launcher_binary=ArtifactIdentity.decode(arguments.launcher_identity),
         interpreter=ArtifactIdentity.decode(arguments.interpreter_identity),
         script=ArtifactIdentity.decode(arguments.script_identity),
+        ip_tool=ArtifactIdentity.decode(arguments.ip_identity),
         test_name=validate_test_name(arguments.test_name),
         runner_uid=uid,
         runner_gid=gid,
@@ -598,6 +650,7 @@ def _internal_config(arguments: argparse.Namespace) -> LaunchConfig:
         (arguments.test_binary, config.test_binary.path, "test binary"),
         (arguments.codex_binary, config.codex_binary.path, "Codex binary"),
         (arguments.launcher_binary, config.launcher_binary.path, "launcher binary"),
+        (arguments.ip_path, config.ip_tool.path, "ip"),
     )
     for public_path, identity_path, label in public_paths:
         if public_path != identity_path:
@@ -620,7 +673,7 @@ def _run_inner_root(arguments: argparse.Namespace) -> None:
     isolated_netns = _read_netns_identity()
     if isolated_netns == config.outer_netns:
         raise ValueError("unshare did not create a distinct network namespace")
-    _enable_and_verify_loopback_network()
+    _enable_and_verify_loopback_network(ip_path=config.ip_tool.path)
     executable, argv, environment = build_root_exec(
         config, isolated_netns=isolated_netns
     )
@@ -662,7 +715,7 @@ def _run_inner_user(arguments: argparse.Namespace) -> None:
     verify_exact_environment(os.environ, expected_environment)
     verify_no_inherited_socket_fds(_read_open_fd_links())
     _verify_artifacts(config)
-    _verify_current_loopback_network()
+    _verify_current_loopback_network(ip_path=config.ip_tool.path)
     executable, argv = build_user_test_exec(
         config.test_binary, test_name=config.test_name
     )
@@ -677,6 +730,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-name", required=True)
     parser.add_argument("--codex-binary", required=True)
     parser.add_argument("--launcher-binary", required=True)
+    parser.add_argument("--ip-path", help=argparse.SUPPRESS)
     stage = parser.add_mutually_exclusive_group()
     stage.add_argument("--inner-root", action="store_true", help=argparse.SUPPRESS)
     stage.add_argument("--inner-user", action="store_true", help=argparse.SUPPRESS)
@@ -689,6 +743,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--launcher-identity", help=argparse.SUPPRESS)
     parser.add_argument("--interpreter-identity", help=argparse.SUPPRESS)
     parser.add_argument("--script-identity", help=argparse.SUPPRESS)
+    parser.add_argument("--ip-identity", help=argparse.SUPPRESS)
     return parser
 
 
@@ -702,6 +757,8 @@ def _require_internal_arguments(arguments: argparse.Namespace) -> None:
         "launcher_identity",
         "interpreter_identity",
         "script_identity",
+        "ip_path",
+        "ip_identity",
     )
     missing = [name for name in required if getattr(arguments, name) is None]
     if arguments.inner_user and arguments.isolated_netns is None:
@@ -726,6 +783,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.launcher_identity,
                 arguments.interpreter_identity,
                 arguments.script_identity,
+                arguments.ip_path,
+                arguments.ip_identity,
             )
             if any(value is not None for value in internal_values):
                 raise ValueError("public stage refused internal-only arguments")

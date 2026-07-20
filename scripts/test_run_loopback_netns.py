@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import pathlib
 import stat
@@ -118,6 +119,66 @@ class ArtifactValidationTests(unittest.TestCase):
         self.assertTrue(inspect.call_args_list[0].kwargs["allow_privileged_bits"])
         self.assertFalse(inspect.call_args_list[1].kwargs["allow_privileged_bits"])
 
+    def test_ip_alias_is_resolved_before_the_canonical_target_is_inspected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            target = self._executable(root, "ip-target")
+            alias = root / "ip-alias"
+            alias.symlink_to(target)
+            expected = run_loopback_netns.ArtifactIdentity(
+                path=str(target),
+                device=1,
+                inode=2,
+                size=3,
+                mode=stat.S_IFREG | 0o755,
+                uid=0,
+                gid=0,
+                link_count=1,
+                mtime_ns=4,
+                ctime_ns=5,
+            )
+
+            with mock.patch.object(
+                run_loopback_netns, "_inspect_artifact", return_value=expected
+            ) as inspect:
+                observed = run_loopback_netns._resolve_system_tool_alias(
+                    str(alias), label="ip"
+                )
+
+        self.assertEqual(observed, expected)
+        inspect.assert_called_once_with(
+            str(target),
+            allowed_uids={0},
+            label="ip",
+            require_executable=True,
+            allow_privileged_bits=False,
+        )
+
+    def test_system_tool_identity_revalidation_rejects_replacement(self) -> None:
+        expected = run_loopback_netns.ArtifactIdentity(
+            path="/usr/libexec/iproute2/ip",
+            device=1,
+            inode=2,
+            size=3,
+            mode=stat.S_IFREG | 0o755,
+            uid=0,
+            gid=0,
+            link_count=1,
+            mtime_ns=4,
+            ctime_ns=5,
+        )
+        replacement = dataclasses.replace(expected, inode=3)
+
+        with mock.patch.object(
+            run_loopback_netns, "_inspect_artifact", return_value=replacement
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "ip changed after outer validation"
+            ):
+                run_loopback_netns._verify_system_tool(expected, label="ip")
+
 
 class ArgumentAndCommandTests(unittest.TestCase):
     def _identity(self, path: str) -> run_loopback_netns.ArtifactIdentity:
@@ -156,6 +217,7 @@ class ArgumentAndCommandTests(unittest.TestCase):
             launcher_binary=self._identity("/runner/target/launcher"),
             interpreter=self._identity("/usr/bin/python3.13"),
             script=self._identity("/runner/repo/scripts/run_loopback_netns.py"),
+            ip_tool=self._identity("/usr/libexec/iproute2/ip"),
             test_name="providers::codex::official_tui",
             runner_uid=1001,
             runner_gid=1002,
@@ -172,6 +234,12 @@ class ArgumentAndCommandTests(unittest.TestCase):
         self.assertIn("PATH=" + run_loopback_netns.SAFE_PATH, argv)
         self.assertIn("LC_ALL=C", argv)
         self.assertIn(run_loopback_netns.UNSHARE, argv)
+        self.assertIn("--ip-path", argv)
+        self.assertEqual(argv[argv.index("--ip-path") + 1], config.ip_tool.path)
+        self.assertIn("--ip-identity", argv)
+        self.assertEqual(
+            argv[argv.index("--ip-identity") + 1], config.ip_tool.encode()
+        )
         unshare = argv.index(run_loopback_netns.UNSHARE)
         self.assertEqual(
             argv[unshare + 1 : unshare + 4],
@@ -190,6 +258,7 @@ class ArgumentAndCommandTests(unittest.TestCase):
             launcher_binary=self._identity("/runner/target/launcher"),
             interpreter=self._identity("/usr/bin/python3.13"),
             script=self._identity("/runner/repo/scripts/run_loopback_netns.py"),
+            ip_tool=self._identity("/usr/libexec/iproute2/ip"),
             test_name="providers::codex::official_tui",
             runner_uid=1001,
             runner_gid=1002,
@@ -220,6 +289,56 @@ class ArgumentAndCommandTests(unittest.TestCase):
             environment,
             {"PATH": run_loopback_netns.SAFE_PATH, "LC_ALL": "C"},
         )
+
+    def test_internal_ip_path_must_match_its_sealed_outer_identity(self) -> None:
+        config = run_loopback_netns.LaunchConfig(
+            test_binary=self._identity("/runner/target/test"),
+            codex_binary=self._identity("/runner/temp/codex"),
+            launcher_binary=self._identity("/runner/target/launcher"),
+            interpreter=self._identity("/usr/bin/python3.13"),
+            script=self._identity("/runner/repo/scripts/run_loopback_netns.py"),
+            ip_tool=self._identity("/usr/libexec/iproute2/ip"),
+            test_name="providers::codex::official_tui",
+            runner_uid=1001,
+            runner_gid=1002,
+            outer_netns="net:[41]",
+        )
+        arguments = run_loopback_netns._parser().parse_args(
+            ["--inner-root", *run_loopback_netns._internal_arguments(config)]
+        )
+
+        self.assertEqual(run_loopback_netns._internal_config(arguments), config)
+        arguments.ip_path = "/usr/sbin/ip"
+        with self.assertRaisesRegex(
+            ValueError, "ip path did not match its outer identity"
+        ):
+            run_loopback_netns._internal_config(arguments)
+
+    def test_stage_artifact_revalidation_includes_the_sealed_ip_identity(
+        self,
+    ) -> None:
+        config = run_loopback_netns.LaunchConfig(
+            test_binary=self._identity("/runner/target/test"),
+            codex_binary=self._identity("/runner/temp/codex"),
+            launcher_binary=self._identity("/runner/target/launcher"),
+            interpreter=self._identity("/usr/bin/python3.13"),
+            script=self._identity("/runner/repo/scripts/run_loopback_netns.py"),
+            ip_tool=self._identity("/usr/libexec/iproute2/ip"),
+            test_name="providers::codex::official_tui",
+            runner_uid=1001,
+            runner_gid=1002,
+            outer_netns="net:[41]",
+        )
+
+        with mock.patch.object(
+            run_loopback_netns, "verify_runner_artifact"
+        ), mock.patch.object(run_loopback_netns, "_verify_support_artifact"):
+            with mock.patch.object(
+                run_loopback_netns, "_verify_system_tool"
+            ) as verify_ip:
+                run_loopback_netns._verify_artifacts(config)
+
+        verify_ip.assert_called_once_with(config.ip_tool, label="ip")
 
 
 class IsolationVerificationTests(unittest.TestCase):
@@ -282,19 +401,21 @@ NoNewPrivs:\t1
             )
 
     def test_network_verifier_requires_only_unrouted_up_loopback(self) -> None:
+        ip_path = "/usr/libexec/iproute2/ip"
         command_results = {
-            (run_loopback_netns.IP, "-4", "route", "show", "table", "main"): (0, ""),
-            (run_loopback_netns.IP, "-6", "route", "show", "table", "main"): (0, ""),
-            (run_loopback_netns.IP, "-4", "route", "get", "192.0.2.1"): (2, ""),
-            (run_loopback_netns.IP, "-4", "route", "get", "198.51.100.1"): (2, ""),
-            (run_loopback_netns.IP, "-4", "route", "get", "203.0.113.1"): (2, ""),
-            (run_loopback_netns.IP, "-6", "route", "get", "2001:db8::1"): (2, ""),
+            (ip_path, "-4", "route", "show", "table", "main"): (0, ""),
+            (ip_path, "-6", "route", "show", "table", "main"): (0, ""),
+            (ip_path, "-4", "route", "get", "192.0.2.1"): (2, ""),
+            (ip_path, "-4", "route", "get", "198.51.100.1"): (2, ""),
+            (ip_path, "-4", "route", "get", "203.0.113.1"): (2, ""),
+            (ip_path, "-6", "route", "get", "2001:db8::1"): (2, ""),
         }
         valid_flags = run_loopback_netns.IFF_UP | run_loopback_netns.IFF_LOOPBACK
 
         run_loopback_netns.verify_loopback_only_network(
             interface_names={"lo"},
             loopback_flags=valid_flags,
+            ip_path=ip_path,
             command_runner=lambda command: command_results[tuple(command)],
         )
 
@@ -302,6 +423,7 @@ NoNewPrivs:\t1
             run_loopback_netns.verify_loopback_only_network(
                 interface_names={"lo", "eth0"},
                 loopback_flags=valid_flags,
+                ip_path=ip_path,
                 command_runner=lambda command: command_results[tuple(command)],
             )
         for flags in (
@@ -313,10 +435,11 @@ NoNewPrivs:\t1
                     run_loopback_netns.verify_loopback_only_network(
                         interface_names={"lo"},
                         loopback_flags=flags,
+                        ip_path=ip_path,
                         command_runner=lambda command: command_results[tuple(command)],
                     )
         routed = dict(command_results)
-        routed[(run_loopback_netns.IP, "-4", "route", "get", "192.0.2.1")] = (
+        routed[(ip_path, "-4", "route", "get", "192.0.2.1")] = (
             0,
             "192.0.2.1 dev eth0",
         )
@@ -324,6 +447,7 @@ NoNewPrivs:\t1
             run_loopback_netns.verify_loopback_only_network(
                 interface_names={"lo"},
                 loopback_flags=valid_flags,
+                ip_path=ip_path,
                 command_runner=lambda command: routed[tuple(command)],
             )
 
@@ -331,7 +455,7 @@ NoNewPrivs:\t1
             with self.subTest(nonempty_main_route=family):
                 nonempty = dict(command_results)
                 route_command = (
-                    run_loopback_netns.IP,
+                    ip_path,
                     family,
                     "route",
                     "show",
@@ -346,11 +470,12 @@ NoNewPrivs:\t1
                     run_loopback_netns.verify_loopback_only_network(
                         interface_names={"lo"},
                         loopback_flags=valid_flags,
+                        ip_path=ip_path,
                         command_runner=lambda command: nonempty[tuple(command)],
                     )
 
         ipv6_routed = dict(command_results)
-        ipv6_routed[(run_loopback_netns.IP, "-6", "route", "get", "2001:db8::1")] = (
+        ipv6_routed[(ip_path, "-6", "route", "get", "2001:db8::1")] = (
             0,
             "2001:db8::1 dev eth0",
         )
@@ -358,11 +483,12 @@ NoNewPrivs:\t1
             run_loopback_netns.verify_loopback_only_network(
                 interface_names={"lo"},
                 loopback_flags=valid_flags,
+                ip_path=ip_path,
                 command_runner=lambda command: ipv6_routed[tuple(command)],
             )
 
         failed_lookup = dict(command_results)
-        failed_lookup[(run_loopback_netns.IP, "-4", "route", "get", "192.0.2.1")] = (
+        failed_lookup[(ip_path, "-4", "route", "get", "192.0.2.1")] = (
             1,
             "",
         )
@@ -370,6 +496,7 @@ NoNewPrivs:\t1
             run_loopback_netns.verify_loopback_only_network(
                 interface_names={"lo"},
                 loopback_flags=valid_flags,
+                ip_path=ip_path,
                 command_runner=lambda command: failed_lookup[tuple(command)],
             )
 

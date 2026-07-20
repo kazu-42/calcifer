@@ -18,7 +18,9 @@ use super::protocol::{ChildDisposition, ChildRole, StopAction, UnixSignal};
 const READINESS_SENTINEL: u8 = b'R';
 const TUI_READINESS_TOKEN: u8 = 1;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const MAX_DESCRIPTOR_OBSERVATION_ATTEMPTS: usize = 4;
+// A Linux attempt walks the process table and target fd tables twice. Give
+// transient churn time to settle without consuming an entire startup budget.
+const DESCRIPTOR_OBSERVATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const SPAWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 static NEXT_CHILD_AUTHORITY: AtomicU64 = AtomicU64::new(1);
@@ -1381,12 +1383,13 @@ impl ManagedGroupChild {
         calcifer_unix_child_fd::ProcessGroupDescriptorIsolationProof,
         calcifer_unix_child_fd::ProcessGroupDescriptorScanError,
     > {
-        retry_descriptor_observation(deadline, || {
+        retry_descriptor_observation(deadline, |deadline| {
             calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
                 self.pgid.as_raw_pid(),
                 forbidden,
                 deadline,
             )
+            .map_err(DescriptorObservationAttemptError::from_scan)
         })
     }
 
@@ -1405,11 +1408,9 @@ impl ManagedGroupChild {
         calcifer_unix_child_fd::ProcessGroupDescriptorScanError,
     > {
         let process_group = self.pgid.as_raw_pid();
-        retry_descriptor_observation(deadline, || {
+        retry_descriptor_observation(deadline, |deadline| {
             self.confirm_running_after_readiness(deadline)
-                .map_err(|_| {
-                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
-                })?;
+                .map_err(|_| DescriptorObservationAttemptError::terminal_process_changed())?;
             let observed =
                 calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
                     process_group,
@@ -1420,7 +1421,7 @@ impl ManagedGroupChild {
                 Ok(proof) => {
                     self.confirm_running_after_readiness(deadline)
                         .map_err(|_| {
-                            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+                            DescriptorObservationAttemptError::terminal_process_changed()
                         })?;
                     Ok(proof)
                 }
@@ -1430,11 +1431,11 @@ impl ManagedGroupChild {
                 )) => {
                     self.confirm_running_after_readiness(deadline)
                         .map_err(|_| {
-                            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+                            DescriptorObservationAttemptError::terminal_process_changed()
                         })?;
-                    Err(error)
+                    Err(DescriptorObservationAttemptError::from_scan(error))
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(DescriptorObservationAttemptError::Terminal(error)),
             }
         })
     }
@@ -2054,34 +2055,62 @@ impl ManagedGroupChild {
     }
 }
 
+enum DescriptorObservationAttemptError {
+    TransientProcessChanged,
+    TransientDescriptorChanged,
+    Terminal(calcifer_unix_child_fd::ProcessGroupDescriptorScanError),
+}
+
+impl DescriptorObservationAttemptError {
+    fn from_scan(error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError) -> Self {
+        match error {
+            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged => {
+                Self::TransientProcessChanged
+            }
+            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged => {
+                Self::TransientDescriptorChanged
+            }
+            error => Self::Terminal(error),
+        }
+    }
+
+    fn terminal_process_changed() -> Self {
+        Self::Terminal(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged)
+    }
+}
+
 fn retry_descriptor_observation<T>(
-    deadline: Instant,
-    mut observe: impl FnMut() -> Result<T, calcifer_unix_child_fd::ProcessGroupDescriptorScanError>,
+    caller_deadline: Instant,
+    mut observe: impl FnMut(Instant) -> Result<T, DescriptorObservationAttemptError>,
 ) -> Result<T, calcifer_unix_child_fd::ProcessGroupDescriptorScanError> {
-    for attempt in 0..MAX_DESCRIPTOR_OBSERVATION_ATTEMPTS {
+    let deadline = descriptor_observation_deadline(Instant::now(), caller_deadline);
+    loop {
         let now = Instant::now();
         if now >= deadline {
             return Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline);
         }
-        match observe() {
+        match observe(deadline) {
             Ok(proof) => return Ok(proof),
             Err(
-                error @ (calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
-                | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged),
+                DescriptorObservationAttemptError::TransientProcessChanged
+                | DescriptorObservationAttemptError::TransientDescriptorChanged,
             ) => {
-                if attempt + 1 == MAX_DESCRIPTOR_OBSERVATION_ATTEMPTS {
-                    return Err(error);
-                }
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline);
                 }
                 thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
             }
-            Err(error) => return Err(error),
+            Err(DescriptorObservationAttemptError::Terminal(error)) => return Err(error),
         }
     }
-    Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ObservationFailed)
+}
+
+fn descriptor_observation_deadline(now: Instant, caller_deadline: Instant) -> Instant {
+    match now.checked_add(DESCRIPTOR_OBSERVATION_SETTLE_TIMEOUT) {
+        Some(settle_deadline) if settle_deadline < caller_deadline => settle_deadline,
+        Some(_) | None => caller_deadline,
+    }
 }
 
 impl Drop for ManagedGroupChild {
@@ -3954,14 +3983,65 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_observation_retries_only_fixed_races_before_the_deadline() {
+    fn live_descriptor_observation_does_not_retry_a_terminal_child_exit()
+    -> Result<(), Box<dyn Error>> {
+        let (forbidden, _peer) = UnixStream::pair()?;
+        let mut identities = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+        identities.capture(forbidden.as_fd())?;
+        let mut child = ManagedGroupChild::spawn_fixture(
+            ChildRole::Tui,
+            shell_command("printf R; exec >/dev/null; exec /bin/sleep 5"),
+            true,
+        )?;
+        child.await_ready(Instant::now() + TEST_DEADLINE)?;
+        rustix::process::kill_process(child.pid, rustix::process::Signal::TERM)?;
+        let exit_deadline = Instant::now() + TEST_DEADLINE;
+        while !child.observe_exit_without_reaping(exit_deadline)? {
+            sleep_until_next_poll(exit_deadline);
+        }
+
+        let error = child
+            .observe_forbidden_descriptors_absent_while_live(
+                &identities,
+                Instant::now() + Duration::from_millis(100),
+            )
+            .err()
+            .ok_or("an exited direct child must fail descriptor observation")?;
+        assert_eq!(
+            error,
+            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+        );
+
+        let outcome = shutdown_fixture_pair(Some(child), None, Duration::ZERO, TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_observation_retries_only_transient_races_until_the_deadline() {
+        let deadline_origin = Instant::now();
+        assert_eq!(
+            descriptor_observation_deadline(
+                deadline_origin,
+                deadline_origin + Duration::from_secs(1),
+            ),
+            deadline_origin + Duration::from_secs(1)
+        );
+        assert_eq!(
+            descriptor_observation_deadline(
+                deadline_origin,
+                deadline_origin + Duration::from_secs(60),
+            ),
+            deadline_origin + DESCRIPTOR_OBSERVATION_SETTLE_TIMEOUT
+        );
+
         let mut attempts = 0_usize;
         let value = retry_descriptor_observation(
             Instant::now() + TEST_DEADLINE,
-            || -> Result<u8, calcifer_unix_child_fd::ProcessGroupDescriptorScanError> {
+            |_| -> Result<u8, DescriptorObservationAttemptError> {
                 attempts += 1;
                 if attempts == 1 {
-                    Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged)
+                    Err(DescriptorObservationAttemptError::TransientDescriptorChanged)
                 } else {
                     Ok(7)
                 }
@@ -3973,10 +4053,10 @@ mod tests {
         let mut process_attempts = 0_usize;
         let process_race = retry_descriptor_observation(
             Instant::now() + TEST_DEADLINE,
-            || -> Result<u8, calcifer_unix_child_fd::ProcessGroupDescriptorScanError> {
+            |_| -> Result<u8, DescriptorObservationAttemptError> {
                 process_attempts += 1;
                 if process_attempts == 1 {
-                    Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged)
+                    Err(DescriptorObservationAttemptError::TransientProcessChanged)
                 } else {
                     Ok(9)
                 }
@@ -3985,26 +4065,41 @@ mod tests {
         assert_eq!(process_race, Ok(9));
         assert_eq!(process_attempts, 2);
 
-        let mut exhausted_attempts = 0_usize;
-        let exhausted = retry_descriptor_observation(
+        const PRIOR_FIXED_ATTEMPT_CAP: usize = 4;
+        let mut delayed_stability_attempts = 0_usize;
+        let delayed_stability = retry_descriptor_observation(
             Instant::now() + TEST_DEADLINE,
-            || -> Result<(), calcifer_unix_child_fd::ProcessGroupDescriptorScanError> {
-                exhausted_attempts += 1;
-                Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged)
+            |_| -> Result<u8, DescriptorObservationAttemptError> {
+                delayed_stability_attempts += 1;
+                if delayed_stability_attempts <= PRIOR_FIXED_ATTEMPT_CAP {
+                    Err(DescriptorObservationAttemptError::TransientProcessChanged)
+                } else {
+                    Ok(11)
+                }
+            },
+        );
+        assert_eq!(delayed_stability, Ok(11));
+        assert_eq!(delayed_stability_attempts, PRIOR_FIXED_ATTEMPT_CAP + 1);
+
+        let persistent_race = retry_descriptor_observation(
+            Instant::now() + Duration::from_millis(100),
+            |_| -> Result<(), DescriptorObservationAttemptError> {
+                Err(DescriptorObservationAttemptError::TransientDescriptorChanged)
             },
         );
         assert_eq!(
-            exhausted,
-            Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged)
+            persistent_race,
+            Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline)
         );
-        assert_eq!(exhausted_attempts, MAX_DESCRIPTOR_OBSERVATION_ATTEMPTS);
 
         let mut fail_closed_attempts = 0_usize;
         let forbidden = retry_descriptor_observation(
             Instant::now() + TEST_DEADLINE,
-            || -> Result<(), calcifer_unix_child_fd::ProcessGroupDescriptorScanError> {
+            |_| -> Result<(), DescriptorObservationAttemptError> {
                 fail_closed_attempts += 1;
-                Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor)
+                Err(DescriptorObservationAttemptError::Terminal(
+                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor,
+                ))
             },
         );
         assert_eq!(
@@ -4016,7 +4111,7 @@ mod tests {
         let mut expired_attempts = 0_usize;
         let expired = retry_descriptor_observation(
             Instant::now(),
-            || -> Result<(), calcifer_unix_child_fd::ProcessGroupDescriptorScanError> {
+            |_| -> Result<(), DescriptorObservationAttemptError> {
                 expired_attempts += 1;
                 Ok(())
             },
