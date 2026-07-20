@@ -10,10 +10,11 @@ use std::fs;
 #[cfg(feature = "internal-supervisor-fixture")]
 use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
-#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use rustix::fs::{
     AtFlags, Dir, FileType, Mode, OFlags, RawMode, RenameFlags, Stat, fstat, mkdirat, open, openat,
@@ -21,9 +22,16 @@ use rustix::fs::{
 };
 use uuid::Uuid;
 
+use super::process::{ChildAuthority, PinnedAppGracefulDrain};
+
 const RUNTIME_CREATE_ATTEMPTS: usize = 8;
 const RUNTIME_QUARANTINE_ATTEMPTS: usize = 8;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const APP_SOCKET_NAME: &str = "app.sock";
+const TUI_RELAY_SOCKET_NAME: &str = "tui.sock";
+const APP_SOCKET_QUARANTINE_PREFIX: &str = ".calcifer-app-socket-quarantine-";
+const APP_SOCKET_MODE: u32 = 0o600;
+const MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES: usize = 103;
 
 #[cfg(target_os = "linux")]
 fn stat_permission_mode(mode: RawMode) -> u32 {
@@ -100,6 +108,149 @@ impl NodeIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+}
+
+impl SocketIdentity {
+    fn private_socket_stat(stat: &Stat) -> Result<Self, AppSocketError> {
+        #[cfg(target_os = "macos")]
+        let device = u64::from(stat.st_dev as u32);
+        #[cfg(target_os = "linux")]
+        let device = stat.st_dev;
+
+        let identity = Self {
+            device,
+            inode: stat.st_ino,
+            uid: stat.st_uid,
+            mode: stat_permission_mode(stat.st_mode),
+        };
+        if FileType::from_raw_mode(stat.st_mode).is_socket()
+            && identity.uid == rustix::process::geteuid().as_raw()
+            && identity.mode == APP_SOCKET_MODE
+            && stat.st_nlink == 1
+        {
+            Ok(identity)
+        } else {
+            Err(AppSocketError::UnsafeNode)
+        }
+    }
+
+    fn matches_socket_stat(self, stat: &Stat) -> bool {
+        FileType::from_raw_mode(stat.st_mode).is_socket()
+            && stat.st_uid == rustix::process::geteuid().as_raw()
+            && stat_permission_mode(stat.st_mode) == APP_SOCKET_MODE
+            && Self::private_socket_stat_with_any_link_count(stat) == Some(self)
+    }
+
+    fn private_socket_stat_with_any_link_count(stat: &Stat) -> Option<Self> {
+        if !FileType::from_raw_mode(stat.st_mode).is_socket() {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        let device = u64::from(stat.st_dev as u32);
+        #[cfg(target_os = "linux")]
+        let device = stat.st_dev;
+        Some(Self {
+            device,
+            inode: stat.st_ino,
+            uid: stat.st_uid,
+            mode: stat_permission_mode(stat.st_mode),
+        })
+    }
+}
+
+/// Identity of the exact App socket vnode while its creator is still applying
+/// the final private mode. The mode itself is deliberately excluded: only a
+/// same-UID Unix socket with one link and no special permission bits may enter
+/// this state, and every later observation must retain this exact vnode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InitializingSocketIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+}
+
+impl InitializingSocketIdentity {
+    fn private_socket_candidate_stat(stat: &Stat) -> Result<Self, AppSocketError> {
+        #[cfg(target_os = "macos")]
+        let device = u64::from(stat.st_dev as u32);
+        #[cfg(target_os = "linux")]
+        let device = stat.st_dev;
+
+        let mode = stat_permission_mode(stat.st_mode);
+        if !FileType::from_raw_mode(stat.st_mode).is_socket()
+            || stat.st_uid != rustix::process::geteuid().as_raw()
+            || stat.st_nlink != 1
+            || mode & 0o7000 != 0
+        {
+            return Err(AppSocketError::UnsafeNode);
+        }
+        Ok(Self {
+            device,
+            inode: stat.st_ino,
+            uid: stat.st_uid,
+        })
+    }
+
+    fn matches_candidate_stat(self, stat: &Stat) -> bool {
+        stat.st_nlink == 1 && self.matches_socket_stat(stat)
+    }
+
+    fn matches_unlinked_stat(self, stat: &Stat) -> bool {
+        stat.st_nlink == 0 && self.matches_socket_stat(stat)
+    }
+
+    fn matches_socket_stat(self, stat: &Stat) -> bool {
+        #[cfg(target_os = "macos")]
+        let device = u64::from(stat.st_dev as u32);
+        #[cfg(target_os = "linux")]
+        let device = stat.st_dev;
+
+        FileType::from_raw_mode(stat.st_mode).is_socket()
+            && stat.st_uid == rustix::process::geteuid().as_raw()
+            && stat_permission_mode(stat.st_mode) & 0o7000 == 0
+            && device == self.device
+            && stat.st_ino == self.inode
+            && stat.st_uid == self.uid
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppSocketCleanupIdentity {
+    Ready(SocketIdentity),
+    Initializing(InitializingSocketIdentity),
+}
+
+impl AppSocketCleanupIdentity {
+    fn matches_named_stat(self, stat: &Stat) -> bool {
+        match self {
+            Self::Ready(identity) => SocketIdentity::private_socket_stat(stat) == Ok(identity),
+            Self::Initializing(identity) => identity.matches_candidate_stat(stat),
+        }
+    }
+
+    fn matches_unlinked_stat(self, stat: &Stat) -> bool {
+        match self {
+            Self::Ready(identity) => identity.matches_socket_stat(stat) && stat.st_nlink == 0,
+            Self::Initializing(identity) => identity.matches_unlinked_stat(stat),
+        }
+    }
+
+    const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+}
+
+struct InitializingAppSocket {
+    identity: InitializingSocketIdentity,
+    descriptor: Option<OwnedFd>,
+}
+
 /// A parent directory whose open inode, visible path, owner, mode, and ACL are
 /// bound together. All mutation authority below it uses `descriptor`, never
 /// the rendered path.
@@ -156,6 +307,14 @@ impl StableParent {
 
 fn directory_open_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
+}
+
+fn sync_runtime_parent(descriptor: &OwnedFd) -> Result<(), RuntimeError> {
+    rustix::fs::fsync(descriptor).map_err(|_| RuntimeError::Cleanup)
+}
+
+fn sync_app_socket_runtime(descriptor: &OwnedFd) -> Result<(), AppSocketError> {
+    rustix::fs::fsync(descriptor).map_err(|_| AppSocketError::Cleanup)
 }
 
 #[cfg(target_os = "macos")]
@@ -218,6 +377,17 @@ pub(super) struct PrivateRuntime {
 }
 
 impl PrivateRuntime {
+    /// Appends the stable parent and runtime-directory authorities to a
+    /// source-pinned child denyset. Raw descriptor identities never leave the
+    /// typed set.
+    fn append_forbidden_descriptors<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        forbidden.capture(self.parent.descriptor.as_fd())?;
+        forbidden.capture(self.directory.as_fd())
+    }
+
     /// Creates a new empty mode-0700 directory below an already-private parent.
     pub(super) fn create(parent: &Path) -> Result<Self, RuntimeCreateFailure> {
         Self::create_inner(parent, |_| Ok(()))
@@ -383,9 +553,88 @@ impl PrivateRuntime {
         &self.path
     }
 
+    /// Reserves the one fixed App Server socket node below this runtime.
+    ///
+    /// The reservation is a linear state transition: callers receive no API
+    /// that accepts a filename, and the runtime can no longer be cleaned while
+    /// the child may create `app.sock`.
+    #[cfg(test)]
+    pub(super) fn reserve_app_socket(
+        self,
+    ) -> Result<AppSocketReservation, AppSocketReserveFailure> {
+        let socket_path = self.path.join(APP_SOCKET_NAME);
+        let result = (|| {
+            validate_app_socket_path(&socket_path)?;
+            match self.checked_app_socket_state()? {
+                AppSocketEntryState::Absent => Ok(()),
+                AppSocketEntryState::Present => Err(AppSocketError::Collision),
+            }
+        })();
+
+        match result {
+            Ok(()) => Ok(AppSocketReservation {
+                runtime: Box::new(self),
+                socket_path,
+                initializing: None,
+                app_child_authority: None,
+            }),
+            Err(error) => Err(AppSocketReserveFailure {
+                runtime: Box::new(self),
+                error,
+            }),
+        }
+    }
+
+    /// Reserves the fixed App Server and exact-resume relay routes as one
+    /// owner-private layout.
+    ///
+    /// The App reservation remains the sole runtime owner. The relay route is
+    /// a sealed, non-owning capability whose downstream is always `tui.sock`
+    /// and whose upstream is the same layout's exact `app.sock`. Consumers
+    /// receive no parent-directory or arbitrary-filename constructor.
+    pub(super) fn reserve_supervised_layout(
+        self,
+    ) -> Result<SupervisedRuntimeLayout, AppSocketReserveFailure> {
+        let app_socket_path = self.path.join(APP_SOCKET_NAME);
+        let relay_socket_path = self.path.join(TUI_RELAY_SOCKET_NAME);
+        let result = (|| {
+            validate_app_socket_path(&app_socket_path)?;
+            validate_app_socket_path(&relay_socket_path)?;
+            match self.checked_app_socket_state()? {
+                AppSocketEntryState::Absent => {}
+                AppSocketEntryState::Present => return Err(AppSocketError::Collision),
+            }
+            let relay_address = relay_socket_path
+                .to_str()
+                .ok_or(AppSocketError::UnsafeRuntime)?
+                .to_owned();
+            Ok(relay_address)
+        })();
+
+        match result {
+            Ok(relay_address) => Ok(SupervisedRuntimeLayout {
+                app: AppSocketReservation {
+                    runtime: Box::new(self),
+                    socket_path: app_socket_path.clone(),
+                    initializing: None,
+                    app_child_authority: None,
+                },
+                relay: ExactRelayRoute {
+                    relay_socket_path,
+                    relay_address,
+                    upstream_socket_path: app_socket_path,
+                },
+            }),
+            Err(error) => Err(AppSocketReserveFailure {
+                runtime: Box::new(self),
+                error,
+            }),
+        }
+    }
+
     /// Removes only the still-empty directory with the exact recorded identity.
     pub(super) fn cleanup(self) -> Result<CleanRuntime, RuntimeCleanupFailure> {
-        self.cleanup_inner(|_| Ok(()))
+        self.cleanup_inner(|_| Ok(()), sync_runtime_parent)
     }
 
     #[cfg(test)]
@@ -396,20 +645,47 @@ impl PrivateRuntime {
     where
         F: FnMut(&Path) -> std::io::Result<()>,
     {
-        self.cleanup_inner(before_unlink)
+        self.cleanup_inner(before_unlink, sync_runtime_parent)
     }
 
-    fn cleanup_inner<F>(
+    #[cfg(test)]
+    fn cleanup_with_parent_sync_failure(
+        self,
+        fail_on_sync: usize,
+    ) -> Result<CleanRuntime, RuntimeCleanupFailure> {
+        let mut sync_count = 0_usize;
+        self.cleanup_inner(
+            |_| Ok(()),
+            move |_| {
+                sync_count += 1;
+                if sync_count == fail_on_sync {
+                    Err(RuntimeError::Cleanup)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+
+    fn cleanup_inner<F, S>(
         mut self,
         mut before_unlink: F,
+        mut sync_parent: S,
     ) -> Result<CleanRuntime, RuntimeCleanupFailure>
     where
         F: FnMut(&Path) -> std::io::Result<()>,
+        S: FnMut(&OwnedFd) -> Result<(), RuntimeError>,
     {
         let result = (|| {
+            if self.name.is_none() {
+                self.verify_removed_runtime()?;
+                sync_parent(&self.parent.descriptor)?;
+                self.parent.verify()?;
+                return self.verify_removed_runtime();
+            }
             self.verify_runtime_entry()?;
             self.verify_empty()?;
-            self.move_to_quarantine()?;
+            self.move_to_quarantine(&mut sync_parent)?;
             self.verify_runtime_entry()?;
             self.verify_empty()?;
             self.verify_runtime_entry()?;
@@ -453,6 +729,9 @@ impl PrivateRuntime {
             {
                 return Err(RuntimeError::IdentityMismatch);
             }
+            sync_parent(&self.parent.descriptor)?;
+            self.parent.verify()?;
+            self.verify_removed_runtime()?;
             Ok(())
         })();
 
@@ -484,6 +763,39 @@ impl PrivateRuntime {
         }
     }
 
+    fn verify_removed_runtime(&self) -> Result<(), RuntimeError> {
+        if self.name.is_some() {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        self.parent.verify()?;
+        let opened = fstat(&self.directory).map_err(|_| RuntimeError::IdentityMismatch)?;
+        if !self.identity.matches_private_stat(&opened) || !open_inode_acl_is_empty(&self.directory)
+        {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        let removed_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(RuntimeError::IdentityMismatch)?;
+        if !matches!(
+            statat(
+                &self.parent.descriptor,
+                removed_name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ),
+            Err(rustix::io::Errno::NOENT)
+        ) || !open_inode_was_unlinked(
+            &self.directory,
+            &opened,
+            opened.st_nlink as u64,
+            &self.path,
+        ) {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        self.parent.verify()
+    }
+
     fn verify_empty(&self) -> Result<(), RuntimeError> {
         let directory = Dir::read_from(&self.directory).map_err(|_| RuntimeError::Cleanup)?;
         for entry in directory {
@@ -496,7 +808,89 @@ impl PrivateRuntime {
         Ok(())
     }
 
-    fn move_to_quarantine(&mut self) -> Result<(), RuntimeError> {
+    fn checked_app_socket_state(&self) -> Result<AppSocketEntryState, AppSocketError> {
+        strict_app_socket_entry_state(self.observe_app_socket_entry()?)
+    }
+
+    /// Accepts only the monotonic absence-to-presence transition that the
+    /// exact bound App child is authorized to perform during its first bind.
+    /// Every later reservation, revalidation, and cleanup observation keeps
+    /// using the strict stable-state check above.
+    fn checked_app_socket_state_for_initial_bind(
+        &self,
+    ) -> Result<AppSocketEntryState, AppSocketError> {
+        initial_bind_app_socket_entry_state(self.observe_app_socket_entry()?)
+    }
+
+    fn observe_app_socket_entry(&self) -> Result<AppSocketEntryObservation, AppSocketError> {
+        self.verify_runtime_entry()
+            .map_err(AppSocketError::from_runtime)?;
+        let before = self.app_socket_entry_state()?;
+        let visible = match statat(&self.directory, APP_SOCKET_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => AppSocketEntryState::Present,
+            Err(rustix::io::Errno::NOENT) => AppSocketEntryState::Absent,
+            Err(_) => return Err(AppSocketError::IdentityMismatch),
+        };
+        self.verify_runtime_entry()
+            .map_err(AppSocketError::from_runtime)?;
+        let after = self.app_socket_entry_state()?;
+        classify_app_socket_entry_observation(before, visible, after)
+    }
+
+    fn app_socket_entry_state(&self) -> Result<AppSocketEntryState, AppSocketError> {
+        let directory =
+            Dir::read_from(&self.directory).map_err(|_| AppSocketError::IdentityMismatch)?;
+        let mut app_socket_present = false;
+        for entry in directory {
+            let entry = entry.map_err(|_| AppSocketError::IdentityMismatch)?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if name == APP_SOCKET_NAME.as_bytes() && !app_socket_present {
+                app_socket_present = true;
+            } else {
+                return Err(AppSocketError::UnknownEntry);
+            }
+        }
+        Ok(if app_socket_present {
+            AppSocketEntryState::Present
+        } else {
+            AppSocketEntryState::Absent
+        })
+    }
+
+    fn verify_only_generated_entry(&self, expected: &str) -> Result<(), AppSocketError> {
+        self.verify_runtime_entry()
+            .map_err(AppSocketError::from_runtime)?;
+        let directory =
+            Dir::read_from(&self.directory).map_err(|_| AppSocketError::IdentityMismatch)?;
+        let mut expected_present = false;
+        for entry in directory {
+            let entry = entry.map_err(|_| AppSocketError::IdentityMismatch)?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if name == expected.as_bytes() && !expected_present {
+                expected_present = true;
+            } else {
+                return Err(AppSocketError::UnknownEntry);
+            }
+        }
+        self.verify_runtime_entry()
+            .map_err(AppSocketError::from_runtime)?;
+        if expected_present {
+            Ok(())
+        } else {
+            Err(AppSocketError::IdentityMismatch)
+        }
+    }
+
+    fn move_to_quarantine<S>(&mut self, sync_parent: &mut S) -> Result<(), RuntimeError>
+    where
+        S: FnMut(&OwnedFd) -> Result<(), RuntimeError>,
+    {
         let Some(current_name) = self.name.clone() else {
             return Err(RuntimeError::IdentityMismatch);
         };
@@ -512,6 +906,8 @@ impl PrivateRuntime {
                 Ok(()) => {
                     self.path = self.parent.path.join(&quarantine_name);
                     self.name = Some(quarantine_name);
+                    sync_parent(&self.parent.descriptor)?;
+                    self.parent.verify()?;
                     return Ok(());
                 }
                 Err(rustix::io::Errno::EXIST) => {}
@@ -520,6 +916,1276 @@ impl PrivateRuntime {
             }
         }
         Err(RuntimeError::Cleanup)
+    }
+}
+
+/// One fixed runtime layout for an App Server plus exact-resume relay.
+#[must_use = "a supervised runtime layout must be split into its linear owners"]
+pub(super) struct SupervisedRuntimeLayout {
+    app: AppSocketReservation,
+    relay: ExactRelayRoute,
+}
+
+impl SupervisedRuntimeLayout {
+    pub(super) fn into_parts(self) -> (AppSocketReservation, ExactRelayRoute) {
+        (self.app, self.relay)
+    }
+}
+
+impl fmt::Debug for SupervisedRuntimeLayout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (&self.app, &self.relay);
+        formatter.write_str("SupervisedRuntimeLayout(<redacted>)")
+    }
+}
+
+/// Sealed exact route from fixed `tui.sock` to the same layout's `app.sock`.
+///
+/// This capability owns no runtime. The session aggregate must therefore stop
+/// and join the relay before cleaning the App reservation/runtime owner.
+#[must_use = "an exact relay route must be bound to one pinned provider session"]
+pub(super) struct ExactRelayRoute {
+    relay_socket_path: PathBuf,
+    relay_address: String,
+    upstream_socket_path: PathBuf,
+}
+
+impl ExactRelayRoute {
+    pub(super) fn relay_address(&self) -> &str {
+        &self.relay_address
+    }
+
+    #[cfg(feature = "internal-supervisor-fixture")]
+    pub(super) fn spawn_exact(
+        &self,
+        probe: crate::providers::codex::remote::ExactResumeProbe<'_>,
+        timeout: std::time::Duration,
+    ) -> Result<
+        crate::providers::codex::remote::ReadinessProxy,
+        Box<crate::providers::codex::remote::ReadinessProxyStartFailure>,
+    > {
+        crate::providers::codex::remote::ReadinessProxy::spawn_exact_owned(
+            &self.relay_socket_path,
+            &self.upstream_socket_path,
+            probe,
+            timeout,
+        )
+    }
+
+    #[cfg(test)]
+    fn paths_for_test(&self) -> (&Path, &Path) {
+        (&self.relay_socket_path, &self.upstream_socket_path)
+    }
+}
+
+impl fmt::Debug for ExactRelayRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (
+            &self.relay_socket_path,
+            &self.relay_address,
+            &self.upstream_socket_path,
+        );
+        formatter.write_str("ExactRelayRoute(<redacted>)")
+    }
+}
+
+fn validate_app_socket_path(path: &Path) -> Result<(), AppSocketError> {
+    if path.as_os_str().as_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
+        return Err(AppSocketError::PathTooLong);
+    }
+    if !path.is_absolute()
+        || path
+            .to_str()
+            .is_none_or(|path| path.chars().any(char::is_control))
+    {
+        return Err(AppSocketError::UnsafeRuntime);
+    }
+    Ok(())
+}
+
+/// Test-only fail-fast validation for a package harness runtime parent.
+///
+/// This intentionally reuses the production parent identity/ACL validation
+/// and the production portable socket-path bound. It does not mint a runtime
+/// owner or weaken either invariant.
+#[cfg(test)]
+pub(super) fn validate_packaged_runtime_parent(parent: &Path) -> Result<(), AppSocketError> {
+    let _stable_parent =
+        StableParent::open_private(parent).map_err(AppSocketError::from_runtime)?;
+    let runtime_name = format!(".calcifer-supervisor-{}", Uuid::nil());
+    for socket_name in [APP_SOCKET_NAME, TUI_RELAY_SOCKET_NAME] {
+        validate_app_socket_path(&parent.join(&runtime_name).join(socket_name))?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppSocketEntryState {
+    Absent,
+    Present,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppSocketEntryObservation {
+    Stable(AppSocketEntryState),
+    Appeared,
+}
+
+fn strict_app_socket_entry_state(
+    observation: AppSocketEntryObservation,
+) -> Result<AppSocketEntryState, AppSocketError> {
+    match observation {
+        AppSocketEntryObservation::Stable(state) => Ok(state),
+        AppSocketEntryObservation::Appeared => Err(AppSocketError::IdentityMismatch),
+    }
+}
+
+fn initial_bind_app_socket_entry_state(
+    observation: AppSocketEntryObservation,
+) -> Result<AppSocketEntryState, AppSocketError> {
+    match observation {
+        AppSocketEntryObservation::Stable(state) => Ok(state),
+        AppSocketEntryObservation::Appeared => Ok(AppSocketEntryState::Present),
+    }
+}
+
+fn classify_app_socket_entry_observation(
+    before: AppSocketEntryState,
+    visible: AppSocketEntryState,
+    after: AppSocketEntryState,
+) -> Result<AppSocketEntryObservation, AppSocketError> {
+    use AppSocketEntryObservation::{Appeared, Stable};
+    use AppSocketEntryState::{Absent, Present};
+
+    match (before, visible, after) {
+        (Absent, Absent, Absent) => Ok(Stable(Absent)),
+        (Present, Present, Present) => Ok(Stable(Present)),
+        (Absent, Absent, Present) | (Absent, Present, Present) => Ok(Appeared),
+        (Absent, Present, Absent)
+        | (Present, Absent, Absent)
+        | (Present, Absent, Present)
+        | (Present, Present, Absent) => Err(AppSocketError::IdentityMismatch),
+    }
+}
+
+/// Linear authority for the one fixed App Server socket pathname.
+///
+/// The reservation contains the runtime itself, so cleanup cannot race a
+/// child that has been authorized to bind the socket.
+#[must_use = "an App Server socket reservation must be adopted, released, or retained"]
+pub(super) struct AppSocketReservation {
+    runtime: Box<PrivateRuntime>,
+    socket_path: PathBuf,
+    initializing: Option<InitializingAppSocket>,
+    app_child_authority: Option<ChildAuthority>,
+}
+
+impl AppSocketReservation {
+    pub(super) fn path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    pub(super) fn bind_app_child(
+        &mut self,
+        authority: ChildAuthority,
+    ) -> Result<(), AppSocketError> {
+        match self.app_child_authority {
+            None => {
+                self.app_child_authority = Some(authority);
+                Ok(())
+            }
+            Some(existing) if existing == authority => Ok(()),
+            Some(_) => Err(AppSocketError::IdentityMismatch),
+        }
+    }
+
+    pub(super) const fn is_unbound_from_app_child(&self) -> bool {
+        self.app_child_authority.is_none()
+    }
+
+    /// Requires the exact managed App child bound at launch/adoption to be the
+    /// child represented by this move-only graceful-reap proof. This check is
+    /// mandatory before releasing even an apparently empty reservation: an
+    /// unrelated live child may still be about to bind its socket.
+    pub(super) fn require_matching_reaped_child(
+        self,
+        reaped_child: &PinnedAppGracefulDrain,
+    ) -> Result<Self, AppSocketReservationFailure> {
+        if self.app_child_authority == Some(reaped_child.child_authority()) {
+            Ok(self)
+        } else {
+            Err(AppSocketReservationFailure {
+                reservation: Box::new(self),
+                error: AppSocketError::IdentityMismatch,
+            })
+        }
+    }
+
+    /// Appends every persistent runtime descriptor retained by this
+    /// reservation to one source-pinned child denyset.
+    pub(super) fn append_forbidden_descriptors<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        self.runtime.append_forbidden_descriptors(forbidden)?;
+        if let Some(descriptor) = self
+            .initializing
+            .as_ref()
+            .and_then(|initializing| initializing.descriptor.as_ref())
+        {
+            forbidden.capture(descriptor.as_fd())?;
+        }
+        Ok(())
+    }
+
+    /// Adopts the socket only after comparing the visible node around every
+    /// runtime identity/ACL check and retaining the vnode where the OS permits.
+    ///
+    /// Linux uses `O_PATH`, which can retain a Unix-domain socket vnode without
+    /// opening its stream. Darwin rejects every safe `open(2)` probe for a Unix
+    /// socket with `EOPNOTSUPP`; on Darwin the owner is therefore a conservative
+    /// path observation below the retained private runtime descriptor. That
+    /// observation may prove absence, but never authorizes rename or unlink.
+    pub(super) fn adopt(mut self) -> Result<OwnedAppSocket, AppSocketReservationFailure> {
+        let captured = self.capture_identity();
+        match captured {
+            Ok((descriptor, identity)) => Ok(OwnedAppSocket {
+                runtime: Some(self.runtime),
+                descriptor,
+                identity: AppSocketCleanupIdentity::Ready(identity),
+                location: AppSocketLocation::Visible,
+                visible_path: self.socket_path,
+            }),
+            Err(error) => Err(AppSocketReservationFailure {
+                reservation: Box::new(self),
+                error,
+            }),
+        }
+    }
+
+    /// Claims the exact socket vnode for namespace cleanup after the caller
+    /// has proved that the exact direct App child completed its pinned
+    /// graceful-drain contract.
+    ///
+    /// This deliberately returns a cleanup-only capability. A pre-`chmod`
+    /// socket never becomes connectable, and a replacement or disappearance
+    /// returns the original reservation without mutating the namespace.
+    pub(super) fn claim_socket_for_cleanup_after_child_exit(
+        self,
+        reaped_child: &PinnedAppGracefulDrain,
+    ) -> Result<AppSocketCleanupAuthority, AppSocketReservationFailure> {
+        self.require_matching_reaped_child(reaped_child)?
+            .claim_socket_for_cleanup()
+    }
+
+    #[cfg(test)]
+    fn claim_socket_for_cleanup_for_test(
+        self,
+    ) -> Result<AppSocketCleanupAuthority, AppSocketReservationFailure> {
+        self.claim_socket_for_cleanup()
+    }
+
+    fn claim_socket_for_cleanup(
+        mut self,
+    ) -> Result<AppSocketCleanupAuthority, AppSocketReservationFailure> {
+        let captured = self.capture_cleanup_identity();
+        match captured {
+            Ok((descriptor, identity)) => Ok(AppSocketCleanupAuthority {
+                socket: Box::new(OwnedAppSocket {
+                    runtime: Some(self.runtime),
+                    descriptor,
+                    identity: AppSocketCleanupIdentity::Initializing(identity),
+                    location: AppSocketLocation::Visible,
+                    visible_path: self.socket_path,
+                }),
+            }),
+            Err(error) => Err(AppSocketReservationFailure {
+                reservation: Box::new(self),
+                error,
+            }),
+        }
+    }
+
+    /// Releases the reservation only when the fixed node is still absent and
+    /// the runtime identity, ACL, and directory contents remain unchanged.
+    pub(super) fn release_if_absent(self) -> Result<PrivateRuntime, AppSocketReservationFailure> {
+        let result = match self.runtime.checked_app_socket_state() {
+            Ok(AppSocketEntryState::Absent) => Ok(()),
+            Ok(AppSocketEntryState::Present) => Err(AppSocketError::SocketStillPresent),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => Ok(*self.runtime),
+            Err(error) => Err(AppSocketReservationFailure {
+                reservation: Box::new(self),
+                error,
+            }),
+        }
+    }
+
+    fn capture_identity(&mut self) -> Result<(Option<OwnedFd>, SocketIdentity), AppSocketError> {
+        let entry_state = if self.initializing.is_none() && self.app_child_authority.is_some() {
+            self.runtime.checked_app_socket_state_for_initial_bind()?
+        } else {
+            self.runtime.checked_app_socket_state()?
+        };
+        match entry_state {
+            AppSocketEntryState::Absent if self.initializing.is_some() => {
+                return Err(AppSocketError::IdentityMismatch);
+            }
+            AppSocketEntryState::Absent => return Err(AppSocketError::SocketNotReady),
+            AppSocketEntryState::Present => {}
+        }
+
+        let before = statat(
+            &self.runtime.directory,
+            APP_SOCKET_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| AppSocketError::IdentityMismatch)?;
+        let candidate = InitializingSocketIdentity::private_socket_candidate_stat(&before)?;
+        if self
+            .initializing
+            .as_ref()
+            .is_some_and(|initializing| initializing.identity != candidate)
+        {
+            return Err(AppSocketError::IdentityMismatch);
+        }
+
+        if stat_permission_mode(before.st_mode) != APP_SOCKET_MODE {
+            if self.initializing.is_none() {
+                let descriptor =
+                    capture_initializing_app_socket_descriptor(&self.runtime.directory, candidate)?;
+                let after = statat(
+                    &self.runtime.directory,
+                    APP_SOCKET_NAME,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .map_err(|_| AppSocketError::IdentityMismatch)?;
+                if !candidate.matches_candidate_stat(&after)
+                    || self.runtime.checked_app_socket_state()? != AppSocketEntryState::Present
+                {
+                    return Err(AppSocketError::IdentityMismatch);
+                }
+                if let Some(descriptor) = descriptor.as_ref() {
+                    let opened = fstat(descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+                    if !candidate.matches_candidate_stat(&opened) {
+                        return Err(AppSocketError::IdentityMismatch);
+                    }
+                }
+                self.initializing = Some(InitializingAppSocket {
+                    identity: candidate,
+                    descriptor,
+                });
+            } else {
+                let after = statat(
+                    &self.runtime.directory,
+                    APP_SOCKET_NAME,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .map_err(|_| AppSocketError::IdentityMismatch)?;
+                let initializing = self
+                    .initializing
+                    .as_ref()
+                    .ok_or(AppSocketError::IdentityMismatch)?;
+                if !initializing.identity.matches_candidate_stat(&after)
+                    || self.runtime.checked_app_socket_state()? != AppSocketEntryState::Present
+                {
+                    return Err(AppSocketError::IdentityMismatch);
+                }
+                if let Some(descriptor) = initializing.descriptor.as_ref() {
+                    let opened = fstat(descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+                    if !initializing.identity.matches_candidate_stat(&opened) {
+                        return Err(AppSocketError::IdentityMismatch);
+                    }
+                }
+            }
+            return Err(AppSocketError::SocketNotReady);
+        }
+
+        let identity = SocketIdentity::private_socket_stat(&before)?;
+        let descriptor = if self.initializing.is_none() {
+            capture_app_socket_descriptor(&self.runtime.directory, identity)?
+        } else {
+            None
+        };
+
+        let after = statat(
+            &self.runtime.directory,
+            APP_SOCKET_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| AppSocketError::IdentityMismatch)?;
+        if SocketIdentity::private_socket_stat(&after) != Ok(identity)
+            || self.runtime.checked_app_socket_state()? != AppSocketEntryState::Present
+        {
+            return Err(AppSocketError::IdentityMismatch);
+        }
+        let retained_descriptor = self
+            .initializing
+            .as_ref()
+            .and_then(|initializing| initializing.descriptor.as_ref())
+            .or(descriptor.as_ref());
+        if let Some(descriptor) = retained_descriptor {
+            let opened_after = fstat(descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+            if SocketIdentity::private_socket_stat(&opened_after) != Ok(identity) {
+                return Err(AppSocketError::IdentityMismatch);
+            }
+        }
+        let descriptor = match self.initializing.take() {
+            Some(initializing) => initializing.descriptor,
+            None => descriptor,
+        };
+        Ok((descriptor, identity))
+    }
+
+    fn capture_cleanup_identity(
+        &mut self,
+    ) -> Result<(Option<OwnedFd>, InitializingSocketIdentity), AppSocketError> {
+        match self.runtime.checked_app_socket_state()? {
+            AppSocketEntryState::Absent if self.initializing.is_some() => {
+                return Err(AppSocketError::IdentityMismatch);
+            }
+            AppSocketEntryState::Absent => return Err(AppSocketError::SocketNotReady),
+            AppSocketEntryState::Present => {}
+        }
+
+        let before = statat(
+            &self.runtime.directory,
+            APP_SOCKET_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| AppSocketError::IdentityMismatch)?;
+        let candidate = InitializingSocketIdentity::private_socket_candidate_stat(&before)?;
+        if self
+            .initializing
+            .as_ref()
+            .is_some_and(|initializing| initializing.identity != candidate)
+        {
+            return Err(AppSocketError::IdentityMismatch);
+        }
+
+        if self.initializing.is_none() {
+            let descriptor =
+                capture_initializing_app_socket_descriptor(&self.runtime.directory, candidate)?;
+            self.initializing = Some(InitializingAppSocket {
+                identity: candidate,
+                descriptor,
+            });
+        }
+
+        let after = statat(
+            &self.runtime.directory,
+            APP_SOCKET_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| AppSocketError::IdentityMismatch)?;
+        let initializing = self
+            .initializing
+            .as_ref()
+            .ok_or(AppSocketError::IdentityMismatch)?;
+        if !initializing.identity.matches_candidate_stat(&after)
+            || self.runtime.checked_app_socket_state()? != AppSocketEntryState::Present
+        {
+            return Err(AppSocketError::IdentityMismatch);
+        }
+        if let Some(descriptor) = initializing.descriptor.as_ref() {
+            let opened = fstat(descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+            if !initializing.identity.matches_candidate_stat(&opened) {
+                return Err(AppSocketError::IdentityMismatch);
+            }
+        }
+
+        let initializing = self
+            .initializing
+            .take()
+            .ok_or(AppSocketError::IdentityMismatch)?;
+        Ok((initializing.descriptor, initializing.identity))
+    }
+}
+
+impl fmt::Debug for AppSocketReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (
+            &self.runtime,
+            &self.socket_path,
+            &self.initializing,
+            self.app_child_authority,
+        );
+        formatter.write_str("AppSocketReservation(<redacted>)")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_app_socket_descriptor(
+    directory: impl AsFd,
+    identity: SocketIdentity,
+) -> Result<Option<OwnedFd>, AppSocketError> {
+    let descriptor = openat(
+        directory,
+        APP_SOCKET_NAME,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::NOENT {
+            AppSocketError::IdentityMismatch
+        } else {
+            AppSocketError::IdentityLeaseUnavailable
+        }
+    })?;
+    let opened = fstat(&descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+    if SocketIdentity::private_socket_stat(&opened) == Ok(identity) {
+        Ok(Some(descriptor))
+    } else {
+        Err(AppSocketError::IdentityMismatch)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_initializing_app_socket_descriptor(
+    directory: impl AsFd,
+    identity: InitializingSocketIdentity,
+) -> Result<Option<OwnedFd>, AppSocketError> {
+    let descriptor = openat(
+        directory,
+        APP_SOCKET_NAME,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::NOENT {
+            AppSocketError::IdentityMismatch
+        } else {
+            AppSocketError::IdentityLeaseUnavailable
+        }
+    })?;
+    let opened = fstat(&descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+    if identity.matches_candidate_stat(&opened) {
+        Ok(Some(descriptor))
+    } else {
+        Err(AppSocketError::IdentityMismatch)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_initializing_app_socket_descriptor(
+    _directory: impl AsFd,
+    _identity: InitializingSocketIdentity,
+) -> Result<Option<OwnedFd>, AppSocketError> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn capture_app_socket_descriptor(
+    _directory: impl AsFd,
+    _identity: SocketIdentity,
+) -> Result<Option<OwnedFd>, AppSocketError> {
+    // Darwin 25 returns EOPNOTSUPP for O_RDONLY | O_NONBLOCK | O_NOFOLLOW on a
+    // Unix socket. Do not pretend a descriptor exists; namespace cleanup stays
+    // non-destructive and descriptor-relative to the private runtime instead.
+    Ok(None)
+}
+
+#[derive(Clone)]
+enum AppSocketLocation {
+    Visible,
+    QuarantineCandidate(String),
+    Quarantined { name: String, durable: bool },
+    Removed(String),
+}
+
+/// A connectable private App socket. Linux retains its exact vnode through an
+/// `O_PATH` descriptor; Darwin uses repeated identity checks beneath the
+/// retained private runtime because it cannot safely open a Unix socket vnode.
+#[must_use = "an owned App Server socket must be exactly released or deliberately retained"]
+pub(super) struct OwnedAppSocket {
+    runtime: Option<Box<PrivateRuntime>>,
+    descriptor: Option<OwnedFd>,
+    identity: AppSocketCleanupIdentity,
+    location: AppSocketLocation,
+    visible_path: PathBuf,
+}
+
+impl OwnedAppSocket {
+    pub(super) fn visible_path(&self) -> &Path {
+        &self.visible_path
+    }
+
+    /// Appends the runtime namespace and, where the platform can safely retain
+    /// it, the exact socket vnode to one source-pinned child denyset.
+    pub(super) fn append_forbidden_descriptors<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        let runtime = self.runtime.as_deref().ok_or(
+            calcifer_unix_child_fd::CrossProcessDescriptorIdentityError::ObservationFailed,
+        )?;
+        runtime.append_forbidden_descriptors(forbidden)?;
+        if let Some(descriptor) = self.descriptor.as_ref() {
+            forbidden.capture(descriptor.as_fd())?;
+        }
+        Ok(())
+    }
+
+    /// Connects only through the exact identity-validated socket owned by
+    /// this value. Callers never receive a raw pathname with which they could
+    /// substitute another session's App Server.
+    pub(super) fn connect(&self, deadline: Instant) -> Result<UnixStream, AppSocketError> {
+        ensure_before_deadline(deadline)?;
+        if !self.identity.is_ready() {
+            return Err(AppSocketError::IdentityMismatch);
+        }
+        self.revalidate()?;
+        if !matches!(self.location, AppSocketLocation::Visible) {
+            return Err(AppSocketError::IdentityMismatch);
+        }
+        let stream =
+            UnixStream::connect(&self.visible_path).map_err(|_| AppSocketError::SocketNotReady)?;
+        ensure_before_deadline(deadline)?;
+        self.revalidate()?;
+        Ok(stream)
+    }
+
+    pub(super) fn revalidate(&self) -> Result<(), AppSocketError> {
+        let runtime = self
+            .runtime
+            .as_deref()
+            .ok_or(AppSocketError::IdentityMismatch)?;
+        match &self.location {
+            AppSocketLocation::Visible => {
+                if runtime.checked_app_socket_state()? != AppSocketEntryState::Present {
+                    return Err(AppSocketError::IdentityMismatch);
+                }
+                self.verify_named_identity(APP_SOCKET_NAME)
+            }
+            AppSocketLocation::Quarantined { name, .. } => {
+                runtime.verify_only_generated_entry(name)?;
+                self.verify_named_identity(name)
+            }
+            AppSocketLocation::QuarantineCandidate(_) | AppSocketLocation::Removed(_) => {
+                Err(AppSocketError::IdentityMismatch)
+            }
+        }
+    }
+
+    /// Releases an already-unlinked socket. A lingering exact socket is moved
+    /// to an unguessable same-directory quarantine, durably synced, revalidated,
+    /// and then removed. A collision or replacement is never unlinked.
+    ///
+    /// The deadline is checked before and after each multi-step transition.
+    /// Filesystem syscalls are not cancellable; an overrun therefore returns
+    /// retained ownership instead of a clean capability.
+    pub(super) fn cleanup(
+        self,
+        deadline: Instant,
+    ) -> Result<PrivateRuntime, AppSocketCleanupFailure> {
+        self.cleanup_inner(deadline, |_| Ok(()), sync_app_socket_runtime)
+    }
+
+    #[cfg(test)]
+    fn cleanup_with_before_final_revalidation<F>(
+        self,
+        deadline: Instant,
+        before_final_revalidation: F,
+    ) -> Result<PrivateRuntime, AppSocketCleanupFailure>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
+        self.cleanup_inner(deadline, before_final_revalidation, sync_app_socket_runtime)
+    }
+
+    #[cfg(test)]
+    fn cleanup_with_runtime_sync_failure(
+        self,
+        deadline: Instant,
+        fail_on_sync: usize,
+    ) -> Result<PrivateRuntime, AppSocketCleanupFailure> {
+        let mut sync_count = 0_usize;
+        self.cleanup_inner(
+            deadline,
+            |_| Ok(()),
+            move |_| {
+                sync_count += 1;
+                if sync_count == fail_on_sync {
+                    Err(AppSocketError::Cleanup)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+
+    fn cleanup_inner<F, S>(
+        mut self,
+        deadline: Instant,
+        mut before_final_revalidation: F,
+        mut sync_runtime: S,
+    ) -> Result<PrivateRuntime, AppSocketCleanupFailure>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+        S: FnMut(&OwnedFd) -> Result<(), AppSocketError>,
+    {
+        match self.try_release(deadline, &mut before_final_revalidation, &mut sync_runtime) {
+            Ok(()) => {
+                self.descriptor = None;
+                let runtime = self
+                    .runtime
+                    .take()
+                    .ok_or(AppSocketError::IdentityMismatch)
+                    .map_err(|error| AppSocketCleanupFailure {
+                        socket: AppSocketCleanupAuthority {
+                            socket: Box::new(self),
+                        },
+                        error,
+                    })?;
+                Ok(*runtime)
+            }
+            Err(error) => Err(AppSocketCleanupFailure {
+                socket: AppSocketCleanupAuthority {
+                    socket: Box::new(self),
+                },
+                error,
+            }),
+        }
+    }
+
+    fn try_release<F, S>(
+        &mut self,
+        deadline: Instant,
+        before_final_revalidation: &mut F,
+        sync_runtime: &mut S,
+    ) -> Result<(), AppSocketError>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+        S: FnMut(&OwnedFd) -> Result<(), AppSocketError>,
+    {
+        ensure_before_deadline(deadline)?;
+        match self.location.clone() {
+            AppSocketLocation::Visible => {
+                let runtime = self
+                    .runtime
+                    .as_deref()
+                    .ok_or(AppSocketError::IdentityMismatch)?;
+                match runtime.checked_app_socket_state()? {
+                    AppSocketEntryState::Absent => {
+                        self.verify_unlinked_identity(deadline, sync_runtime)
+                    }
+                    AppSocketEntryState::Present => {
+                        self.revalidate()?;
+                        self.move_visible_to_quarantine(
+                            deadline,
+                            before_final_revalidation,
+                            sync_runtime,
+                        )
+                    }
+                }
+            }
+            AppSocketLocation::QuarantineCandidate(name) => {
+                self.make_quarantine_durable(&name, deadline, sync_runtime)?;
+                self.remove_quarantined(&name, deadline, before_final_revalidation, sync_runtime)
+            }
+            AppSocketLocation::Quarantined { name, durable } => {
+                if !durable {
+                    self.make_quarantine_durable(&name, deadline, sync_runtime)?;
+                }
+                self.remove_quarantined(&name, deadline, before_final_revalidation, sync_runtime)
+            }
+            AppSocketLocation::Removed(_name) => {
+                self.verify_unlinked_identity(deadline, sync_runtime)
+            }
+        }
+    }
+
+    fn move_visible_to_quarantine<F, S>(
+        &mut self,
+        deadline: Instant,
+        before_final_revalidation: &mut F,
+        sync_runtime: &mut S,
+    ) -> Result<(), AppSocketError>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+        S: FnMut(&OwnedFd) -> Result<(), AppSocketError>,
+    {
+        for _ in 0..RUNTIME_QUARANTINE_ATTEMPTS {
+            ensure_before_deadline(deadline)?;
+            let quarantine_name = format!("{APP_SOCKET_QUARANTINE_PREFIX}{}", Uuid::new_v4());
+            let rename = {
+                let runtime = self
+                    .runtime
+                    .as_deref()
+                    .ok_or(AppSocketError::IdentityMismatch)?;
+                runtime
+                    .verify_runtime_entry()
+                    .map_err(AppSocketError::from_runtime)?;
+                renameat_with(
+                    &runtime.directory,
+                    APP_SOCKET_NAME,
+                    &runtime.directory,
+                    quarantine_name.as_str(),
+                    RenameFlags::NOREPLACE,
+                )
+            };
+            match rename {
+                Ok(()) => {
+                    // A rename is namespace-preserving. Until the moved node is
+                    // compared with the retained identity, the candidate name
+                    // carries no unlink authority.
+                    self.location = AppSocketLocation::QuarantineCandidate(quarantine_name.clone());
+                    self.make_quarantine_durable(&quarantine_name, deadline, sync_runtime)?;
+                    return self.remove_quarantined(
+                        &quarantine_name,
+                        deadline,
+                        before_final_revalidation,
+                        sync_runtime,
+                    );
+                }
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(rustix::io::Errno::NOENT) => {
+                    return self.verify_unlinked_identity(deadline, sync_runtime);
+                }
+                Err(_) => return Err(AppSocketError::Cleanup),
+            }
+        }
+        Err(AppSocketError::Cleanup)
+    }
+
+    fn make_quarantine_durable<S>(
+        &mut self,
+        name: &str,
+        deadline: Instant,
+        sync_runtime: &mut S,
+    ) -> Result<(), AppSocketError>
+    where
+        S: FnMut(&OwnedFd) -> Result<(), AppSocketError>,
+    {
+        if self.verify_quarantine_candidate(name).is_err() {
+            self.location = AppSocketLocation::QuarantineCandidate(name.to_owned());
+            return Err(AppSocketError::IdentityMismatch);
+        }
+        self.location = AppSocketLocation::Quarantined {
+            name: name.to_owned(),
+            durable: false,
+        };
+        ensure_before_deadline(deadline)?;
+        let runtime = self
+            .runtime
+            .as_deref()
+            .ok_or(AppSocketError::IdentityMismatch)?;
+        sync_runtime(&runtime.directory)?;
+        if self.verify_quarantine_candidate(name).is_err() {
+            self.location = AppSocketLocation::QuarantineCandidate(name.to_owned());
+            return Err(AppSocketError::IdentityMismatch);
+        }
+        self.location = AppSocketLocation::Quarantined {
+            name: name.to_owned(),
+            durable: true,
+        };
+        ensure_before_deadline(deadline)
+    }
+
+    fn remove_quarantined<F, S>(
+        &mut self,
+        name: &str,
+        deadline: Instant,
+        before_final_revalidation: &mut F,
+        sync_runtime: &mut S,
+    ) -> Result<(), AppSocketError>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+        S: FnMut(&OwnedFd) -> Result<(), AppSocketError>,
+    {
+        self.revalidate()?;
+        let quarantine_path = self
+            .runtime
+            .as_deref()
+            .ok_or(AppSocketError::IdentityMismatch)?
+            .path
+            .join(name);
+        before_final_revalidation(&quarantine_path).map_err(|_| AppSocketError::Cleanup)?;
+        ensure_before_deadline(deadline)?;
+        if self.revalidate().is_err() {
+            self.location = AppSocketLocation::QuarantineCandidate(name.to_owned());
+            return Err(AppSocketError::IdentityMismatch);
+        }
+
+        let unlink_result = {
+            let runtime = self
+                .runtime
+                .as_deref()
+                .ok_or(AppSocketError::IdentityMismatch)?;
+            unlinkat(&runtime.directory, name, AtFlags::empty())
+        };
+        match unlink_result {
+            Ok(()) => {
+                self.location = AppSocketLocation::Removed(name.to_owned());
+                self.verify_unlinked_identity(deadline, sync_runtime)
+            }
+            Err(_) => {
+                if self.verify_quarantine_candidate(name).is_err() {
+                    self.location = AppSocketLocation::QuarantineCandidate(name.to_owned());
+                    Err(AppSocketError::IdentityMismatch)
+                } else {
+                    Err(AppSocketError::Cleanup)
+                }
+            }
+        }
+    }
+
+    fn verify_quarantine_candidate(&self, name: &str) -> Result<(), AppSocketError> {
+        let runtime = self
+            .runtime
+            .as_deref()
+            .ok_or(AppSocketError::IdentityMismatch)?;
+        runtime.verify_only_generated_entry(name)?;
+        self.verify_named_identity(name)
+    }
+
+    fn verify_named_identity(&self, name: &str) -> Result<(), AppSocketError> {
+        let runtime = self
+            .runtime
+            .as_deref()
+            .ok_or(AppSocketError::IdentityMismatch)?;
+        runtime
+            .verify_runtime_entry()
+            .map_err(AppSocketError::from_runtime)?;
+        if let Some(descriptor) = self.descriptor.as_ref() {
+            let opened = fstat(descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+            if !self.identity.matches_named_stat(&opened) {
+                return Err(AppSocketError::IdentityMismatch);
+            }
+        }
+        let visible = statat(&runtime.directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| AppSocketError::IdentityMismatch)?;
+        if !self.identity.matches_named_stat(&visible) {
+            return Err(AppSocketError::IdentityMismatch);
+        }
+        runtime
+            .verify_runtime_entry()
+            .map_err(AppSocketError::from_runtime)?;
+        let visible_after = statat(&runtime.directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| AppSocketError::IdentityMismatch)?;
+        if !self.identity.matches_named_stat(&visible_after) {
+            return Err(AppSocketError::IdentityMismatch);
+        }
+        if let Some(descriptor) = self.descriptor.as_ref() {
+            let opened_after = fstat(descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+            if !self.identity.matches_named_stat(&opened_after) {
+                return Err(AppSocketError::IdentityMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_unlinked_identity<S>(
+        &self,
+        deadline: Instant,
+        sync_runtime: &mut S,
+    ) -> Result<(), AppSocketError>
+    where
+        S: FnMut(&OwnedFd) -> Result<(), AppSocketError>,
+    {
+        let runtime = self
+            .runtime
+            .as_deref()
+            .ok_or(AppSocketError::IdentityMismatch)?;
+        runtime
+            .verify_runtime_entry()
+            .map_err(AppSocketError::from_runtime)?;
+        runtime
+            .verify_empty()
+            .map_err(AppSocketError::from_runtime)?;
+        if let Some(descriptor) = self.descriptor.as_ref() {
+            let unlinked = fstat(descriptor).map_err(|_| AppSocketError::IdentityMismatch)?;
+            if !self.identity.matches_unlinked_stat(&unlinked) {
+                return Err(AppSocketError::IdentityMismatch);
+            }
+        }
+        ensure_before_deadline(deadline)?;
+        sync_runtime(&runtime.directory)?;
+        runtime
+            .verify_runtime_entry()
+            .map_err(AppSocketError::from_runtime)?;
+        runtime
+            .verify_empty()
+            .map_err(AppSocketError::from_runtime)?;
+        ensure_before_deadline(deadline)
+    }
+
+    #[cfg(test)]
+    fn runtime_path_for_test(&self) -> &Path {
+        self.runtime
+            .as_deref()
+            .map_or(Path::new(""), PrivateRuntime::path)
+    }
+
+    #[cfg(test)]
+    fn visible_path_for_test(&self) -> &Path {
+        &self.visible_path
+    }
+
+    #[cfg(test)]
+    fn quarantine_path_for_test(&self) -> Option<PathBuf> {
+        let name = match &self.location {
+            AppSocketLocation::QuarantineCandidate(name)
+            | AppSocketLocation::Quarantined { name, .. }
+            | AppSocketLocation::Removed(name) => name,
+            AppSocketLocation::Visible => return None,
+        };
+        self.runtime
+            .as_deref()
+            .map(|runtime| runtime.path.join(name))
+    }
+}
+
+impl Drop for OwnedAppSocket {
+    fn drop(&mut self) {
+        // Dropping authority is not authorization to mutate the namespace.
+        // Explicit deadline-bearing cleanup is the only cleanup transition.
+    }
+}
+
+impl fmt::Debug for OwnedAppSocket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (
+            &self.runtime,
+            &self.descriptor,
+            self.identity,
+            &self.location,
+            &self.visible_path,
+        );
+        formatter.write_str("OwnedAppSocket(<redacted>)")
+    }
+}
+
+/// Cleanup-only ownership for either a fully ready socket or the exact vnode
+/// observed during bind-before-chmod initialization. This type intentionally
+/// exposes no monitor connection transition.
+#[must_use = "App socket cleanup authority must be released or deliberately retained"]
+pub(super) struct AppSocketCleanupAuthority {
+    socket: Box<OwnedAppSocket>,
+}
+
+impl AppSocketCleanupAuthority {
+    pub(super) fn cleanup(
+        self,
+        deadline: Instant,
+    ) -> Result<PrivateRuntime, AppSocketCleanupFailure> {
+        (*self.socket).cleanup_inner(deadline, |_| Ok(()), sync_app_socket_runtime)
+    }
+
+    #[cfg(test)]
+    fn cleanup_with_before_final_revalidation<F>(
+        self,
+        deadline: Instant,
+        before_final_revalidation: F,
+    ) -> Result<PrivateRuntime, AppSocketCleanupFailure>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
+        (*self.socket).cleanup_inner(deadline, before_final_revalidation, sync_app_socket_runtime)
+    }
+
+    #[cfg(test)]
+    fn cleanup_with_runtime_sync_failure(
+        self,
+        deadline: Instant,
+        fail_on_sync: usize,
+    ) -> Result<PrivateRuntime, AppSocketCleanupFailure> {
+        let mut sync_count = 0_usize;
+        (*self.socket).cleanup_inner(
+            deadline,
+            |_| Ok(()),
+            move |_| {
+                sync_count += 1;
+                if sync_count == fail_on_sync {
+                    Err(AppSocketError::Cleanup)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn runtime_path_for_test(&self) -> &Path {
+        self.socket.runtime_path_for_test()
+    }
+
+    #[cfg(test)]
+    fn quarantine_path_for_test(&self) -> Option<PathBuf> {
+        self.socket.quarantine_path_for_test()
+    }
+}
+
+impl fmt::Debug for AppSocketCleanupAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = &self.socket;
+        formatter.write_str("AppSocketCleanupAuthority(<redacted>)")
+    }
+}
+
+/// Reservation failure before a runtime has transferred into socket state.
+#[must_use = "a failed reservation returns the private runtime ownership"]
+pub(super) struct AppSocketReserveFailure {
+    runtime: Box<PrivateRuntime>,
+    error: AppSocketError,
+}
+
+impl AppSocketReserveFailure {
+    #[cfg(test)]
+    pub(super) const fn error(&self) -> AppSocketError {
+        self.error
+    }
+
+    pub(super) fn into_runtime(self) -> PrivateRuntime {
+        *self.runtime
+    }
+}
+
+impl fmt::Debug for AppSocketReserveFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppSocketReserveFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for AppSocketReserveFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AppSocketReserveFailure {}
+
+/// Adoption/release failure that returns the exact reservation ownership.
+#[must_use = "a failed socket transition returns its reservation ownership"]
+pub(super) struct AppSocketReservationFailure {
+    reservation: Box<AppSocketReservation>,
+    error: AppSocketError,
+}
+
+impl AppSocketReservationFailure {
+    pub(super) const fn error(&self) -> AppSocketError {
+        self.error
+    }
+
+    pub(super) fn into_reservation(self) -> AppSocketReservation {
+        *self.reservation
+    }
+}
+
+impl fmt::Debug for AppSocketReservationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppSocketReservationFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for AppSocketReservationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AppSocketReservationFailure {}
+
+/// Cleanup failure that retains descriptor-backed ownership on Linux and the
+/// conservative private-runtime identity observation on Darwin.
+#[must_use = "failed socket cleanup returns ownership and must be retried or retained"]
+pub(super) struct AppSocketCleanupFailure {
+    socket: AppSocketCleanupAuthority,
+    error: AppSocketError,
+}
+
+impl AppSocketCleanupFailure {
+    pub(super) const fn error(&self) -> AppSocketError {
+        self.error
+    }
+
+    pub(super) fn into_socket(self) -> AppSocketCleanupAuthority {
+        self.socket
+    }
+}
+
+impl fmt::Debug for AppSocketCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppSocketCleanupFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for AppSocketCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AppSocketCleanupFailure {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AppSocketError {
+    UnsafeRuntime,
+    PathTooLong,
+    Collision,
+    UnknownEntry,
+    SocketNotReady,
+    UnsafeNode,
+    #[cfg(target_os = "linux")]
+    IdentityLeaseUnavailable,
+    IdentityMismatch,
+    SocketStillPresent,
+    AdoptionTimeout,
+    Timeout,
+    Cleanup,
+}
+
+impl AppSocketError {
+    const fn from_runtime(error: RuntimeError) -> Self {
+        match error {
+            RuntimeError::NotEmpty => Self::UnknownEntry,
+            RuntimeError::Cleanup => Self::Cleanup,
+            RuntimeError::UnsafeParent
+            | RuntimeError::Create
+            | RuntimeError::UnsafeIdentity
+            | RuntimeError::IdentityMismatch => Self::IdentityMismatch,
+        }
+    }
+}
+
+impl fmt::Display for AppSocketError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsafeRuntime => "App Server socket runtime is unsafe",
+            Self::PathTooLong => "App Server socket address exceeds the portable limit",
+            Self::Collision => "App Server socket reservation collided",
+            Self::UnknownEntry => "App Server socket runtime contains an unknown entry",
+            Self::SocketNotReady => "App Server socket is not ready",
+            Self::UnsafeNode => "App Server socket node is unsafe",
+            #[cfg(target_os = "linux")]
+            Self::IdentityLeaseUnavailable => "App Server socket identity cannot be retained",
+            Self::IdentityMismatch => "App Server socket identity changed",
+            Self::SocketStillPresent => "App Server socket remains present",
+            Self::AdoptionTimeout => "App Server socket adoption deadline elapsed",
+            Self::Timeout => "App Server socket cleanup deadline elapsed",
+            Self::Cleanup => "App Server socket cleanup failed",
+        })
+    }
+}
+
+impl std::error::Error for AppSocketError {}
+
+fn ensure_before_deadline(deadline: Instant) -> Result<(), AppSocketError> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(AppSocketError::Timeout)
     }
 }
 
@@ -786,6 +2452,7 @@ mod tests {
     use std::error::Error;
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     struct TestDirectory {
         path: PathBuf,
@@ -804,6 +2471,22 @@ mod tests {
                 path: fs::canonicalize(raw)?,
             })
         }
+
+        fn new_short() -> Result<Self, Box<dyn Error>> {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            // Keep this namespace disjoint from provider.rs's independently
+            // allocated short parents; both modules run in the same parallel
+            // libtest process and therefore share /tmp and the process id.
+            let raw = PathBuf::from("/tmp").join(format!(
+                "cf-r-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&raw)?;
+            Ok(Self {
+                path: fs::canonicalize(raw)?,
+            })
+        }
     }
 
     impl Drop for TestDirectory {
@@ -812,10 +2495,79 @@ mod tests {
         }
     }
 
+    fn socket_cleanup_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    #[test]
+    fn app_socket_entry_observation_accepts_only_stable_or_monotonic_creation() {
+        use AppSocketEntryObservation::{Appeared, Stable};
+        use AppSocketEntryState::{Absent, Present};
+
+        for (states, expected) in [
+            ((Absent, Absent, Absent), Ok(Stable(Absent))),
+            ((Present, Present, Present), Ok(Stable(Present))),
+            ((Absent, Absent, Present), Ok(Appeared)),
+            ((Absent, Present, Present), Ok(Appeared)),
+            (
+                (Absent, Present, Absent),
+                Err(AppSocketError::IdentityMismatch),
+            ),
+            (
+                (Present, Absent, Absent),
+                Err(AppSocketError::IdentityMismatch),
+            ),
+            (
+                (Present, Absent, Present),
+                Err(AppSocketError::IdentityMismatch),
+            ),
+            (
+                (Present, Present, Absent),
+                Err(AppSocketError::IdentityMismatch),
+            ),
+        ] {
+            assert_eq!(
+                classify_app_socket_entry_observation(states.0, states.1, states.2),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn app_socket_appearance_is_allowed_only_at_the_exact_initial_bind_boundary() {
+        assert_eq!(
+            strict_app_socket_entry_state(AppSocketEntryObservation::Appeared),
+            Err(AppSocketError::IdentityMismatch)
+        );
+        assert_eq!(
+            initial_bind_app_socket_entry_state(AppSocketEntryObservation::Appeared),
+            Ok(AppSocketEntryState::Present)
+        );
+        for state in [AppSocketEntryState::Absent, AppSocketEntryState::Present] {
+            let observation = AppSocketEntryObservation::Stable(state);
+            assert_eq!(strict_app_socket_entry_state(observation), Ok(state));
+            assert_eq!(initial_bind_app_socket_entry_state(observation), Ok(state));
+        }
+    }
+
     #[test]
     fn stat_permission_projection_is_platform_stable() {
         assert_eq!(stat_permission_mode(0o100600), 0o600);
         assert_eq!(stat_permission_mode(0o107777), 0o7777);
+    }
+
+    #[test]
+    fn portable_app_socket_path_limit_accepts_103_bytes_and_rejects_104() {
+        let exact = PathBuf::from(format!("/{}", "a".repeat(102)));
+        let over = PathBuf::from(format!("/{}", "a".repeat(103)));
+
+        assert_eq!(exact.as_os_str().as_bytes().len(), 103);
+        assert_eq!(validate_app_socket_path(&exact), Ok(()));
+        assert_eq!(over.as_os_str().as_bytes().len(), 104);
+        assert_eq!(
+            validate_app_socket_path(&over),
+            Err(AppSocketError::PathTooLong)
+        );
     }
 
     #[test]
@@ -913,6 +2665,50 @@ mod tests {
                 .is_some_and(|name| name.starts_with(".calcifer-cleanup-"))
         );
         let _runtime = failure.into_runtime();
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cleanup_retains_ownership_when_parent_sync_after_rename_fails()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+
+        let failure = runtime
+            .cleanup_with_parent_sync_failure(1)
+            .err()
+            .ok_or("the quarantine rename sync failure must retain ownership")?;
+        assert_eq!(failure.error(), RuntimeError::Cleanup);
+        let runtime = failure.into_runtime();
+        assert!(runtime.path().exists());
+        assert!(
+            runtime
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".calcifer-cleanup-"))
+        );
+
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cleanup_retains_removed_identity_when_parent_sync_after_remove_fails()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+
+        let failure = runtime
+            .cleanup_with_parent_sync_failure(2)
+            .err()
+            .ok_or("the remove sync failure must retain open-inode evidence")?;
+        assert_eq!(failure.error(), RuntimeError::Cleanup);
+        let runtime = failure.into_runtime();
+        assert!(!runtime.path().exists());
+        assert!(runtime.name.is_none());
+
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
         Ok(())
     }
 
@@ -1024,6 +2820,753 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn app_socket_reservation_has_one_fixed_portable_name() -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let runtime_path = runtime.path().to_path_buf();
+
+        let reservation = runtime.reserve_app_socket()?;
+        assert_eq!(
+            reservation
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("app.sock")
+        );
+        assert_eq!(reservation.path(), runtime_path.join("app.sock"));
+        assert!(reservation.path().as_os_str().as_bytes().len() <= 103);
+
+        let runtime = reservation.release_if_absent()?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn supervised_layout_seals_fixed_app_and_exact_relay_routes() -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let runtime_path = runtime.path().to_path_buf();
+
+        let layout = runtime.reserve_supervised_layout()?;
+        assert_eq!(format!("{layout:?}"), "SupervisedRuntimeLayout(<redacted>)");
+        let (app, relay) = layout.into_parts();
+        let (downstream, upstream) = relay.paths_for_test();
+        assert_eq!(app.path(), runtime_path.join("app.sock"));
+        assert_eq!(upstream, app.path());
+        assert_eq!(downstream, runtime_path.join("tui.sock"));
+        assert_ne!(downstream, upstream);
+        assert!(downstream.as_os_str().as_bytes().len() <= 103);
+        assert_eq!(format!("{relay:?}"), "ExactRelayRoute(<redacted>)");
+
+        let runtime = app.release_if_absent()?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn app_socket_reservation_rejects_an_overlong_path_and_returns_runtime()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new()?;
+        let long_parent = parent.path.join("x".repeat(110));
+        fs::DirBuilder::new().mode(0o700).create(&long_parent)?;
+        let long_parent = fs::canonicalize(long_parent)?;
+        let runtime = PrivateRuntime::create(&long_parent)?;
+        let runtime_path = runtime.path().to_path_buf();
+
+        let failure = runtime
+            .reserve_app_socket()
+            .err()
+            .ok_or("an overlong socket address must fail")?;
+        assert_eq!(failure.error(), AppSocketError::PathTooLong);
+        let runtime = failure.into_runtime();
+        assert_eq!(runtime.path(), runtime_path);
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn app_socket_reservation_rejects_a_collision_without_rendering_data()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let runtime_path = runtime.path().to_path_buf();
+        let socket_path = runtime_path.join("app.sock");
+        fs::write(&socket_path, b"secret-payload")?;
+
+        let failure = runtime
+            .reserve_app_socket()
+            .err()
+            .ok_or("a pre-existing node must fail reservation")?;
+        assert_eq!(failure.error(), AppSocketError::Collision);
+        let rendered = format!("{failure:?} {failure}");
+        assert!(!rendered.contains(runtime_path.to_string_lossy().as_ref()));
+        assert!(!rendered.contains("app.sock"));
+        assert!(!rendered.contains("secret-payload"));
+
+        let runtime = failure.into_runtime();
+        fs::remove_file(socket_path)?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn reservation_release_fails_closed_for_an_unknown_entry_and_returns_ownership()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let reservation = runtime.reserve_app_socket()?;
+        let runtime_path = reservation.runtime.path().to_path_buf();
+        fs::write(runtime_path.join("sensitive-node-name"), b"secret-payload")?;
+
+        let failure = reservation
+            .release_if_absent()
+            .err()
+            .ok_or("an unknown entry must prevent release")?;
+        assert_eq!(failure.error(), AppSocketError::UnknownEntry);
+        let rendered = format!("{failure:?} {failure}");
+        assert!(!rendered.contains(runtime_path.to_string_lossy().as_ref()));
+        assert!(!rendered.contains("sensitive-node-name"));
+        assert!(!rendered.contains("secret-payload"));
+
+        let reservation = failure.into_reservation();
+        fs::remove_file(runtime_path.join("sensitive-node-name"))?;
+        let runtime = reservation.release_if_absent()?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn app_socket_transition_rechecks_the_runtime_identity() -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let reservation = runtime.reserve_app_socket()?;
+        let runtime_path = reservation.runtime.path().to_path_buf();
+        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755))?;
+
+        let failure = reservation
+            .release_if_absent()
+            .err()
+            .ok_or("a changed runtime mode must fail closed")?;
+        assert_eq!(failure.error(), AppSocketError::IdentityMismatch);
+
+        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o700))?;
+        let runtime = failure.into_reservation().release_if_absent()?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn app_socket_adoption_rejects_a_file_symlink_and_unknown_entry() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::net::UnixListener;
+
+        for bad_node in ["file", "symlink", "unknown-entry"] {
+            let parent = TestDirectory::new_short()?;
+            let runtime = PrivateRuntime::create(&parent.path)?;
+            let reservation = runtime.reserve_app_socket()?;
+            let runtime_path = reservation.runtime.path().to_path_buf();
+            let socket_path = reservation.path().to_path_buf();
+            let mut listener = None;
+
+            match bad_node {
+                "file" => fs::write(&socket_path, b"not-a-socket")?,
+                "symlink" => std::os::unix::fs::symlink("target", &socket_path)?,
+                "unknown-entry" => {
+                    listener = Some(UnixListener::bind(&socket_path)?);
+                    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+                    fs::write(runtime_path.join("unknown"), b"secret-payload")?;
+                }
+                _ => return Err("unknown test case".into()),
+            }
+
+            let failure = reservation
+                .adopt()
+                .err()
+                .ok_or("unsafe socket adoption must fail")?;
+            let expected = if bad_node == "unknown-entry" {
+                AppSocketError::UnknownEntry
+            } else {
+                AppSocketError::UnsafeNode
+            };
+            assert_eq!(failure.error(), expected);
+            assert!(fs::symlink_metadata(&socket_path).is_ok());
+
+            let reservation = failure.into_reservation();
+            drop(listener);
+            fs::remove_file(&socket_path)?;
+            if bad_node == "unknown-entry" {
+                fs::remove_file(runtime_path.join("unknown"))?;
+            }
+            let runtime = reservation.release_if_absent()?;
+            let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn app_socket_initialization_never_accepts_a_replacement_vnode() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let reservation = runtime.reserve_app_socket()?;
+        let socket_path = reservation.path().to_path_buf();
+        let first = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o755))?;
+        let first_identity = fs::symlink_metadata(&socket_path)?;
+
+        let failure = reservation
+            .adopt()
+            .err()
+            .ok_or("a bind-before-chmod socket must remain pending")?;
+        assert_eq!(failure.error(), AppSocketError::SocketNotReady);
+        let reservation = failure.into_reservation();
+
+        // Keep the original listener open while replacing its unlinked name,
+        // making inode reuse impossible and exercising the exact-vnode guard.
+        fs::remove_file(&socket_path)?;
+        let second = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        let second_identity = fs::symlink_metadata(&socket_path)?;
+        assert_ne!(
+            (first_identity.dev(), first_identity.ino()),
+            (second_identity.dev(), second_identity.ino())
+        );
+
+        let failure = reservation
+            .adopt()
+            .err()
+            .ok_or("a replacement ready socket must not satisfy initialization")?;
+        assert_eq!(failure.error(), AppSocketError::IdentityMismatch);
+
+        let reservation = failure.into_reservation();
+        drop(second);
+        fs::remove_file(&socket_path)?;
+        drop(first);
+        let runtime = reservation.release_if_absent()?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn initializing_app_socket_retains_a_non_inheritable_exact_identity()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::net::UnixListener;
+
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let reservation = runtime.reserve_app_socket()?;
+        let socket_path = reservation.path().to_path_buf();
+        let listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o755))?;
+
+        let failure = reservation
+            .adopt()
+            .err()
+            .ok_or("a bind-before-chmod socket must remain pending")?;
+        assert_eq!(failure.error(), AppSocketError::SocketNotReady);
+        let reservation = failure.into_reservation();
+
+        #[cfg(target_os = "linux")]
+        {
+            let initializing = reservation
+                .initializing
+                .as_ref()
+                .ok_or("initialization must retain exact cleanup identity")?;
+            let descriptor = initializing
+                .descriptor
+                .as_ref()
+                .ok_or("Linux initialization must retain an O_PATH descriptor")?;
+            assert!(rustix::fs::fcntl_getfl(descriptor)?.contains(OFlags::PATH));
+            assert!(rustix::io::fcntl_getfd(descriptor)?.contains(rustix::io::FdFlags::CLOEXEC));
+            assert!(
+                initializing
+                    .identity
+                    .matches_candidate_stat(&fstat(descriptor)?)
+            );
+        }
+
+        drop(listener);
+        fs::remove_file(&socket_path)?;
+        let runtime = reservation.release_if_absent()?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    fn initializing_cleanup_authority(
+        parent: &TestDirectory,
+    ) -> Result<
+        (
+            std::os::unix::net::UnixListener,
+            PathBuf,
+            AppSocketCleanupAuthority,
+        ),
+        Box<dyn Error>,
+    > {
+        use std::os::unix::net::UnixListener;
+
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let reservation = runtime.reserve_app_socket()?;
+        let socket_path = reservation.path().to_path_buf();
+        let listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o755))?;
+        let failure = reservation
+            .adopt()
+            .err()
+            .ok_or("a bind-before-chmod socket must remain pending")?;
+        assert_eq!(failure.error(), AppSocketError::SocketNotReady);
+        let cleanup = failure
+            .into_reservation()
+            .claim_socket_for_cleanup_for_test()?;
+        Ok((listener, socket_path, cleanup))
+    }
+
+    #[test]
+    fn initializing_cleanup_deadline_and_fsync_failure_retain_retryable_authority()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let (listener, socket_path, cleanup) = initializing_cleanup_authority(&parent)?;
+        let runtime_path = cleanup.runtime_path_for_test().to_path_buf();
+        drop(listener);
+
+        let failure = cleanup
+            .cleanup(Instant::now())
+            .err()
+            .ok_or("expired initialization cleanup must retain authority")?;
+        assert_eq!(failure.error(), AppSocketError::Timeout);
+        assert!(socket_path.exists());
+        assert!(runtime_path.exists());
+
+        let failure = failure
+            .into_socket()
+            .cleanup_with_runtime_sync_failure(socket_cleanup_deadline(), 1)
+            .err()
+            .ok_or("initialization quarantine fsync failure must retain authority")?;
+        assert_eq!(failure.error(), AppSocketError::Cleanup);
+        let cleanup = failure.into_socket();
+        let quarantine = cleanup
+            .quarantine_path_for_test()
+            .ok_or("initialization quarantine identity must remain retained")?;
+        assert!(quarantine.exists());
+        assert!(!socket_path.exists());
+
+        let runtime = cleanup.cleanup(socket_cleanup_deadline())?;
+        assert!(!quarantine.exists());
+        assert_eq!(runtime.path(), runtime_path);
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn initializing_cleanup_never_unlinks_a_last_moment_replacement() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let parent = TestDirectory::new_short()?;
+        let (listener, socket_path, cleanup) = initializing_cleanup_authority(&parent)?;
+        let runtime_path = cleanup.runtime_path_for_test().to_path_buf();
+        let parked_original = parent.path.join("parked-initializing-original");
+        let mut replacement_inode = None;
+        drop(listener);
+
+        let failure = cleanup
+            .cleanup_with_before_final_revalidation(socket_cleanup_deadline(), |quarantine| {
+                fs::rename(quarantine, &parked_original)?;
+                fs::write(quarantine, b"replacement-must-survive")?;
+                fs::set_permissions(quarantine, fs::Permissions::from_mode(0o600))?;
+                replacement_inode = Some(fs::symlink_metadata(quarantine)?.ino());
+                Ok(())
+            })
+            .err()
+            .ok_or("a replacement must prevent initialization cleanup")?;
+
+        assert_eq!(failure.error(), AppSocketError::IdentityMismatch);
+        assert!(parked_original.exists());
+        let cleanup = failure.into_socket();
+        let quarantine = cleanup
+            .quarantine_path_for_test()
+            .ok_or("raced initialization quarantine must remain owned")?;
+        assert_eq!(
+            fs::symlink_metadata(&quarantine)?.ino(),
+            replacement_inode.ok_or("replacement was not created")?
+        );
+        assert_eq!(fs::read(&quarantine)?, b"replacement-must-survive");
+        assert!(!socket_path.exists());
+        assert!(runtime_path.exists());
+
+        drop(cleanup);
+        assert!(parked_original.exists());
+        assert!(quarantine.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn another_app_childs_reap_proof_cannot_authorize_initializing_cleanup()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::net::UnixListener;
+
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let mut reservation = runtime.reserve_app_socket()?;
+        let socket_path = reservation.path().to_path_buf();
+        let owning_child = ChildAuthority::for_test(41);
+        let other_child = ChildAuthority::for_test(42);
+        reservation.bind_app_child(owning_child)?;
+        let listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o755))?;
+        let failure = reservation
+            .adopt()
+            .err()
+            .ok_or("a bind-before-chmod socket must remain pending")?;
+        assert_eq!(failure.error(), AppSocketError::SocketNotReady);
+        let reservation = failure.into_reservation();
+
+        let unrelated_drain = PinnedAppGracefulDrain::for_child_authority_test(other_child);
+        let failure = reservation
+            .claim_socket_for_cleanup_after_child_exit(&unrelated_drain)
+            .err()
+            .ok_or("another App child's reap proof authorized cleanup")?;
+        assert_eq!(failure.error(), AppSocketError::IdentityMismatch);
+        assert!(socket_path.exists());
+
+        let owning_drain = PinnedAppGracefulDrain::for_child_authority_test(owning_child);
+        drop(listener);
+        let cleanup = failure
+            .into_reservation()
+            .claim_socket_for_cleanup_after_child_exit(&owning_drain)?;
+        let runtime = cleanup.cleanup(socket_cleanup_deadline())?;
+        assert!(!socket_path.exists());
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_adopts_by_private_runtime_observation_without_fabricating_a_vnode_descriptor()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::net::UnixListener;
+
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let reservation = runtime.reserve_app_socket()?;
+        let socket_path = reservation.path().to_path_buf();
+        let listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+
+        let socket = reservation.adopt()?;
+        assert!(socket.descriptor.is_none());
+        socket.revalidate()?;
+        assert!(socket_path.exists());
+
+        drop(listener);
+        fs::remove_file(&socket_path)?;
+        let runtime = socket.cleanup(socket_cleanup_deadline())?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    fn bind_adopted_socket(
+        runtime: PrivateRuntime,
+    ) -> Result<(std::os::unix::net::UnixListener, OwnedAppSocket), Box<dyn Error>> {
+        use std::os::unix::net::UnixListener;
+
+        let reservation = runtime.reserve_app_socket()?;
+        let listener = UnixListener::bind(reservation.path())?;
+        fs::set_permissions(reservation.path(), fs::Permissions::from_mode(0o600))?;
+        let socket = reservation.adopt()?;
+        Ok((listener, socket))
+    }
+
+    #[test]
+    fn owned_socket_drop_preserves_the_visible_node_and_runtime() -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (listener, socket) = bind_adopted_socket(runtime)?;
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        let socket_path = socket.visible_path_for_test().to_path_buf();
+
+        drop(socket);
+        assert!(runtime_path.exists());
+        assert!(socket_path.exists());
+        drop(listener);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_socket_cleanup_deadline_returns_ownership_without_mutation()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (listener, socket) = bind_adopted_socket(runtime)?;
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        let socket_path = socket.visible_path_for_test().to_path_buf();
+
+        let failure = socket
+            .cleanup(Instant::now())
+            .err()
+            .ok_or("an elapsed deadline must return socket ownership")?;
+        assert_eq!(failure.error(), AppSocketError::Timeout);
+        assert!(runtime_path.exists());
+        assert!(socket_path.exists());
+
+        let socket = failure.into_socket();
+        drop(listener);
+        fs::remove_file(socket_path)?;
+        let runtime = socket.cleanup(socket_cleanup_deadline())?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn socket_absence_sync_failure_returns_identity_ownership_for_retry()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (listener, socket) = bind_adopted_socket(runtime)?;
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        let socket_path = socket.visible_path_for_test().to_path_buf();
+        drop(listener);
+        fs::remove_file(socket_path)?;
+
+        let failure = socket
+            .cleanup_with_runtime_sync_failure(socket_cleanup_deadline(), 1)
+            .err()
+            .ok_or("an absence fsync failure must return socket ownership")?;
+        assert_eq!(failure.error(), AppSocketError::Cleanup);
+        assert!(runtime_path.exists());
+
+        let runtime = failure.into_socket().cleanup(socket_cleanup_deadline())?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn socket_quarantine_sync_failure_returns_exact_ownership_for_retry()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (listener, socket) = bind_adopted_socket(runtime)?;
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        drop(listener);
+
+        let failure = socket
+            .cleanup_with_runtime_sync_failure(socket_cleanup_deadline(), 1)
+            .err()
+            .ok_or("the quarantine fsync failure must return exact ownership")?;
+        assert_eq!(failure.error(), AppSocketError::Cleanup);
+        let socket = failure.into_socket();
+        let quarantine = socket
+            .quarantine_path_for_test()
+            .ok_or("the quarantine identity must be retained")?;
+        assert!(quarantine.exists());
+        assert!(!runtime_path.join(APP_SOCKET_NAME).exists());
+
+        let runtime = socket.cleanup(socket_cleanup_deadline())?;
+        assert!(!quarantine.exists());
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn socket_remove_sync_failure_returns_removed_identity_evidence_for_retry()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (listener, socket) = bind_adopted_socket(runtime)?;
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        drop(listener);
+
+        let failure = socket
+            .cleanup_with_runtime_sync_failure(socket_cleanup_deadline(), 2)
+            .err()
+            .ok_or("the socket unlink fsync failure must retain evidence")?;
+        assert_eq!(failure.error(), AppSocketError::Cleanup);
+        let socket = failure.into_socket();
+        let removed_path = socket
+            .quarantine_path_for_test()
+            .ok_or("the removed quarantine name must remain recorded")?;
+        assert!(!removed_path.exists());
+        assert!(!runtime_path.join(APP_SOCKET_NAME).exists());
+
+        let runtime = socket.cleanup(socket_cleanup_deadline())?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_adoption_retains_an_o_path_identity_and_revalidates_it() -> Result<(), Box<dyn Error>>
+    {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (listener, socket) = bind_adopted_socket(runtime)?;
+
+        assert!(
+            rustix::fs::fcntl_getfl(
+                socket
+                    .descriptor
+                    .as_ref()
+                    .ok_or("the Linux lease must retain a descriptor")?
+            )?
+            .contains(OFlags::PATH)
+        );
+        socket.revalidate()?;
+
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        let socket_path = socket.visible_path_for_test().to_path_buf();
+        drop(listener);
+        fs::remove_file(&socket_path)?;
+        let runtime = socket.cleanup(socket_cleanup_deadline())?;
+        assert_eq!(runtime.path(), runtime_path);
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_adoption_rejects_a_socket_with_an_extra_hard_link() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::net::UnixListener;
+
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let reservation = runtime.reserve_app_socket()?;
+        let socket_path = reservation.path().to_path_buf();
+        let listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        let extra_link = parent.path.join("extra-socket-link");
+        fs::hard_link(&socket_path, &extra_link)?;
+
+        let failure = reservation
+            .adopt()
+            .err()
+            .ok_or("a socket with st_nlink != 1 must fail closed")?;
+        assert_eq!(failure.error(), AppSocketError::UnsafeNode);
+        assert_eq!(fs::symlink_metadata(&socket_path)?.nlink(), 2);
+
+        let reservation = failure.into_reservation();
+        drop(listener);
+        fs::remove_file(extra_link)?;
+        fs::remove_file(socket_path)?;
+        let runtime = reservation.release_if_absent()?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn revalidation_rejects_replacement_without_mutating_either_socket()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::net::UnixListener;
+
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (original_listener, socket) = bind_adopted_socket(runtime)?;
+        let socket_path = socket.visible_path_for_test().to_path_buf();
+        let parked_original = parent.path.join("parked-original");
+        fs::rename(&socket_path, &parked_original)?;
+        let replacement_listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+
+        assert_eq!(socket.revalidate(), Err(AppSocketError::IdentityMismatch));
+        assert!(socket_path.exists());
+        assert!(parked_original.exists());
+
+        drop(original_listener);
+        drop(replacement_listener);
+        drop(socket);
+        assert!(socket_path.exists());
+        assert!(parked_original.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_removes_a_lingering_exact_socket_via_durable_quarantine()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (listener, socket) = bind_adopted_socket(runtime)?;
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        let visible_path = socket.visible_path_for_test().to_path_buf();
+
+        drop(listener);
+        let runtime = socket.cleanup(socket_cleanup_deadline())?;
+        assert!(!visible_path.exists());
+        assert_eq!(runtime.path(), runtime_path);
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[test]
+    fn last_race_replacement_is_never_renamed_unlinked_or_reported_clean()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (original_listener, socket) = bind_adopted_socket(runtime)?;
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        let parked_original = parent.path.join("parked-final-race-original");
+        let mut replacement_inode = None;
+
+        let failure = socket
+            .cleanup_with_before_final_revalidation(socket_cleanup_deadline(), |visible| {
+                fs::rename(visible, &parked_original)?;
+                fs::write(visible, b"replacement-must-survive")?;
+                fs::set_permissions(visible, fs::Permissions::from_mode(0o600))?;
+                replacement_inode = Some(fs::symlink_metadata(visible)?.ino());
+                Ok(())
+            })
+            .err()
+            .ok_or("a final replacement race must not report clean")?;
+
+        assert_eq!(failure.error(), AppSocketError::IdentityMismatch);
+        assert!(parked_original.exists());
+        let replacement_inode = replacement_inode.ok_or("replacement was not created")?;
+        let quarantine_path = failure
+            .socket
+            .quarantine_path_for_test()
+            .ok_or("the raced quarantine path must remain owned")?;
+        assert_eq!(
+            fs::symlink_metadata(&quarantine_path)?.ino(),
+            replacement_inode
+        );
+        assert_eq!(fs::read(&quarantine_path)?, b"replacement-must-survive");
+        assert!(!runtime_path.join(APP_SOCKET_NAME).exists());
+
+        drop(original_listener);
+        drop(failure);
+        assert!(parked_original.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_failure_drop_preserves_runtime_without_an_implicit_retry()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let (listener, socket) = bind_adopted_socket(runtime)?;
+        let runtime_path = socket.runtime_path_for_test().to_path_buf();
+        drop(listener);
+        let failure = socket
+            .cleanup_with_runtime_sync_failure(socket_cleanup_deadline(), 1)
+            .err()
+            .ok_or("a quarantine sync failure must return ownership")?;
+        assert_eq!(failure.error(), AppSocketError::Cleanup);
+        let quarantine_path = failure
+            .socket
+            .quarantine_path_for_test()
+            .ok_or("the exact quarantine must remain owned")?;
+        assert!(quarantine_path.exists());
+        assert!(!runtime_path.join(APP_SOCKET_NAME).exists());
+        let rendered = format!("{failure:?} {failure}");
+        assert!(!rendered.contains(runtime_path.to_string_lossy().as_ref()));
+        assert!(!rendered.contains("app.sock"));
+
+        drop(failure);
+        assert!(runtime_path.exists());
+        assert!(quarantine_path.exists());
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn creation_rejects_a_parent_with_extended_acl_without_creating_a_runtime()
@@ -1069,6 +3612,36 @@ mod tests {
         assert_eq!(failure.error(), RuntimeError::IdentityMismatch);
         let runtime = failure.into_runtime();
         calcifer_macos_acl::clear_acl(runtime.directory.as_fd())?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_socket_transition_rechecks_the_runtime_acl_through_its_open_inode()
+    -> Result<(), Box<dyn Error>> {
+        use exacl::{AclEntry, Perm};
+
+        let parent = TestDirectory::new_short()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let reservation = runtime.reserve_app_socket()?;
+        let current_uid = rustix::process::geteuid().as_raw();
+        let other_uid = if current_uid == 89 { "1" } else { "89" };
+        let acl = [AclEntry::allow_user(other_uid, Perm::READ, None)];
+        exacl::setfacl(
+            &[reservation.runtime.path()],
+            &acl,
+            Some(exacl::AclOption::SYMLINK_ACL),
+        )?;
+
+        let failure = reservation
+            .release_if_absent()
+            .err()
+            .ok_or("a changed runtime ACL must fail closed")?;
+        assert_eq!(failure.error(), AppSocketError::IdentityMismatch);
+        let reservation = failure.into_reservation();
+        calcifer_macos_acl::clear_acl(reservation.runtime.directory.as_fd())?;
+        let runtime = reservation.release_if_absent()?;
         let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
         Ok(())
     }

@@ -202,6 +202,7 @@ struct OuterPtyChild {
     kill_marker: PathBuf,
     retained_resolution_marker: Option<PathBuf>,
     failure_quiescence_release_marker: Option<PathBuf>,
+    entry_role: bool,
     master: File,
     master_closed: bool,
     capture: FixedPtyCapture,
@@ -211,6 +212,14 @@ struct OuterPtyChild {
 
 impl OuterPtyChild {
     fn spawn(fixture: &SupervisorCase, scenario: &str) -> TestResult<Self> {
+        Self::spawn_role(fixture, "terminal-anchor", scenario)
+    }
+
+    fn spawn_entry(fixture: &SupervisorCase, scenario: &str) -> TestResult<Self> {
+        Self::spawn_role(fixture, "entry-anchor", scenario)
+    }
+
+    fn spawn_role(fixture: &SupervisorCase, role: &str, scenario: &str) -> TestResult<Self> {
         let master =
             rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)?;
         rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
@@ -249,7 +258,7 @@ impl OuterPtyChild {
         let mut command = fixture.fixture_command();
         command
             .env("TERM", "xterm-256color")
-            .args(["terminal-anchor", scenario])
+            .args([role, scenario])
             .stdin(Stdio::from(slave))
             .stdout(Stdio::from(slave_stdout))
             .stderr(Stdio::from(slave_stderr));
@@ -279,6 +288,7 @@ impl OuterPtyChild {
                 "pty-tui-exit-before-gate" | "pty-resume-failure"
             )
             .then(|| fixture.markers.join("test.release-quiescence")),
+            entry_role: role == "entry-anchor",
             master,
             master_closed: false,
             capture: FixedPtyCapture::new(),
@@ -465,6 +475,22 @@ impl OuterPtyChild {
         write_private_release_marker_idempotent(&self.kill_marker).map_err(Into::into)
     }
 
+    fn signal_anchor(&self, signal: rustix::process::Signal) -> TestResult {
+        if self.reaped {
+            return Err(io::Error::other("outer PTY fixture was already reaped").into());
+        }
+        let child = self
+            .child
+            .as_ref()
+            .ok_or_else(|| io::Error::other("outer PTY child was already consumed"))?;
+        let pid = rustix::process::Pid::from_child(child);
+        if rustix::process::getpgid(Some(pid))? != pid {
+            return Err(io::Error::other("outer PTY anchor group identity changed").into());
+        }
+        rustix::process::kill_process_group(pid, signal)?;
+        Ok(())
+    }
+
     fn drain_until_closed(&mut self, timeout: Duration) -> TestResult {
         let deadline = deadline_after(timeout)?;
         loop {
@@ -501,6 +527,65 @@ impl OuterPtyChild {
                         termios_fingerprint(&self.original_termios),
                         termios_fingerprint(&current)
                     ),
+                )
+                .into());
+            }
+            sleep_until_next_poll(deadline);
+        }
+    }
+
+    fn wait_until_raw(&mut self, timeout: Duration) -> TestResult {
+        let deadline = deadline_after(timeout)?;
+        loop {
+            self.drain_once()?;
+            if !self.termios_matches_original()? {
+                return Ok(());
+            }
+            if let Some(status) = self.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "outer PTY entry fixture exited as {status} before raw mode"
+                ))
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "outer PTY entry fixture did not enter raw mode",
+                )
+                .into());
+            }
+            sleep_until_next_poll(deadline);
+        }
+    }
+
+    fn wait_until_anchor_stopped(&mut self, timeout: Duration) -> TestResult {
+        let deadline = deadline_after(timeout)?;
+        let child = self
+            .child
+            .as_ref()
+            .ok_or_else(|| io::Error::other("outer PTY child was already consumed"))?;
+        let pid = rustix::process::Pid::from_child(child);
+        loop {
+            let options = rustix::process::WaitIdOptions::STOPPED
+                | rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT;
+            match rustix::process::waitid(rustix::process::WaitId::Pid(pid), options) {
+                Ok(Some(status)) if status.stopped() => return Ok(()),
+                Ok(Some(status)) if status.exited() || status.killed() || status.dumped() => {
+                    return Err(io::Error::other(
+                        "entry anchor exited before the suspend handoff completed",
+                    )
+                    .into());
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "entry anchor did not stop after coordinator STOPPED",
                 )
                 .into());
             }
@@ -618,6 +703,13 @@ impl OuterPtyChild {
         if let Some(resolution) = &self.retained_resolution_marker {
             let _ = write_private_release_marker_idempotent(resolution);
         }
+        if self.entry_role {
+            signal_owned_process_group(child, rustix::process::Signal::TERM);
+            if wait_for_child(child, DROP_CLEANUP_TIMEOUT).is_ok() {
+                self.reaped = true;
+                return;
+            }
+        }
         let _ = write_private_release_marker_idempotent(&self.kill_marker);
         if wait_for_child(child, DROP_CLEANUP_TIMEOUT).is_ok() {
             self.reaped = true;
@@ -721,6 +813,7 @@ case "${1:-}" in
     printf '{"auth_mode":"chatgpt","tokens":{"account_id":"synthetic-%s-%s"}}\n' "$PPID" "$$" > "$CODEX_HOME/auth.json"
     ;;
   app-server)
+    trap 'exit 0' TERM
     IFS= read -r initialize
     case "$initialize" in
       *'"method":"initialize"'*'"experimentalApi":false'*) ;;
@@ -1190,11 +1283,6 @@ fn live_guardian_failures_reap_cleanly_and_release() -> TestResult {
     let _serial = serial_guard();
     let cases = [
         CleanFailureCase {
-            scenario: "app-early-exit",
-            app_started: true,
-            tui_started: false,
-        },
-        CleanFailureCase {
             scenario: "startup-timeout",
             app_started: true,
             tui_started: false,
@@ -1267,6 +1355,19 @@ fn stuck_descendant_is_force_contained_and_reported_failed() -> TestResult {
 fn untrusted_guardian_endings_retain_a_until_coordinator_exit() -> TestResult {
     let _serial = serial_guard();
     let cases = [
+        // A started App that exits before the one-shot graceful-drain edge
+        // cannot mint provider-release proof. The guardian therefore withholds
+        // completion; the coordinator eventually treats that lifecycle as
+        // untrusted and retains A plus the private runtime.
+        RetainedCase {
+            scenario: "app-early-exit",
+            worker_started: true,
+            app_started: true,
+            tui_started: false,
+            ready: false,
+            cleaned: None,
+            runtime: RetainedRuntime::Empty,
+        },
         RetainedCase {
             scenario: "cleanup-mismatch",
             worker_started: true,
@@ -1400,6 +1501,135 @@ fn coordinator_death_lets_guardian_finish_and_releases_os_authority() -> TestRes
 }
 
 #[test]
+fn production_entry_anchor_requires_exact_completion_and_preserves_exit_status() -> TestResult {
+    let _serial = serial_guard();
+    for (scenario, expected) in [("normal", Some(0)), ("nonzero", Some(42))] {
+        let fixture = SupervisorCase::new(&format!("entry-{scenario}"))?;
+        let mut anchor = OuterPtyChild::spawn_entry(&fixture, scenario)?;
+        let status = anchor.wait(PROCESS_TIMEOUT)?;
+        assert_status_code(status, expected)?;
+        anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+        anchor.assert_restored()?;
+        fixture.assert_provider_untouched()?;
+    }
+
+    for scenario in ["missing", "invalid", "trailing"] {
+        let fixture = SupervisorCase::new(&format!("entry-{scenario}"))?;
+        let mut anchor = OuterPtyChild::spawn_entry(&fixture, scenario)?;
+        anchor.wait_until_raw(PROCESS_TIMEOUT)?;
+        anchor.wait_until_restored(PROCESS_TIMEOUT)?;
+        if anchor.try_wait()?.is_some() {
+            return Err(io::Error::other(
+                "entry anchor returned without a verified completion frame and EOF",
+            )
+            .into());
+        }
+        anchor.assert_restored()?;
+        // The retained anchor is intentionally non-cooperative: test cleanup
+        // reaps only this exact direct child after the safety assertion.
+        anchor.force_kill_and_reap();
+        anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+        fixture.assert_provider_untouched()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn production_entry_anchor_hup_and_term_wait_for_completion_before_exit() -> TestResult {
+    use signal_hook::consts::signal::{SIGHUP, SIGTERM};
+
+    let _serial = serial_guard();
+    for (scenario, signal, expected) in [
+        ("hup", rustix::process::Signal::HUP, SIGHUP),
+        ("term", rustix::process::Signal::TERM, SIGTERM),
+    ] {
+        let fixture = SupervisorCase::new(&format!("entry-{scenario}"))?;
+        let mut anchor = OuterPtyChild::spawn_entry(&fixture, scenario)?;
+        anchor.wait_until_raw(PROCESS_TIMEOUT)?;
+        // Leave one bounded scheduling turn for the fixture coordinator to
+        // install its latch after the observed raw transition.
+        thread::sleep(Duration::from_millis(50));
+        anchor.signal_anchor(signal)?;
+        thread::sleep(Duration::from_millis(50));
+        if anchor.try_wait()?.is_some() {
+            return Err(io::Error::other(
+                "entry anchor exited on HUP/TERM before guardian completion",
+            )
+            .into());
+        }
+        let status = anchor.wait(PROCESS_TIMEOUT)?;
+        if status.signal() != Some(expected) {
+            return Err(io::Error::other(
+                "entry anchor flattened the exact post-cleanup signal disposition",
+            )
+            .into());
+        }
+        anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+        anchor.assert_restored()?;
+        fixture.assert_provider_untouched()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn production_entry_anchor_ignores_late_signals_after_exact_child_exit() -> TestResult {
+    let _serial = serial_guard();
+    for scenario in ["late-hup-after-exit", "late-term-after-exit"] {
+        let fixture = SupervisorCase::new(&format!("entry-{scenario}"))?;
+        let mut anchor = OuterPtyChild::spawn_entry(&fixture, scenario)?;
+        let status = anchor.wait(PROCESS_TIMEOUT)?;
+        assert_status_code(status, Some(42))?;
+        anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+        anchor.assert_restored()?;
+        fixture.assert_provider_untouched()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn production_entry_anchor_tstp_cont_handoff_restores_before_stop() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("entry-suspend-resume")?;
+    let mut anchor = OuterPtyChild::spawn_entry(&fixture, "suspend-resume")?;
+    anchor.wait_until_raw(PROCESS_TIMEOUT)?;
+    thread::sleep(Duration::from_millis(50));
+    anchor.signal_anchor(rustix::process::Signal::TSTP)?;
+    anchor.wait_until_anchor_stopped(PROCESS_TIMEOUT)?;
+    anchor.assert_restored()?;
+    anchor.signal_anchor(rustix::process::Signal::CONT)?;
+    let status = anchor.wait(PROCESS_TIMEOUT)?;
+    if !status.success() {
+        return Err(io::Error::other("entry anchor failed the TSTP/CONT handoff").into());
+    }
+    anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+    anchor.assert_restored()?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn production_entry_anchor_retains_while_guardian_completion_is_open() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("entry-retained")?;
+    let mut anchor = OuterPtyChild::spawn_entry(&fixture, "retained")?;
+    anchor.wait_until_raw(PROCESS_TIMEOUT)?;
+    thread::sleep(Duration::from_millis(150));
+    if anchor.try_wait()?.is_some() {
+        return Err(io::Error::other(
+            "entry anchor returned while the retained completion endpoint was open",
+        )
+        .into());
+    }
+    anchor.signal_anchor(rustix::process::Signal::TERM)?;
+    let status = anchor.wait(PROCESS_TIMEOUT)?;
+    assert_status_code(status, Some(1))?;
+    anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+    anchor.assert_restored()?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
 fn gated_pty_discards_pre_ready_input_and_restores_on_normal_exit() -> TestResult {
     let _serial = serial_guard();
     let fixture = SupervisorCase::new("pty-normal")?;
@@ -1458,6 +1688,68 @@ fn gated_pty_discards_pre_ready_input_and_restores_on_normal_exit() -> TestResul
     fixture.assert_no_runtime()?;
     fixture.wait_for_provider_contender(0, CONTENDER_TIMEOUT)?;
     fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn official_tui_launcher_claims_real_pty_execs_and_contains_pre_ready_failures() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("official-tui-launcher")?;
+
+    for case in ["success", "exec-failure", "early-exit"] {
+        let mut command = fixture.fixture_command();
+        command.args(["tui-launcher-harness", case]).env(
+            "CALCIFER_INTERNAL_TUI_FIXTURE_AMBIENT_CANARY",
+            "must-not-reach-exec-target",
+        );
+        let output =
+            BoundedChild::spawn(command, &fixture.captures, &format!("tui-launcher-{case}"))?
+                .wait(PROCESS_TIMEOUT)?;
+        if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+            return Err(io::Error::other(format!(
+                "sealed TUI launcher fixture {case} failed as {}",
+                output.status
+            ))
+            .into());
+        }
+    }
+
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn managed_app_and_wrapped_tui_receive_the_same_sealed_effective_environment() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("official-tui-environment")?;
+    let mut command = fixture.fixture_command();
+    command
+        .args(["tui-launcher-harness", "environment"])
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &fixture.sandbox)
+        .env("TERM", "xterm-256color")
+        .env("LANG", "C")
+        .env("XDG_CONFIG_HOME", fixture.sandbox.join("xdg-config"))
+        .env("XDG_DATA_HOME", fixture.sandbox.join("xdg-data"))
+        .env("XDG_CACHE_HOME", fixture.sandbox.join("xdg-cache"))
+        .env("XDG_RUNTIME_DIR", fixture.sandbox.join("xdg-run"))
+        .env("SAFE_AMBIENT_CONTEXT", "preserved")
+        .env(
+            "CALCIFER_PACKAGE_SUPERVISOR_ROLE",
+            "must-not-reach-provider",
+        )
+        .env("CALCIFER_CODEX_COMPAT_BINARY", "must-not-reach-provider")
+        .env("CaLcIfEr_FuTuRe_CoNtRoL", "must-not-reach-provider")
+        .env("OPENAI_API_KEY", "must-not-reach-provider");
+    let output = BoundedChild::spawn(command, &fixture.captures, "tui-launcher-environment")?
+        .wait(PROCESS_TIMEOUT)?;
+    if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err(io::Error::other(
+            "managed App and wrapped TUI effective environments differed",
+        )
+        .into());
+    }
     fixture.assert_provider_untouched()?;
     Ok(())
 }

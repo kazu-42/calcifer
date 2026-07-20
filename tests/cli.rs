@@ -2531,12 +2531,19 @@ config_file = "{sensitive_role_path}"
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if !barrier_ready.is_file() {
-            let _ =
-                signal_child_process_group(&untracked_spawn_parent, rustix::process::Signal::KILL);
-            let _ = untracked_spawn_parent.wait();
-            return Err(
-                std::io::Error::other("untracked guardian missed preflight barrier").into(),
-            );
+            if untracked_spawn_parent.try_wait()?.is_none() {
+                let _ = signal_child_process_group(
+                    &untracked_spawn_parent,
+                    rustix::process::Signal::KILL,
+                );
+            }
+            let output = untracked_spawn_parent.wait_with_output()?;
+            return Err(std::io::Error::other(format!(
+                "untracked guardian missed preflight barrier (status={:?}, stderr={})",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
         }
         std::fs::rename(&fake_codex, &fake_codex_backup)?;
         let release = std::fs::OpenOptions::new()

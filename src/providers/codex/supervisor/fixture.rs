@@ -26,16 +26,17 @@ use super::channel::{
     spawn_guardian_with_lifecycle_stdin,
 };
 use super::process::{
-    ChildLiveness, ForwardedTuiSignal, InteractiveTerminalSignal, ManagedGroupChild,
-    ReapedChildren, SpawnFailureState, TerminalShutdownSignal, UnreapedChildren, shutdown_pair,
-    shutdown_pair_after_forwarded_tui_signal,
+    ChildLiveness, ForwardedTuiSignal, InheritedTuiReadiness, InteractiveTerminalSignal,
+    ManagedGroupChild, ReapedChildren, SpawnFailureState, TerminalShutdownSignal,
+    TuiReadinessReceiver, UnreapedChildren, VerifiedTuiReadiness, shutdown_fixture_pair,
+    shutdown_fixture_pair_after_forwarded_tui_signal, tui_readiness_pair,
 };
 use super::protocol::{
     ChildDisposition, ChildRole, CleanupStatus, CoordinatorCommand, CoordinatorReceiver,
-    FailureCode, GuardianCommandReceiver, GuardianEvent, Phase, ProtocolError, SessionStatus,
-    StopAction, UnixSignal, WorkerJoinStatus, send_coordinator_command,
-    send_fixture_malformed_guardian_frame, send_fixture_trailing_terminal_armed,
-    send_guardian_event,
+    FailureCode, GuardianCommandReceiver, GuardianEvent, GuardianExitDisposition, Phase,
+    ProtocolError, SessionStatus, StopAction, UnixSignal, WorkerJoinStatus,
+    send_coordinator_command, send_fixture_malformed_guardian_frame,
+    send_fixture_trailing_terminal_armed, send_guardian_event,
 };
 use super::runtime::{PrivateRuntime, RuntimeCleanupFailure, RuntimeCreateFailure};
 use super::transfer::TransferChannelPair;
@@ -295,12 +296,39 @@ pub(crate) fn run_internal_fixture(arguments: impl IntoIterator<Item = OsString>
 }
 
 fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<ExitCode, FixtureError> {
+    if super::launcher::fixture_target_requested() {
+        return super::launcher::run_fixture_target(arguments).map_err(|_| FixtureError::Process);
+    }
     let mut arguments = arguments.into_iter();
     let _program = arguments.next().ok_or(FixtureError::Arguments)?;
     let role = arguments
         .next()
         .and_then(|value| value.into_string().ok())
         .ok_or(FixtureError::Arguments)?;
+    if role == "tui-launcher-harness" {
+        let case = arguments
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or(FixtureError::Arguments)?;
+        if arguments.next().is_some() {
+            return Err(FixtureError::Arguments);
+        }
+        return super::launcher::run_fixture_harness(&case).map_err(|_| FixtureError::Process);
+    }
+    if role == "entry-anchor" || role == "entry-coordinator" {
+        let scenario = arguments
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or(FixtureError::Arguments)?;
+        if arguments.next().is_some() {
+            return Err(FixtureError::Arguments);
+        }
+        return Ok(if role == "entry-anchor" {
+            super::entry::run_entry_anchor_fixture(&scenario)
+        } else {
+            super::entry::run_entry_coordinator_fixture(&scenario)
+        });
+    }
     let (role, scenario) = match role.as_str() {
         "terminal-anchor" | "coordinator" | "guardian" => {
             let scenario = arguments
@@ -599,11 +627,20 @@ fn run_fake_child(role: ChildRole) -> Result<ExitCode, FixtureError> {
         return Ok(ExitCode::from(31));
     }
     if scenario == Scenario::StartupTimeout && role == ChildRole::AppServer {
-        return exec_shell("exec >/dev/null; while IFS= read -r _; do :; done");
+        return exec_shell("trap 'exit 0' TERM; exec >/dev/null; while IFS= read -r _; do :; done");
     }
     if scenario == Scenario::StuckDescendant && role == ChildRole::Tui {
         return exec_shell(
             "trap '' TERM; /bin/sh -c 'trap \"\" TERM; while :; do /bin/sleep 1; done' >/dev/null 2>&1 & printf '%s\\n' \"$!\" > \"$CALCIFER_SUPERVISOR_FIXTURE_DESCENDANT_MARKER\"; printf R; exec >/dev/null; wait",
+        );
+    }
+    if role == ChildRole::AppServer {
+        // The pinned production App contract treats exactly one TERM followed
+        // by exit 0 as graceful drain evidence. Keep the synthetic App faithful
+        // to that contract; abnormal fixture scenarios still exit above before
+        // installing this handler and therefore cannot mint the proof.
+        return exec_shell(
+            "trap 'exit 0' TERM; printf R; exec >/dev/null; while IFS= read -r _; do :; done",
         );
     }
     exec_shell("printf R; exec >/dev/null; while IFS= read -r _; do :; done")
@@ -1705,7 +1742,7 @@ fn finish_guardian(
         }
     }
 
-    let shutdown = match shutdown_pair(tui, app, SHUTDOWN_GRACE, SHUTDOWN_FORCE) {
+    let shutdown = match shutdown_fixture_pair(tui, app, SHUTDOWN_GRACE, SHUTDOWN_FORCE) {
         Ok(outcome) => outcome,
         Err(mut unreaped) => {
             let _ = &provider_lease;
@@ -1797,6 +1834,11 @@ fn finish_guardian(
             worker: worker_status,
             cleanup: CleanupStatus::Complete,
             session,
+            guardian_exit: if session == SessionStatus::Completed {
+                GuardianExitDisposition::Code(0)
+            } else {
+                GuardianExitDisposition::InternalFailure
+            },
         },
         phase_deadline(),
     )

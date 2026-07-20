@@ -4,19 +4,20 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+
+use super::json::decode_unique_json;
 
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -34,6 +35,7 @@ const MAX_FRAME_BUFFER_BYTES: usize = MAX_MESSAGE_BYTES + 14;
 const COPY_BUFFER_BYTES: usize = 8 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 32;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 const RELAY_RUNNING: u8 = 0;
 const RELAY_DISCONNECTED: u8 = 1;
@@ -57,6 +59,17 @@ pub(super) enum ReadinessProxyError {
     Transport,
     Worker,
     Cleanup,
+}
+
+enum ProxyRunError {
+    Stopped,
+    Failed(ReadinessProxyError),
+}
+
+impl From<ReadinessProxyError> for ProxyRunError {
+    fn from(error: ReadinessProxyError) -> Self {
+        Self::Failed(error)
+    }
 }
 
 impl fmt::Display for ReadinessProxyError {
@@ -91,6 +104,7 @@ impl std::error::Error for ReadinessProxyError {}
 /// this value alive for the remote TUI's lifetime and call `shutdown` to join
 /// both copy pumps and verify socket cleanup.
 pub(super) struct ReadinessProxy {
+    observer: UnixListener,
     socket_path: PathBuf,
     socket_identity: SocketIdentity,
     readiness: Receiver<Result<EffectiveThreadSettings, ReadinessProxyError>>,
@@ -98,7 +112,109 @@ pub(super) struct ReadinessProxy {
     lifecycle: Arc<AtomicU8>,
     health: Arc<Mutex<Option<RelayHealth>>>,
     worker: Option<JoinHandle<Result<(), ReadinessProxyError>>>,
+    joined_result: Option<Result<(), ReadinessProxyError>>,
+    cleanup_complete: bool,
     deadline: Instant,
+    shutdown_error: Option<ReadinessProxyError>,
+}
+
+struct BoundReadinessStartSocket {
+    listener: UnixListener,
+    path: PathBuf,
+    identity: Option<SocketIdentity>,
+}
+
+/// Failed exact-relay startup with every socket cleanup authority retained.
+///
+/// An existing collision produces no bound owner. Once bind succeeds, the
+/// listener remains open in this failure and a recorded pathname identity is
+/// required before cleanup may unlink anything. An unidentified or replaced
+/// pathname is preserved and returned for explicit recovery.
+#[must_use = "a readiness start failure can retain an exact bound socket"]
+pub(super) struct ReadinessProxyStartFailure {
+    error: ReadinessProxyError,
+    cleanup_error: Option<ReadinessProxyError>,
+    bound: Option<BoundReadinessStartSocket>,
+}
+
+impl ReadinessProxyStartFailure {
+    fn unbound(error: ReadinessProxyError) -> Box<Self> {
+        Box::new(Self {
+            error,
+            cleanup_error: None,
+            bound: None,
+        })
+    }
+
+    fn bound(error: ReadinessProxyError, bound: BoundReadinessStartSocket) -> Box<Self> {
+        Box::new(Self {
+            error,
+            cleanup_error: None,
+            bound: Some(bound),
+        })
+    }
+
+    pub(super) const fn error(&self) -> ReadinessProxyError {
+        self.error
+    }
+
+    #[cfg(test)]
+    pub(super) const fn cleanup_error(&self) -> Option<ReadinessProxyError> {
+        self.cleanup_error
+    }
+
+    pub(super) const fn has_bound_socket(&self) -> bool {
+        self.bound.is_some()
+    }
+
+    pub(super) fn cleanup(mut self: Box<Self>) -> Result<ReadinessProxyStartCleanup, Box<Self>> {
+        let Some(bound) = self.bound.as_ref() else {
+            return Ok(ReadinessProxyStartCleanup { _private: () });
+        };
+        let Some(identity) = bound.identity else {
+            self.cleanup_error = Some(ReadinessProxyError::Cleanup);
+            return Err(self);
+        };
+        match remove_owned_socket_inner(&bound.path, identity, false) {
+            Ok(()) => {
+                drop(self.bound.take());
+                Ok(ReadinessProxyStartCleanup { _private: () })
+            }
+            Err(error) => {
+                self.cleanup_error = Some(error);
+                Err(self)
+            }
+        }
+    }
+}
+
+impl fmt::Debug for ReadinessProxyStartFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadinessProxyStartFailure")
+            .field("error", &self.error)
+            .field("cleanup_error", &self.cleanup_error)
+            .field("bound_socket_retained", &self.bound.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for ReadinessProxyStartFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ReadinessProxyStartFailure {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReadinessProxyStartCleanup {
+    _private: (),
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_EXACT_START_AFTER_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[derive(Clone)]
@@ -217,6 +333,11 @@ impl ReadinessExpectation {
 }
 
 impl ReadinessProxy {
+    #[cfg(test)]
+    pub(super) fn fail_next_exact_start_after_bind_for_test() {
+        FAIL_EXACT_START_AFTER_BIND.with(|fault| fault.set(true));
+    }
+
     pub(super) fn spawn(
         socket_path: &Path,
         upstream_path: &Path,
@@ -252,6 +373,153 @@ impl ReadinessProxy {
     ) -> Result<Self, ReadinessProxyError> {
         let expectation = ReadinessExpectation::exact_resume(probe.target_thread_id, probe.cwd)?;
         Self::spawn_with_expectation(socket_path, upstream_path, expectation, timeout)
+    }
+
+    /// Starts an exact-resume relay without discarding post-bind cleanup
+    /// authority on any failure edge.
+    pub(super) fn spawn_exact_owned(
+        socket_path: &Path,
+        upstream_path: &Path,
+        probe: ExactResumeProbe<'_>,
+        timeout: Duration,
+    ) -> Result<Self, Box<ReadinessProxyStartFailure>> {
+        let expectation = ReadinessExpectation::exact_resume(probe.target_thread_id, probe.cwd)
+            .map_err(ReadinessProxyStartFailure::unbound)?;
+        Self::spawn_with_expectation_owned(socket_path, upstream_path, expectation, timeout)
+    }
+
+    fn spawn_with_expectation_owned(
+        socket_path: &Path,
+        upstream_path: &Path,
+        expectation: ReadinessExpectation,
+        timeout: Duration,
+    ) -> Result<Self, Box<ReadinessProxyStartFailure>> {
+        if socket_path == upstream_path || timeout.is_zero() {
+            return Err(ReadinessProxyStartFailure::unbound(
+                ReadinessProxyError::InvalidArgument,
+            ));
+        }
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            ReadinessProxyStartFailure::unbound(ReadinessProxyError::InvalidArgument)
+        })?;
+        verify_private_socket_parent(socket_path).map_err(ReadinessProxyStartFailure::unbound)?;
+        let listener = UnixListener::bind(socket_path)
+            .map_err(|_| ReadinessProxyStartFailure::unbound(ReadinessProxyError::Bind))?;
+        let mut bound = BoundReadinessStartSocket {
+            listener,
+            path: socket_path.to_owned(),
+            identity: None,
+        };
+        if bound
+            .listener
+            .local_addr()
+            .ok()
+            .and_then(|address| address.as_pathname().map(Path::to_owned))
+            .as_deref()
+            != Some(socket_path)
+        {
+            return Err(ReadinessProxyStartFailure::bound(
+                ReadinessProxyError::Bind,
+                bound,
+            ));
+        }
+        let identity = match raw_socket_identity(socket_path) {
+            Ok(identity) => identity,
+            Err(error) => return Err(ReadinessProxyStartFailure::bound(error, bound)),
+        };
+        bound.identity = Some(identity);
+        if fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).is_err() {
+            return Err(ReadinessProxyStartFailure::bound(
+                ReadinessProxyError::Bind,
+                bound,
+            ));
+        }
+        match socket_identity(socket_path) {
+            Ok(observed) if observed == identity => {}
+            Ok(_) => {
+                return Err(ReadinessProxyStartFailure::bound(
+                    ReadinessProxyError::Bind,
+                    bound,
+                ));
+            }
+            Err(error) => return Err(ReadinessProxyStartFailure::bound(error, bound)),
+        }
+        if bound.listener.set_nonblocking(true).is_err() {
+            return Err(ReadinessProxyStartFailure::bound(
+                ReadinessProxyError::Bind,
+                bound,
+            ));
+        }
+        #[cfg(test)]
+        if FAIL_EXACT_START_AFTER_BIND.with(|fault| fault.replace(false)) {
+            return Err(ReadinessProxyStartFailure::bound(
+                ReadinessProxyError::Worker,
+                bound,
+            ));
+        }
+
+        let worker_listener = match bound.listener.try_clone() {
+            Ok(listener) => listener,
+            Err(_) => {
+                return Err(ReadinessProxyStartFailure::bound(
+                    ReadinessProxyError::Worker,
+                    bound,
+                ));
+            }
+        };
+        let (readiness_sender, readiness) = mpsc::sync_channel(1);
+        let lifecycle = Arc::new(AtomicU8::new(RELAY_RUNNING));
+        let worker_lifecycle = Arc::clone(&lifecycle);
+        let health = Arc::new(Mutex::new(None));
+        let worker_health = Arc::clone(&health);
+        let worker_socket_path = socket_path.to_owned();
+        let worker_upstream_path = upstream_path.to_owned();
+        let worker_expectation = expectation;
+        let worker = match thread::Builder::new()
+            .name("calcifer-codex-readiness-proxy".to_owned())
+            .spawn(move || {
+                let mut socket_guard = SocketPathGuard::new(worker_socket_path, identity);
+                let proxy_result = run_proxy(
+                    worker_listener,
+                    &worker_upstream_path,
+                    &worker_expectation,
+                    deadline,
+                    &worker_lifecycle,
+                    &worker_health,
+                    &readiness_sender,
+                );
+                let proxy_result = finalize_proxy_run(proxy_result);
+                let _ = socket_guard.cleanup();
+                proxy_result
+            }) {
+            Ok(worker) => worker,
+            Err(_) => {
+                return Err(ReadinessProxyStartFailure::bound(
+                    ReadinessProxyError::Worker,
+                    bound,
+                ));
+            }
+        };
+        let BoundReadinessStartSocket {
+            listener: observer,
+            path: _,
+            identity: _,
+        } = bound;
+
+        Ok(Self {
+            observer,
+            socket_path: socket_path.to_owned(),
+            socket_identity: identity,
+            readiness,
+            readiness_result: None,
+            lifecycle,
+            health,
+            worker: Some(worker),
+            joined_result: None,
+            cleanup_complete: false,
+            deadline,
+            shutdown_error: None,
+        })
     }
 
     fn spawn_with_expectation(
@@ -315,6 +583,15 @@ impl ReadinessProxy {
             return Err(ReadinessProxyError::Bind);
         }
 
+        let worker_listener = match listener.try_clone() {
+            Ok(listener) => listener,
+            Err(_) => {
+                drop(listener);
+                let _ = remove_owned_socket(socket_path, socket_identity);
+                return Err(ReadinessProxyError::Worker);
+            }
+        };
+
         let (readiness_sender, readiness) = mpsc::sync_channel(1);
         let lifecycle = Arc::new(AtomicU8::new(RELAY_RUNNING));
         let worker_lifecycle = Arc::clone(&lifecycle);
@@ -328,7 +605,7 @@ impl ReadinessProxy {
             .spawn(move || {
                 let mut socket_guard = SocketPathGuard::new(worker_socket_path, socket_identity);
                 let proxy_result = run_proxy(
-                    listener,
+                    worker_listener,
                     &worker_upstream_path,
                     &worker_expectation,
                     deadline,
@@ -336,7 +613,12 @@ impl ReadinessProxy {
                     &worker_health,
                     &readiness_sender,
                 );
-                proxy_result.and(socket_guard.cleanup())
+                let proxy_result = finalize_proxy_run(proxy_result);
+                // The joining owner performs the authoritative cleanup proof.
+                // This worker-side attempt covers detached/panicking owners but
+                // cannot erase a retryable cleanup failure from the owner.
+                let _ = socket_guard.cleanup();
+                proxy_result
             })
             .map_err(|_| {
                 let _ = remove_owned_socket(socket_path, socket_identity);
@@ -344,6 +626,7 @@ impl ReadinessProxy {
             })?;
 
         Ok(Self {
+            observer: listener,
             socket_path: socket_path.to_owned(),
             socket_identity,
             readiness,
@@ -351,7 +634,10 @@ impl ReadinessProxy {
             lifecycle,
             health,
             worker: Some(worker),
+            joined_result: None,
+            cleanup_complete: false,
             deadline,
+            shutdown_error: None,
         })
     }
 
@@ -359,15 +645,74 @@ impl ReadinessProxy {
         &self.socket_path
     }
 
+    /// Appends the parent-retained duplicate of the relay listener to a
+    /// source-pinned child denyset. It represents the exact kernel socket used
+    /// by the worker without exposing the worker thread's raw descriptor.
+    pub(super) fn append_forbidden_descriptor<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        forbidden.capture(self.observer.as_fd())
+    }
+
     pub(super) fn wait_until_ready(&mut self) -> Result<(), ReadinessProxyError> {
         self.wait_until_ready_with_settings().map(|_| ())
+    }
+
+    /// Observes exact readiness without blocking the session event loop.
+    ///
+    /// `Ok(None)` is returned only while the relay is still running and its
+    /// fixed startup deadline has not elapsed. Success and failure are cached,
+    /// so a later poll cannot reclassify the authoritative first result. A
+    /// successful readiness result deliberately remains successful here if the
+    /// transport disconnects later; [`Self::ensure_connected`] is the separate
+    /// post-readiness liveness proof.
+    pub(super) fn poll_ready(
+        &mut self,
+    ) -> Result<Option<EffectiveThreadSettings>, ReadinessProxyError> {
+        if let Some(result) = self.readiness_result.as_ref() {
+            return result.clone().map(Some);
+        }
+        match self.readiness.try_recv() {
+            Ok(result) => return self.record_readiness(result).map(Some),
+            Err(TryRecvError::Disconnected) => {
+                return self
+                    .record_readiness(Err(ReadinessProxyError::Worker))
+                    .map(Some);
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= self.deadline {
+            return self
+                .record_readiness(Err(ReadinessProxyError::Timeout))
+                .map(Some);
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            // A copy pump can observe EOF after it has already queued the
+            // final semantic event. The supervisor worker must be allowed to
+            // consume that event and publish its authoritative readiness
+            // verdict before transport disconnect is classified.
+            return Ok(None);
+        }
+        // Close the race between the first empty observation and worker exit.
+        // A finished sender can still have left one bounded verdict queued.
+        match self.readiness.try_recv() {
+            Ok(result) => self.record_readiness(result).map(Some),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self
+                .record_readiness(Err(ReadinessProxyError::Worker))
+                .map(Some),
+        }
     }
 
     pub(super) fn wait_until_ready_with_settings(
         &mut self,
     ) -> Result<EffectiveThreadSettings, ReadinessProxyError> {
-        if let Some(result) = self.readiness_result.as_ref() {
-            return result.clone();
+        if let Some(result) = self.poll_ready()? {
+            return Ok(result);
         }
         let wait = self
             .deadline
@@ -384,6 +729,13 @@ impl ReadinessProxy {
             Ok(result) => result,
             Err(error) => Err(error),
         };
+        self.record_readiness(result)
+    }
+
+    fn record_readiness(
+        &mut self,
+        result: Result<EffectiveThreadSettings, ReadinessProxyError>,
+    ) -> Result<EffectiveThreadSettings, ReadinessProxyError> {
         if result.is_err() {
             let _ = self.lifecycle.compare_exchange(
                 RELAY_RUNNING,
@@ -396,8 +748,22 @@ impl ReadinessProxy {
         result
     }
 
-    pub(super) fn shutdown(mut self) -> Result<(), ReadinessProxyError> {
-        self.stop_and_join()
+    pub(super) fn shutdown(
+        mut self,
+        deadline: Instant,
+    ) -> Result<ReadinessProxyShutdownComplete, ReadinessProxyShutdownFailure> {
+        self.request_stop();
+        match self.wait_and_join(deadline) {
+            Ok(()) => Ok(ReadinessProxyShutdownComplete { _private: () }),
+            Err(errors) => {
+                let retained = self.worker.is_some() || !self.cleanup_complete;
+                Err(ReadinessProxyShutdownFailure {
+                    proxy: retained.then(|| Box::new(self)),
+                    operation_error: errors.operation,
+                    cleanup_error: errors.cleanup,
+                })
+            }
+        }
     }
 
     /// Proves that the relay has not ended between readiness and the caller's
@@ -425,44 +791,189 @@ impl ReadinessProxy {
             mark_relay_disconnected(&self.lifecycle);
             return Err(ReadinessProxyError::Transport);
         }
+        // Liveness checks never consume exact join authority. Shutdown owns the
+        // join plus the subsequent socket-cleanup proof as one retryable phase.
+        Err(ReadinessProxyError::Transport)
+    }
 
-        let worker = self.worker.take().ok_or(ReadinessProxyError::Worker)?;
-        match worker.join().map_err(|_| ReadinessProxyError::Worker)? {
-            Ok(()) => Err(ReadinessProxyError::Transport),
-            Err(error) => Err(error),
+    fn request_stop(&mut self) {
+        loop {
+            let lifecycle = self.lifecycle.load(Ordering::Acquire);
+            if lifecycle == RELAY_STOPPING {
+                break;
+            }
+            if lifecycle == RELAY_DISCONNECTED
+                && !self.readiness_result.as_ref().is_some_and(Result::is_err)
+            {
+                self.shutdown_error
+                    .get_or_insert(ReadinessProxyError::Transport);
+            }
+            if self
+                .lifecycle
+                .compare_exchange(
+                    lifecycle,
+                    RELAY_STOPPING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
         }
     }
 
-    fn stop_and_join(&mut self) -> Result<(), ReadinessProxyError> {
-        let lifecycle_at_stop = self
-            .lifecycle
-            .compare_exchange(
-                RELAY_RUNNING,
-                RELAY_STOPPING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .unwrap_or_else(|state| state);
-        let worker_result = match self.worker.take() {
-            Some(worker) => worker.join().map_err(|_| ReadinessProxyError::Worker)?,
-            None => Ok(()),
+    fn force_stop(&self) {
+        let health = match self.health.try_lock() {
+            Ok(health) => health,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         };
-        let cleanup_result = remove_owned_socket(&self.socket_path, self.socket_identity);
-        if self.readiness_result.as_ref().is_some_and(Result::is_err) {
-            cleanup_result
-        } else if lifecycle_at_stop == RELAY_DISCONNECTED {
-            cleanup_result.and(Err(ReadinessProxyError::Transport))
-        } else {
-            cleanup_result.and(worker_result)
+        if let Some(health) = health.as_ref() {
+            let _ = health.client.shutdown(Shutdown::Both);
+            let _ = health.upstream.shutdown(Shutdown::Both);
         }
+    }
+
+    fn wait_and_join(&mut self, deadline: Instant) -> Result<(), ProxyShutdownErrors> {
+        if self.worker.is_some() {
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    self.force_stop();
+                    return Err(ProxyShutdownErrors::operation(ReadinessProxyError::Timeout));
+                }
+                let Some(worker) = self.worker.as_ref() else {
+                    return Err(ProxyShutdownErrors::operation(ReadinessProxyError::Worker));
+                };
+                if worker.is_finished() {
+                    break;
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(SHUTDOWN_POLL_INTERVAL),
+                );
+            }
+            let joined = match self.worker.take() {
+                Some(worker) => match worker.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(ReadinessProxyError::Worker),
+                },
+                None => Err(ReadinessProxyError::Worker),
+            };
+            self.joined_result = Some(joined);
+        }
+
+        let Some(joined_result) = self.joined_result else {
+            return Err(ProxyShutdownErrors::operation(ReadinessProxyError::Worker));
+        };
+        if !self.cleanup_complete && Instant::now() >= deadline {
+            return Err(ProxyShutdownErrors::operation(ReadinessProxyError::Timeout));
+        }
+        let cleanup_error = if self.cleanup_complete {
+            None
+        } else {
+            match remove_owned_socket(&self.socket_path, self.socket_identity) {
+                Ok(()) => {
+                    self.cleanup_complete = true;
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        };
+        let operation_error = if self.readiness_result.as_ref().is_some_and(Result::is_err) {
+            None
+        } else {
+            self.shutdown_error.or(joined_result.err())
+        };
+        match (operation_error, cleanup_error) {
+            (None, None) => Ok(()),
+            (operation, cleanup) => Err(ProxyShutdownErrors { operation, cleanup }),
+        }
+    }
+}
+
+struct ProxyShutdownErrors {
+    operation: Option<ReadinessProxyError>,
+    cleanup: Option<ReadinessProxyError>,
+}
+
+impl ProxyShutdownErrors {
+    const fn operation(error: ReadinessProxyError) -> Self {
+        Self {
+            operation: Some(error),
+            cleanup: None,
+        }
+    }
+}
+
+fn finalize_proxy_run(result: Result<(), ProxyRunError>) -> Result<(), ReadinessProxyError> {
+    match result {
+        Ok(()) | Err(ProxyRunError::Stopped) => Ok(()),
+        Err(ProxyRunError::Failed(error)) => Err(error),
     }
 }
 
 impl Drop for ReadinessProxy {
     fn drop(&mut self) {
-        let _ = self.stop_and_join();
+        // Drop may request cancellation and wake blocking copies, but it must
+        // never perform an unbounded join or manufacture shutdown proof.
+        self.request_stop();
+        self.force_stop();
     }
 }
+
+#[derive(Debug)]
+pub(super) struct ReadinessProxyShutdownComplete {
+    _private: (),
+}
+
+#[must_use = "a timed-out readiness proxy retains worker join ownership"]
+pub(super) struct ReadinessProxyShutdownFailure {
+    proxy: Option<Box<ReadinessProxy>>,
+    operation_error: Option<ReadinessProxyError>,
+    cleanup_error: Option<ReadinessProxyError>,
+}
+
+impl ReadinessProxyShutdownFailure {
+    pub(super) fn error(&self) -> ReadinessProxyError {
+        self.operation_error
+            .or(self.cleanup_error)
+            .unwrap_or(ReadinessProxyError::Worker)
+    }
+
+    pub(super) const fn operation_error(&self) -> Option<ReadinessProxyError> {
+        self.operation_error
+    }
+
+    pub(super) const fn cleanup_error(&self) -> Option<ReadinessProxyError> {
+        self.cleanup_error
+    }
+
+    pub(super) fn into_proxy(self) -> Option<ReadinessProxy> {
+        self.proxy.map(|proxy| *proxy)
+    }
+}
+
+impl fmt::Debug for ReadinessProxyShutdownFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadinessProxyShutdownFailure")
+            .field("operation_error", &self.operation_error)
+            .field("cleanup_error", &self.cleanup_error)
+            .field("proxy_retained", &self.proxy.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for ReadinessProxyShutdownFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error().fmt(formatter)
+    }
+}
+
+impl std::error::Error for ReadinessProxyShutdownFailure {}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct SocketIdentity {
@@ -647,7 +1158,7 @@ fn run_proxy(
     lifecycle: &Arc<AtomicU8>,
     health: &Arc<Mutex<Option<RelayHealth>>>,
     readiness_sender: &SyncSender<Result<EffectiveThreadSettings, ReadinessProxyError>>,
-) -> Result<(), ReadinessProxyError> {
+) -> Result<(), ProxyRunError> {
     let mut notifier = ReadyNotifier::new(readiness_sender);
     let result = run_proxy_inner(
         &listener,
@@ -658,8 +1169,8 @@ fn run_proxy(
         health,
         &mut notifier,
     );
-    if let Err(error) = result {
-        notifier.failure(error);
+    if let Err(ProxyRunError::Failed(error)) = &result {
+        notifier.failure(*error);
     }
     result
 }
@@ -672,7 +1183,7 @@ fn run_proxy_inner(
     lifecycle: &Arc<AtomicU8>,
     health: &Arc<Mutex<Option<RelayHealth>>>,
     notifier: &mut ReadyNotifier<'_>,
-) -> Result<(), ReadinessProxyError> {
+) -> Result<(), ProxyRunError> {
     let client = accept_client(listener, deadline, lifecycle)?;
     let upstream = connect_upstream(upstream_path, deadline, lifecycle)?;
     let client_reader = client
@@ -744,7 +1255,7 @@ fn run_proxy_inner(
             let _ = client.shutdown(Shutdown::Both);
             let _ = upstream.shutdown(Shutdown::Both);
             let _ = client_pump.join();
-            return Err(ReadinessProxyError::Worker);
+            return Err(ReadinessProxyError::Worker.into());
         }
     };
 
@@ -752,10 +1263,10 @@ fn run_proxy_inner(
     let mut ready = false;
     let result = loop {
         if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING {
-            break Ok(());
+            break Err(ProxyRunError::Stopped);
         }
         if !ready && Instant::now() >= deadline {
-            break Err(ReadinessProxyError::Timeout);
+            break Err(ReadinessProxyError::Timeout.into());
         }
         let wait = if ready {
             POLL_INTERVAL
@@ -776,24 +1287,26 @@ fn run_proxy_inner(
                     ready = true;
                 }
                 Ok(false) => {}
-                Err(error) => break Err(error),
+                Err(error) => break Err(error.into()),
             },
             Ok(PumpEvent::Observed(_)) => {}
             Ok(PumpEvent::Ended) if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING => {
-                break Ok(());
+                break Err(ProxyRunError::Stopped);
             }
-            Ok(PumpEvent::Ended) => break Err(ReadinessProxyError::Transport),
+            Ok(PumpEvent::Ended) => break Err(ReadinessProxyError::Transport.into()),
             Ok(PumpEvent::Failed(_)) if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING => {
-                break Ok(());
+                break Err(ProxyRunError::Stopped);
             }
-            Ok(PumpEvent::Failed(error)) => break Err(error),
+            Ok(PumpEvent::Failed(error)) => break Err(error.into()),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected)
                 if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING =>
             {
-                break Ok(());
+                break Err(ProxyRunError::Stopped);
             }
-            Err(RecvTimeoutError::Disconnected) => break Err(ReadinessProxyError::Transport),
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(ReadinessProxyError::Transport.into());
+            }
         }
     };
 
@@ -804,7 +1317,7 @@ fn run_proxy_inner(
     let client_join = client_pump.join();
     let server_join = server_pump.join();
     if client_join.is_err() || server_join.is_err() {
-        return Err(ReadinessProxyError::Worker);
+        return Err(ReadinessProxyError::Worker.into());
     }
     result
 }
@@ -813,10 +1326,10 @@ fn accept_client(
     listener: &UnixListener,
     deadline: Instant,
     lifecycle: &AtomicU8,
-) -> Result<UnixStream, ReadinessProxyError> {
+) -> Result<UnixStream, ProxyRunError> {
     loop {
         if lifecycle.load(Ordering::Acquire) != RELAY_RUNNING {
-            return Err(ReadinessProxyError::Transport);
+            return Err(ProxyRunError::Stopped);
         }
         match listener.accept() {
             Ok((stream, _)) => {
@@ -827,11 +1340,11 @@ fn accept_client(
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
-                    return Err(ReadinessProxyError::Timeout);
+                    return Err(ReadinessProxyError::Timeout.into());
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return Err(ReadinessProxyError::Accept),
+            Err(_) => return Err(ReadinessProxyError::Accept.into()),
         }
     }
 }
@@ -840,10 +1353,10 @@ fn connect_upstream(
     path: &Path,
     deadline: Instant,
     lifecycle: &AtomicU8,
-) -> Result<UnixStream, ReadinessProxyError> {
+) -> Result<UnixStream, ProxyRunError> {
     loop {
         if lifecycle.load(Ordering::Acquire) != RELAY_RUNNING {
-            return Err(ReadinessProxyError::Transport);
+            return Err(ProxyRunError::Stopped);
         }
         match UnixStream::connect(path) {
             Ok(stream) => return Ok(stream),
@@ -856,11 +1369,11 @@ fn connect_upstream(
                 ) =>
             {
                 if Instant::now() >= deadline {
-                    return Err(ReadinessProxyError::Timeout);
+                    return Err(ReadinessProxyError::Timeout.into());
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return Err(ReadinessProxyError::Connect),
+            Err(_) => return Err(ReadinessProxyError::Connect.into()),
         }
     }
 }
@@ -1362,105 +1875,12 @@ impl EffectiveThreadSettings {
     }
 }
 
-struct UniqueJsonValue(Value);
-
-impl<'de> Deserialize<'de> for UniqueJsonValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(UniqueJsonValueVisitor)
-    }
-}
-
-struct UniqueJsonValueVisitor;
-
-impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
-    type Value = UniqueJsonValue;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value without duplicate object keys")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(UniqueJsonValue(Value::Bool(value)))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(UniqueJsonValue(Value::Number(value.into())))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(UniqueJsonValue(Value::Number(value.into())))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        serde_json::Number::from_f64(value)
-            .map(Value::Number)
-            .map(UniqueJsonValue)
-            .ok_or_else(|| de::Error::custom("non-finite JSON number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(UniqueJsonValue(Value::String(value.to_owned())))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(UniqueJsonValue(Value::String(value)))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(UniqueJsonValue(Value::Null))
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(UniqueJsonValue(Value::Null))
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        UniqueJsonValue::deserialize(deserializer)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some(UniqueJsonValue(value)) = sequence.next_element::<UniqueJsonValue>()? {
-            values.push(value);
-        }
-        Ok(UniqueJsonValue(Value::Array(values)))
-    }
-
-    fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut object = serde_json::Map::new();
-        while let Some(key) = entries.next_key::<String>()? {
-            if object.contains_key(&key) {
-                return Err(de::Error::custom("duplicate JSON object key"));
-            }
-            let UniqueJsonValue(value) = entries.next_value::<UniqueJsonValue>()?;
-            object.insert(key, value);
-        }
-        Ok(UniqueJsonValue(Value::Object(object)))
-    }
-}
-
 fn inspect_message(
     direction: Direction,
     bytes: &[u8],
     events: &mut Vec<ObservedEvent>,
 ) -> Result<(), ReadinessProxyError> {
-    let UniqueJsonValue(message) =
-        serde_json::from_slice(bytes).map_err(|_| ReadinessProxyError::InvalidMessage)?;
+    let message = decode_unique_json(bytes).map_err(|_| ReadinessProxyError::InvalidMessage)?;
     let Some(object) = message.as_object() else {
         return Err(ReadinessProxyError::InvalidMessage);
     };
@@ -2204,6 +2624,12 @@ mod tests {
             ExactResumeProbe::new(TARGET_THREAD_ID, Path::new(TARGET_CWD)),
             timeout,
         )
+    }
+
+    fn shutdown_deadline() -> Result<Instant, ReadinessProxyError> {
+        Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or(ReadinessProxyError::InvalidArgument)
     }
 
     fn state_awaiting_resume_response() -> ReadinessState {
@@ -3449,7 +3875,7 @@ mod tests {
 
         assert_eq!(proxy.wait_until_ready(), Ok(()));
         assert_eq!(proxy.ensure_connected(), Ok(()));
-        proxy.shutdown()?;
+        proxy.shutdown(shutdown_deadline()?)?;
         drop(client);
         server
             .join()
@@ -3552,6 +3978,8 @@ mod tests {
 
         let mut proxy =
             spawn_exact_test_proxy(&proxy_path, &upstream_path, Duration::from_secs(2))?;
+        assert_eq!(proxy.poll_ready(), Ok(None));
+        assert_eq!(proxy.lifecycle.load(Ordering::Acquire), RELAY_RUNNING);
         let mut client = UnixStream::connect(proxy.socket_path())?;
         set_short_timeouts(&client)?;
         client.write_all(&request_handshake)?;
@@ -3563,12 +3991,22 @@ mod tests {
         client.write_all(&parent_read_request)?;
         assert_read_exact(&mut client, &parent_read_response)?;
 
-        assert_eq!(
-            proxy.wait_until_ready_with_settings(),
-            Ok(observed_settings())
-        );
+        let poll_deadline = shutdown_deadline()?;
+        let settings = loop {
+            match proxy.poll_ready()? {
+                Some(settings) => break settings,
+                None if Instant::now() < poll_deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                None => {
+                    return Err("exact readiness did not arrive before the test deadline".into());
+                }
+            }
+        };
+        assert_eq!(settings, observed_settings());
+        assert_eq!(proxy.poll_ready(), Ok(Some(observed_settings())));
         assert_eq!(proxy.ensure_connected(), Ok(()));
-        proxy.shutdown()?;
+        proxy.shutdown(shutdown_deadline()?)?;
         drop(client);
         server
             .join()
@@ -3702,7 +4140,7 @@ mod tests {
             Ok(observed_settings())
         );
         assert_eq!(proxy.ensure_connected(), Ok(()));
-        proxy.shutdown()?;
+        proxy.shutdown(shutdown_deadline()?)?;
         drop(client);
         server
             .join()
@@ -3859,7 +4297,16 @@ mod tests {
             proxy.ensure_connected(),
             Err(ReadinessProxyError::Transport)
         );
-        assert_eq!(proxy.shutdown(), Err(ReadinessProxyError::Transport));
+        let failure = proxy
+            .shutdown(shutdown_deadline()?)
+            .err()
+            .ok_or("a disconnected proxy unexpectedly shut down cleanly")?;
+        assert_eq!(failure.error(), ReadinessProxyError::Transport);
+        assert_eq!(
+            failure.operation_error(),
+            Some(ReadinessProxyError::Transport)
+        );
+        assert_eq!(failure.cleanup_error(), None);
         server
             .join()
             .map_err(|_| io::Error::other("mock app-server panicked"))??;
@@ -3894,8 +4341,71 @@ mod tests {
         fs::remove_file(&proxy_path)?;
         fs::write(&proxy_path, b"replacement")?;
 
-        assert_eq!(proxy.shutdown(), Err(ReadinessProxyError::Cleanup));
+        let failure = proxy
+            .shutdown(shutdown_deadline()?)
+            .err()
+            .ok_or("a replaced proxy socket unexpectedly cleaned up")?;
+        assert_eq!(failure.error(), ReadinessProxyError::Cleanup);
+        assert_eq!(failure.operation_error(), None);
+        assert_eq!(failure.cleanup_error(), Some(ReadinessProxyError::Cleanup));
+        assert!(failure.into_proxy().is_some());
         assert_eq!(fs::read(&proxy_path)?, b"replacement");
+        Ok(())
+    }
+
+    #[test]
+    fn exact_start_failure_retains_bound_socket_and_preserves_a_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        FAIL_EXACT_START_AFTER_BIND.with(|fault| fault.set(true));
+
+        let failure = ReadinessProxy::spawn_exact_owned(
+            &proxy_path,
+            &upstream_path,
+            ExactResumeProbe::new(TARGET_THREAD_ID, Path::new(TARGET_CWD)),
+            Duration::from_secs(1),
+        )
+        .err()
+        .ok_or("the injected post-bind worker fault unexpectedly started a relay")?;
+        assert_eq!(failure.error(), ReadinessProxyError::Worker);
+        assert!(failure.has_bound_socket());
+        assert!(fs::symlink_metadata(&proxy_path)?.file_type().is_socket());
+
+        fs::remove_file(&proxy_path)?;
+        fs::write(&proxy_path, b"preserve-start-replacement")?;
+        let failure = failure
+            .cleanup()
+            .err()
+            .ok_or("replacement unexpectedly satisfied exact start cleanup")?;
+        assert_eq!(failure.cleanup_error(), Some(ReadinessProxyError::Cleanup));
+        assert!(failure.has_bound_socket());
+        assert_eq!(fs::read(&proxy_path)?, b"preserve-start-replacement");
+        fs::remove_file(&proxy_path)?;
+        drop(failure);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_start_failure_can_clean_its_recorded_bound_socket() -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        FAIL_EXACT_START_AFTER_BIND.with(|fault| fault.set(true));
+
+        let failure = ReadinessProxy::spawn_exact_owned(
+            &proxy_path,
+            &upstream_path,
+            ExactResumeProbe::new(TARGET_THREAD_ID, Path::new(TARGET_CWD)),
+            Duration::from_secs(1),
+        )
+        .err()
+        .ok_or("the injected post-bind worker fault unexpectedly started a relay")?;
+        let _cleanup = failure.cleanup()?;
+        assert!(!proxy_path.exists());
         Ok(())
     }
 
@@ -3979,8 +4489,20 @@ mod tests {
         let proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_secs(1))?;
         fs::set_permissions(&proxy_path, fs::Permissions::from_mode(0o666))?;
 
-        assert_eq!(proxy.shutdown(), Err(ReadinessProxyError::Cleanup));
+        let failure = proxy
+            .shutdown(shutdown_deadline()?)
+            .err()
+            .ok_or("an insecure proxy socket unexpectedly cleaned up")?;
+        assert_eq!(failure.error(), ReadinessProxyError::Cleanup);
+        assert_eq!(failure.operation_error(), None);
+        assert_eq!(failure.cleanup_error(), Some(ReadinessProxyError::Cleanup));
         assert!(fs::symlink_metadata(&proxy_path)?.file_type().is_socket());
+        let retained = failure
+            .into_proxy()
+            .ok_or("cleanup failure lost proxy socket ownership")?;
+        fs::set_permissions(&proxy_path, fs::Permissions::from_mode(0o600))?;
+        retained.shutdown(shutdown_deadline()?)?;
+        assert!(!proxy_path.exists());
         Ok(())
     }
 
@@ -3990,10 +4512,156 @@ mod tests {
         let upstream_path = temp.path().join("upstream.sock");
         let proxy_path = temp.path().join("proxy.sock");
         let _upstream = UnixListener::bind(&upstream_path)?;
-        let mut proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_millis(40))?;
+        let mut proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_millis(100))?;
 
-        assert_eq!(proxy.wait_until_ready(), Err(ReadinessProxyError::Timeout));
-        proxy.shutdown()?;
+        assert_eq!(proxy.poll_ready(), Ok(None));
+        thread::sleep(Duration::from_millis(120));
+        assert_eq!(proxy.poll_ready(), Err(ReadinessProxyError::Timeout));
+        assert_eq!(proxy.poll_ready(), Err(ReadinessProxyError::Timeout));
+        assert_eq!(proxy.lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+        proxy.shutdown(shutdown_deadline()?)?;
+        assert!(!proxy_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_disconnect_is_sticky_across_nonblocking_polls() -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        let mut proxy =
+            spawn_exact_test_proxy(&proxy_path, &upstream_path, Duration::from_secs(1))?;
+        let client = UnixStream::connect(proxy.socket_path())?;
+        drop(client);
+
+        let poll_deadline = shutdown_deadline()?;
+        let error = loop {
+            match proxy.poll_ready() {
+                Err(error) => break error,
+                Ok(None) if Instant::now() < poll_deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Ok(None) => {
+                    return Err("disconnect was not observed before the test deadline".into());
+                }
+                Ok(Some(_)) => return Err("disconnect unexpectedly produced readiness".into()),
+            }
+        };
+        assert_eq!(error, ReadinessProxyError::Transport);
+        assert_eq!(proxy.poll_ready(), Err(ReadinessProxyError::Transport));
+        proxy.shutdown(shutdown_deadline()?)?;
+        assert!(!proxy_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_timeout_returns_join_ownership_for_a_bounded_retry() -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        let proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_secs(1))?;
+
+        let failure = proxy
+            .shutdown(Instant::now())
+            .err()
+            .ok_or("an expired shutdown deadline unexpectedly joined the proxy")?;
+        assert_eq!(failure.error(), ReadinessProxyError::Timeout);
+        assert_eq!(
+            failure.operation_error(),
+            Some(ReadinessProxyError::Timeout)
+        );
+        assert_eq!(failure.cleanup_error(), None);
+        let retained = failure
+            .into_proxy()
+            .ok_or("shutdown timeout lost proxy join ownership")?;
+        retained.shutdown(shutdown_deadline()?)?;
+        assert!(!proxy_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn forced_shutdown_never_waits_for_a_busy_health_observer() -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        let proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_secs(1))?;
+        let health = proxy
+            .health
+            .lock()
+            .map_err(|_| "health observer mutex was poisoned")?;
+
+        let started = Instant::now();
+        proxy.force_stop();
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        drop(health);
+        proxy.shutdown(shutdown_deadline()?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pre_stop_transport_failure_cannot_be_reclassified_by_a_later_stop()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(AtomicU8::new(RELAY_RUNNING));
+        let worker_lifecycle = Arc::clone(&lifecycle);
+        let (returned_sender, returned_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            let result = Err(ProxyRunError::Failed(ReadinessProxyError::Transport));
+            returned_sender
+                .send(())
+                .map_err(|_| "failure-return barrier receiver disappeared")?;
+            release_receiver
+                .recv()
+                .map_err(|_| "failure-finalize barrier sender disappeared")?;
+            let finalized = finalize_proxy_run(result);
+            Ok::<_, &'static str>((worker_lifecycle.load(Ordering::Acquire), finalized))
+        });
+
+        returned_receiver.recv()?;
+        lifecycle.store(RELAY_STOPPING, Ordering::Release);
+        release_sender.send(())?;
+        let (observed_lifecycle, result) = worker
+            .join()
+            .map_err(|_| "failure-finalize worker panicked")??;
+        assert_eq!(observed_lifecycle, RELAY_STOPPING);
+        assert_eq!(result, Err(ReadinessProxyError::Transport));
+        Ok(())
+    }
+
+    #[test]
+    fn finished_worker_liveness_check_preserves_join_and_cleanup_authority()
+    -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        let mut proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_millis(30))?;
+        let deadline = shutdown_deadline()?;
+        while !proxy.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            if Instant::now() >= deadline {
+                return Err("proxy worker did not finish before the test deadline".into());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        proxy.readiness_result = Some(Ok(observed_settings()));
+        proxy.lifecycle.store(RELAY_RUNNING, Ordering::Release);
+
+        assert_eq!(
+            proxy.ensure_connected(),
+            Err(ReadinessProxyError::Transport)
+        );
+        assert!(proxy.worker.is_some());
+        let failure = proxy
+            .shutdown(shutdown_deadline()?)
+            .err()
+            .ok_or("a timed-out worker unexpectedly produced clean shutdown proof")?;
+        assert_eq!(failure.error(), ReadinessProxyError::Timeout);
+        assert_eq!(failure.cleanup_error(), None);
+        assert!(failure.into_proxy().is_none());
         assert!(!proxy_path.exists());
         Ok(())
     }

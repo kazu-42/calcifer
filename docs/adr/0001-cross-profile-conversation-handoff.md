@@ -1,6 +1,6 @@
 # ADR 0001: Treat conversation lineage as independent from credential profiles
 
-- Status: Accepted for the failover design; private compatibility gate and Linux/macOS no-gap target-reservation primitive implemented, supervisor integration and production handoff transaction pending
+- Status: Accepted for the failover design; private compatibility gate, Linux/macOS no-gap target reservation, and pinned same-profile supervisor implemented internally; public cross-profile handoff pending
 - Date: 2026-07-15
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 
@@ -62,7 +62,7 @@ No PID establishes lock authority.
 
 This primitive is ephemeral and internal. It changes no public command,
 registry or conversation schema, transition journal, or provider protocol, and
-is deliberately unused until the supervisor integration in issue #33. That
+is deliberately unused until the cross-profile transaction in issue #33. That
 integration must acquire locks in this order: retained source lifetime lease,
 handoff coordinator, conversation transition, target A, then target B.
 
@@ -270,7 +270,7 @@ The baseline source contracts are:
 - A Calcifer logical conversation ID remains stable while the provider thread ID changes at each handoff.
 - The lineage registry and conversation lease become first-class state alongside credential profiles.
 - The supervised path must use App Server plus remote TUI; the current direct `run` and same-profile `resume` commands remain available and unchanged.
-- Production handoff stays disabled until this synthetic gate is wired into a
-  reviewed capability-owned launch path and transition recovery, pool policy,
-  authoritative exhaustion selection, leases, and adversarial user-state
-  path/lock tests are implemented.
+- Production handoff stays disabled until the synthetic compatibility gate and
+  default-unused pinned supervisor are wired into a reviewed cross-profile
+  transaction with transition recovery, pool policy, authoritative exhaustion
+  selection, leases, and adversarial user-state path/lock tests.

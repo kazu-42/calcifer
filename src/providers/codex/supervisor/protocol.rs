@@ -6,10 +6,9 @@
 //! with an OS read/write timeout no later than the supplied absolute deadline;
 //! the generic I/O loops also enforce the deadline around every operation.
 
-#![allow(dead_code)] // Wired to the default-off supervisor in issue #50.
-
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::time::Instant;
 
 use subtle::ConstantTimeEq;
@@ -58,7 +57,7 @@ const TERMINAL_SIZE_BODY_BYTES: usize = 5;
 const CHILD_STARTED_BODY_BYTES: usize = 10;
 const FAILED_BODY_BYTES: usize = 3;
 const CHILD_DISPOSITION_BYTES: usize = 4;
-const CHILDREN_REAPED_BODY_BYTES: usize = 12;
+const CHILDREN_REAPED_BODY_BYTES: usize = 14;
 
 /// A coordinator-to-guardian command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +111,7 @@ pub(super) enum GuardianEvent {
         worker: WorkerJoinStatus,
         cleanup: CleanupStatus,
         session: SessionStatus,
+        guardian_exit: GuardianExitDisposition,
     },
 }
 
@@ -259,6 +259,26 @@ pub(super) enum SessionStatus {
     Failed,
 }
 
+/// Why the guardian entered ordered TUI shutdown. The variants deliberately
+/// exclude arbitrary signals: only protocol-validated HUP/TERM forwarding can
+/// suppress the normal coordinator-stop semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionTerminationCause {
+    NaturalTuiEof,
+    CoordinatorStop,
+    ForwardedHup,
+    ForwardedTerm,
+}
+
+/// Exact process disposition the guardian applies only after publishing its
+/// terminal lifecycle frame and releasing the lifecycle wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GuardianExitDisposition {
+    Code(u8),
+    Signal(u8),
+    InternalFailure,
+}
+
 /// A redacted protocol failure. It deliberately retains no input bytes or I/O
 /// error string so diagnostics cannot expose lifecycle-adjacent secrets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,12 +336,16 @@ struct TerminalLifecycleValidator {
     lease_committed: bool,
     app_started: bool,
     tui_started: bool,
+    app_process_group: Option<i32>,
     gate_ever_opened: bool,
     // A failure observed in `ReadyForGate` can race exactly one gate command
     // already written by the peer. It may be consumed after quiescence, but it
     // can never mint an input acknowledgement or survive terminal restore.
     superseded_gate_may_be_pending: bool,
+    recovery_command_allowance: RecoveryCommandAllowance,
     failure: Option<(Phase, FailureCode)>,
+    termination_cause: Option<SessionTerminationCause>,
+    terminal_exit_disposition: Option<GuardianExitDisposition>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,6 +382,27 @@ enum TerminalLifecycleState {
     Terminal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryCommandWindow {
+    ReadyForGate,
+    Active,
+    Suspended,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryCommandAllowance {
+    Inactive,
+    AwaitingFailure(RecoveryCommandWindow),
+    Armed(RecoveryCommandWindow),
+    Consumed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalCommandAcceptance {
+    Applied,
+    RecoverySuperseded,
+}
+
 impl TerminalLifecycleValidator {
     const fn before_start() -> Self {
         Self {
@@ -365,16 +410,101 @@ impl TerminalLifecycleValidator {
             lease_committed: false,
             app_started: false,
             tui_started: false,
+            app_process_group: None,
             gate_ever_opened: false,
             superseded_gate_may_be_pending: false,
+            recovery_command_allowance: RecoveryCommandAllowance::Inactive,
             failure: None,
+            termination_cause: None,
+            terminal_exit_disposition: None,
         }
     }
 
-    fn accept_command(&mut self, command: CoordinatorCommand) -> Result<(), ProtocolError> {
-        use CoordinatorCommand as Command;
+    fn arm_recovery_command_race(&mut self) -> Result<(), ProtocolError> {
+        use RecoveryCommandAllowance as Allowance;
+        use RecoveryCommandWindow as Window;
         use TerminalLifecycleState as State;
 
+        if self.failure.is_some() || self.recovery_command_allowance != Allowance::Inactive {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        let window = match self.state {
+            State::ReadyForGate => Window::ReadyForGate,
+            State::Active => Window::Active,
+            State::Suspended => Window::Suspended,
+            _ => return Err(ProtocolError::UnexpectedState),
+        };
+        self.recovery_command_allowance = Allowance::AwaitingFailure(window);
+        Ok(())
+    }
+
+    fn accept_recovery_superseded_command(
+        &mut self,
+        command: CoordinatorCommand,
+    ) -> Result<Option<TerminalCommandAcceptance>, ProtocolError> {
+        use CoordinatorCommand as Command;
+        use RecoveryCommandAllowance as Allowance;
+        use RecoveryCommandWindow as Window;
+        use TerminalCommandAcceptance as Acceptance;
+        use TerminalLifecycleState as State;
+
+        if self.state != State::Quiesced {
+            return Ok(None);
+        }
+        let window = match self.recovery_command_allowance {
+            Allowance::Inactive => return Ok(None),
+            Allowance::AwaitingFailure(_) => return Err(ProtocolError::UnexpectedState),
+            Allowance::Consumed => {
+                if command == Command::TerminalRestored {
+                    self.recovery_command_allowance = Allowance::Inactive;
+                    return Ok(None);
+                }
+                return Err(ProtocolError::UnexpectedState);
+            }
+            Allowance::Armed(window) => window,
+        };
+        if command == Command::TerminalRestored {
+            self.recovery_command_allowance = Allowance::Inactive;
+            return Ok(None);
+        }
+        let allowed = match (window, command) {
+            (Window::ReadyForGate, Command::OpenInputGate | Command::Stop)
+            | (Window::Active, Command::Signal { .. } | Command::Suspend | Command::Stop)
+            | (Window::Suspended, Command::Signal { .. } | Command::Stop) => true,
+            (Window::Active, Command::Resize { rows, cols })
+            | (Window::Suspended, Command::Resume { rows, cols }) => {
+                validate_terminal_size(rows, cols)?;
+                true
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        self.recovery_command_allowance = Allowance::Consumed;
+        self.superseded_gate_may_be_pending = false;
+        Ok(Some(Acceptance::RecoverySuperseded))
+    }
+
+    fn accept_command(
+        &mut self,
+        command: CoordinatorCommand,
+    ) -> Result<TerminalCommandAcceptance, ProtocolError> {
+        use CoordinatorCommand as Command;
+        use TerminalCommandAcceptance as Acceptance;
+        use TerminalLifecycleState as State;
+
+        if let Some(acceptance) = self.accept_recovery_superseded_command(command)? {
+            return Ok(acceptance);
+        }
+
+        let coordinator_stop = matches!(
+            (self.state, command),
+            (
+                State::ReadyForGate | State::Active | State::Suspended,
+                Command::Stop
+            )
+        );
         self.state = match (self.state, command) {
             (State::AwaitStart, Command::Start) => State::AwaitTerminalArmed,
             (State::AwaitTerminalArmAcceptance, Command::TerminalArmAccepted) => State::AwaitApp,
@@ -428,7 +558,10 @@ impl TerminalLifecycleValidator {
             }
             _ => return Err(ProtocolError::UnexpectedState),
         };
-        Ok(())
+        if coordinator_stop {
+            self.termination_cause = Some(SessionTerminationCause::CoordinatorStop);
+        }
+        Ok(Acceptance::Applied)
     }
 
     fn accept_event(&mut self, event: GuardianEvent) -> Result<(), ProtocolError> {
@@ -439,7 +572,8 @@ impl TerminalLifecycleValidator {
             return self.accept_failure(phase, code);
         }
 
-        self.state = match (self.state, event) {
+        let prior_state = self.state;
+        self.state = match (prior_state, event) {
             (State::AwaitLeaseBeforeStart, Event::LeaseCommitted) => {
                 self.lease_committed = true;
                 State::AwaitStart
@@ -457,6 +591,7 @@ impl TerminalLifecycleValidator {
             ) => {
                 validate_process_group(pid, pgid)?;
                 self.app_started = true;
+                self.app_process_group = Some(pgid);
                 State::AwaitTui
             }
             (
@@ -468,6 +603,9 @@ impl TerminalLifecycleValidator {
                 },
             ) => {
                 validate_process_group(pid, pgid)?;
+                if self.app_process_group == Some(pgid) {
+                    return Err(ProtocolError::InvalidValue);
+                }
                 self.tui_started = true;
                 State::AwaitReady
             }
@@ -484,6 +622,11 @@ impl TerminalLifecycleValidator {
                 Event::SignalForwarded { signal },
             ) if signal == expected => {
                 if matches!(signal, UnixSignal::Hup | UnixSignal::Term) {
+                    self.termination_cause = Some(match signal {
+                        UnixSignal::Hup => SessionTerminationCause::ForwardedHup,
+                        UnixSignal::Term => SessionTerminationCause::ForwardedTerm,
+                        UnixSignal::Int | UnixSignal::Quit => unreachable!(),
+                    });
                     State::AwaitQuiesced
                 } else if was_suspended {
                     State::Suspended
@@ -532,15 +675,30 @@ impl TerminalLifecycleValidator {
                 State::RecoveryDisarmed
             }
             (State::RecoveryDisarmed, terminal @ Event::ChildrenReaped { .. }) => {
-                self.validate_terminal(terminal)?;
+                self.terminal_exit_disposition = Some(self.validate_terminal(terminal)?);
                 State::Terminal
             }
             _ => return Err(ProtocolError::UnexpectedState),
         };
+        if event == GuardianEvent::TerminalQuiesced
+            && self.termination_cause.is_none()
+            && matches!(
+                prior_state,
+                State::Active
+                    | State::AwaitResizeApplied { .. }
+                    | State::AwaitSignalForwarded {
+                        signal: UnixSignal::Int | UnixSignal::Quit,
+                        was_suspended: false,
+                    }
+            )
+        {
+            self.termination_cause = Some(SessionTerminationCause::NaturalTuiEof);
+        }
         Ok(())
     }
 
     fn accept_failure(&mut self, phase: Phase, code: FailureCode) -> Result<(), ProtocolError> {
+        use RecoveryCommandAllowance as Allowance;
         use TerminalLifecycleState as State;
 
         // Worker join happens only after the coordinator has restored the
@@ -563,7 +721,22 @@ impl TerminalLifecycleValidator {
         {
             return Err(ProtocolError::UnexpectedState);
         }
-        self.superseded_gate_may_be_pending = self.state == State::ReadyForGate;
+        let recovery_window = match self.recovery_command_allowance {
+            Allowance::AwaitingFailure(window)
+                if phase == Phase::Protocol && code == FailureCode::Internal =>
+            {
+                Some(window)
+            }
+            Allowance::AwaitingFailure(_) | Allowance::Armed(_) | Allowance::Consumed => {
+                return Err(ProtocolError::UnexpectedState);
+            }
+            Allowance::Inactive => None,
+        };
+        self.superseded_gate_may_be_pending =
+            self.state == State::ReadyForGate && recovery_window.is_none();
+        if let Some(window) = recovery_window {
+            self.recovery_command_allowance = Allowance::Armed(window);
+        }
         self.failure = Some((phase, code));
         self.state = match self.state {
             State::Quiesced | State::AwaitRecoveryDisarmed | State::RecoveryDisarmed => self.state,
@@ -572,13 +745,17 @@ impl TerminalLifecycleValidator {
         Ok(())
     }
 
-    fn validate_terminal(&self, event: GuardianEvent) -> Result<(), ProtocolError> {
+    fn validate_terminal(
+        &self,
+        event: GuardianEvent,
+    ) -> Result<GuardianExitDisposition, ProtocolError> {
         let GuardianEvent::ChildrenReaped {
             app,
             tui,
             worker,
             cleanup: CleanupStatus::Complete,
             session,
+            guardian_exit,
         } = event
         else {
             return Err(ProtocolError::UnexpectedState);
@@ -589,21 +766,42 @@ impl TerminalLifecycleValidator {
         if app_started != self.app_started || tui_started != self.tui_started {
             return Err(ProtocolError::InvalidValue);
         }
-        if (app_started || tui_started) && worker == WorkerJoinStatus::NotStarted {
+        // App may fail after `ChildStarted` but before the monitor worker is
+        // spawned. That reportable startup path legitimately has no join.
+        // TUI can start only after monitor startup, and every non-failed
+        // terminal session still requires a clean worker join.
+        if worker == WorkerJoinStatus::NotStarted
+            && (tui_started || (app_started && self.failure.is_none()))
+        {
             return Err(ProtocolError::InvalidValue);
         }
 
         match self.failure {
             None => {
-                if session != SessionStatus::Completed
-                    || worker != WorkerJoinStatus::JoinedClean
+                if worker != WorkerJoinStatus::JoinedClean
                     || !self.lease_committed
                     || !self.app_started
                     || !self.tui_started
-                    || !self.gate_ever_opened
+                    || (!self.gate_ever_opened
+                        && self.termination_cause != Some(SessionTerminationCause::CoordinatorStop))
                 {
                     return Err(ProtocolError::InvalidValue);
                 }
+                let (expected_status, disposition) = project_terminal_semantics(
+                    app,
+                    tui,
+                    worker,
+                    self.termination_cause
+                        .ok_or(ProtocolError::UnexpectedState)?,
+                );
+                if guardian_exit == GuardianExitDisposition::InternalFailure {
+                    if session != SessionStatus::Failed {
+                        return Err(ProtocolError::InvalidValue);
+                    }
+                } else if session != expected_status || guardian_exit != disposition {
+                    return Err(ProtocolError::InvalidValue);
+                }
+                return Ok(guardian_exit);
             }
             Some((phase, code)) => {
                 // Cleanup or restoration failure cannot manufacture terminal
@@ -613,12 +811,18 @@ impl TerminalLifecycleValidator {
                 {
                     return Err(ProtocolError::UnexpectedState);
                 }
-                if session != SessionStatus::Failed {
+                if session != SessionStatus::Failed
+                    || guardian_exit != GuardianExitDisposition::InternalFailure
+                {
                     return Err(ProtocolError::InvalidValue);
                 }
             }
         }
-        Ok(())
+        Ok(guardian_exit)
+    }
+
+    fn take_terminal_exit_disposition(&mut self) -> Option<GuardianExitDisposition> {
+        self.terminal_exit_disposition.take()
     }
 
     const fn terminal_received(&self) -> bool {
@@ -635,6 +839,111 @@ impl TerminalLifecycleValidator {
                 }
                 | TerminalLifecycleState::AwaitResizeApplied { .. }
         )
+    }
+}
+
+pub(super) fn project_terminal_semantics(
+    app: ChildDisposition,
+    tui: ChildDisposition,
+    worker: WorkerJoinStatus,
+    cause: SessionTerminationCause,
+) -> (SessionStatus, GuardianExitDisposition) {
+    use ChildDisposition::{Exited, NotStarted, Signaled};
+    use GuardianExitDisposition::{Code, InternalFailure, Signal};
+    use SessionStatus::{Completed, Failed};
+
+    let app_expected = matches!(
+        app,
+        Exited {
+            code: 0,
+            stop_action: StopAction::None | StopAction::Term,
+        } | Signaled {
+            signal: 15,
+            core_dumped: false,
+            stop_action: StopAction::Term,
+        }
+    );
+    if worker != WorkerJoinStatus::JoinedClean || !app_expected {
+        return (Failed, InternalFailure);
+    }
+
+    match (cause, tui) {
+        (
+            SessionTerminationCause::NaturalTuiEof,
+            Exited {
+                code,
+                stop_action: StopAction::None,
+            },
+        ) => (if code == 0 { Completed } else { Failed }, Code(code)),
+        (
+            SessionTerminationCause::NaturalTuiEof,
+            Signaled {
+                signal,
+                stop_action: StopAction::None,
+                ..
+            },
+        ) => (Failed, Signal(signal)),
+        (
+            SessionTerminationCause::CoordinatorStop,
+            Exited {
+                code,
+                stop_action: StopAction::None | StopAction::Term,
+            },
+        ) => (if code == 0 { Completed } else { Failed }, Code(code)),
+        (
+            SessionTerminationCause::CoordinatorStop,
+            Signaled {
+                signal: 15,
+                stop_action: StopAction::Term,
+                ..
+            },
+        ) => (Completed, Code(0)),
+        (
+            SessionTerminationCause::CoordinatorStop,
+            Signaled {
+                signal,
+                stop_action: StopAction::None,
+                ..
+            },
+        ) => (Failed, Signal(signal)),
+        (
+            SessionTerminationCause::ForwardedHup,
+            Signaled {
+                signal: 1,
+                stop_action: StopAction::None,
+                ..
+            },
+        ) => (Completed, Signal(1)),
+        (
+            SessionTerminationCause::ForwardedTerm,
+            Signaled {
+                signal: 15,
+                stop_action: StopAction::None,
+                ..
+            },
+        ) => (Completed, Signal(15)),
+        (
+            SessionTerminationCause::ForwardedHup | SessionTerminationCause::ForwardedTerm,
+            Exited {
+                code,
+                stop_action: StopAction::None,
+            },
+        ) => (if code == 0 { Completed } else { Failed }, Code(code)),
+        (
+            SessionTerminationCause::ForwardedHup | SessionTerminationCause::ForwardedTerm,
+            Signaled {
+                signal,
+                stop_action: StopAction::None,
+                ..
+            },
+        ) => (Failed, Signal(signal)),
+        (
+            SessionTerminationCause::NaturalTuiEof
+            | SessionTerminationCause::CoordinatorStop
+            | SessionTerminationCause::ForwardedHup
+            | SessionTerminationCause::ForwardedTerm,
+            NotStarted | Exited { .. } | Signaled { .. },
+        ) => (Failed, InternalFailure),
     }
 }
 
@@ -727,12 +1036,14 @@ pub(super) fn send_guardian_event<W: Write>(
             worker,
             cleanup,
             session,
+            guardian_exit,
         } => {
             encode_child_disposition(app, &mut body[1..5])?;
             encode_child_disposition(tui, &mut body[5..9])?;
             body[9] = encode_worker_join_status(worker);
             body[10] = encode_cleanup_status(cleanup);
             body[11] = encode_session_status(session);
+            encode_guardian_exit_disposition(guardian_exit, &mut body[12..14])?;
             (GUARDIAN_CHILDREN_REAPED, CHILDREN_REAPED_BODY_BYTES)
         }
     };
@@ -803,6 +1114,21 @@ pub(super) struct CoordinatorReceiver<R> {
     verified_open_gate_ack_pending: bool,
 }
 
+impl<R: AsFd> AsFd for CoordinatorReceiver<R> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.reader.as_fd()
+    }
+}
+
+impl<R> CoordinatorReceiver<R> {
+    /// Borrows the exact owned lifecycle wire for descriptor polling and
+    /// fail-closed shutdown. Protocol reads and writes remain available only
+    /// through the validated receiver methods.
+    pub(super) const fn wire(&self) -> &R {
+        &self.reader
+    }
+}
+
 /// Move-only proof minted only after the coordinator receiver accepts a
 /// protocol-valid initial `Ready` or post-suspend `Resumed` event.
 #[must_use = "verified readiness must be consumed by the input gate"]
@@ -817,6 +1143,82 @@ pub(super) struct VerifiedOpenGateAck {
     _private: (),
 }
 
+/// Move-only proof that the guardian accepted the initial `OpenInputGate`
+/// command after publishing `Ready`. It is minted by the sequence validator,
+/// not by terminal or provider code.
+#[must_use = "the verified initial gate command must be consumed by the guardian pump"]
+pub(super) struct VerifiedInitialOpenGateCommand {
+    _private: (),
+}
+
+/// Move-only proof that the guardian accepted a new `OpenInputGate` command
+/// after the suspend/resume handshake. Keeping this distinct from the initial
+/// proof prevents a stale first-generation gate from recreating ingress.
+#[must_use = "the verified resume gate command must be consumed by the guardian pump"]
+pub(super) struct VerifiedResumeOpenGateCommand {
+    _private: (),
+}
+
+/// Move-only proof that the guardian accepted `Suspend` while active.
+#[must_use = "the verified suspend command must drive the TUI suspend transition"]
+pub(super) struct VerifiedSuspendCommand {
+    _private: (),
+}
+
+/// Move-only proof binding a protocol-valid resume command to its exact size.
+#[must_use = "the verified resume command must drive resize and CONT"]
+pub(super) struct VerifiedResumeCommand {
+    rows: u16,
+    cols: u16,
+}
+
+/// Move-only proof binding an active-session resize command to exact geometry.
+#[must_use = "the verified resize command must drive PTY resize and SIGWINCH"]
+pub(super) struct VerifiedResizeCommand {
+    rows: u16,
+    cols: u16,
+}
+
+/// Move-only guardian proof that the coordinator restored the exact outer
+/// terminal after receiving `TerminalQuiesced`.
+#[must_use = "verified terminal restoration must disarm guardian recovery"]
+pub(super) struct VerifiedTerminalRestoredCommand {
+    _private: (),
+}
+
+/// Move-only proof binding the guardian's final process disposition to the
+/// complete validated command/event transcript.
+#[must_use = "verified guardian exit must be consumed exactly once"]
+pub(super) struct VerifiedGuardianExitDisposition {
+    disposition: GuardianExitDisposition,
+}
+
+impl VerifiedGuardianExitDisposition {
+    pub(super) const fn into_disposition(self) -> GuardianExitDisposition {
+        self.disposition
+    }
+}
+
+impl VerifiedResizeCommand {
+    pub(super) const fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    pub(super) const fn cols(&self) -> u16 {
+        self.cols
+    }
+}
+
+impl VerifiedResumeCommand {
+    pub(super) const fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    pub(super) const fn cols(&self) -> u16 {
+        self.cols
+    }
+}
+
 impl fmt::Debug for VerifiedReady {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("VerifiedReady(<redacted>)")
@@ -826,6 +1228,51 @@ impl fmt::Debug for VerifiedReady {
 impl fmt::Debug for VerifiedOpenGateAck {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("VerifiedOpenGateAck(<redacted>)")
+    }
+}
+
+impl fmt::Debug for VerifiedInitialOpenGateCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedInitialOpenGateCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for VerifiedResumeOpenGateCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedResumeOpenGateCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for VerifiedSuspendCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedSuspendCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for VerifiedResumeCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (self.rows, self.cols);
+        formatter.write_str("VerifiedResumeCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for VerifiedResizeCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (self.rows, self.cols);
+        formatter.write_str("VerifiedResizeCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for VerifiedTerminalRestoredCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedTerminalRestoredCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for VerifiedGuardianExitDisposition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self.disposition;
+        formatter.write_str("VerifiedGuardianExitDisposition(<redacted>)")
     }
 }
 
@@ -937,6 +1384,22 @@ impl<R: Read> CoordinatorReceiver<R> {
         Ok(VerifiedOpenGateAck { _private: () })
     }
 
+    /// Consumes the exact terminal disposition minted from the complete
+    /// validated guardian transcript. The proof exists only after an accepted
+    /// `ChildrenReaped` frame and cannot be recovered after poisoning.
+    pub(super) fn take_verified_exit_disposition(
+        &mut self,
+    ) -> Result<VerifiedGuardianExitDisposition, ProtocolError> {
+        if self.poisoned {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        self.terminal
+            .as_mut()
+            .and_then(TerminalLifecycleValidator::take_terminal_exit_disposition)
+            .map(|disposition| VerifiedGuardianExitDisposition { disposition })
+            .ok_or(ProtocolError::UnexpectedState)
+    }
+
     /// Records a command emitted by the coordinator into the terminal
     /// transcript. `START` itself must be recorded only after `LeaseCommitted`
     /// and the external phase-barrier proof; later commands must be recorded
@@ -961,6 +1424,13 @@ impl<R: Read> CoordinatorReceiver<R> {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "coordinator transcript-state observation is exercised by protocol unit tests"
+        )
+    )]
     pub(super) const fn input_gate_opened(&self) -> bool {
         !self.poisoned
             && match &self.terminal {
@@ -1087,6 +1557,7 @@ impl<R: Read> CoordinatorReceiver<R> {
             worker,
             cleanup: CleanupStatus::Complete,
             session,
+            guardian_exit,
         } = event
         else {
             return Err(ProtocolError::UnexpectedState);
@@ -1097,7 +1568,11 @@ impl<R: Read> CoordinatorReceiver<R> {
         if app_started != self.app_started || tui_started != self.tui_started {
             return Err(ProtocolError::InvalidValue);
         }
-        if (app_started || tui_started) && worker == WorkerJoinStatus::NotStarted {
+        // App-only failure before monitor startup has no worker to join. Once
+        // TUI was announced, monitor startup necessarily succeeded.
+        if worker == WorkerJoinStatus::NotStarted
+            && (tui_started || (app_started && self.failure.is_none()))
+        {
             return Err(ProtocolError::InvalidValue);
         }
 
@@ -1109,6 +1584,7 @@ impl<R: Read> CoordinatorReceiver<R> {
                     || !self.lease_committed
                     || !self.app_started
                     || !self.tui_started
+                    || guardian_exit != GuardianExitDisposition::Code(0)
                 {
                     return Err(ProtocolError::InvalidValue);
                 }
@@ -1119,12 +1595,33 @@ impl<R: Read> CoordinatorReceiver<R> {
                 if phase == Phase::Cleanup || code == FailureCode::CleanupMismatch {
                     return Err(ProtocolError::UnexpectedState);
                 }
-                if session != SessionStatus::Failed {
+                if session != SessionStatus::Failed
+                    || guardian_exit != GuardianExitDisposition::InternalFailure
+                {
                     return Err(ProtocolError::InvalidValue);
                 }
             }
         }
         Ok(())
+    }
+}
+
+impl<R: Read + Write> CoordinatorReceiver<R> {
+    /// Advances the local transcript and writes the same command through the
+    /// one lifecycle owner. Keeping both operations behind this method avoids
+    /// a self-referential `CoordinatorReceiver<&LifecycleEndpoint>` in the
+    /// production coordinator and makes every failure retain the exact wire.
+    ///
+    /// The transcript is deliberately advanced first. If the write fails the
+    /// receiver remains poisoned-by-circumstance and must enter fail-closed
+    /// recovery; replaying the command on a different channel is forbidden.
+    pub(super) fn record_and_send(
+        &mut self,
+        command: CoordinatorCommand,
+        deadline: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.record_command(command)?;
+        send_coordinator_command(&mut self.reader, command, deadline)
     }
 }
 
@@ -1134,6 +1631,23 @@ pub(super) struct GuardianCommandReceiver<R> {
     terminal: Option<TerminalLifecycleValidator>,
     state: GuardianCommandState,
     poisoned: bool,
+    verified_open_gate_command_pending: Option<OpenGateCommandCycle>,
+    verified_suspend_command_pending: bool,
+    verified_resume_command_pending: Option<(u16, u16)>,
+    verified_resize_command_pending: Option<(u16, u16)>,
+    verified_terminal_restored_command_pending: bool,
+}
+
+impl<R: AsFd> AsFd for GuardianCommandReceiver<R> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.reader.as_fd()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenGateCommandCycle {
+    Initial,
+    Resume,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1150,6 +1664,11 @@ impl<R: Read> GuardianCommandReceiver<R> {
             terminal: None,
             state: GuardianCommandState::AwaitStart,
             poisoned: false,
+            verified_open_gate_command_pending: None,
+            verified_suspend_command_pending: false,
+            verified_resume_command_pending: None,
+            verified_resize_command_pending: None,
+            verified_terminal_restored_command_pending: false,
         }
     }
 
@@ -1163,6 +1682,11 @@ impl<R: Read> GuardianCommandReceiver<R> {
             terminal: Some(TerminalLifecycleValidator::before_start()),
             state: GuardianCommandState::AwaitStart,
             poisoned: false,
+            verified_open_gate_command_pending: None,
+            verified_suspend_command_pending: false,
+            verified_resume_command_pending: None,
+            verified_resize_command_pending: None,
+            verified_terminal_restored_command_pending: false,
         }
     }
 
@@ -1174,6 +1698,13 @@ impl<R: Read> GuardianCommandReceiver<R> {
         {
             return Err(ProtocolError::UnexpectedState);
         }
+        // A gate proof is valid only for the immediately preceding accepted
+        // command. Reading another command permanently expires it.
+        self.verified_open_gate_command_pending = None;
+        self.verified_suspend_command_pending = false;
+        self.verified_resume_command_pending = None;
+        self.verified_resize_command_pending = None;
+        self.verified_terminal_restored_command_pending = false;
         let command = match receive_coordinator_command(&mut self.reader, deadline) {
             Ok(command) => command,
             Err(error) => {
@@ -1182,9 +1713,36 @@ impl<R: Read> GuardianCommandReceiver<R> {
             }
         };
         if let Some(terminal) = self.terminal.as_mut() {
-            if let Err(error) = terminal.accept_command(command) {
-                self.poisoned = true;
-                return Err(error);
+            let open_gate_cycle = (command == CoordinatorCommand::OpenInputGate).then_some(
+                if terminal.gate_ever_opened {
+                    OpenGateCommandCycle::Resume
+                } else {
+                    OpenGateCommandCycle::Initial
+                },
+            );
+            let suspend_pending = command == CoordinatorCommand::Suspend;
+            let resume_pending = match command {
+                CoordinatorCommand::Resume { rows, cols } => Some((rows, cols)),
+                _ => None,
+            };
+            let resize_pending = match command {
+                CoordinatorCommand::Resize { rows, cols } => Some((rows, cols)),
+                _ => None,
+            };
+            let terminal_restored_pending = command == CoordinatorCommand::TerminalRestored;
+            let acceptance = match terminal.accept_command(command) {
+                Ok(acceptance) => acceptance,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            };
+            if acceptance == TerminalCommandAcceptance::Applied {
+                self.verified_open_gate_command_pending = open_gate_cycle;
+                self.verified_suspend_command_pending = suspend_pending;
+                self.verified_resume_command_pending = resume_pending;
+                self.verified_resize_command_pending = resize_pending;
+                self.verified_terminal_restored_command_pending = terminal_restored_pending;
             }
             return Ok(command);
         }
@@ -1210,6 +1768,13 @@ impl<R: Read> GuardianCommandReceiver<R> {
         if self.poisoned {
             return Err(ProtocolError::UnexpectedState);
         }
+        // The pump must consume the command proof before publishing its ACK.
+        // Any other transcript advance also makes the proof stale.
+        self.verified_open_gate_command_pending = None;
+        self.verified_suspend_command_pending = false;
+        self.verified_resume_command_pending = None;
+        self.verified_resize_command_pending = None;
+        self.verified_terminal_restored_command_pending = false;
         let Some(terminal) = self.terminal.as_mut() else {
             self.poisoned = true;
             return Err(ProtocolError::UnexpectedState);
@@ -1221,6 +1786,118 @@ impl<R: Read> GuardianCommandReceiver<R> {
         Ok(())
     }
 
+    /// Arms one state-scoped drain slot only for an out-of-band recovery
+    /// request selected before the guardian reads a concurrently-written
+    /// lifecycle command. The immediately following typed recovery failure
+    /// must confirm the slot before it can consume anything.
+    pub(super) fn arm_recovery_command_race(&mut self) -> Result<(), ProtocolError> {
+        if self.poisoned || self.state == GuardianCommandState::Stopped || self.terminal_received()
+        {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        self.verified_open_gate_command_pending = None;
+        self.verified_suspend_command_pending = false;
+        self.verified_resume_command_pending = None;
+        self.verified_resize_command_pending = None;
+        self.verified_terminal_restored_command_pending = false;
+        self.terminal
+            .as_mut()
+            .ok_or(ProtocolError::UnexpectedState)?
+            .arm_recovery_command_race()
+    }
+
+    /// Consumes the one-shot proof for the first input-gate generation.
+    pub(super) fn take_verified_initial_open_gate_command(
+        &mut self,
+    ) -> Result<VerifiedInitialOpenGateCommand, ProtocolError> {
+        if self.poisoned
+            || self.verified_open_gate_command_pending != Some(OpenGateCommandCycle::Initial)
+        {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        self.verified_open_gate_command_pending = None;
+        Ok(VerifiedInitialOpenGateCommand { _private: () })
+    }
+
+    /// Consumes the one-shot proof for a post-resume input-gate generation.
+    pub(super) fn take_verified_resume_open_gate_command(
+        &mut self,
+    ) -> Result<VerifiedResumeOpenGateCommand, ProtocolError> {
+        if self.poisoned
+            || self.verified_open_gate_command_pending != Some(OpenGateCommandCycle::Resume)
+        {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        self.verified_open_gate_command_pending = None;
+        Ok(VerifiedResumeOpenGateCommand { _private: () })
+    }
+
+    pub(super) fn take_verified_suspend_command(
+        &mut self,
+    ) -> Result<VerifiedSuspendCommand, ProtocolError> {
+        if self.poisoned || !std::mem::take(&mut self.verified_suspend_command_pending) {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        Ok(VerifiedSuspendCommand { _private: () })
+    }
+
+    pub(super) fn take_verified_resume_command(
+        &mut self,
+    ) -> Result<VerifiedResumeCommand, ProtocolError> {
+        let Some((rows, cols)) = self.verified_resume_command_pending.take() else {
+            return Err(ProtocolError::UnexpectedState);
+        };
+        if self.poisoned {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        Ok(VerifiedResumeCommand { rows, cols })
+    }
+
+    pub(super) fn take_verified_resize_command(
+        &mut self,
+    ) -> Result<VerifiedResizeCommand, ProtocolError> {
+        let Some((rows, cols)) = self.verified_resize_command_pending.take() else {
+            return Err(ProtocolError::UnexpectedState);
+        };
+        if self.poisoned {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        Ok(VerifiedResizeCommand { rows, cols })
+    }
+
+    pub(super) fn take_verified_terminal_restored_command(
+        &mut self,
+    ) -> Result<VerifiedTerminalRestoredCommand, ProtocolError> {
+        if self.poisoned || !std::mem::take(&mut self.verified_terminal_restored_command_pending) {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        Ok(VerifiedTerminalRestoredCommand { _private: () })
+    }
+
+    /// Consumes the exact terminal disposition minted from the complete
+    /// guardian transcript. It is unavailable before `ChildrenReaped` and is
+    /// never returned after a protocol or lifecycle write failure poisons the
+    /// receiver.
+    pub(super) fn take_verified_exit_disposition(
+        &mut self,
+    ) -> Result<VerifiedGuardianExitDisposition, ProtocolError> {
+        if self.poisoned {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        self.terminal
+            .as_mut()
+            .and_then(TerminalLifecycleValidator::take_terminal_exit_disposition)
+            .map(|disposition| VerifiedGuardianExitDisposition { disposition })
+            .ok_or(ProtocolError::UnexpectedState)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "guardian transcript-state observation is exercised by protocol unit tests"
+        )
+    )]
     pub(super) const fn input_gate_opened(&self) -> bool {
         !self.poisoned
             && match &self.terminal {
@@ -1235,6 +1912,26 @@ impl<R: Read> GuardianCommandReceiver<R> {
                 Some(terminal) => terminal.terminal_received(),
                 None => matches!(self.state, GuardianCommandState::Stopped),
             }
+    }
+}
+
+impl<R: Read + Write> GuardianCommandReceiver<R> {
+    /// Advances the guardian transcript before publishing the event. A write
+    /// failure is terminal for this receiver: replay on another channel would
+    /// create two competing lifecycle histories.
+    pub(super) fn record_and_send(
+        &mut self,
+        event: GuardianEvent,
+        deadline: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.record_event(event)?;
+        match send_guardian_event(&mut self.reader, event, deadline) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1410,6 +2107,7 @@ fn receive_guardian_event<R: Read>(
                 worker: decode_worker_join_status(frame.body[9])?,
                 cleanup: decode_cleanup_status(frame.body[10])?,
                 session: decode_session_status(frame.body[11])?,
+                guardian_exit: decode_guardian_exit_disposition(&frame.body[12..14])?,
             })
         }
         _ => Err(ProtocolError::UnknownType),
@@ -1715,6 +2413,37 @@ fn decode_child_disposition(input: &[u8]) -> Result<ChildDisposition, ProtocolEr
     }
 }
 
+fn encode_guardian_exit_disposition(
+    disposition: GuardianExitDisposition,
+    output: &mut [u8],
+) -> Result<(), ProtocolError> {
+    if output.len() != 2 {
+        return Err(ProtocolError::InvalidLength);
+    }
+    let encoded = match disposition {
+        GuardianExitDisposition::Code(code) => [1, code],
+        GuardianExitDisposition::Signal(signal) if (1..=127).contains(&signal) => [2, signal],
+        GuardianExitDisposition::Signal(_) => return Err(ProtocolError::InvalidValue),
+        GuardianExitDisposition::InternalFailure => [3, 0],
+    };
+    output.copy_from_slice(&encoded);
+    Ok(())
+}
+
+fn decode_guardian_exit_disposition(
+    input: &[u8],
+) -> Result<GuardianExitDisposition, ProtocolError> {
+    if input.len() != 2 {
+        return Err(ProtocolError::InvalidLength);
+    }
+    match input {
+        [1, code] => Ok(GuardianExitDisposition::Code(*code)),
+        [2, signal @ 1..=127] => Ok(GuardianExitDisposition::Signal(*signal)),
+        [3, 0] => Ok(GuardianExitDisposition::InternalFailure),
+        _ => Err(ProtocolError::InvalidValue),
+    }
+}
+
 const fn encode_stop_action(action: StopAction) -> u8 {
     match action {
         StopAction::None => 0,
@@ -1927,6 +2656,7 @@ mod tests {
             worker: WorkerJoinStatus::JoinedClean,
             cleanup: CleanupStatus::Complete,
             session: SessionStatus::Completed,
+            guardian_exit: GuardianExitDisposition::Code(0),
         }
     }
 
@@ -1951,6 +2681,7 @@ mod tests {
             },
             cleanup: CleanupStatus::Complete,
             session: SessionStatus::Failed,
+            guardian_exit: GuardianExitDisposition::InternalFailure,
         }
     }
 
@@ -2175,6 +2906,7 @@ mod tests {
             worker: WorkerJoinStatus::JoinedClean,
             cleanup: CleanupStatus::Complete,
             session: SessionStatus::Completed,
+            guardian_exit: GuardianExitDisposition::Code(0),
         };
         assert_eq!(
             send_guardian_event(&mut Vec::new(), invalid_signal, deadline()),
@@ -2409,6 +3141,7 @@ mod tests {
             worker: WorkerJoinStatus::JoinedFailed,
             cleanup: CleanupStatus::Complete,
             session: SessionStatus::Failed,
+            guardian_exit: GuardianExitDisposition::InternalFailure,
         };
         let mut wire = Vec::new();
         append_event(&mut wire, GuardianEvent::LeaseCommitted)?;
@@ -2442,6 +3175,7 @@ mod tests {
             worker: WorkerJoinStatus::JoinedFailed,
             cleanup: CleanupStatus::Complete,
             session: SessionStatus::Failed,
+            guardian_exit: GuardianExitDisposition::InternalFailure,
         };
         let mut wire = Vec::new();
         append_event(&mut wire, GuardianEvent::LeaseCommitted)?;
@@ -2473,6 +3207,7 @@ mod tests {
                 worker: WorkerJoinStatus::JoinedFailed,
                 cleanup: CleanupStatus::Complete,
                 session: SessionStatus::Completed,
+                guardian_exit: GuardianExitDisposition::Code(0),
             },
             GuardianEvent::ChildrenReaped {
                 app: exited(0),
@@ -2480,6 +3215,7 @@ mod tests {
                 worker: WorkerJoinStatus::JoinedClean,
                 cleanup: CleanupStatus::Complete,
                 session: SessionStatus::Failed,
+                guardian_exit: GuardianExitDisposition::Code(0),
             },
         ] {
             let mut wire = Vec::new();
@@ -2779,6 +3515,118 @@ mod tests {
         Ok(())
     }
 
+    fn active_terminal_validator() -> Result<TerminalLifecycleValidator, ProtocolError> {
+        let mut validator = TerminalLifecycleValidator::before_start();
+        validator.accept_event(GuardianEvent::LeaseCommitted)?;
+        validator.accept_command(CoordinatorCommand::Start)?;
+        validator.accept_event(terminal_armed())?;
+        validator.accept_command(CoordinatorCommand::TerminalArmAccepted)?;
+        validator.accept_event(app_started())?;
+        validator.accept_event(tui_started())?;
+        validator.accept_event(GuardianEvent::Ready)?;
+        validator.accept_command(CoordinatorCommand::OpenInputGate)?;
+        validator.accept_event(GuardianEvent::InputGateOpened)?;
+        Ok(validator)
+    }
+
+    fn complete_terminal_event(tui: ChildDisposition, session: SessionStatus) -> GuardianEvent {
+        let guardian_exit = match tui {
+            ChildDisposition::Exited { code, .. } => GuardianExitDisposition::Code(code),
+            ChildDisposition::Signaled {
+                stop_action: StopAction::Term,
+                ..
+            } => GuardianExitDisposition::Code(0),
+            ChildDisposition::Signaled { signal, .. } => GuardianExitDisposition::Signal(signal),
+            ChildDisposition::NotStarted => GuardianExitDisposition::InternalFailure,
+        };
+        GuardianEvent::ChildrenReaped {
+            app: ChildDisposition::Signaled {
+                signal: 15,
+                core_dumped: false,
+                stop_action: StopAction::Term,
+            },
+            tui,
+            worker: WorkerJoinStatus::JoinedClean,
+            cleanup: CleanupStatus::Complete,
+            session,
+            guardian_exit,
+        }
+    }
+
+    #[test]
+    fn terminal_semantics_accept_natural_nonzero_without_infrastructure_failure()
+    -> Result<(), Box<dyn Error>> {
+        let tui = ChildDisposition::Exited {
+            code: 23,
+            stop_action: StopAction::None,
+        };
+        let mut validator = active_terminal_validator()?;
+        validator.accept_event(GuardianEvent::TerminalQuiesced)?;
+        validator.accept_command(CoordinatorCommand::TerminalRestored)?;
+        validator.accept_event(GuardianEvent::TerminalRecoveryDisarmed)?;
+        validator.accept_event(complete_terminal_event(tui, SessionStatus::Failed))?;
+        assert_eq!(
+            validator.take_terminal_exit_disposition(),
+            Some(GuardianExitDisposition::Code(23))
+        );
+
+        let mut invalid = active_terminal_validator()?;
+        invalid.accept_event(GuardianEvent::TerminalQuiesced)?;
+        invalid.accept_command(CoordinatorCommand::TerminalRestored)?;
+        invalid.accept_event(GuardianEvent::TerminalRecoveryDisarmed)?;
+        assert_eq!(
+            invalid.accept_event(complete_terminal_event(tui, SessionStatus::Completed)),
+            Err(ProtocolError::InvalidValue)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_semantics_bind_stop_and_forwarded_signal_to_exact_exit()
+    -> Result<(), Box<dyn Error>> {
+        let mut stopped = active_terminal_validator()?;
+        stopped.accept_command(CoordinatorCommand::Stop)?;
+        stopped.accept_event(GuardianEvent::TerminalQuiesced)?;
+        stopped.accept_command(CoordinatorCommand::TerminalRestored)?;
+        stopped.accept_event(GuardianEvent::TerminalRecoveryDisarmed)?;
+        stopped.accept_event(complete_terminal_event(
+            ChildDisposition::Signaled {
+                signal: 15,
+                core_dumped: false,
+                stop_action: StopAction::Term,
+            },
+            SessionStatus::Completed,
+        ))?;
+        assert_eq!(
+            stopped.take_terminal_exit_disposition(),
+            Some(GuardianExitDisposition::Code(0))
+        );
+
+        let mut forwarded = active_terminal_validator()?;
+        forwarded.accept_command(CoordinatorCommand::Signal {
+            signal: UnixSignal::Hup,
+        })?;
+        forwarded.accept_event(GuardianEvent::SignalForwarded {
+            signal: UnixSignal::Hup,
+        })?;
+        forwarded.accept_event(GuardianEvent::TerminalQuiesced)?;
+        forwarded.accept_command(CoordinatorCommand::TerminalRestored)?;
+        forwarded.accept_event(GuardianEvent::TerminalRecoveryDisarmed)?;
+        forwarded.accept_event(complete_terminal_event(
+            ChildDisposition::Signaled {
+                signal: 1,
+                core_dumped: false,
+                stop_action: StopAction::None,
+            },
+            SessionStatus::Completed,
+        ))?;
+        assert_eq!(
+            forwarded.take_terminal_exit_disposition(),
+            Some(GuardianExitDisposition::Signal(1))
+        );
+        Ok(())
+    }
+
     #[test]
     fn terminal_receiver_requires_arming_ready_and_gate_ack_before_input_state()
     -> Result<(), Box<dyn Error>> {
@@ -2829,6 +3677,48 @@ mod tests {
             Err(ProtocolError::UnexpectedState)
         ));
         assert!(receiver.input_gate_opened());
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_receiver_rejects_shared_app_and_tui_process_groups() -> Result<(), Box<dyn Error>> {
+        let snapshot = TerminalSnapshotFingerprint::from_digest([0x31; 32]);
+        let app = GuardianEvent::ChildStarted {
+            role: ChildRole::AppServer,
+            pid: 101,
+            pgid: 101,
+        };
+        let tui_same_group = GuardianEvent::ChildStarted {
+            role: ChildRole::Tui,
+            pid: 101,
+            pgid: 101,
+        };
+        let mut wire = Vec::new();
+        for event in [
+            GuardianEvent::LeaseCommitted,
+            GuardianEvent::TerminalArmed { snapshot },
+            app,
+            tui_same_group,
+        ] {
+            append_event(&mut wire, event)?;
+        }
+        let mut receiver = CoordinatorReceiver::new_terminal(Cursor::new(wire));
+        assert_eq!(receiver.receive(deadline())?, GuardianEvent::LeaseCommitted);
+        receiver.record_command(CoordinatorCommand::Start)?;
+        assert_eq!(
+            receiver.receive(deadline())?,
+            GuardianEvent::TerminalArmed { snapshot }
+        );
+        receiver.record_command(CoordinatorCommand::TerminalArmAccepted)?;
+        assert_eq!(receiver.receive(deadline())?, app);
+        assert_eq!(
+            receiver.receive(deadline()),
+            Err(ProtocolError::InvalidValue)
+        );
+        assert_eq!(
+            receiver.receive(deadline()),
+            Err(ProtocolError::UnexpectedState)
+        );
         Ok(())
     }
 
@@ -3243,9 +4133,133 @@ mod tests {
             receiver.receive(deadline())?,
             CoordinatorCommand::TerminalRestored
         );
+        let restored = receiver.take_verified_terminal_restored_command()?;
+        assert_eq!(
+            format!("{restored:?}"),
+            "VerifiedTerminalRestoredCommand(<redacted>)"
+        );
+        assert_eq!(std::mem::size_of_val(&restored), 0);
+        assert!(matches!(
+            receiver.take_verified_terminal_restored_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
         receiver.record_event(GuardianEvent::TerminalRecoveryDisarmed)?;
         receiver.record_event(completed_terminal())?;
         assert!(receiver.terminal_received());
+        Ok(())
+    }
+
+    #[test]
+    fn guardian_mints_distinct_one_shot_gate_proofs_for_initial_and_resume_cycles()
+    -> Result<(), Box<dyn Error>> {
+        let mut commands = encode_coordinator(CoordinatorCommand::Start)?;
+        commands.extend_from_slice(&encode_coordinator(
+            CoordinatorCommand::TerminalArmAccepted,
+        )?);
+        commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
+        commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::Resize {
+            rows: 37,
+            cols: 111,
+        })?);
+        commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::Suspend)?);
+        commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::Resume {
+            rows: 41,
+            cols: 123,
+        })?);
+        commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
+
+        let mut receiver = GuardianCommandReceiver::new_terminal(Cursor::new(commands));
+        receiver.record_event(GuardianEvent::LeaseCommitted)?;
+        assert_eq!(receiver.receive(deadline())?, CoordinatorCommand::Start);
+        record_guardian_terminal_ready(&mut receiver)?;
+
+        assert!(matches!(
+            receiver.take_verified_initial_open_gate_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        assert_eq!(
+            receiver.receive(deadline())?,
+            CoordinatorCommand::OpenInputGate
+        );
+        let initial = receiver.take_verified_initial_open_gate_command()?;
+        assert_eq!(
+            format!("{initial:?}"),
+            "VerifiedInitialOpenGateCommand(<redacted>)"
+        );
+        assert_eq!(std::mem::size_of_val(&initial), 0);
+        assert!(matches!(
+            receiver.take_verified_initial_open_gate_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        assert!(matches!(
+            receiver.take_verified_resume_open_gate_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        receiver.record_event(GuardianEvent::InputGateOpened)?;
+
+        assert_eq!(
+            receiver.receive(deadline())?,
+            CoordinatorCommand::Resize {
+                rows: 37,
+                cols: 111,
+            }
+        );
+        let resize = receiver.take_verified_resize_command()?;
+        assert_eq!((resize.rows(), resize.cols()), (37, 111));
+        assert_eq!(format!("{resize:?}"), "VerifiedResizeCommand(<redacted>)");
+        assert!(matches!(
+            receiver.take_verified_resize_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        receiver.record_event(GuardianEvent::ResizeApplied {
+            rows: 37,
+            cols: 111,
+        })?;
+
+        assert_eq!(receiver.receive(deadline())?, CoordinatorCommand::Suspend);
+        let suspend = receiver.take_verified_suspend_command()?;
+        assert_eq!(format!("{suspend:?}"), "VerifiedSuspendCommand(<redacted>)");
+        assert!(matches!(
+            receiver.take_verified_suspend_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        receiver.record_event(GuardianEvent::Suspended)?;
+        assert_eq!(
+            receiver.receive(deadline())?,
+            CoordinatorCommand::Resume {
+                rows: 41,
+                cols: 123,
+            }
+        );
+        let resume = receiver.take_verified_resume_command()?;
+        assert_eq!((resume.rows(), resume.cols()), (41, 123));
+        assert_eq!(format!("{resume:?}"), "VerifiedResumeCommand(<redacted>)");
+        assert!(matches!(
+            receiver.take_verified_resume_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        receiver.record_event(GuardianEvent::Resumed {
+            rows: 41,
+            cols: 123,
+        })?;
+        assert_eq!(
+            receiver.receive(deadline())?,
+            CoordinatorCommand::OpenInputGate
+        );
+        assert!(matches!(
+            receiver.take_verified_initial_open_gate_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        let resumed = receiver.take_verified_resume_open_gate_command()?;
+        assert_eq!(
+            format!("{resumed:?}"),
+            "VerifiedResumeOpenGateCommand(<redacted>)"
+        );
+        assert_eq!(std::mem::size_of_val(&resumed), 0);
+        assert!(matches!(
+            receiver.take_verified_resume_open_gate_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
         Ok(())
     }
 
@@ -3266,6 +4280,7 @@ mod tests {
             worker: WorkerJoinStatus::JoinedFailed,
             cleanup: CleanupStatus::Complete,
             session: SessionStatus::Failed,
+            guardian_exit: GuardianExitDisposition::InternalFailure,
         };
         let mut wire = terminal_ready_events()?;
         for event in [
@@ -3378,6 +4393,281 @@ mod tests {
                 Err(ProtocolError::UnexpectedState)
             );
         }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum RecoveryRaceState {
+        ReadyForGate,
+        Active,
+        Suspended,
+    }
+
+    fn recovery_failure() -> GuardianEvent {
+        GuardianEvent::Failed {
+            phase: Phase::Protocol,
+            code: FailureCode::Internal,
+        }
+    }
+
+    fn guardian_at_recovery_race_state(
+        state: RecoveryRaceState,
+        queued: &[CoordinatorCommand],
+    ) -> Result<GuardianCommandReceiver<Cursor<Vec<u8>>>, Box<dyn Error>> {
+        let mut commands = encode_coordinator(CoordinatorCommand::Start)?;
+        commands.extend_from_slice(&encode_coordinator(
+            CoordinatorCommand::TerminalArmAccepted,
+        )?);
+        if matches!(
+            state,
+            RecoveryRaceState::Active | RecoveryRaceState::Suspended
+        ) {
+            commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
+        }
+        if matches!(state, RecoveryRaceState::Suspended) {
+            commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::Suspend)?);
+        }
+        for command in queued {
+            commands.extend_from_slice(&encode_coordinator(*command)?);
+        }
+
+        let mut receiver = GuardianCommandReceiver::new_terminal(Cursor::new(commands));
+        receiver.record_event(GuardianEvent::LeaseCommitted)?;
+        if receiver.receive(deadline())? != CoordinatorCommand::Start {
+            return Err("guardian did not consume START".into());
+        }
+        record_guardian_terminal_ready(&mut receiver)?;
+        if matches!(
+            state,
+            RecoveryRaceState::Active | RecoveryRaceState::Suspended
+        ) {
+            if receiver.receive(deadline())? != CoordinatorCommand::OpenInputGate {
+                return Err("guardian did not consume the initial gate command".into());
+            }
+            let _proof = receiver.take_verified_initial_open_gate_command()?;
+            receiver.record_event(GuardianEvent::InputGateOpened)?;
+        }
+        if matches!(state, RecoveryRaceState::Suspended) {
+            if receiver.receive(deadline())? != CoordinatorCommand::Suspend {
+                return Err("guardian did not consume the setup suspend command".into());
+            }
+            let _proof = receiver.take_verified_suspend_command()?;
+            receiver.record_event(GuardianEvent::Suspended)?;
+        }
+        Ok(receiver)
+    }
+
+    fn assert_no_superseded_command_proof(receiver: &mut GuardianCommandReceiver<Cursor<Vec<u8>>>) {
+        assert!(matches!(
+            receiver.take_verified_initial_open_gate_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        assert!(matches!(
+            receiver.take_verified_resume_open_gate_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        assert!(matches!(
+            receiver.take_verified_suspend_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        assert!(matches!(
+            receiver.take_verified_resume_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+        assert!(matches!(
+            receiver.take_verified_resize_command(),
+            Err(ProtocolError::UnexpectedState)
+        ));
+    }
+
+    fn assert_no_recovery_race_termination_cause(
+        receiver: &GuardianCommandReceiver<Cursor<Vec<u8>>>,
+    ) {
+        assert_eq!(
+            receiver
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.termination_cause),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_and_in_flight_controls_are_deterministic_in_both_arrival_orders()
+    -> Result<(), Box<dyn Error>> {
+        for (state, command) in [
+            (
+                RecoveryRaceState::Active,
+                CoordinatorCommand::Signal {
+                    signal: UnixSignal::Hup,
+                },
+            ),
+            (
+                RecoveryRaceState::Active,
+                CoordinatorCommand::Signal {
+                    signal: UnixSignal::Term,
+                },
+            ),
+            (RecoveryRaceState::Active, CoordinatorCommand::Suspend),
+            (
+                RecoveryRaceState::Suspended,
+                CoordinatorCommand::Resume {
+                    rows: 41,
+                    cols: 123,
+                },
+            ),
+        ] {
+            // Recovery is observed before the guardian reads the already-written
+            // command. It may drain that exact frame only after quiescence.
+            let mut recovery_first = guardian_at_recovery_race_state(
+                state,
+                &[command, CoordinatorCommand::TerminalRestored],
+            )?;
+            recovery_first.arm_recovery_command_race()?;
+            recovery_first.record_event(recovery_failure())?;
+            recovery_first.record_event(GuardianEvent::TerminalQuiesced)?;
+            assert_eq!(recovery_first.receive(deadline())?, command);
+            assert_no_superseded_command_proof(&mut recovery_first);
+            assert_no_recovery_race_termination_cause(&recovery_first);
+            assert_eq!(
+                recovery_first.receive(deadline())?,
+                CoordinatorCommand::TerminalRestored
+            );
+            let _restored = recovery_first.take_verified_terminal_restored_command()?;
+
+            // The command reaches the guardian first. The subsequent recovery
+            // failure invalidates its unconsumed operation proof and still does
+            // not manufacture an ACK or termination cause.
+            let mut command_first = guardian_at_recovery_race_state(
+                state,
+                &[command, CoordinatorCommand::TerminalRestored],
+            )?;
+            assert_eq!(command_first.receive(deadline())?, command);
+            command_first.record_event(recovery_failure())?;
+            command_first.record_event(GuardianEvent::TerminalQuiesced)?;
+            assert_no_superseded_command_proof(&mut command_first);
+            assert_no_recovery_race_termination_cause(&command_first);
+            assert_eq!(
+                command_first.receive(deadline())?,
+                CoordinatorCommand::TerminalRestored
+            );
+            let _restored = command_first.take_verified_terminal_restored_command()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_command_allowance_is_state_scoped_one_shot_and_expires_on_restore()
+    -> Result<(), Box<dyn Error>> {
+        for (state, command) in [
+            (
+                RecoveryRaceState::ReadyForGate,
+                CoordinatorCommand::OpenInputGate,
+            ),
+            (RecoveryRaceState::ReadyForGate, CoordinatorCommand::Stop),
+            (
+                RecoveryRaceState::Active,
+                CoordinatorCommand::Resize {
+                    rows: 41,
+                    cols: 123,
+                },
+            ),
+            (RecoveryRaceState::Active, CoordinatorCommand::Stop),
+            (
+                RecoveryRaceState::Suspended,
+                CoordinatorCommand::Signal {
+                    signal: UnixSignal::Quit,
+                },
+            ),
+            (RecoveryRaceState::Suspended, CoordinatorCommand::Stop),
+        ] {
+            let mut receiver = guardian_at_recovery_race_state(
+                state,
+                &[command, CoordinatorCommand::TerminalRestored],
+            )?;
+            receiver.arm_recovery_command_race()?;
+            receiver.record_event(recovery_failure())?;
+            receiver.record_event(GuardianEvent::TerminalQuiesced)?;
+            assert_eq!(receiver.receive(deadline())?, command);
+            assert_no_superseded_command_proof(&mut receiver);
+            assert_no_recovery_race_termination_cause(&receiver);
+            assert_eq!(
+                receiver.receive(deadline())?,
+                CoordinatorCommand::TerminalRestored
+            );
+        }
+
+        for (state, invalid) in [
+            (RecoveryRaceState::ReadyForGate, CoordinatorCommand::Suspend),
+            (
+                RecoveryRaceState::Active,
+                CoordinatorCommand::Resume {
+                    rows: 41,
+                    cols: 123,
+                },
+            ),
+            (
+                RecoveryRaceState::Suspended,
+                CoordinatorCommand::Resize {
+                    rows: 41,
+                    cols: 123,
+                },
+            ),
+        ] {
+            let mut receiver = guardian_at_recovery_race_state(state, &[invalid])?;
+            receiver.arm_recovery_command_race()?;
+            receiver.record_event(recovery_failure())?;
+            receiver.record_event(GuardianEvent::TerminalQuiesced)?;
+            assert_eq!(
+                receiver.receive(deadline()),
+                Err(ProtocolError::UnexpectedState)
+            );
+        }
+
+        for replay in [
+            CoordinatorCommand::Signal {
+                signal: UnixSignal::Hup,
+            },
+            CoordinatorCommand::Signal {
+                signal: UnixSignal::Int,
+            },
+            CoordinatorCommand::Resize {
+                rows: 41,
+                cols: 123,
+            },
+        ] {
+            let mut replayed = guardian_at_recovery_race_state(
+                RecoveryRaceState::Active,
+                &[replay, replay, CoordinatorCommand::TerminalRestored],
+            )?;
+            replayed.arm_recovery_command_race()?;
+            replayed.record_event(recovery_failure())?;
+            replayed.record_event(GuardianEvent::TerminalQuiesced)?;
+            assert_eq!(replayed.receive(deadline())?, replay);
+            assert_eq!(
+                replayed.receive(deadline()),
+                Err(ProtocolError::UnexpectedState)
+            );
+        }
+
+        let mut expired = guardian_at_recovery_race_state(
+            RecoveryRaceState::ReadyForGate,
+            &[
+                CoordinatorCommand::TerminalRestored,
+                CoordinatorCommand::OpenInputGate,
+            ],
+        )?;
+        expired.arm_recovery_command_race()?;
+        expired.record_event(recovery_failure())?;
+        expired.record_event(GuardianEvent::TerminalQuiesced)?;
+        assert_eq!(
+            expired.receive(deadline())?,
+            CoordinatorCommand::TerminalRestored
+        );
+        assert_eq!(
+            expired.receive(deadline()),
+            Err(ProtocolError::UnexpectedState)
+        );
         Ok(())
     }
 

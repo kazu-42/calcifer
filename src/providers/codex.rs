@@ -14,11 +14,27 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
 mod handoff_compat;
-#[cfg(unix)]
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod json;
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod monitor;
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
 mod remote;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(dead_code)] // Staged behind issue #50 until the public supervisor is complete.
 mod supervisor;
 
 #[cfg(all(
@@ -26,6 +42,17 @@ mod supervisor;
     any(target_os = "linux", target_os = "macos")
 ))]
 pub(crate) use supervisor::run_internal_fixture;
+
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) use supervisor::{internal_production_role_requested, run_internal_production_role};
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) use supervisor::{internal_tui_launcher_requested, run_internal_tui_launcher};
 
 /// Capability proving that the installed Codex process passed the exact
 /// identity-adapter initialize/home/version gate.
@@ -69,6 +96,15 @@ pub(crate) const MCP_OAUTH_FILE_CREDENTIALS_OVERRIDE: &str =
     r#"mcp_oauth_credentials_store="file""#;
 
 const MANAGED_ENVIRONMENT_DENYLIST: &[&str] = &[
+    // Calcifer's private supervisor bootstrap is authority-bearing. Provider
+    // descendants must never inherit enough of it to dispatch another role or
+    // retain the anchor completion endpoint.
+    "CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE",
+    "CALCIFER_INTERNAL_CODEX_PROFILE_ID",
+    "CALCIFER_INTERNAL_CODEX_THREAD_ID",
+    "CALCIFER_INTERNAL_CODEX_EXECUTABLE",
+    "CALCIFER_INTERNAL_CODEX_FOREGROUND_PROCESS_GROUP",
+    "CALCIFER_SUPERVISOR_READINESS_FD",
     "OPENAI_API_KEY",
     "OPENAI_ORGANIZATION",
     "OPENAI_PROJECT",
@@ -243,6 +279,12 @@ impl std::error::Error for CodexThreadError {}
 /// replace the profile selected by Calcifer.
 pub(crate) fn managed_command(executable: &Path, codex_home: &Path) -> Command {
     let mut command = Command::new(executable);
+    command.env_clear();
+    for (name, value) in std::env::vars_os() {
+        if !is_managed_environment_override(&name) {
+            command.env(name, value);
+        }
+    }
     sanitize_managed_environment(&mut command);
     command
         .args([
@@ -275,6 +317,8 @@ fn is_managed_environment_override(name: &OsStr) -> bool {
     };
     let normalized = name.to_ascii_uppercase();
     MANAGED_ENVIRONMENT_DENYLIST.contains(&normalized.as_str())
+        || normalized.starts_with("CALCIFER_")
+        || normalized.starts_with("OPENAI_")
         || normalized.starts_with("CODEX_TEST_")
         || normalized.starts_with("CODEX_CLOUD_TASKS_")
         || normalized.starts_with("CODEX_EXEC_SERVER_")
@@ -2821,7 +2865,21 @@ mod tests {
     #[test]
     fn managed_environment_filter_rejects_auth_config_and_future_overrides() {
         for name in [
+            "CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE",
+            "CALCIFER_INTERNAL_CODEX_PROFILE_ID",
+            "CALCIFER_INTERNAL_CODEX_THREAD_ID",
+            "CALCIFER_INTERNAL_CODEX_EXECUTABLE",
+            "CALCIFER_INTERNAL_CODEX_FOREGROUND_PROCESS_GROUP",
+            "CALCIFER_SUPERVISOR_READINESS_FD",
+            "CALCIFER_PACKAGE_SUPERVISOR_ROLE",
+            "CALCIFER_PACKAGE_TUI_LAUNCHER",
+            "CaLcIfEr_PaCkAgE_FuTuRe_CoNtRoL",
+            "CALCIFER_CODEX_COMPAT_BINARY",
+            "CALCIFER_HOME",
+            "CaLcIfEr_FuTuRe_CoNtRoL",
             "OPENAI_API_KEY",
+            "OPENAI_FUTURE_ENDPOINT",
+            "OpEnAi_FuTuRe_RoUtInG_SeCrEt",
             "CODEX_ACCESS_TOKEN",
             "CoDeX_AcCeSs_ToKeN",
             "CODEX_AUTHAPI_BASE_URL",
@@ -2859,6 +2917,34 @@ mod tests {
                 "{name} is outside the managed authentication denylist"
             );
         }
+    }
+
+    #[test]
+    fn managed_command_projects_the_complete_safe_ambient_environment() {
+        let command = managed_command(
+            Path::new("/synthetic/codex"),
+            Path::new("/synthetic/profile"),
+        );
+        let projected = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<BTreeMap<std::ffi::OsString, Option<std::ffi::OsString>>>();
+        let mut safe_values = 0_usize;
+        for (name, value) in std::env::vars_os() {
+            if name == OsStr::new("CODEX_HOME") || is_managed_environment_override(&name) {
+                continue;
+            }
+            safe_values += 1;
+            assert_eq!(
+                projected.get(&name),
+                Some(&Some(value)),
+                "safe ambient environment must survive the launcher projection"
+            );
+        }
+        assert!(
+            safe_values > 0,
+            "the test process had no safe ambient values"
+        );
     }
 
     #[test]

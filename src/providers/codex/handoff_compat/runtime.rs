@@ -1,8 +1,10 @@
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::ops::Deref;
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
@@ -14,15 +16,18 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::super::remote::{ReadinessProbe, ReadinessProxy, ReadinessProxyError};
+use super::super::remote::{
+    ReadinessProbe, ReadinessProxy, ReadinessProxyError, ReadinessProxyShutdownFailure,
+};
 use super::super::{
     AppServerProcess, CodexThreadError, CodexUsageError, child_exit_observed_without_reaping,
     child_reap_confirmed, configure_own_process_group, force_terminate_process_tree,
-    probe_codex_version_command, reap_exited_process_tree, validate_initialize_result,
+    managed_command, probe_codex_version_command, reap_exited_process_tree,
+    validate_initialize_result,
 };
 use super::{
-    CodexExecutableIdentity, CodexHandoffCapability, CodexHandoffError, HandoffSchemaContract,
-    validate_handoff_schema_pair,
+    CodexExecutableIdentity, CodexHandoffCapability, CodexHandoffError, CodexHandoffFailure,
+    HandoffSchemaContract, validate_handoff_schema_pair,
 };
 
 const SUPPORTED_VERSION: &str = "0.144.4";
@@ -44,31 +49,75 @@ const MAX_TUI_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const PROBE_EXECUTABLE_FILE: &str = "codex";
 
+#[cfg(test)]
+thread_local! {
+    static VERIFICATION_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn verification_attempts_for_test() -> usize {
+    VERIFICATION_ATTEMPTS.with(std::cell::Cell::get)
+}
+
 pub(super) fn verify(
     codex_executable: &Path,
     timeout: Duration,
-) -> Result<CodexHandoffCapability, CodexHandoffError> {
+) -> Result<CodexHandoffCapability, CodexHandoffFailure> {
+    #[cfg(test)]
+    VERIFICATION_ATTEMPTS.with(|attempts| {
+        attempts.set(attempts.get().saturating_add(1));
+    });
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(CodexHandoffError::Timeout)?;
     let executable = capture_executable(codex_executable, deadline)?;
     let proof = verify_before_remote_until(&executable, deadline)?;
-    let remote = verify_remote_tui(&proof.probe_executable, &proof, deadline)?;
-    ensure_no_credentials(proof.scratch.path())?;
-    ensure_no_model_request(&proof.model_listener)?;
-    proof.probe_binary_directory.revalidate()?;
-    revalidate_executable_until(&proof.probe_executable, Some(deadline))?;
-    revalidate_executable_until(&executable, Some(deadline))?;
-    Ok(mint_capability(
-        executable,
-        proof.schema,
-        proof.fork,
-        remote,
-    ))
+    let remote = match verify_remote_tui(&proof.probe_executable, &proof, deadline) {
+        Ok(remote) => remote,
+        Err(failure) => return Err(cleanup_failed_proof(proof, failure, deadline)),
+    };
+    let verification = (|| {
+        ensure_no_credentials(proof.scratch.path())?;
+        ensure_no_model_request(&proof.model_listener)?;
+        proof.probe_binary_directory.revalidate()?;
+        revalidate_executable_until(&proof.probe_executable, Some(deadline))?;
+        revalidate_executable_until(&executable, Some(deadline))
+    })();
+    if let Err(error) = verification {
+        return Err(cleanup_failed_proof(proof, error.into(), deadline));
+    }
+    let pinned_executable =
+        match PinnedExecutableStage::from_verified(&proof.probe_executable, deadline) {
+            Ok(stage) => stage,
+            Err(failure) => {
+                return Err(cleanup_failed_proof(proof, failure.into(), deadline));
+            }
+        };
+    if let Err(error) = pinned_executable.revalidate(deadline) {
+        let failure = CodexHandoffFailure::from(PinnedStageCreateFailure::with_complete(
+            error,
+            pinned_executable,
+        ));
+        return Err(cleanup_failed_proof(proof, failure, deadline));
+    }
+    cleanup_verified_proof(proof, pinned_executable, remote, deadline)
 }
 
 struct PreRemoteProof {
     scratch: ScratchRoot,
+    probe_binary_directory: PrivateDirectory,
+    probe_executable: CodexExecutableIdentity,
+    schema: HandoffSchemaContract,
+    fork: ForkProof,
+    model_listener: TcpListener,
+    source_home: PrivateDirectory,
+    target_home: PrivateDirectory,
+    workspace: PrivateDirectory,
+    environment_home: PrivateDirectory,
+    target_config: TargetConfigProof,
+}
+
+struct PreRemoteParts {
     probe_binary_directory: PrivateDirectory,
     probe_executable: CodexExecutableIdentity,
     schema: HandoffSchemaContract,
@@ -126,7 +175,7 @@ struct RemoteTuiProof {
 fn verify_before_remote(
     codex_executable: &Path,
     timeout: Duration,
-) -> Result<PreRemoteProof, CodexHandoffError> {
+) -> Result<PreRemoteProof, CodexHandoffFailure> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(CodexHandoffError::Timeout)?;
@@ -137,10 +186,39 @@ fn verify_before_remote(
 fn verify_before_remote_until(
     source_executable: &CodexExecutableIdentity,
     deadline: Instant,
-) -> Result<PreRemoteProof, CodexHandoffError> {
+) -> Result<PreRemoteProof, CodexHandoffFailure> {
     let scratch = ScratchRoot::create()?;
+    match build_pre_remote_parts(source_executable, &scratch, deadline) {
+        Ok(parts) => Ok(PreRemoteProof {
+            scratch,
+            probe_binary_directory: parts.probe_binary_directory,
+            probe_executable: parts.probe_executable,
+            schema: parts.schema,
+            fork: parts.fork,
+            model_listener: parts.model_listener,
+            source_home: parts.source_home,
+            target_home: parts.target_home,
+            workspace: parts.workspace,
+            environment_home: parts.environment_home,
+            target_config: parts.target_config,
+        }),
+        Err(error) => match scratch.cleanup(deadline) {
+            Ok(_) => Err(error.into()),
+            Err(cleanup) => Err(CodexHandoffFailure::with_retained(
+                error,
+                CodexHandoffRetention::ScratchCleanup(cleanup),
+            )),
+        },
+    }
+}
+
+fn build_pre_remote_parts(
+    source_executable: &CodexExecutableIdentity,
+    scratch: &ScratchRoot,
+    deadline: Instant,
+) -> Result<PreRemoteParts, CodexHandoffError> {
     let (probe_binary_directory, probe_executable) =
-        stage_executable(source_executable, &scratch, deadline)?;
+        stage_executable(source_executable, scratch, deadline)?;
     let executable = &probe_executable;
     let source_home = scratch.create_directory("s")?;
     let target_home = scratch.create_directory("t")?;
@@ -166,7 +244,7 @@ fn verify_before_remote_until(
     )?;
 
     revalidate_probe_roots(
-        &scratch,
+        scratch,
         &source_home,
         &target_home,
         &workspace,
@@ -180,7 +258,7 @@ fn verify_before_remote_until(
         .map_err(map_thread_error)?;
     target_config.revalidate(&target_home)?;
     revalidate_probe_roots(
-        &scratch,
+        scratch,
         &source_home,
         &target_home,
         &workspace,
@@ -197,13 +275,13 @@ fn verify_before_remote_until(
         &target_home,
         &environment_home,
         &workspace,
-        &scratch,
+        scratch,
         &target_config,
         deadline,
     )?;
     target_config.revalidate(&target_home)?;
     revalidate_probe_roots(
-        &scratch,
+        scratch,
         &source_home,
         &target_home,
         &workspace,
@@ -226,15 +304,14 @@ fn verify_before_remote_until(
     ensure_no_credentials(scratch.path())?;
     ensure_no_model_request(&model_listener)?;
     revalidate_probe_roots(
-        &scratch,
+        scratch,
         &source_home,
         &target_home,
         &workspace,
         &environment_home,
     )?;
 
-    Ok(PreRemoteProof {
-        scratch,
+    Ok(PreRemoteParts {
         probe_binary_directory,
         probe_executable,
         schema,
@@ -252,7 +329,7 @@ fn verify_remote_tui(
     executable: &CodexExecutableIdentity,
     proof: &PreRemoteProof,
     deadline: Instant,
-) -> Result<RemoteTuiProof, CodexHandoffError> {
+) -> Result<RemoteTuiProof, CodexHandoffFailure> {
     proof.scratch.revalidate()?;
     proof.source_home.revalidate()?;
     proof.target_home.revalidate()?;
@@ -326,10 +403,16 @@ fn verify_remote_tui(
         "handoff probe: post-ready liveness tui={tui_running} app-server={app_server_running}"
     );
     if !tui_running || !app_server_running {
-        return Err(CodexHandoffError::Protocol);
+        return Err(CodexHandoffError::Protocol.into());
     }
     proxy.ensure_connected().map_err(map_proxy_error)?;
-    proxy.shutdown().map_err(map_proxy_error)?;
+    if let Err(failure) = proxy.shutdown(deadline) {
+        let error = map_proxy_error(failure.error());
+        return Err(CodexHandoffFailure::with_retained(
+            error,
+            CodexHandoffRetention::ProxyShutdown(Box::new(failure)),
+        ));
+    }
     #[cfg(test)]
     eprintln!("handoff probe: readiness proxy shut down while connected");
     let tui_output = tui.shutdown()?;
@@ -341,7 +424,7 @@ fn verify_remote_tui(
         tui_output.failed
     );
     if tui_output.overflowed || tui_output.failed || tui_output.bytes.len() > MAX_TUI_OUTPUT_BYTES {
-        return Err(CodexHandoffError::Protocol);
+        return Err(CodexHandoffError::Protocol.into());
     }
     app_server.shutdown()?;
     #[cfg(test)]
@@ -361,12 +444,903 @@ fn verify_remote_tui(
 }
 
 fn mint_capability(
-    executable: CodexExecutableIdentity,
+    executable: PinnedExecutableStage,
     _schema: HandoffSchemaContract,
     _fork: ForkProof,
     _remote: RemoteTuiProof,
 ) -> CodexHandoffCapability {
     CodexHandoffCapability { executable }
+}
+
+fn cleanup_failed_proof(
+    proof: PreRemoteProof,
+    failure: CodexHandoffFailure,
+    deadline: Instant,
+) -> CodexHandoffFailure {
+    let PreRemoteProof {
+        scratch,
+        probe_binary_directory,
+        probe_executable,
+        schema,
+        fork,
+        model_listener,
+        source_home,
+        target_home,
+        workspace,
+        environment_home,
+        target_config,
+    } = proof;
+    drop((
+        probe_binary_directory,
+        probe_executable,
+        schema,
+        fork,
+        model_listener,
+        source_home,
+        target_home,
+        workspace,
+        environment_home,
+        target_config,
+    ));
+    match scratch.cleanup(deadline) {
+        Ok(_) => failure,
+        Err(cleanup) => retain_scratch_cleanup(failure, cleanup),
+    }
+}
+
+fn cleanup_verified_proof(
+    proof: PreRemoteProof,
+    pinned_executable: PinnedExecutableStage,
+    remote: RemoteTuiProof,
+    deadline: Instant,
+) -> Result<CodexHandoffCapability, CodexHandoffFailure> {
+    let PreRemoteProof {
+        scratch,
+        probe_binary_directory,
+        probe_executable,
+        schema,
+        fork,
+        model_listener,
+        source_home,
+        target_home,
+        workspace,
+        environment_home,
+        target_config,
+    } = proof;
+    drop((
+        probe_binary_directory,
+        probe_executable,
+        model_listener,
+        source_home,
+        target_home,
+        workspace,
+        environment_home,
+        target_config,
+    ));
+    match scratch.cleanup(deadline) {
+        Ok(_) => Ok(mint_capability(pinned_executable, schema, fork, remote)),
+        Err(cleanup) => {
+            let cleanup_error = cleanup.error();
+            let stage = PinnedStageCreateFailure::with_complete(
+                PinnedStageError::Storage,
+                pinned_executable,
+            );
+            let retained_stage = match CodexHandoffFailure::from(stage).retained {
+                Some(retained) => retained,
+                None => return Err(cleanup_error.into()),
+            };
+            Err(CodexHandoffFailure::with_retained(
+                cleanup_error,
+                CodexHandoffRetention::Combined {
+                    prior: Box::new(retained_stage),
+                    scratch: cleanup,
+                },
+            ))
+        }
+    }
+}
+
+fn retain_scratch_cleanup(
+    mut failure: CodexHandoffFailure,
+    cleanup: Box<ScratchRootCleanupFailure>,
+) -> CodexHandoffFailure {
+    failure.retained = Some(match failure.retained.take() {
+        Some(prior) => CodexHandoffRetention::Combined {
+            prior: Box::new(prior),
+            scratch: cleanup,
+        },
+        None => CodexHandoffRetention::ScratchCleanup(cleanup),
+    });
+    failure
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PinnedStageError {
+    ExecutableChanged,
+    Storage,
+    Timeout,
+}
+
+impl fmt::Display for PinnedStageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ExecutableChanged => "the verified Codex executable changed",
+            Self::Storage => "the private Codex executable stage is unsafe",
+            Self::Timeout => "the verified Codex executable stage timed out",
+        })
+    }
+}
+
+impl std::error::Error for PinnedStageError {}
+
+#[must_use = "stage creation failure can retain filesystem ownership"]
+pub(crate) struct PinnedStageCreateFailure {
+    error: PinnedStageError,
+    ownership: Option<PinnedStageConstructionOwnership>,
+}
+
+enum PinnedStageConstructionOwnership {
+    ScratchCreate(Box<ScratchRootCreateFailure>),
+    Scratch(Box<ScratchRoot>),
+    Complete(Box<PinnedExecutableStage>),
+}
+
+impl fmt::Debug for PinnedStageConstructionOwnership {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ScratchCreate(failure) => {
+                let _ = failure;
+                formatter.write_str("PinnedStageConstructionOwnership::ScratchCreate(<redacted>)")
+            }
+            Self::Scratch(scratch) => {
+                let _ = scratch;
+                formatter.write_str("PinnedStageConstructionOwnership::Scratch(<redacted>)")
+            }
+            Self::Complete(stage) => {
+                let _ = stage;
+                formatter.write_str("PinnedStageConstructionOwnership::Complete(<redacted>)")
+            }
+        }
+    }
+}
+
+pub(super) enum CodexHandoffRetention {
+    ScratchCreate(Box<ScratchRootCreateFailure>),
+    ScratchCleanup(Box<ScratchRootCleanupFailure>),
+    StageCreate(Box<PinnedStageCreateFailure>),
+    ProxyShutdown(Box<ReadinessProxyShutdownFailure>),
+    Combined {
+        prior: Box<CodexHandoffRetention>,
+        scratch: Box<ScratchRootCleanupFailure>,
+    },
+}
+
+pub(super) struct HandoffRetentionResolveFailure {
+    pub(super) retained: CodexHandoffRetention,
+    pub(super) error: CodexHandoffError,
+}
+
+/// Retries the exact cleanup phase retained by a failed compatibility probe.
+///
+/// Recursive `Combined` ownership is resolved in dependency order: a live
+/// relay/probe or pinned stage first, then the scratch tree containing its
+/// files. Every failed branch reconstructs an owned variant; no pathname-only
+/// cleanup authority is invented.
+pub(super) fn resolve_handoff_retention(
+    retained: CodexHandoffRetention,
+    deadline: Instant,
+) -> Result<(), HandoffRetentionResolveFailure> {
+    match retained {
+        CodexHandoffRetention::ScratchCreate(mut failure) => {
+            let Some(retained) = failure.retained.take() else {
+                return Ok(());
+            };
+            match retained {
+                ScratchRootRetention::Open(root) => resolve_scratch_root(*root, deadline),
+                ScratchRootRetention::Partial(root) => {
+                    let error = failure.error();
+                    failure.retained = Some(ScratchRootRetention::Partial(root));
+                    Err(HandoffRetentionResolveFailure {
+                        retained: CodexHandoffRetention::ScratchCreate(failure),
+                        error,
+                    })
+                }
+            }
+        }
+        CodexHandoffRetention::ScratchCleanup(failure) => {
+            resolve_scratch_cleanup(*failure, deadline)
+        }
+        CodexHandoffRetention::StageCreate(mut failure) => {
+            let Some(ownership) = failure.ownership.take() else {
+                return Ok(());
+            };
+            match ownership {
+                PinnedStageConstructionOwnership::ScratchCreate(failure) => {
+                    resolve_handoff_retention(
+                        CodexHandoffRetention::ScratchCreate(failure),
+                        deadline,
+                    )
+                }
+                PinnedStageConstructionOwnership::Scratch(scratch) => {
+                    resolve_scratch_root(*scratch, deadline)
+                }
+                PinnedStageConstructionOwnership::Complete(stage) => {
+                    let original_error = failure.error;
+                    match (*stage).cleanup(deadline) {
+                        Ok(_) => Ok(()),
+                        Err(cleanup) => {
+                            let error = map_pinned_stage_error(cleanup.error());
+                            Err(HandoffRetentionResolveFailure {
+                                retained: CodexHandoffRetention::StageCreate(Box::new(
+                                    PinnedStageCreateFailure::with_complete(
+                                        original_error,
+                                        (*cleanup).into_stage(),
+                                    ),
+                                )),
+                                error,
+                            })
+                        }
+                    }
+                }
+            }
+        }
+        CodexHandoffRetention::ProxyShutdown(failure) => {
+            let Some(proxy) = failure.into_proxy() else {
+                return Ok(());
+            };
+            match proxy.shutdown(deadline) {
+                Ok(_) => Ok(()),
+                Err(failure) => {
+                    let error = map_proxy_error(failure.error());
+                    Err(HandoffRetentionResolveFailure {
+                        retained: CodexHandoffRetention::ProxyShutdown(Box::new(failure)),
+                        error,
+                    })
+                }
+            }
+        }
+        CodexHandoffRetention::Combined { prior, scratch } => {
+            match resolve_handoff_retention(*prior, deadline) {
+                Ok(()) => resolve_scratch_cleanup(*scratch, deadline),
+                Err(failure) => Err(HandoffRetentionResolveFailure {
+                    retained: CodexHandoffRetention::Combined {
+                        prior: Box::new(failure.retained),
+                        scratch,
+                    },
+                    error: failure.error,
+                }),
+            }
+        }
+    }
+}
+
+fn resolve_scratch_cleanup(
+    failure: ScratchRootCleanupFailure,
+    deadline: Instant,
+) -> Result<(), HandoffRetentionResolveFailure> {
+    let ScratchRootCleanupFailure { root, .. } = failure;
+    resolve_scratch_root(root, deadline)
+}
+
+fn resolve_scratch_root(
+    mut root: ScratchRoot,
+    deadline: Instant,
+) -> Result<(), HandoffRetentionResolveFailure> {
+    // Construction failures intentionally mark an exact open root as
+    // preserved so Drop can never mutate it. Reaching this function consumes
+    // that retained owner through the explicit deadline-bearing cleanup API,
+    // which is the only transition allowed to reactivate mutation.
+    root.authorize_explicit_cleanup();
+    match root.cleanup(deadline) {
+        Ok(_) => Ok(()),
+        Err(failure) => {
+            let error = failure.error();
+            Err(HandoffRetentionResolveFailure {
+                retained: CodexHandoffRetention::ScratchCleanup(failure),
+                error,
+            })
+        }
+    }
+}
+
+impl PinnedStageCreateFailure {
+    fn not_created(error: PinnedStageError) -> Self {
+        Self {
+            error,
+            ownership: None,
+        }
+    }
+
+    fn from_scratch_create(failure: ScratchRootCreateFailure) -> Self {
+        Self {
+            error: map_stage_error(failure.error()),
+            ownership: Some(PinnedStageConstructionOwnership::ScratchCreate(Box::new(
+                failure,
+            ))),
+        }
+    }
+
+    fn with_scratch(error: PinnedStageError, mut scratch: ScratchRoot) -> Self {
+        scratch.preserve();
+        Self {
+            error,
+            ownership: Some(PinnedStageConstructionOwnership::Scratch(Box::new(scratch))),
+        }
+    }
+
+    fn with_complete(error: PinnedStageError, stage: PinnedExecutableStage) -> Self {
+        Self {
+            error,
+            ownership: Some(PinnedStageConstructionOwnership::Complete(Box::new(stage))),
+        }
+    }
+
+    pub(crate) const fn error(&self) -> PinnedStageError {
+        self.error
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_path(&self) -> Option<&Path> {
+        match self.ownership.as_ref()? {
+            PinnedStageConstructionOwnership::ScratchCreate(failure) => failure.retained_path(),
+            PinnedStageConstructionOwnership::Scratch(scratch) => Some(scratch.path()),
+            PinnedStageConstructionOwnership::Complete(stage) => Some(stage.scratch.path()),
+        }
+    }
+}
+
+impl fmt::Display for PinnedStageCreateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl fmt::Debug for PinnedStageCreateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = &self.ownership;
+        formatter
+            .debug_struct("PinnedStageCreateFailure")
+            .field("error", &self.error)
+            .field("retained", &self.ownership.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for PinnedStageCreateFailure {}
+
+impl From<PinnedStageCreateFailure> for CodexHandoffFailure {
+    fn from(failure: PinnedStageCreateFailure) -> Self {
+        let error = map_pinned_stage_error(failure.error());
+        if failure.ownership.is_some() {
+            Self::with_retained(error, CodexHandoffRetention::StageCreate(Box::new(failure)))
+        } else {
+            error.into()
+        }
+    }
+}
+
+impl From<ScratchRootCreateFailure> for CodexHandoffFailure {
+    fn from(failure: ScratchRootCreateFailure) -> Self {
+        let error = failure.error();
+        if failure.retained.is_some() {
+            Self::with_retained(
+                error,
+                CodexHandoffRetention::ScratchCreate(Box::new(failure)),
+            )
+        } else {
+            error.into()
+        }
+    }
+}
+
+impl fmt::Debug for CodexHandoffRetention {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ScratchCreate(failure) => {
+                let _ = failure;
+                formatter.write_str("CodexHandoffRetention::ScratchCreate(<redacted>)")
+            }
+            Self::ScratchCleanup(failure) => {
+                let _ = failure;
+                formatter.write_str("CodexHandoffRetention::ScratchCleanup(<redacted>)")
+            }
+            Self::StageCreate(failure) => {
+                let _ = failure;
+                formatter.write_str("CodexHandoffRetention::StageCreate(<redacted>)")
+            }
+            Self::ProxyShutdown(failure) => {
+                let _ = failure;
+                formatter.write_str("CodexHandoffRetention::ProxyShutdown(<redacted>)")
+            }
+            Self::Combined { prior, scratch } => {
+                let _ = (prior, scratch);
+                formatter.write_str("CodexHandoffRetention::Combined(<redacted>)")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedStageCleanupComplete {
+    _private: (),
+}
+
+#[must_use = "cleanup failure retains the pinned stage and must be handled"]
+pub(crate) struct PinnedStageCleanupFailure {
+    stage: PinnedExecutableStage,
+    error: PinnedStageError,
+}
+
+impl PinnedStageCleanupFailure {
+    pub(crate) const fn error(&self) -> PinnedStageError {
+        self.error
+    }
+
+    pub(crate) fn into_stage(self) -> PinnedExecutableStage {
+        self.stage
+    }
+}
+
+impl fmt::Debug for PinnedStageCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = &self.stage;
+        formatter
+            .debug_struct("PinnedStageCleanupFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One compatibility-proven executable retained below an owner-private root.
+///
+/// The installed pathname is never used after this value is minted. Both
+/// provider command plans revalidate and use this exact private stage.
+#[must_use = "a pinned executable stage must be explicitly cleaned or retained"]
+pub(crate) struct PinnedExecutableStage {
+    scratch: ScratchRoot,
+    directory: PrivateDirectory,
+    executable: CodexExecutableIdentity,
+    cleanup_state: PinnedStageCleanupState,
+    cleanup_first_error: Option<PinnedStageError>,
+    cleanup_fault: Option<PinnedStageCleanupFault>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PinnedStageCleanupState {
+    Active,
+    ExecutableRemovedPendingDirectorySync,
+    ExecutableRemovalDurable,
+    DirectoryRemovedPendingRootSync,
+    DirectoryRemovalDurable,
+    RootRemovedPendingParentSync,
+    Cleaned,
+    Preserved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PinnedStageCleanupFault {
+    BeforeMutation,
+    AfterExecutableRemove,
+    AfterDirectorySync,
+    AfterDirectoryRemove,
+    AfterRootSync,
+    AfterRootRemove,
+}
+
+impl PinnedExecutableStage {
+    /// Appends every persistent descriptor that pins the private executable
+    /// stage to one source-pinned child denyset.
+    pub(crate) fn append_forbidden_descriptors<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        forbidden.capture(self.scratch.parent_descriptor.as_fd())?;
+        forbidden.capture(self.scratch.descriptor.as_fd())?;
+        forbidden.capture(self.directory.descriptor.as_fd())
+    }
+
+    fn from_verified(
+        source: &CodexExecutableIdentity,
+        deadline: Instant,
+    ) -> Result<Self, PinnedStageCreateFailure> {
+        revalidate_executable_until(source, Some(deadline))
+            .map_err(map_stage_error)
+            .map_err(PinnedStageCreateFailure::not_created)?;
+        let scratch =
+            ScratchRoot::create().map_err(PinnedStageCreateFailure::from_scratch_create)?;
+        Self::stage(source, scratch, deadline)
+    }
+
+    #[cfg(test)]
+    fn from_verified_in(
+        source: &CodexExecutableIdentity,
+        parent: &Path,
+        deadline: Instant,
+    ) -> Result<Self, PinnedStageCreateFailure> {
+        revalidate_executable_until(source, Some(deadline))
+            .map_err(map_stage_error)
+            .map_err(PinnedStageCreateFailure::not_created)?;
+        let scratch = ScratchRoot::create_in(parent)
+            .map_err(PinnedStageCreateFailure::from_scratch_create)?;
+        Self::stage(source, scratch, deadline)
+    }
+
+    #[cfg(test)]
+    fn from_verified_in_with_root_sync_failure(
+        source: &CodexExecutableIdentity,
+        parent: &Path,
+        deadline: Instant,
+    ) -> Result<Self, PinnedStageCreateFailure> {
+        revalidate_executable_until(source, Some(deadline))
+            .map_err(map_stage_error)
+            .map_err(PinnedStageCreateFailure::not_created)?;
+        let scratch = ScratchRoot::create_in_with_sync_failure(parent)
+            .map_err(PinnedStageCreateFailure::from_scratch_create)?;
+        Self::stage(source, scratch, deadline)
+    }
+
+    #[cfg(test)]
+    fn from_verified_in_with_parent_sync_failure(
+        source: &CodexExecutableIdentity,
+        parent: &Path,
+        deadline: Instant,
+    ) -> Result<Self, PinnedStageCreateFailure> {
+        revalidate_executable_until(source, Some(deadline))
+            .map_err(map_stage_error)
+            .map_err(PinnedStageCreateFailure::not_created)?;
+        let scratch = ScratchRoot::create_in_with_parent_sync_failure(parent)
+            .map_err(PinnedStageCreateFailure::from_scratch_create)?;
+        Self::stage(source, scratch, deadline)
+    }
+
+    fn stage(
+        source: &CodexExecutableIdentity,
+        mut scratch: ScratchRoot,
+        deadline: Instant,
+    ) -> Result<Self, PinnedStageCreateFailure> {
+        // A pinned stage never delegates to ScratchRoot's recursive probe
+        // cleanup. From this point onward, partial or ambiguous construction
+        // is retained; a complete stage uses only identity-conditioned cleanup.
+        scratch.preserve();
+        let (directory, executable) = match stage_executable(source, &scratch, deadline) {
+            Ok(staged) => staged,
+            Err(error) => {
+                return Err(PinnedStageCreateFailure::with_scratch(
+                    map_stage_error(error),
+                    scratch,
+                ));
+            }
+        };
+        if directory.descriptor.sync_all().is_err() {
+            return Err(PinnedStageCreateFailure::with_scratch(
+                PinnedStageError::Storage,
+                scratch,
+            ));
+        }
+        if scratch.sync_all().is_err() {
+            return Err(PinnedStageCreateFailure::with_scratch(
+                PinnedStageError::Storage,
+                scratch,
+            ));
+        }
+        if let Err(error) = scratch.revalidate() {
+            return Err(PinnedStageCreateFailure::with_scratch(
+                map_stage_error(error),
+                scratch,
+            ));
+        }
+        Ok(Self {
+            scratch,
+            directory,
+            executable,
+            cleanup_state: PinnedStageCleanupState::Active,
+            cleanup_first_error: None,
+            cleanup_fault: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn executable_path_for_test(&self) -> &Path {
+        &self.executable.canonical_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_path(&self) -> &Path {
+        self.directory.as_ref()
+    }
+
+    pub(crate) fn revalidate(&self, deadline: Instant) -> Result<(), PinnedStageError> {
+        if self.cleanup_state != PinnedStageCleanupState::Active {
+            return Err(PinnedStageError::Storage);
+        }
+        ensure_stage_deadline(deadline)?;
+        self.scratch.revalidate().map_err(map_stage_error)?;
+        self.directory.revalidate().map_err(map_stage_error)?;
+        revalidate_executable_until(&self.executable, Some(deadline)).map_err(map_stage_error)
+    }
+
+    /// Rechecks the exact private stage without re-reading its full contents.
+    ///
+    /// A full digest validation must already have succeeded for the launch
+    /// being prepared. This narrow check is intended for the final spawn
+    /// boundary: it rejects pathname replacement and in-place metadata changes
+    /// while keeping storage throughput out of a relative readiness budget.
+    pub(crate) fn revalidate_metadata(&self) -> Result<(), PinnedStageError> {
+        if self.cleanup_state != PinnedStageCleanupState::Active {
+            return Err(PinnedStageError::Storage);
+        }
+        self.scratch.revalidate().map_err(map_stage_error)?;
+        self.directory.revalidate().map_err(map_stage_error)?;
+        revalidate_executable_metadata(&self.executable).map_err(map_stage_error)
+    }
+
+    pub(crate) fn app_server_command(
+        &self,
+        codex_home: &Path,
+        working_directory: &Path,
+        socket_address: &str,
+        deadline: Instant,
+    ) -> Result<Command, PinnedStageError> {
+        self.revalidate(deadline)?;
+        let mut command = managed_command(&self.executable.canonical_path, codex_home);
+        command
+            .env_remove("RUST_LOG")
+            .env_remove("LOG_FORMAT")
+            .args(["app-server", "--listen", socket_address])
+            .current_dir(working_directory);
+        Ok(command)
+    }
+
+    pub(crate) fn remote_tui_command(
+        &self,
+        codex_home: &Path,
+        working_directory: &Path,
+        socket_address: &str,
+        thread_id: &str,
+        deadline: Instant,
+    ) -> Result<Command, PinnedStageError> {
+        self.revalidate(deadline)?;
+        let mut command = managed_command(&self.executable.canonical_path, codex_home);
+        command
+            .env_remove("RUST_LOG")
+            .env_remove("LOG_FORMAT")
+            .args([
+                "resume",
+                "--no-alt-screen",
+                "--remote",
+                socket_address,
+                thread_id,
+            ])
+            .current_dir(working_directory);
+        Ok(command)
+    }
+
+    pub(crate) fn cleanup(
+        mut self,
+        deadline: Instant,
+    ) -> Result<PinnedStageCleanupComplete, Box<PinnedStageCleanupFailure>> {
+        let result = self.cleanup_once(deadline);
+        match result {
+            Ok(()) => {
+                self.cleanup_state = PinnedStageCleanupState::Cleaned;
+                Ok(PinnedStageCleanupComplete { _private: () })
+            }
+            Err(error) => {
+                self.scratch.preserve();
+                let first_error = *self.cleanup_first_error.get_or_insert(error);
+                Err(Box::new(PinnedStageCleanupFailure {
+                    stage: self,
+                    error: first_error,
+                }))
+            }
+        }
+    }
+
+    fn cleanup_once(&mut self, deadline: Instant) -> Result<(), PinnedStageError> {
+        loop {
+            ensure_stage_deadline(deadline)?;
+            match self.cleanup_state {
+                PinnedStageCleanupState::Active => {
+                    self.inject_cleanup_fault(PinnedStageCleanupFault::BeforeMutation)?;
+                    self.revalidate(deadline)?;
+                    let mut entries = fs::read_dir(self.directory.as_ref())
+                        .map_err(|_| PinnedStageError::Storage)?;
+                    let entry = entries
+                        .next()
+                        .transpose()
+                        .map_err(|_| PinnedStageError::Storage)?
+                        .ok_or(PinnedStageError::ExecutableChanged)?;
+                    if entry.file_name() != OsStr::new(PROBE_EXECUTABLE_FILE) {
+                        return Err(PinnedStageError::ExecutableChanged);
+                    }
+                    match entries.next() {
+                        None => {}
+                        Some(Ok(_)) => return Err(PinnedStageError::ExecutableChanged),
+                        Some(Err(_)) => return Err(PinnedStageError::Storage),
+                    }
+                    ensure_stage_deadline(deadline)?;
+                    fs::remove_file(&self.executable.canonical_path)
+                        .map_err(|_| PinnedStageError::Storage)?;
+                    if fs::symlink_metadata(&self.executable.canonical_path).is_ok() {
+                        return Err(PinnedStageError::ExecutableChanged);
+                    }
+                    self.cleanup_state =
+                        PinnedStageCleanupState::ExecutableRemovedPendingDirectorySync;
+                    self.inject_cleanup_fault(PinnedStageCleanupFault::AfterExecutableRemove)?;
+                }
+                PinnedStageCleanupState::ExecutableRemovedPendingDirectorySync => {
+                    self.directory
+                        .descriptor
+                        .sync_all()
+                        .map_err(|_| PinnedStageError::Storage)?;
+                    self.cleanup_state = PinnedStageCleanupState::ExecutableRemovalDurable;
+                    self.inject_cleanup_fault(PinnedStageCleanupFault::AfterDirectorySync)?;
+                }
+                PinnedStageCleanupState::ExecutableRemovalDurable => {
+                    self.directory.revalidate().map_err(map_stage_error)?;
+                    self.scratch.revalidate().map_err(map_stage_error)?;
+                    fs::remove_dir(self.directory.as_ref())
+                        .map_err(|_| PinnedStageError::Storage)?;
+                    if fs::symlink_metadata(self.directory.as_ref()).is_ok() {
+                        return Err(PinnedStageError::Storage);
+                    }
+                    self.cleanup_state = PinnedStageCleanupState::DirectoryRemovedPendingRootSync;
+                    self.inject_cleanup_fault(PinnedStageCleanupFault::AfterDirectoryRemove)?;
+                }
+                PinnedStageCleanupState::DirectoryRemovedPendingRootSync => {
+                    self.scratch.sync_all().map_err(map_stage_error)?;
+                    self.cleanup_state = PinnedStageCleanupState::DirectoryRemovalDurable;
+                    self.inject_cleanup_fault(PinnedStageCleanupFault::AfterRootSync)?;
+                }
+                PinnedStageCleanupState::DirectoryRemovalDurable => {
+                    self.scratch.revalidate().map_err(map_stage_error)?;
+                    fs::remove_dir(self.scratch.path()).map_err(|_| PinnedStageError::Storage)?;
+                    if fs::symlink_metadata(self.scratch.path()).is_ok() {
+                        return Err(PinnedStageError::Storage);
+                    }
+                    self.cleanup_state = PinnedStageCleanupState::RootRemovedPendingParentSync;
+                    self.inject_cleanup_fault(PinnedStageCleanupFault::AfterRootRemove)?;
+                }
+                PinnedStageCleanupState::RootRemovedPendingParentSync => {
+                    self.scratch.sync_parent().map_err(map_stage_error)?;
+                    return Ok(());
+                }
+                PinnedStageCleanupState::Cleaned => return Ok(()),
+                PinnedStageCleanupState::Preserved => return Err(PinnedStageError::Storage),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_cleanup_for_test(&mut self) {
+        self.cleanup_fault = Some(PinnedStageCleanupFault::BeforeMutation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_cleanup_at_for_test(&mut self, fault: PinnedStageCleanupFault) {
+        self.cleanup_fault = Some(fault);
+    }
+
+    fn inject_cleanup_fault(
+        &mut self,
+        expected: PinnedStageCleanupFault,
+    ) -> Result<(), PinnedStageError> {
+        if self.cleanup_fault == Some(expected) {
+            self.cleanup_fault = None;
+            Err(PinnedStageError::Storage)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl fmt::Debug for PinnedExecutableStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (&self.executable, self.cleanup_state);
+        formatter.write_str("PinnedExecutableStage(<redacted>)")
+    }
+}
+
+impl Drop for PinnedExecutableStage {
+    fn drop(&mut self) {
+        if !matches!(
+            self.cleanup_state,
+            PinnedStageCleanupState::Cleaned | PinnedStageCleanupState::Preserved
+        ) {
+            // Drop must never perform an unbounded executable hash or hide a
+            // cleanup failure. Explicit cleanup owns a caller-supplied
+            // deadline; implicit drop retains the identity-bound evidence and
+            // never attempts a remaining partial-cleanup phase.
+            self.cleanup_state = PinnedStageCleanupState::Preserved;
+            self.scratch.preserve();
+        }
+    }
+}
+
+fn ensure_stage_deadline(deadline: Instant) -> Result<(), PinnedStageError> {
+    if Instant::now() >= deadline {
+        Err(PinnedStageError::Timeout)
+    } else {
+        Ok(())
+    }
+}
+
+fn map_pinned_stage_error(error: PinnedStageError) -> CodexHandoffError {
+    match error {
+        PinnedStageError::ExecutableChanged => CodexHandoffError::Unsupported,
+        PinnedStageError::Storage => CodexHandoffError::Transport,
+        PinnedStageError::Timeout => CodexHandoffError::Timeout,
+    }
+}
+
+fn map_stage_error(error: CodexHandoffError) -> PinnedStageError {
+    match error {
+        CodexHandoffError::Timeout => PinnedStageError::Timeout,
+        CodexHandoffError::Unsupported | CodexHandoffError::Spawn => {
+            PinnedStageError::ExecutableChanged
+        }
+        CodexHandoffError::Protocol | CodexHandoffError::Transport => PinnedStageError::Storage,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn capture_test_compatibility(
+    executable: &Path,
+) -> Result<CodexExecutableIdentity, PinnedStageError> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .ok_or(PinnedStageError::Timeout)?;
+    capture_test_compatibility_until(executable, deadline).map_err(map_stage_error)
+}
+
+#[cfg(test)]
+pub(super) fn capture_test_compatibility_until(
+    executable: &Path,
+    deadline: Instant,
+) -> Result<CodexExecutableIdentity, CodexHandoffError> {
+    capture_executable(executable, deadline)
+}
+
+#[cfg(test)]
+pub(super) fn pin_test_compatibility(
+    executable: CodexExecutableIdentity,
+    parent: &Path,
+) -> Result<PinnedExecutableStage, PinnedStageCreateFailure> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .ok_or_else(|| PinnedStageCreateFailure::not_created(PinnedStageError::Timeout))?;
+    pin_test_compatibility_until(executable, parent, deadline)
+}
+
+#[cfg(test)]
+pub(super) fn pin_test_compatibility_until(
+    executable: CodexExecutableIdentity,
+    parent: &Path,
+    deadline: Instant,
+) -> Result<PinnedExecutableStage, PinnedStageCreateFailure> {
+    PinnedExecutableStage::from_verified_in(&executable, parent, deadline)
+}
+
+#[cfg(test)]
+pub(super) fn pin_test_compatibility_with_root_sync_failure(
+    executable: CodexExecutableIdentity,
+    parent: &Path,
+) -> Result<PinnedExecutableStage, PinnedStageCreateFailure> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .ok_or_else(|| PinnedStageCreateFailure::not_created(PinnedStageError::Timeout))?;
+    PinnedExecutableStage::from_verified_in_with_root_sync_failure(&executable, parent, deadline)
+}
+
+#[cfg(test)]
+pub(super) fn pin_test_compatibility_with_parent_sync_failure(
+    executable: CodexExecutableIdentity,
+    parent: &Path,
+) -> Result<PinnedExecutableStage, PinnedStageCreateFailure> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .ok_or_else(|| PinnedStageCreateFailure::not_created(PinnedStageError::Timeout))?;
+    PinnedExecutableStage::from_verified_in_with_parent_sync_failure(&executable, parent, deadline)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -445,6 +1419,9 @@ fn stage_executable(
     let digest: [u8; 32] = hasher.finalize().into();
     if total != source.length
         || staged_metadata.length != source.length
+        || staged_metadata.mode & 0o777 != 0o500
+        || staged_metadata.uid != rustix::process::geteuid().as_raw()
+        || staged_metadata.links != 1
         || source_after != before
         || source_visible != before
         || digest != source.digest
@@ -1610,6 +2587,22 @@ impl FileFingerprint {
 struct ScratchRoot {
     path: PathBuf,
     identity: ScratchIdentity,
+    descriptor: File,
+    parent_path: PathBuf,
+    parent_identity: ScratchParentIdentity,
+    parent_descriptor: File,
+    cleanup_state: ScratchRootCleanupState,
+    cleanup_first_error: Option<CodexHandoffError>,
+    #[cfg(test)]
+    fail_next_sync: std::cell::Cell<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScratchRootCleanupState {
+    Active,
+    RootRemovedPendingParentSync,
+    Cleaned,
+    Preserved,
 }
 
 #[derive(Clone, Copy)]
@@ -1619,32 +2612,319 @@ struct ScratchIdentity {
     uid: u32,
 }
 
+#[derive(Clone, Copy)]
+struct ScratchParentIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScratchRootCleanupComplete {
+    _private: (),
+}
+
+#[must_use = "scratch cleanup failure retains the exact root owner"]
+pub(super) struct ScratchRootCleanupFailure {
+    root: ScratchRoot,
+    error: CodexHandoffError,
+}
+
+impl ScratchRootCleanupFailure {
+    const fn error(&self) -> CodexHandoffError {
+        self.error
+    }
+
+    #[cfg(test)]
+    fn into_root(self) -> ScratchRoot {
+        self.root
+    }
+}
+
+impl fmt::Debug for ScratchRootCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = &self.root;
+        formatter
+            .debug_struct("ScratchRootCleanupFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "scratch creation can retain a created path requiring ownership"]
+pub(super) struct ScratchRootCreateFailure {
+    error: CodexHandoffError,
+    retained: Option<ScratchRootRetention>,
+}
+
+enum ScratchRootRetention {
+    Open(Box<ScratchRoot>),
+    Partial(Box<PartialScratchRoot>),
+}
+
+impl fmt::Debug for ScratchRootRetention {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(root) => {
+                let _ = root;
+                formatter.write_str("ScratchRootRetention::Open(<redacted>)")
+            }
+            Self::Partial(root) => {
+                let _ = root;
+                formatter.write_str("ScratchRootRetention::Partial(<redacted>)")
+            }
+        }
+    }
+}
+
+struct PartialScratchRoot {
+    path: PathBuf,
+    parent_path: PathBuf,
+    parent_identity: ScratchParentIdentity,
+    parent_descriptor: File,
+}
+
+impl ScratchRootCreateFailure {
+    const fn not_created(error: CodexHandoffError) -> Self {
+        Self {
+            error,
+            retained: None,
+        }
+    }
+
+    fn with_root(error: CodexHandoffError, mut root: ScratchRoot) -> Self {
+        root.preserve();
+        Self {
+            error,
+            retained: Some(ScratchRootRetention::Open(Box::new(root))),
+        }
+    }
+
+    fn with_partial(
+        error: CodexHandoffError,
+        path: PathBuf,
+        parent_path: PathBuf,
+        parent_identity: ScratchParentIdentity,
+        parent_descriptor: File,
+    ) -> Self {
+        Self {
+            error,
+            retained: Some(ScratchRootRetention::Partial(Box::new(
+                PartialScratchRoot {
+                    path,
+                    parent_path,
+                    parent_identity,
+                    parent_descriptor,
+                },
+            ))),
+        }
+    }
+
+    const fn error(&self) -> CodexHandoffError {
+        self.error
+    }
+
+    #[cfg(test)]
+    fn retained_path(&self) -> Option<&Path> {
+        match self.retained.as_ref()? {
+            ScratchRootRetention::Open(root) => Some(root.path()),
+            ScratchRootRetention::Partial(root) => Some(&root.path),
+        }
+    }
+}
+
+impl From<CodexHandoffError> for ScratchRootCreateFailure {
+    fn from(error: CodexHandoffError) -> Self {
+        Self::not_created(error)
+    }
+}
+
+impl fmt::Display for ScratchRootCreateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl fmt::Debug for ScratchRootCreateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ScratchRootRetention::Partial(root)) = &self.retained {
+            let _ = (
+                &root.path,
+                &root.parent_path,
+                root.parent_identity,
+                &root.parent_descriptor,
+            );
+        }
+        formatter
+            .debug_struct("ScratchRootCreateFailure")
+            .field("error", &self.error)
+            .field("created", &self.retained.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for ScratchRootCreateFailure {}
+
 impl ScratchRoot {
-    fn create() -> Result<Self, CodexHandoffError> {
+    fn create() -> Result<Self, ScratchRootCreateFailure> {
+        Self::create_below(Path::new("/tmp"), false, false)
+    }
+
+    #[cfg(test)]
+    fn create_in(parent: &Path) -> Result<Self, ScratchRootCreateFailure> {
+        Self::create_below(parent, true, false)
+    }
+
+    #[cfg(test)]
+    fn create_in_with_sync_failure(parent: &Path) -> Result<Self, ScratchRootCreateFailure> {
+        let root = Self::create_below(parent, true, false)?;
+        root.fail_next_sync.set(true);
+        Ok(root)
+    }
+
+    #[cfg(test)]
+    fn create_in_with_parent_sync_failure(parent: &Path) -> Result<Self, ScratchRootCreateFailure> {
+        Self::create_below(parent, true, true)
+    }
+
+    fn create_below(
+        parent: &Path,
+        require_private_parent: bool,
+        fail_parent_sync_for_test: bool,
+    ) -> Result<Self, ScratchRootCreateFailure> {
+        let canonical_parent =
+            fs::canonicalize(parent).map_err(|_| CodexHandoffError::Transport)?;
+        if require_private_parent {
+            verify_private_directory(parent)?;
+            if canonical_parent != parent {
+                return Err(CodexHandoffError::Protocol.into());
+            }
+        }
+        let parent_visible =
+            fs::symlink_metadata(&canonical_parent).map_err(|_| CodexHandoffError::Transport)?;
+        if !parent_visible.file_type().is_dir() {
+            return Err(CodexHandoffError::Protocol.into());
+        }
+        let parent_descriptor = rustix::fs::open(
+            &canonical_parent,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| CodexHandoffError::Transport)?;
+        let parent_opened = parent_descriptor
+            .metadata()
+            .map_err(|_| CodexHandoffError::Transport)?;
+        if !parent_opened.file_type().is_dir()
+            || parent_opened.dev() != parent_visible.dev()
+            || parent_opened.ino() != parent_visible.ino()
+        {
+            return Err(CodexHandoffError::Protocol.into());
+        }
+        let parent_identity = ScratchParentIdentity {
+            device: parent_visible.dev(),
+            inode: parent_visible.ino(),
+        };
         for _ in 0..4 {
             let path =
-                Path::new("/tmp").join(format!("cfh-{}-{}", std::process::id(), Uuid::new_v4()));
+                canonical_parent.join(format!("cfh-{}-{}", std::process::id(), Uuid::new_v4()));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
-                    verify_private_directory(&path)?;
-                    let path = fs::canonicalize(path).map_err(|_| CodexHandoffError::Transport)?;
-                    verify_private_directory(&path)?;
-                    let metadata =
-                        fs::symlink_metadata(&path).map_err(|_| CodexHandoffError::Transport)?;
-                    return Ok(Self {
+                    if let Err(error) = verify_private_directory(&path) {
+                        return Err(ScratchRootCreateFailure::with_partial(
+                            error,
+                            path,
+                            canonical_parent,
+                            parent_identity,
+                            parent_descriptor,
+                        ));
+                    }
+                    let path = match fs::canonicalize(&path) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            return Err(ScratchRootCreateFailure::with_partial(
+                                CodexHandoffError::Transport,
+                                path,
+                                canonical_parent,
+                                parent_identity,
+                                parent_descriptor,
+                            ));
+                        }
+                    };
+                    if let Err(error) = verify_private_directory(&path) {
+                        return Err(ScratchRootCreateFailure::with_partial(
+                            error,
+                            path,
+                            canonical_parent,
+                            parent_identity,
+                            parent_descriptor,
+                        ));
+                    }
+                    let metadata = match fs::symlink_metadata(&path) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            return Err(ScratchRootCreateFailure::with_partial(
+                                CodexHandoffError::Transport,
+                                path,
+                                canonical_parent,
+                                parent_identity,
+                                parent_descriptor,
+                            ));
+                        }
+                    };
+                    let descriptor = match rustix::fs::open(
+                        &path,
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    ) {
+                        Ok(descriptor) => File::from(descriptor),
+                        Err(_) => {
+                            return Err(ScratchRootCreateFailure::with_partial(
+                                CodexHandoffError::Transport,
+                                path,
+                                canonical_parent,
+                                parent_identity,
+                                parent_descriptor,
+                            ));
+                        }
+                    };
+                    let root = Self {
                         path,
                         identity: ScratchIdentity {
                             device: metadata.dev(),
                             inode: metadata.ino(),
                             uid: metadata.uid(),
                         },
-                    });
+                        descriptor,
+                        parent_path: canonical_parent,
+                        parent_identity,
+                        parent_descriptor,
+                        cleanup_state: ScratchRootCleanupState::Active,
+                        cleanup_first_error: None,
+                        #[cfg(test)]
+                        fail_next_sync: std::cell::Cell::new(false),
+                    };
+                    // Persist the new scratch-root directory entry before any
+                    // staged child is published. A failed parent fsync leaves
+                    // its exact open identity in the returned failure.
+                    if fail_parent_sync_for_test || root.parent_descriptor.sync_all().is_err() {
+                        return Err(ScratchRootCreateFailure::with_root(
+                            CodexHandoffError::Transport,
+                            root,
+                        ));
+                    }
+                    return Ok(root);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(_) => return Err(CodexHandoffError::Transport),
+                Err(_) => return Err(CodexHandoffError::Transport.into()),
             }
         }
-        Err(CodexHandoffError::Transport)
+        Err(CodexHandoffError::Transport.into())
     }
 
     fn path(&self) -> &Path {
@@ -1661,30 +2941,341 @@ impl ScratchRoot {
             return Err(CodexHandoffError::Protocol);
         }
         let metadata = fs::symlink_metadata(&self.path).map_err(|_| CodexHandoffError::Protocol)?;
+        let opened = self
+            .descriptor
+            .metadata()
+            .map_err(|_| CodexHandoffError::Transport)?;
         if !metadata.file_type().is_dir()
             || metadata.dev() != self.identity.device
             || metadata.ino() != self.identity.inode
             || metadata.uid() != self.identity.uid
             || metadata.mode() & 0o077 != 0
+            || !opened.file_type().is_dir()
+            || opened.dev() != self.identity.device
+            || opened.ino() != self.identity.inode
+            || opened.uid() != self.identity.uid
+            || opened.mode() & 0o077 != 0
         {
             return Err(CodexHandoffError::Protocol);
         }
         Ok(())
     }
+
+    fn sync_all(&self) -> Result<(), CodexHandoffError> {
+        #[cfg(test)]
+        if self.fail_next_sync.replace(false) {
+            return Err(CodexHandoffError::Transport);
+        }
+        self.descriptor
+            .sync_all()
+            .map_err(|_| CodexHandoffError::Transport)
+    }
+
+    fn sync_parent(&self) -> Result<(), CodexHandoffError> {
+        if fs::canonicalize(&self.parent_path).map_err(|_| CodexHandoffError::Protocol)?
+            != self.parent_path
+        {
+            return Err(CodexHandoffError::Protocol);
+        }
+        let visible =
+            fs::symlink_metadata(&self.parent_path).map_err(|_| CodexHandoffError::Protocol)?;
+        let opened = self
+            .parent_descriptor
+            .metadata()
+            .map_err(|_| CodexHandoffError::Transport)?;
+        if !visible.file_type().is_dir()
+            || !opened.file_type().is_dir()
+            || visible.dev() != self.parent_identity.device
+            || visible.ino() != self.parent_identity.inode
+            || opened.dev() != self.parent_identity.device
+            || opened.ino() != self.parent_identity.inode
+        {
+            return Err(CodexHandoffError::Protocol);
+        }
+        self.parent_descriptor
+            .sync_all()
+            .map_err(|_| CodexHandoffError::Transport)
+    }
+
+    fn preserve(&mut self) {
+        if self.cleanup_state != ScratchRootCleanupState::Cleaned {
+            self.cleanup_state = ScratchRootCleanupState::Preserved;
+        }
+    }
+
+    fn authorize_explicit_cleanup(&mut self) {
+        if self.cleanup_state == ScratchRootCleanupState::Preserved {
+            self.cleanup_state = ScratchRootCleanupState::Active;
+        }
+    }
+
+    fn cleanup(
+        mut self,
+        deadline: Instant,
+    ) -> Result<ScratchRootCleanupComplete, Box<ScratchRootCleanupFailure>> {
+        let result = self.cleanup_once(deadline);
+        match result {
+            Ok(()) => {
+                self.cleanup_state = ScratchRootCleanupState::Cleaned;
+                Ok(ScratchRootCleanupComplete { _private: () })
+            }
+            Err(error) => {
+                let first_error = *self.cleanup_first_error.get_or_insert(error);
+                Err(Box::new(ScratchRootCleanupFailure {
+                    root: self,
+                    error: first_error,
+                }))
+            }
+        }
+    }
+
+    fn cleanup_once(&mut self, deadline: Instant) -> Result<(), CodexHandoffError> {
+        loop {
+            ensure_before_deadline(deadline)?;
+            match self.cleanup_state {
+                ScratchRootCleanupState::Active => {
+                    self.revalidate()?;
+                    let descriptor = rustix::io::fcntl_dupfd_cloexec(&self.descriptor, 0)
+                        .map_err(|_| CodexHandoffError::Transport)?;
+                    let mut budget = MAX_SCRATCH_NODES;
+                    remove_scratch_entries(
+                        rustix::fs::Dir::new(descriptor)
+                            .map_err(|_| CodexHandoffError::Transport)?,
+                        self.identity.device,
+                        self.identity.uid,
+                        &mut budget,
+                        0,
+                        deadline,
+                    )?;
+                    self.descriptor
+                        .sync_all()
+                        .map_err(|_| CodexHandoffError::Transport)?;
+                    self.revalidate()?;
+                    revalidate_scratch_parent(self)?;
+                    let name = self.path.file_name().ok_or(CodexHandoffError::Protocol)?;
+                    let visible = rustix::fs::statat(
+                        &self.parent_descriptor,
+                        name,
+                        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                    )
+                    .map_err(|_| CodexHandoffError::Protocol)?;
+                    if visible.st_dev as u64 != self.identity.device
+                        || visible.st_ino != self.identity.inode
+                        || visible.st_uid != self.identity.uid
+                        || !rustix::fs::FileType::from_raw_mode(visible.st_mode).is_dir()
+                    {
+                        return Err(CodexHandoffError::Protocol);
+                    }
+                    let opened = rustix::fs::openat(
+                        &self.parent_descriptor,
+                        name,
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map_err(|_| CodexHandoffError::Protocol)?;
+                    let opened =
+                        rustix::fs::fstat(&opened).map_err(|_| CodexHandoffError::Transport)?;
+                    if opened.st_dev as u64 != self.identity.device
+                        || opened.st_ino != self.identity.inode
+                        || opened.st_uid != self.identity.uid
+                    {
+                        return Err(CodexHandoffError::Protocol);
+                    }
+                    rustix::fs::unlinkat(
+                        &self.parent_descriptor,
+                        name,
+                        rustix::fs::AtFlags::REMOVEDIR,
+                    )
+                    .map_err(|_| CodexHandoffError::Transport)?;
+                    self.cleanup_state = ScratchRootCleanupState::RootRemovedPendingParentSync;
+                }
+                ScratchRootCleanupState::RootRemovedPendingParentSync => {
+                    self.sync_parent()?;
+                    return Ok(());
+                }
+                ScratchRootCleanupState::Cleaned => return Ok(()),
+                ScratchRootCleanupState::Preserved => return Err(CodexHandoffError::Protocol),
+            }
+        }
+    }
 }
 
 impl Drop for ScratchRoot {
     fn drop(&mut self) {
-        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
-            return;
-        };
-        if metadata.file_type().is_dir()
-            && metadata.dev() == self.identity.device
-            && metadata.ino() == self.identity.inode
-            && metadata.uid() == self.identity.uid
-        {
-            let _ = fs::remove_dir_all(&self.path);
+        if !matches!(
+            self.cleanup_state,
+            ScratchRootCleanupState::Cleaned | ScratchRootCleanupState::Preserved
+        ) {
+            // Drop is deliberately mutation-free. Explicit cleanup is bounded
+            // by a caller-owned deadline and returns the exact root authority
+            // when a retry is required.
+            self.cleanup_state = ScratchRootCleanupState::Preserved;
         }
+    }
+}
+
+fn revalidate_scratch_parent(root: &ScratchRoot) -> Result<(), CodexHandoffError> {
+    if fs::canonicalize(&root.parent_path).map_err(|_| CodexHandoffError::Protocol)?
+        != root.parent_path
+    {
+        return Err(CodexHandoffError::Protocol);
+    }
+    let visible =
+        fs::symlink_metadata(&root.parent_path).map_err(|_| CodexHandoffError::Protocol)?;
+    let opened = root
+        .parent_descriptor
+        .metadata()
+        .map_err(|_| CodexHandoffError::Transport)?;
+    if !visible.file_type().is_dir()
+        || !opened.file_type().is_dir()
+        || visible.dev() != root.parent_identity.device
+        || visible.ino() != root.parent_identity.inode
+        || opened.dev() != root.parent_identity.device
+        || opened.ino() != root.parent_identity.inode
+    {
+        return Err(CodexHandoffError::Protocol);
+    }
+    Ok(())
+}
+
+fn remove_scratch_entries(
+    directory: rustix::fs::Dir,
+    expected_device: u64,
+    expected_uid: u32,
+    budget: &mut usize,
+    depth: usize,
+    deadline: Instant,
+) -> Result<(), CodexHandoffError> {
+    const MAX_DEPTH: usize = 128;
+    ensure_before_deadline(deadline)?;
+    if depth > MAX_DEPTH {
+        return Err(CodexHandoffError::Protocol);
+    }
+    // dup(2) shares a directory stream offset. Reopen `.` first so a failed
+    // or diagnostic traversal cannot advance the retained owner's descriptor
+    // and make a later retry incorrectly observe an empty directory.
+    let reopened = rustix::fs::openat(
+        directory.fd().map_err(|_| CodexHandoffError::Transport)?,
+        ".",
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|_| CodexHandoffError::Transport)?;
+    drop(directory);
+    let mut directory = rustix::fs::Dir::new(reopened).map_err(|_| CodexHandoffError::Transport)?;
+    let descriptor = rustix::io::fcntl_dupfd_cloexec(
+        directory.fd().map_err(|_| CodexHandoffError::Transport)?,
+        0,
+    )
+    .map_err(|_| CodexHandoffError::Transport)?;
+    let mut entries: Vec<(CString, rustix::fs::Stat)> = Vec::new();
+    for entry in directory.by_ref() {
+        ensure_before_deadline(deadline)?;
+        let entry = entry.map_err(|_| CodexHandoffError::Transport)?;
+        if entry.file_name().to_bytes() == b"." || entry.file_name().to_bytes() == b".." {
+            continue;
+        }
+        *budget = budget.checked_sub(1).ok_or(CodexHandoffError::Protocol)?;
+        let stat = rustix::fs::statat(
+            &descriptor,
+            entry.file_name(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| CodexHandoffError::Transport)?;
+        validate_scratch_entry(&stat, expected_device, expected_uid)?;
+        entries
+            .try_reserve(1)
+            .map_err(|_| CodexHandoffError::Transport)?;
+        entries.push((entry.file_name().to_owned(), stat));
+    }
+    for (name, expected) in entries {
+        ensure_before_deadline(deadline)?;
+        let current = rustix::fs::statat(&descriptor, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| CodexHandoffError::Transport)?;
+        validate_scratch_entry(&current, expected_device, expected_uid)?;
+        if current.st_dev != expected.st_dev
+            || current.st_ino != expected.st_ino
+            || current.st_mode != expected.st_mode
+            || current.st_uid != expected.st_uid
+        {
+            return Err(CodexHandoffError::Protocol);
+        }
+        let kind = rustix::fs::FileType::from_raw_mode(current.st_mode);
+        if kind.is_dir() {
+            let child = rustix::fs::openat(
+                &descriptor,
+                &name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| CodexHandoffError::Protocol)?;
+            let opened = rustix::fs::fstat(&child).map_err(|_| CodexHandoffError::Transport)?;
+            if opened.st_dev != current.st_dev
+                || opened.st_ino != current.st_ino
+                || opened.st_uid != current.st_uid
+            {
+                return Err(CodexHandoffError::Protocol);
+            }
+            remove_scratch_entries(
+                rustix::fs::Dir::new(child).map_err(|_| CodexHandoffError::Transport)?,
+                expected_device,
+                expected_uid,
+                budget,
+                depth + 1,
+                deadline,
+            )?;
+            let final_stat =
+                rustix::fs::statat(&descriptor, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| CodexHandoffError::Transport)?;
+            if final_stat.st_dev != current.st_dev
+                || final_stat.st_ino != current.st_ino
+                || !rustix::fs::FileType::from_raw_mode(final_stat.st_mode).is_dir()
+            {
+                return Err(CodexHandoffError::Protocol);
+            }
+            rustix::fs::unlinkat(&descriptor, &name, rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(|_| CodexHandoffError::Transport)?;
+        } else {
+            // unlinkat without REMOVEDIR never follows a symlink and cannot
+            // escape this already-open owner-private directory.
+            rustix::fs::unlinkat(&descriptor, &name, rustix::fs::AtFlags::empty())
+                .map_err(|_| CodexHandoffError::Transport)?;
+        }
+    }
+    rustix::fs::fsync(&descriptor).map_err(|_| CodexHandoffError::Transport)
+}
+
+fn validate_scratch_entry(
+    stat: &rustix::fs::Stat,
+    expected_device: u64,
+    expected_uid: u32,
+) -> Result<(), CodexHandoffError> {
+    let kind = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    let safe_links = !kind.is_file() || stat.st_nlink == 1;
+    if stat.st_dev as u64 != expected_device
+        || stat.st_uid != expected_uid
+        || !safe_links
+        || (kind.is_dir() && stat.st_mode as u32 & 0o022 != 0)
+    {
+        return Err(CodexHandoffError::Protocol);
+    }
+    Ok(())
+}
+
+fn ensure_before_deadline(deadline: Instant) -> Result<(), CodexHandoffError> {
+    if Instant::now() >= deadline {
+        Err(CodexHandoffError::Timeout)
+    } else {
+        Ok(())
     }
 }
 
@@ -1984,6 +3575,42 @@ mod tests {
 
     use super::*;
 
+    fn cleanup_test_scratch(scratch: ScratchRoot) -> Result<(), CodexHandoffError> {
+        scratch
+            .cleanup(Instant::now() + Duration::from_secs(2))
+            .map(|_| ())
+            .map_err(|failure| failure.error())
+    }
+
+    fn cleanup_test_proof(proof: PreRemoteProof) -> Result<(), CodexHandoffError> {
+        let PreRemoteProof {
+            scratch,
+            probe_binary_directory,
+            probe_executable,
+            schema,
+            fork,
+            model_listener,
+            source_home,
+            target_home,
+            workspace,
+            environment_home,
+            target_config,
+        } = proof;
+        drop((
+            probe_binary_directory,
+            probe_executable,
+            schema,
+            fork,
+            model_listener,
+            source_home,
+            target_home,
+            workspace,
+            environment_home,
+            target_config,
+        ));
+        cleanup_test_scratch(scratch)
+    }
+
     fn valid_fork_result(
         source_thread_id: &str,
         target_thread_id: &str,
@@ -2035,6 +3662,18 @@ mod tests {
                 .and_then(|name| name.to_str()),
             Some("w")
         );
+        cleanup_test_proof(proof)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_root_uses_the_canonical_fixed_parent() -> Result<(), Box<dyn std::error::Error>> {
+        let expected_parent = fs::canonicalize("/tmp")?;
+        let scratch = ScratchRoot::create()?;
+
+        assert_eq!(scratch.path().parent(), Some(expected_parent.as_path()));
+        scratch.revalidate()?;
+        cleanup_test_scratch(scratch)?;
         Ok(())
     }
 
@@ -2056,11 +3695,143 @@ mod tests {
     }
 
     #[test]
+    fn scratch_cleanup_is_explicit_recursive_and_retryable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = ScratchRoot::create()?;
+        let root = scratch.path().to_path_buf();
+        let nested = scratch.create_directory("nested")?;
+        nested.create_relative_directories(Path::new("one/two"))?;
+        nested.write_relative_new(Path::new("one/two/probe.json"), b"{}")?;
+        symlink("one/two/probe.json", nested.join("probe-link"))?;
+
+        let failure = match scratch.cleanup(Instant::now()) {
+            Ok(_) => return Err("expired cleanup released the exact scratch owner".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.error(), CodexHandoffError::Timeout);
+        assert!(root.exists());
+
+        let scratch = (*failure).into_root();
+        cleanup_test_scratch(scratch)?;
+        assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_failure_retains_and_retries_exact_cleanup_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = ScratchRoot::create()?;
+        let root = scratch.path().to_path_buf();
+        fs::write(root.join("retained"), b"compatibility-evidence")?;
+        let cleanup = match scratch.cleanup(Instant::now()) {
+            Ok(_) => return Err("expired cleanup released the scratch owner".into()),
+            Err(cleanup) => cleanup,
+        };
+        let failure = Box::new(CodexHandoffFailure::with_retained(
+            CodexHandoffError::Protocol,
+            CodexHandoffRetention::ScratchCleanup(cleanup),
+        ));
+        fn assert_static<T: 'static>(_: &T) {}
+        assert_static(&failure);
+
+        let failure = match failure.resolve(Instant::now()) {
+            Ok(_) => return Err("an expired retained cleanup unexpectedly resolved".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.error(), CodexHandoffError::Protocol);
+        assert_eq!(failure.cleanup_error(), Some(CodexHandoffError::Timeout));
+        assert!(failure.has_retained_ownership());
+        assert_eq!(fs::read(root.join("retained"))?, b"compatibility-evidence");
+
+        let resolution = failure
+            .resolve(Instant::now() + Duration::from_secs(2))
+            .map_err(|failure| format!("retained cleanup did not resolve: {failure:?}"))?;
+        assert_eq!(resolution.error(), CodexHandoffError::Protocol);
+        assert_eq!(resolution.cleanup_error(), Some(CodexHandoffError::Timeout));
+        assert_eq!(resolution.release(), CodexHandoffError::Protocol);
+        assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_failure_explicitly_cleans_preserved_construction_owners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parent = ScratchRoot::create()?;
+
+        let create = match ScratchRoot::create_in_with_parent_sync_failure(parent.path()) {
+            Ok(root) => {
+                cleanup_test_scratch(root)?;
+                return Err(
+                    "injected parent sync failure unexpectedly created a clean root".into(),
+                );
+            }
+            Err(failure) => failure,
+        };
+        let create_path = create
+            .retained_path()
+            .ok_or("scratch create failure lost its exact root")?
+            .to_path_buf();
+        let create = Box::new(CodexHandoffFailure::from(create));
+        assert!(create.has_retained_ownership());
+        let create = match create.resolve(Instant::now()) {
+            Ok(_) => return Err("expired construction cleanup unexpectedly resolved".into()),
+            Err(create) => create,
+        };
+        assert_eq!(create.error(), CodexHandoffError::Transport);
+        assert_eq!(create.cleanup_error(), Some(CodexHandoffError::Timeout));
+        assert!(create_path.exists());
+        let resolution = create
+            .resolve(Instant::now() + Duration::from_secs(2))
+            .map_err(|failure| format!("preserved create root did not resolve: {failure:?}"))?;
+        assert_eq!(resolution.error(), CodexHandoffError::Transport);
+        assert_eq!(resolution.cleanup_error(), Some(CodexHandoffError::Timeout));
+        assert!(!create_path.exists());
+
+        let scratch = ScratchRoot::create_in(parent.path())?;
+        let stage_path = scratch.path().to_path_buf();
+        fs::write(stage_path.join("partial-stage"), b"owned-evidence")?;
+        let stage = PinnedStageCreateFailure::with_scratch(PinnedStageError::Storage, scratch);
+        let stage = Box::new(CodexHandoffFailure::from(stage));
+        assert!(stage.has_retained_ownership());
+        let resolution = stage
+            .resolve(Instant::now() + Duration::from_secs(2))
+            .map_err(|failure| format!("preserved stage root did not resolve: {failure:?}"))?;
+        assert_eq!(resolution.error(), CodexHandoffError::Transport);
+        assert!(!stage_path.exists());
+        cleanup_test_scratch(parent)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_cleanup_budget_failure_does_not_mutate_the_tree()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = ScratchRoot::create()?;
+        fs::write(scratch.path().join("retained"), b"safe")?;
+        let descriptor = rustix::io::fcntl_dupfd_cloexec(&scratch.descriptor, 0)?;
+        let mut budget = 0;
+
+        assert_eq!(
+            remove_scratch_entries(
+                rustix::fs::Dir::new(descriptor)?,
+                scratch.identity.device,
+                scratch.identity.uid,
+                &mut budget,
+                0,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(CodexHandoffError::Protocol)
+        );
+        assert_eq!(fs::read(scratch.path().join("retained"))?, b"safe");
+        cleanup_test_scratch(scratch)?;
+        Ok(())
+    }
+
+    #[test]
     fn app_server_socket_may_inherit_the_childs_normal_umask()
     -> Result<(), Box<dyn std::error::Error>> {
         let scratch = ScratchRoot::create()?;
         let socket_path = scratch.path().join("app-server.sock");
-        let _listener = UnixListener::bind(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o755))?;
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 30"]);
@@ -2074,6 +3845,8 @@ mod tests {
         child.shutdown()?;
 
         assert_eq!(result, Ok(()));
+        drop(listener);
+        cleanup_test_scratch(scratch)?;
         Ok(())
     }
 
@@ -2096,6 +3869,7 @@ mod tests {
         let after = fs::symlink_metadata(&victim_path)?;
         assert_eq!(before.mode(), after.mode());
         assert_eq!(before.ino(), after.ino());
+        cleanup_test_scratch(scratch)?;
         Ok(())
     }
 
@@ -2113,6 +3887,7 @@ mod tests {
         assert_eq!(directory.revalidate(), Err(CodexHandoffError::Protocol));
         assert!(moved.is_dir());
         assert!(directory.is_dir());
+        cleanup_test_scratch(scratch)?;
         Ok(())
     }
 
@@ -2138,6 +3913,7 @@ mod tests {
             capture_executable(&executable, Instant::now() + Duration::from_secs(2)),
             Err(CodexHandoffError::Unsupported)
         ));
+        cleanup_test_scratch(scratch)?;
         Ok(())
     }
 
@@ -2164,6 +3940,7 @@ mod tests {
             Err(CodexHandoffError::Unsupported)
         );
         revalidate_executable_until(&staged, Some(deadline))?;
+        cleanup_test_scratch(scratch)?;
         Ok(())
     }
 
@@ -2255,6 +4032,7 @@ mod tests {
                 Err(CodexHandoffError::Protocol)
             ));
         }
+        cleanup_test_scratch(scratch)?;
         Ok(())
     }
 
@@ -2299,6 +4077,7 @@ mod tests {
             fs::read(external.join("rollout.jsonl"))?,
             HISTORY_SENTINEL.as_bytes()
         );
+        cleanup_test_scratch(scratch)?;
         Ok(())
     }
 
