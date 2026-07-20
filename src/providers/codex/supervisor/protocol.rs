@@ -2122,12 +2122,10 @@ struct ReceivedFrame {
 
 impl ReceivedFrame {
     fn require_exact_len(&self, expected: usize) -> Result<(), ProtocolError> {
-        if self.body_len < expected {
-            Err(ProtocolError::InvalidLength)
-        } else if self.body_len > expected {
-            Err(ProtocolError::TrailingData)
-        } else {
-            Ok(())
+        match self.body_len.cmp(&expected) {
+            std::cmp::Ordering::Less => Err(ProtocolError::InvalidLength),
+            std::cmp::Ordering::Greater => Err(ProtocolError::TrailingData),
+            std::cmp::Ordering::Equal => Ok(()),
         }
     }
 

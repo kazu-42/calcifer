@@ -1489,6 +1489,111 @@ mod tests {
     }
 
     #[test]
+    fn usage_snapshots_accept_every_exact_collection_and_retained_string_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let exact_text = "x".repeat(MAX_USAGE_TEXT_BYTES);
+        let exact_decimal = "1".repeat(MAX_DECIMAL_BYTES);
+        let exact_snapshot = json!({
+            "limitId": exact_text,
+            "limitName": exact_text,
+            "planType": exact_text,
+            "rateLimitReachedType": exact_text,
+            "primary": { "usedPercent": 1 },
+            "credits": {
+                "hasCredits": true,
+                "unlimited": false,
+                "balance": exact_decimal
+            },
+            "individualLimit": {
+                "limit": exact_decimal,
+                "used": exact_decimal,
+                "remainingPercent": 99,
+                "resetsAt": 2
+            }
+        });
+        let mut exact_buckets = serde_json::Map::new();
+        for index in 0..MAX_RATE_LIMIT_BUCKETS {
+            let key = format!("{index:02}{}", "k".repeat(MAX_USAGE_TEXT_BYTES - 2));
+            assert_eq!(key.len(), MAX_USAGE_TEXT_BYTES);
+            exact_buckets.insert(key, exact_snapshot.clone());
+        }
+        let exact_details: Vec<_> = (0..MAX_RESET_CREDIT_DETAILS)
+            .map(|_| {
+                json!({
+                    "grantedAt": 1,
+                    "expiresAt": 2,
+                    "resetType": exact_text,
+                    "status": exact_text
+                })
+            })
+            .collect();
+        let result = json!({
+            "rateLimits": exact_snapshot,
+            "rateLimitsByLimitId": exact_buckets,
+            "rateLimitResetCredits": {
+                "availableCount": MAX_RESET_CREDIT_DETAILS,
+                "credits": exact_details
+            }
+        });
+
+        let (_home, mut monitor) = observing_monitor()?;
+        let actions = monitor.receive(&serde_json::to_vec(&json!({
+            "id": 1,
+            "result": result
+        }))?)?;
+        let MonitorAction::PublishUsage(usage) = &actions[0] else {
+            return Err("expected an exact-bound usage publication".into());
+        };
+
+        let assert_exact_snapshot = |snapshot: &crate::providers::codex::RateLimitSnapshot|
+         -> Result<(), Box<dyn std::error::Error>> {
+            for retained in [
+                snapshot.limit_id.as_deref(),
+                snapshot.limit_name.as_deref(),
+                snapshot.plan_type.as_deref(),
+                snapshot.rate_limit_reached_type.as_deref(),
+            ] {
+                assert_eq!(retained, Some(exact_text.as_str()));
+            }
+            assert_eq!(
+                snapshot
+                    .credits
+                    .as_ref()
+                    .and_then(|credits| credits.balance.as_deref()),
+                Some(exact_decimal.as_str())
+            );
+            let Some(individual) = snapshot.individual_limit.as_ref() else {
+                return Err("the exact-bound individual limit was discarded".into());
+            };
+            assert_eq!(individual.limit, exact_decimal);
+            assert_eq!(individual.used, exact_decimal);
+            Ok(())
+        };
+        let Some(rate_limits) = usage.rate_limits.as_ref() else {
+            return Err("the exact-bound top-level snapshot was discarded".into());
+        };
+        assert_exact_snapshot(rate_limits)?;
+        assert_eq!(usage.rate_limits_by_limit_id.len(), MAX_RATE_LIMIT_BUCKETS);
+        for (key, snapshot) in &usage.rate_limits_by_limit_id {
+            assert_eq!(key.len(), MAX_USAGE_TEXT_BYTES);
+            assert_exact_snapshot(snapshot)?;
+        }
+        let Some(details) = usage
+            .reset_credits
+            .as_ref()
+            .and_then(|credits| credits.details.as_ref())
+        else {
+            return Err("the exact-bound reset details were discarded".into());
+        };
+        assert_eq!(details.len(), MAX_RESET_CREDIT_DETAILS);
+        for detail in details {
+            assert_eq!(detail.reset_type, exact_text);
+            assert_eq!(detail.status, exact_text);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn usage_snapshots_enforce_collection_and_retained_string_bounds()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut too_many_buckets = serde_json::Map::new();
@@ -1543,28 +1648,6 @@ mod tests {
             long_decimal["rateLimits"]["individualLimit"][key] = json!("1".repeat(129));
             assert_usage_result_rejected(long_decimal)?;
         }
-
-        let mut exact_decimals = usage_result(1, 0);
-        exact_decimals["rateLimits"]["credits"] = json!({
-            "hasCredits": true,
-            "unlimited": false,
-            "balance": "1".repeat(MAX_DECIMAL_BYTES)
-        });
-        exact_decimals["rateLimits"]["individualLimit"] = json!({
-            "limit": "1".repeat(MAX_DECIMAL_BYTES),
-            "used": "-0.25",
-            "remainingPercent": 99,
-            "resetsAt": 2
-        });
-        let (_home, mut exact_monitor) = observing_monitor()?;
-        assert!(
-            exact_monitor
-                .receive(&serde_json::to_vec(&json!({
-                    "id": 1,
-                    "result": exact_decimals
-                }))?)
-                .is_ok()
-        );
 
         for invalid in ["provider-secret", "+1", "1e3", ".1", "1.", "--1"] {
             for pointer in [

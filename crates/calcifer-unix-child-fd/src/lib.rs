@@ -1719,10 +1719,10 @@ mod tests {
                 "InheritedFdSpawnError { child_started: true }"
             );
 
-            let mut child = failure
+            let started_child = failure
                 .into_started_child()
-                .ok_or("started child authority was missing")?
-                .into_child();
+                .ok_or("started child authority was missing")?;
+            let mut child = started_child.into_child();
             assert!(terminate_spawned_child(&mut child));
             Ok(())
         })

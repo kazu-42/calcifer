@@ -2186,10 +2186,17 @@ impl RemovalRegistryBarrier {
 }
 
 fn registry_digest(document: &RegistryDocument) -> Result<String, ProfileError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let bytes = serde_json::to_vec(document)
         .map_err(|_| ProfileError::InvalidRegistry("registry serialization failed".to_owned()))?;
     let digest = Sha256::digest(bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(encoded)
 }
 
 fn effective_removal_journal(
@@ -3315,10 +3322,10 @@ impl VerifiedTargetReservation {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn send_provider_lease<'control>(
+    pub(crate) fn send_provider_lease(
         self,
-        control: &'control std::os::unix::net::UnixStream,
-    ) -> Result<AwaitingProviderLeaseAck<'control>, Box<ProviderLeaseTransferSendError>> {
+        control: &std::os::unix::net::UnixStream,
+    ) -> Result<AwaitingProviderLeaseAck<'_>, Box<ProviderLeaseTransferSendError>> {
         if self.lease.coordinator.is_none() {
             return Err(Box::new(ProviderLeaseTransferSendError {
                 reservation: self,

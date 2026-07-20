@@ -21,7 +21,7 @@ The release workflow enforces these boundaries:
   `kazu-42/calcifer` repository; a fork or repository transfer fails before
   writing a GitHub Release until the manifest contract is deliberately updated.
 - The tagged commit must be reachable from `main`.
-- The five branch-protection checks must have completed successfully for the
+- The six branch-protection checks must have completed successfully for the
   tagged commit.
 - The repository quality gate runs again before release builds start.
 - Every target is built on a native GitHub-hosted runner; the completed archive

@@ -1844,7 +1844,8 @@ fn finish_guardian(
     )
     .map_err(|_| FixtureError::Protocol)?;
     if scenario == Scenario::TrailingFrame {
-        (&*endpoint)
+        let mut endpoint_writer = endpoint;
+        endpoint_writer
             .write_all(b"x")
             .map_err(|_| FixtureError::Protocol)?;
     }

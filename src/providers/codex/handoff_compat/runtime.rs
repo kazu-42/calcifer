@@ -4220,13 +4220,22 @@ mod tests {
     #[test]
     fn pty_exit_kills_a_descendant_that_inherits_the_terminal()
     -> Result<(), Box<dyn std::error::Error>> {
+        const DESCENDANT_READY: &[u8] = b"calcifer-descendant-ready";
+        const DESCENDANT_SURVIVED: &[u8] = b"calcifer-descendant-survived";
+
         let mut command = Command::new("/bin/sh");
         command.args([
             "-c",
-            "(trap '' HUP TERM; sleep 30) & printf calcifer-descendant-ready; exit 0",
+            "(trap '' HUP TERM; sleep 30; printf calcifer-descendant-survived) & \
+             printf calcifer-descendant-ready; exit 0",
         ]);
-        let started = Instant::now();
 
+        // This deadline bounds observation of the direct leader only. After
+        // that exit, `wait_until_exit` kills the exact process group and joins
+        // the PTY drainer. A total wall-clock assertion would therefore test
+        // scheduler latency outside the deadline contract. The descendant's
+        // terminal marker below instead proves whether it survived that kill
+        // long enough to close the inherited descriptor naturally.
         let child = PtyChild::spawn(command, Path::new("/tmp"))?;
         let output = child.wait_until_exit(
             Instant::now()
@@ -4234,15 +4243,20 @@ mod tests {
                 .ok_or("deadline overflow")?,
         )?;
 
+        assert!(!output.overflowed);
+        assert!(!output.failed);
         assert!(
             output
                 .bytes
-                .windows(b"calcifer-descendant-ready".len())
-                .any(|window| window == b"calcifer-descendant-ready")
+                .windows(DESCENDANT_READY.len())
+                .any(|window| window == DESCENDANT_READY)
         );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the inherited PTY descriptor must not stall cleanup"
+            !output
+                .bytes
+                .windows(DESCENDANT_SURVIVED.len())
+                .any(|window| window == DESCENDANT_SURVIVED),
+            "the exited leader's process-group kill must terminate the inherited PTY holder"
         );
         Ok(())
     }

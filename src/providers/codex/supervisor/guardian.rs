@@ -229,6 +229,19 @@ impl<R: Read> GuardianLifecycle<R> {
     }
 
     #[cfg(test)]
+    fn record_packaged_recovery_terminal_observation(&self, observation: RecoveryRequestPoll) {
+        let marker = match observation {
+            RecoveryRequestPoll::Verified => "recovery.guardian-checkpoint.request-verified",
+            RecoveryRequestPoll::OwnerLost => "recovery.guardian-checkpoint.owner-lost",
+            RecoveryRequestPoll::ProtocolRejectedOwnerLost => {
+                "recovery.guardian-checkpoint.protocol-rejected-owner-lost"
+            }
+            RecoveryRequestPoll::Pending | RecoveryRequestPoll::ProtocolRejected => return,
+        };
+        self.record_packaged_checkpoint_marker(marker);
+    }
+
+    #[cfg(test)]
     fn recovery_checkpoint_is_selected(&self, checkpoint: RecoveryCheckpoint) -> bool {
         self.recovery_checkpoint == Some(checkpoint)
     }
@@ -262,8 +275,8 @@ impl<R: Read> GuardianLifecycle<R> {
         loop {
             match self.completion.poll_recovery_request(deadline) {
                 Ok(RecoveryRequestPoll::Verified) => {
-                    self.record_packaged_checkpoint_marker(
-                        "recovery.guardian-checkpoint.request-verified",
+                    self.record_packaged_recovery_terminal_observation(
+                        RecoveryRequestPoll::Verified,
                     );
                     return self.finish_test_checkpoint_observation(
                         checkpoint,
@@ -271,8 +284,8 @@ impl<R: Read> GuardianLifecycle<R> {
                     );
                 }
                 Ok(RecoveryRequestPoll::OwnerLost) => {
-                    self.record_packaged_checkpoint_marker(
-                        "recovery.guardian-checkpoint.owner-lost",
+                    self.record_packaged_recovery_terminal_observation(
+                        RecoveryRequestPoll::OwnerLost,
                     );
                     return self.finish_test_checkpoint_observation(
                         checkpoint,
@@ -280,8 +293,8 @@ impl<R: Read> GuardianLifecycle<R> {
                     );
                 }
                 Ok(RecoveryRequestPoll::ProtocolRejectedOwnerLost) => {
-                    self.record_packaged_checkpoint_marker(
-                        "recovery.guardian-checkpoint.protocol-rejected-owner-lost",
+                    self.record_packaged_recovery_terminal_observation(
+                        RecoveryRequestPoll::ProtocolRejectedOwnerLost,
                     );
                     return self.finish_test_checkpoint_observation(
                         checkpoint,
@@ -665,18 +678,18 @@ impl GuardianBounds {
         Ok(SessionShutdownBounds {
             tui_grace: self.tui_grace,
             tui_forced: self.tui_forced,
-            relay_deadline: self.deadline_after(self.relay_shutdown_timeout)?,
-            monitor_deadline: self.deadline_after(self.monitor_shutdown_timeout)?,
+            relay_timeout: self.relay_shutdown_timeout,
+            monitor_timeout: self.monitor_shutdown_timeout,
             app_grace: self.app_grace,
             app_forced: self.app_forced,
-            app_cleanup_deadline: self.deadline_after(self.app_cleanup_timeout)?,
-            build_cleanup_deadline: self.deadline_after(self.build_cleanup_timeout)?,
+            app_cleanup_timeout: self.app_cleanup_timeout,
+            build_cleanup_timeout: self.build_cleanup_timeout,
         })
     }
 
     fn startup_shutdown(self) -> Result<StartupShutdownBounds, GuardianSetupError> {
         Ok(StartupShutdownBounds {
-            containment_deadline: self.deadline_after(self.containment_timeout)?,
+            containment_timeout: self.containment_timeout,
             session: self.session_shutdown()?,
         })
     }
@@ -1147,6 +1160,11 @@ impl RetainedGuardianGeneration {
                 Ok(observation) => observation,
                 Err(_) => self.publish_retained_unrecoverable_and_park(),
             };
+            #[cfg(test)]
+            self.lifecycle
+                .as_ref()
+                .unwrap_or_else(|| std::process::abort())
+                .record_packaged_recovery_terminal_observation(observation);
             match observation {
                 RecoveryRequestPoll::Pending | RecoveryRequestPoll::ProtocolRejected => continue,
                 RecoveryRequestPoll::Verified
@@ -2611,16 +2629,16 @@ fn finish_startup_failure(
 // retained owner without dropping B. Every deadline is already expired.
 fn overflow_startup_shutdown_bounds() -> StartupShutdownBounds {
     StartupShutdownBounds {
-        containment_deadline: Instant::now(),
+        containment_timeout: Duration::MAX,
         session: SessionShutdownBounds {
             tui_grace: Duration::MAX,
             tui_forced: Duration::MAX,
-            relay_deadline: Instant::now(),
-            monitor_deadline: Instant::now(),
+            relay_timeout: Duration::MAX,
+            monitor_timeout: Duration::MAX,
             app_grace: Duration::MAX,
             app_forced: Duration::MAX,
-            app_cleanup_deadline: Instant::now(),
-            build_cleanup_deadline: Instant::now(),
+            app_cleanup_timeout: Duration::MAX,
+            build_cleanup_timeout: Duration::MAX,
         },
     }
 }
@@ -3230,7 +3248,7 @@ fn apply_terminal_disposition(disposition: GuardianExitDisposition) -> ExitCode 
 mod tests {
     use super::{
         GuardianBounds, GuardianControlTurn, GuardianLifecycle, GuardianLifecycleError,
-        GuardianRetentionReason, GuardianRunOutcome, PackagedGuardianOwnerKind,
+        GuardianRetentionReason, GuardianRunOutcome, GuardianSetupError, PackagedGuardianOwnerKind,
         RetainedRecoveryBudget, SessionShutdownTrigger, TestRecoveryCheckpointOutcome,
         checkpoint_arms_recovery_command_race, coordinator_stop_trigger, finalize_projection,
         packaged_guardian_checkpoint_boundary_failure_marker,
@@ -3900,6 +3918,27 @@ mod tests {
         assert!(retention_reason_allows_recovery(timeout));
         assert_eq!(malformed, GuardianRetentionReason::ProtocolInvalid);
         assert!(!retention_reason_allows_recovery(malformed));
+    }
+
+    #[test]
+    fn shutdown_bounds_preserve_relative_phase_budgets() -> Result<(), GuardianSetupError> {
+        let mut bounds = recovery_race_bounds();
+        bounds.containment_timeout = Duration::from_millis(11);
+        bounds.relay_shutdown_timeout = Duration::from_millis(22);
+        bounds.monitor_shutdown_timeout = Duration::from_millis(33);
+        bounds.app_cleanup_timeout = Duration::from_millis(44);
+        bounds.build_cleanup_timeout = Duration::from_millis(55);
+
+        let shutdown = bounds.session_shutdown()?;
+        assert_eq!(shutdown.relay_timeout, Duration::from_millis(22));
+        assert_eq!(shutdown.monitor_timeout, Duration::from_millis(33));
+        assert_eq!(shutdown.app_cleanup_timeout, Duration::from_millis(44));
+        assert_eq!(shutdown.build_cleanup_timeout, Duration::from_millis(55));
+
+        let startup = bounds.startup_shutdown()?;
+        assert_eq!(startup.containment_timeout, Duration::from_millis(11));
+        assert_eq!(startup.session.relay_timeout, Duration::from_millis(22));
+        Ok(())
     }
 
     fn recovery_race_bounds() -> GuardianBounds {

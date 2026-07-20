@@ -4,8 +4,6 @@
 //! profile's coordinator/provider lease. Registry transactions are deliberately
 //! short and never span provider I/O.
 
-#![cfg(unix)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;

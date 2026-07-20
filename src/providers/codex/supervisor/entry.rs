@@ -466,19 +466,53 @@ impl AnchorCompletion {
         )
     )]
     pub(super) fn request_recovery(&mut self, deadline: Instant) -> Result<(), CompletionError> {
-        if self.recovery_request_consumed {
-            return Err(CompletionError::RecoveryReplay);
-        }
-        self.recovery_request_consumed = true;
-
-        let result = match self.terminal_error {
-            Some(error) => Err(error),
-            None => self.request_recovery_before(deadline),
-        };
+        let result = self
+            .begin_recovery_attempt()
+            .and_then(|()| self.request_recovery_before(deadline));
         if result.is_err() {
             // A failed or partial request can never be retried as another
             // command. Best-effort shutdown may let the guardian classify the
             // exact peer as gone, but failure leaves that boundary unknown.
+            let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        }
+        result
+    }
+
+    fn begin_recovery_attempt(&mut self) -> Result<(), CompletionError> {
+        if self.recovery_request_consumed {
+            return Err(CompletionError::RecoveryReplay);
+        }
+        self.recovery_request_consumed = true;
+        match self.terminal_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Test-only owner-loss boundary. It consumes the same one-shot as CFRCR,
+    /// proves that no completion has started, and half-closes only the recovery
+    /// request direction. The read half deliberately remains live so the
+    /// package owner can still require CFCMP plus EOF after guardian cleanup.
+    #[cfg(test)]
+    pub(super) fn shutdown_recovery_owner_write(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), CompletionError> {
+        let result = self
+            .begin_recovery_attempt()
+            .and_then(|()| self.prepare_recovery_attempt())
+            .and_then(|()| {
+                if Instant::now() >= deadline {
+                    Err(CompletionError::RecoveryDeadline)
+                } else {
+                    self.stream
+                        .shutdown(std::net::Shutdown::Write)
+                        .map_err(|_| CompletionError::Io)
+                }
+            });
+        if result.is_err() {
+            // Beginning this path represents loss of the owner request
+            // direction even when its preflight cannot classify the boundary.
             let _ = self.stream.shutdown(std::net::Shutdown::Write);
         }
         result
@@ -492,22 +526,7 @@ impl AnchorCompletion {
         )
     )]
     fn request_recovery_before(&mut self, deadline: Instant) -> Result<(), CompletionError> {
-        if let Some(error) = self.terminal_error {
-            return Err(error);
-        }
-        if self.received != 0 || self.terminal_frame.is_some() {
-            return Err(CompletionError::RecoveryTooLate);
-        }
-        match self.poll_once() {
-            Ok(CompletionPoll::Verified | CompletionPoll::RetainedUnrecoverable) => {
-                return Err(CompletionError::RecoveryTooLate);
-            }
-            Ok(CompletionPoll::Pending) if self.received != 0 || self.terminal_frame.is_some() => {
-                return Err(CompletionError::RecoveryTooLate);
-            }
-            Ok(CompletionPoll::Pending) => {}
-            Err(error) => return Err(error),
-        }
+        self.prepare_recovery_attempt()?;
 
         let request = encode_recovery_request_frame(self.peer_identity);
         let mut written = 0_usize;
@@ -539,6 +558,26 @@ impl AnchorCompletion {
         self.stream
             .shutdown(std::net::Shutdown::Write)
             .map_err(|_| CompletionError::Io)
+    }
+
+    fn prepare_recovery_attempt(&mut self) -> Result<(), CompletionError> {
+        if let Some(error) = self.terminal_error {
+            return Err(error);
+        }
+        if self.received != 0 || self.terminal_frame.is_some() {
+            return Err(CompletionError::RecoveryTooLate);
+        }
+        match self.poll_once() {
+            Ok(CompletionPoll::Verified | CompletionPoll::RetainedUnrecoverable) => {
+                return Err(CompletionError::RecoveryTooLate);
+            }
+            Ok(CompletionPoll::Pending) if self.received != 0 || self.terminal_frame.is_some() => {
+                return Err(CompletionError::RecoveryTooLate);
+            }
+            Ok(CompletionPoll::Pending) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
     }
 
     fn verify_identity(&self) -> Result<(), CompletionError> {
@@ -1521,6 +1560,7 @@ impl AnchorGeneration {
             }
             let signal_dispatch = if self.child_status.is_none() {
                 self.dispatch_signal()
+                    .and_then(|()| self.relay_observed_coordinator_stop())
             } else {
                 Ok(())
             };
@@ -1569,12 +1609,40 @@ impl AnchorGeneration {
     fn suspend_and_resume(&mut self) -> Result<(), ProductionEntryError> {
         self.signal_coordinator(rustix::process::Signal::TSTP)?;
         self.await_coordinator_stopped()?;
-        select_foreground_group(&self.snapshot, self.coordinator_group, self.anchor_group)?;
+        self.relay_stopped_coordinator()
+    }
 
-        // The coordinator's STOPPED state is reachable only after its exact
-        // Suspended acknowledgement and outer-terminal restoration. Clearing a
-        // stale CONT and stopping the anchor under the audited signal mask
-        // preserves that ordering across the shell-facing job boundary.
+    /// Relays a terminal-generated coordinator stop to the shell-visible job.
+    ///
+    /// The coordinator owns the outer TTY foreground while active, so the
+    /// terminal driver sends `SIGTSTP` to its distinct process group rather
+    /// than to this anchor. Observing that exact direct child bridges the
+    /// hidden stop back to the anchor process group without sending a second,
+    /// replayable `SIGTSTP`. The shared relay independently restores the
+    /// anchor snapshot, so an externally forced early stop cannot expose raw
+    /// terminal state to the shell.
+    fn relay_observed_coordinator_stop(&mut self) -> Result<(), ProductionEntryError> {
+        match self.peek_child_state()? {
+            ChildKernelState::Stopped => self.relay_stopped_coordinator(),
+            ChildKernelState::Running | ChildKernelState::Exited => Ok(()),
+        }
+    }
+
+    fn relay_stopped_coordinator(&mut self) -> Result<(), ProductionEntryError> {
+        select_foreground_group(&self.snapshot, self.coordinator_group, self.anchor_group)?;
+        let restored = self
+            .snapshot
+            .restore_with_sigttou_block(io::stdin())
+            .map_err(|_| ProductionEntryError::Terminal)?;
+        if restored.descriptor_identity() != self.snapshot.descriptor_identity() {
+            return Err(ProductionEntryError::Terminal);
+        }
+
+        // In the cooperative path, the coordinator stops only after its exact
+        // Suspended acknowledgement and outer-terminal restoration. The
+        // independent readback above also makes an external early STOP safe
+        // for the shell-facing terminal. Clearing a stale CONT and stopping
+        // the anchor under the audited signal mask preserves the handoff.
         self.signals
             .stop_after_suspended_ack()
             .map_err(|_| ProductionEntryError::Terminal)?;
@@ -2925,13 +2993,19 @@ mod tests {
     #[test]
     fn retained_recovery_request_classifies_owner_eof_partial_invalid_and_trailing_frames()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (anchor, transit) = CompletionPair::new()?.split();
+        let (mut anchor, transit) = CompletionPair::new()?.split();
         let mut guardian = transit.into_guardian();
-        anchor.stream.shutdown(std::net::Shutdown::Write)?;
+        anchor.shutdown_recovery_owner_write(Instant::now() + Duration::from_secs(1))?;
+        assert_eq!(
+            anchor.shutdown_recovery_owner_write(Instant::now() + Duration::from_secs(1)),
+            Err(CompletionError::RecoveryReplay)
+        );
         assert_eq!(
             guardian.poll_recovery_request(Instant::now() + Duration::from_secs(1))?,
             RecoveryRequestPoll::OwnerLost
         );
+        guardian.publish_raw()?;
+        assert_eq!(poll_until_terminal(&mut anchor)?, CompletionPoll::Verified);
 
         let (mut anchor, transit) = CompletionPair::new()?.split();
         let partial = encode_recovery_request_frame(transit.identity);

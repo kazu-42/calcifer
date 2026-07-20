@@ -23,6 +23,8 @@ use std::sync::Mutex;
 
 use super::launcher::RemoteTuiLauncherError;
 use super::launcher::{ReadyRemoteTui, RemoteTuiShutdownFailure};
+#[cfg(test)]
+use super::packaged_smoke::write_private_atomic_new;
 use super::process::{
     ForwardedTuiSignal, InteractiveTerminalSignal, PinnedAppGracefulDrain, ShutdownOutcome,
     TerminalShutdownSignal,
@@ -548,15 +550,27 @@ fn write_packaged_observation_marker(
     name: &str,
     payload: &[u8],
 ) {
-    let result = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(armed.observation_root.join(name))
-        .and_then(|mut file| {
-            file.write_all(payload)?;
-            file.sync_all()
-        });
+    write_packaged_observation_marker_with_publisher(
+        armed,
+        name,
+        payload,
+        write_private_atomic_new,
+    );
+}
+
+#[cfg(test)]
+fn write_packaged_observation_marker_with_publisher<E>(
+    armed: &mut ArmedPackagedSessionObservation,
+    name: &str,
+    payload: &[u8],
+    publish: impl FnOnce(&Path, &[u8]) -> Result<(), E>,
+) {
+    // Observation markers are consumed concurrently by the package-smoke
+    // coordinator. Publish the complete, durable payload atomically so the
+    // reader can never mistake a newly-created empty or partial file for an
+    // integrity failure.
+    let marker = armed.observation_root.join(name);
+    let result = publish(&marker, payload);
     if result.is_err() {
         fail_packaged_session_observation(armed, PackagedObservationIntegrityFailure::MarkerWrite);
     }
@@ -2249,18 +2263,61 @@ impl SessionErrors {
     }
 }
 
-/// All shutdown bounds are supplied together so a retry cannot accidentally
-/// reuse an expired deadline from an earlier phase.
+/// Relative shutdown bounds are supplied together so each sequential phase
+/// arms its own absolute deadline when that phase actually begins. A retry
+/// therefore receives the full configured budget for only its retained edge,
+/// never an expired deadline inherited from earlier cleanup work.
 #[derive(Clone, Copy)]
 pub(super) struct SessionShutdownBounds {
     pub(super) tui_grace: Duration,
     pub(super) tui_forced: Duration,
-    pub(super) relay_deadline: Instant,
-    pub(super) monitor_deadline: Instant,
+    pub(super) relay_timeout: Duration,
+    pub(super) monitor_timeout: Duration,
     pub(super) app_grace: Duration,
     pub(super) app_forced: Duration,
-    pub(super) app_cleanup_deadline: Instant,
-    pub(super) build_cleanup_deadline: Instant,
+    pub(super) app_cleanup_timeout: Duration,
+    pub(super) build_cleanup_timeout: Duration,
+}
+
+impl SessionShutdownBounds {
+    fn deadline_at(now: Instant, timeout: Duration) -> Instant {
+        // An unrepresentable deadline must already be expired. Returning the
+        // phase start preserves the linear owner while forcing the bounded
+        // operation down its existing fail-closed timeout path.
+        now.checked_add(timeout).unwrap_or(now)
+    }
+
+    pub(super) fn relay_deadline(self) -> Instant {
+        self.relay_deadline_at(Instant::now())
+    }
+
+    pub(super) fn monitor_deadline(self) -> Instant {
+        self.monitor_deadline_at(Instant::now())
+    }
+
+    pub(super) fn app_cleanup_deadline(self) -> Instant {
+        self.app_cleanup_deadline_at(Instant::now())
+    }
+
+    pub(super) fn build_cleanup_deadline(self) -> Instant {
+        self.build_cleanup_deadline_at(Instant::now())
+    }
+
+    fn relay_deadline_at(self, now: Instant) -> Instant {
+        Self::deadline_at(now, self.relay_timeout)
+    }
+
+    fn monitor_deadline_at(self, now: Instant) -> Instant {
+        Self::deadline_at(now, self.monitor_timeout)
+    }
+
+    fn app_cleanup_deadline_at(self, now: Instant) -> Instant {
+        Self::deadline_at(now, self.app_cleanup_timeout)
+    }
+
+    fn build_cleanup_deadline_at(self, now: Instant) -> Instant {
+        Self::deadline_at(now, self.build_cleanup_timeout)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2746,15 +2803,17 @@ impl OrderedShutdownBackend for ProductionSessionComponents {
         match phase {
             ShutdownPhase::Quiesce => self.terminal.quiesce(),
             ShutdownPhase::Tui => self.terminal.shutdown_tui(bounds),
-            ShutdownPhase::ReadinessRelay => self.shutdown_relay(bounds.relay_deadline),
-            ShutdownPhase::Monitor => self.shutdown_monitor(bounds.monitor_deadline),
+            ShutdownPhase::ReadinessRelay => self.shutdown_relay(bounds.relay_deadline()),
+            ShutdownPhase::Monitor => self.shutdown_monitor(bounds.monitor_deadline()),
             ShutdownPhase::AppServerStop => {
                 self.stop_app_server(bounds.app_grace, bounds.app_forced)
             }
             ShutdownPhase::TerminalRestore => self.terminal.await_coordinator_restore(),
             ShutdownPhase::RecoveryDisarm => self.terminal.disarm_recovery(),
-            ShutdownPhase::RuntimeCleanup => self.cleanup_app_runtime(bounds.app_cleanup_deadline),
-            ShutdownPhase::PinnedBuild => self.cleanup_build(bounds.build_cleanup_deadline),
+            ShutdownPhase::RuntimeCleanup => {
+                self.cleanup_app_runtime(bounds.app_cleanup_deadline())
+            }
+            ShutdownPhase::PinnedBuild => self.cleanup_build(bounds.build_cleanup_deadline()),
             ShutdownPhase::Complete => ShutdownStep::advanced(),
         }
     }
@@ -5018,6 +5077,42 @@ mod tests {
     }
 
     #[test]
+    fn packaged_observation_marker_routes_through_a_fail_closed_publisher()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scope = PackagedObservationTestScope::arm()?;
+        let marker = scope.root.join("atomic-marker.live");
+        let mut publisher_called = false;
+        {
+            let mut guard = PACKAGED_SESSION_OBSERVATION
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let armed = guard.as_mut().ok_or("packaged observer disappeared")?;
+            write_packaged_observation_marker_with_publisher(
+                armed,
+                "atomic-marker.live",
+                b"complete\n",
+                |path, payload| {
+                    publisher_called = true;
+                    assert_eq!(path, marker.as_path());
+                    assert_eq!(payload, b"complete\n");
+                    Err(std::io::Error::other("injected publication failure"))
+                },
+            );
+        }
+
+        let observation =
+            take_packaged_session_observation().ok_or("packaged observer disappeared")?;
+        assert!(publisher_called);
+        assert!(!marker.exists());
+        assert_eq!(
+            observation.integrity_failure,
+            Some(PackagedObservationIntegrityFailure::MarkerWrite)
+        );
+        assert!(observation.observation_failed);
+        Ok(())
+    }
+
+    #[test]
     fn repeated_resize_observation_preserves_semantics_without_corrupting_the_observer()
     -> Result<(), Box<dyn std::error::Error>> {
         let scope = PackagedObservationTestScope::arm()?;
@@ -5760,17 +5855,62 @@ mod tests {
     }
 
     fn shutdown_bounds() -> SessionShutdownBounds {
-        let deadline = Instant::now() + Duration::from_secs(1);
         SessionShutdownBounds {
             tui_grace: Duration::from_millis(10),
             tui_forced: Duration::from_millis(10),
-            relay_deadline: deadline,
-            monitor_deadline: deadline,
+            relay_timeout: Duration::from_secs(1),
+            monitor_timeout: Duration::from_secs(1),
             app_grace: Duration::from_millis(10),
             app_forced: Duration::from_millis(10),
-            app_cleanup_deadline: deadline,
-            build_cleanup_deadline: deadline,
+            app_cleanup_timeout: Duration::from_secs(1),
+            build_cleanup_timeout: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn sequential_shutdown_phases_each_derive_a_fresh_deadline() {
+        let bounds = shutdown_bounds();
+        let first_phase_started = Instant::now();
+        let later_phase_started = first_phase_started + Duration::from_secs(30);
+
+        assert_eq!(
+            bounds.relay_deadline_at(first_phase_started),
+            first_phase_started + bounds.relay_timeout
+        );
+        assert_eq!(
+            bounds.monitor_deadline_at(later_phase_started),
+            later_phase_started + bounds.monitor_timeout
+        );
+        assert_eq!(
+            bounds.app_cleanup_deadline_at(later_phase_started),
+            later_phase_started + bounds.app_cleanup_timeout
+        );
+        assert_eq!(
+            bounds.build_cleanup_deadline_at(later_phase_started),
+            later_phase_started + bounds.build_cleanup_timeout
+        );
+        assert!(
+            bounds.monitor_deadline_at(later_phase_started)
+                > bounds.relay_deadline_at(first_phase_started),
+            "a later phase must not inherit an absolute deadline armed before earlier work"
+        );
+
+        let overflow = SessionShutdownBounds {
+            relay_timeout: Duration::MAX,
+            monitor_timeout: Duration::MAX,
+            app_cleanup_timeout: Duration::MAX,
+            build_cleanup_timeout: Duration::MAX,
+            ..bounds
+        };
+        assert_eq!(
+            overflow.relay_deadline_at(later_phase_started),
+            later_phase_started
+        );
+        assert_eq!(
+            overflow.app_cleanup_deadline_at(later_phase_started),
+            later_phase_started,
+            "deadline overflow must fail closed with an already-expired phase deadline"
+        );
     }
 
     #[test]

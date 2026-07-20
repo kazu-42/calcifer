@@ -1810,13 +1810,25 @@ fn continue_supervised_session(
     }
 }
 
-/// Fresh bounds for one startup-abort retry. `containment_deadline` applies to
-/// owners created before the normal live-session shutdown aggregate existed;
-/// the remaining values retain the same meanings as session shutdown.
+/// Relative bounds for one startup-abort retry. `containment_timeout` applies
+/// to owners created before the normal live-session shutdown aggregate
+/// existed; each sequential phase derives a fresh absolute deadline only when
+/// it reaches that edge. The remaining values retain the same meanings as
+/// session shutdown.
 #[derive(Clone, Copy)]
 pub(super) struct StartupShutdownBounds {
-    pub(super) containment_deadline: Instant,
+    pub(super) containment_timeout: Duration,
     pub(super) session: SessionShutdownBounds,
+}
+
+impl StartupShutdownBounds {
+    fn containment_deadline(self) -> Instant {
+        self.containment_deadline_at(Instant::now())
+    }
+
+    fn containment_deadline_at(self, now: Instant) -> Instant {
+        now.checked_add(self.containment_timeout).unwrap_or(now)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1926,7 +1938,7 @@ impl PartialStartupOwner {
                 StartupStep::Advanced
             }
             StartupTuiAuthority::LaunchFailure(failure) => {
-                match failure.resolve(bounds.containment_deadline) {
+                match failure.resolve(bounds.containment_deadline()) {
                     Ok(resolution) => {
                         self.terminal_reportable &= resolution.terminal_reportable();
                         drop(resolution);
@@ -2017,7 +2029,7 @@ impl PartialStartupOwner {
                 }
             }
             StartupRelayAuthority::Live(relay) => {
-                match (*relay).shutdown(bounds.session.relay_deadline) {
+                match (*relay).shutdown(bounds.session.relay_deadline()) {
                     Ok(complete) => {
                         complete.release();
                         StartupStep::Advanced
@@ -2038,7 +2050,7 @@ impl PartialStartupOwner {
                 }
             }
             StartupRelayAuthority::ShutdownFailure(failure) => {
-                match failure.resolve(bounds.session.relay_deadline) {
+                match failure.resolve(bounds.session.relay_deadline()) {
                     Ok(resolution) => {
                         let _ = resolution.release();
                         StartupStep::Advanced
@@ -2066,7 +2078,7 @@ impl PartialStartupOwner {
                 }
             }
             StartupMonitorAuthority::Live(monitor) => {
-                match (*monitor).shutdown(bounds.session.monitor_deadline) {
+                match (*monitor).shutdown(bounds.session.monitor_deadline()) {
                     Ok(complete) => {
                         self.worker_join_status = WorkerJoinStatus::JoinedClean;
                         match complete.into_session() {
@@ -2129,7 +2141,7 @@ impl PartialStartupOwner {
     }
 
     fn stop_app(&mut self, bounds: StartupShutdownBounds) -> StartupStep {
-        if !self.resolve_compatibility(bounds.containment_deadline) {
+        if !self.resolve_compatibility(bounds.containment_deadline()) {
             return StartupStep::Retained;
         }
         let authority = std::mem::replace(&mut self.app, StartupAppAuthority::None);
@@ -2149,7 +2161,7 @@ impl PartialStartupOwner {
                 StartupStep::Advanced
             }
             StartupAppAuthority::LaunchFailure(failure) => {
-                match failure.contain_child(bounds.containment_deadline) {
+                match failure.contain_child(bounds.containment_deadline()) {
                     Ok(contained) => {
                         self.app = StartupAppAuthority::LaunchContained(Box::new(contained));
                         StartupStep::Advanced
@@ -2413,7 +2425,7 @@ impl PartialStartupOwner {
                 self.cleanup_reservation(failure.into_reservation())
             }
             StartupAppAuthority::LaunchFailure(failure) => {
-                match failure.contain_child(bounds.containment_deadline) {
+                match failure.contain_child(bounds.containment_deadline()) {
                     Ok(contained) => self.cleanup_launch_contained(contained, bounds),
                     Err(failure) => {
                         self.cleanup_errors.record(StartupCleanupError::Runtime);
@@ -2426,7 +2438,7 @@ impl PartialStartupOwner {
                 self.cleanup_launch_contained(*contained, bounds)
             }
             StartupAppAuthority::AdoptionContained(contained) => {
-                match (*contained).cleanup_socket(bounds.session.app_cleanup_deadline) {
+                match (*contained).cleanup_socket(bounds.session.app_cleanup_deadline()) {
                     Ok(complete) => {
                         self.app = StartupAppAuthority::Clean(
                             StartupProviderRelease::GracefullyDrained(complete.into_drain()),
@@ -2441,7 +2453,7 @@ impl PartialStartupOwner {
                 }
             }
             StartupAppAuthority::Stopped(stopped) => {
-                match (*stopped).cleanup_socket_runtime(bounds.session.app_cleanup_deadline) {
+                match (*stopped).cleanup_socket_runtime(bounds.session.app_cleanup_deadline()) {
                     Ok(complete) => {
                         self.app = StartupAppAuthority::Clean(
                             StartupProviderRelease::GracefullyDrained(complete.into_drain()),
@@ -2456,7 +2468,7 @@ impl PartialStartupOwner {
                 }
             }
             StartupAppAuthority::CleanupFailure(failure) => {
-                match failure.retry(bounds.session.app_cleanup_deadline) {
+                match failure.retry(bounds.session.app_cleanup_deadline()) {
                     Ok(complete) => {
                         self.app = StartupAppAuthority::Clean(
                             StartupProviderRelease::GracefullyDrained(complete.into_drain()),
@@ -2514,7 +2526,7 @@ impl PartialStartupOwner {
         contained: AppServerLaunchContainmentComplete,
         bounds: StartupShutdownBounds,
     ) -> StartupStep {
-        match contained.cleanup_runtime(bounds.session.app_cleanup_deadline) {
+        match contained.cleanup_runtime(bounds.session.app_cleanup_deadline()) {
             Ok(resolution) => {
                 self.terminal_reportable &= resolution.terminal_reportable();
                 let _ = resolution.release();
@@ -2550,7 +2562,7 @@ impl PartialStartupOwner {
                 StartupStep::Advanced
             }
             StartupBuildAuthority::Live(build) => {
-                match (*build).cleanup(bounds.session.build_cleanup_deadline) {
+                match (*build).cleanup(bounds.session.build_cleanup_deadline()) {
                     Ok(_) => StartupStep::Advanced,
                     Err(failure) => {
                         self.cleanup_errors.record(StartupCleanupError::Build);
@@ -2562,7 +2574,7 @@ impl PartialStartupOwner {
             StartupBuildAuthority::CleanupFailure(failure) => {
                 match failure
                     .into_build()
-                    .cleanup(bounds.session.build_cleanup_deadline)
+                    .cleanup(bounds.session.build_cleanup_deadline())
                 {
                     Ok(_) => StartupStep::Advanced,
                     Err(failure) => {
@@ -3114,6 +3126,14 @@ mod tests {
     const TEST_APP_READINESS_BOUND: Duration = Duration::from_secs(5);
     const TEST_APP_GROUP_READINESS_BOUND: Duration = Duration::from_secs(5);
     const TEST_APP_CONTAINMENT_BOUND: Duration = Duration::from_secs(5);
+    const TEST_COOPERATIVE_APP_HELPER_ENV: &str = "CALCIFER_STARTUP_COOPERATIVE_APP_HELPER";
+    const TEST_COOPERATIVE_APP_READY_ENV: &str = "CALCIFER_STARTUP_COOPERATIVE_APP_READY";
+    const TEST_COOPERATIVE_APP_HELPER_TEST: &str =
+        "providers::codex::supervisor::startup::tests::cooperative_app_child_helper";
+    const TEST_GUARDIAN_DESCRIPTOR_HELPER_ENV: &str = "CALCIFER_STARTUP_GUARDIAN_DESCRIPTOR_HELPER";
+    const TEST_GUARDIAN_DESCRIPTOR_HELPER_TEST: &str = "providers::codex::supervisor::startup::tests::guardian_half_rejects_an_inherited_b_descriptor_in_the_app_group";
+    const TEST_RETAINED_APP_HELPER_ENV: &str = "CALCIFER_STARTUP_RETAINED_APP_HELPER";
+    const TEST_RETAINED_APP_HELPER_TEST: &str = "providers::codex::supervisor::startup::tests::real_app_early_exit_permanently_retains_provider_authority_before_restore";
 
     struct Sandbox(PathBuf);
 
@@ -3154,14 +3174,58 @@ mod tests {
     }
 
     fn cooperative_app_body(ready_marker: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let helper = fs::canonicalize(std::env::current_exe()?)?;
+        let helper = shell_quote_test_value(
+            helper
+                .to_str()
+                .ok_or("cooperative App helper path is not UTF-8")?,
+        )?;
         let ready_marker = ready_marker
             .to_str()
             .ok_or("test App readiness marker is not UTF-8")?;
-        let quoted_marker = format!("'{}'", ready_marker.replace('\'', "'\"'\"'"));
+        let quoted_marker = shell_quote_test_value(ready_marker)?;
+        let helper_test = shell_quote_test_value(TEST_COOPERATIVE_APP_HELPER_TEST)?;
         Ok(format!(
-            "#!/bin/sh\ntrap 'exit 0' TERM\nfifo={quoted_marker}.fifo\nmkfifo \"$fifo\"\nexec 3<>\"$fifo\"\nrm -f \"$fifo\"\n: > {quoted_marker}\nwhile :; do read line <&3; done\n"
+            "#!/bin/sh\n{TEST_COOPERATIVE_APP_HELPER_ENV}=1 {TEST_COOPERATIVE_APP_READY_ENV}={quoted_marker} exec {helper} --exact {helper_test} --nocapture --test-threads=1\n"
         )
         .into_bytes())
+    }
+
+    fn shell_quote_test_value(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+        if value.contains(['\n', '\r', '\0']) {
+            return Err("test helper shell value contained a control byte".into());
+        }
+        Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+    }
+
+    fn run_isolated_test(test: &str, environment: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(environment, "1")
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("isolated test {test} exited with {status:?}").into())
+        }
+    }
+
+    #[test]
+    fn cooperative_app_child_helper() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(TEST_COOPERATIVE_APP_HELPER_ENV).is_none() {
+            return Ok(());
+        }
+        let ready = std::env::var_os(TEST_COOPERATIVE_APP_READY_ENV)
+            .ok_or("cooperative App helper ready path is missing")?;
+        let mut signals =
+            signal_hook::iterator::Signals::new([signal_hook::consts::signal::SIGTERM])?;
+        fs::write(ready, b"ready")?;
+        for signal in signals.forever() {
+            if signal == signal_hook::consts::signal::SIGTERM {
+                return Ok(());
+            }
+        }
+        Err("cooperative App signal iterator ended".into())
     }
 
     fn wait_for_test_app_ready(
@@ -3175,6 +3239,31 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         Ok(())
+    }
+
+    fn wait_for_test_process_and_group_absent(
+        process: rustix::process::Pid,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            let process_absent = match rustix::process::getpgid(Some(process)) {
+                Err(rustix::io::Errno::SRCH) => true,
+                Ok(_) | Err(rustix::io::Errno::INTR) => false,
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            };
+            let group_absent = match rustix::process::test_kill_process_group(process) {
+                Err(rustix::io::Errno::SRCH) => true,
+                Ok(()) | Err(rustix::io::Errno::INTR) => false,
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            };
+            if process_absent && group_absent {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("test App process or process group remained live after cleanup".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn contain_test_app_adoption_failure(
@@ -3196,18 +3285,17 @@ mod tests {
     }
 
     fn retry_shutdown_bounds() -> StartupShutdownBounds {
-        let deadline = Instant::now() + Duration::from_secs(5);
         StartupShutdownBounds {
-            containment_deadline: deadline,
+            containment_timeout: Duration::from_secs(5),
             session: SessionShutdownBounds {
                 tui_grace: Duration::from_secs(2),
                 tui_forced: Duration::from_secs(2),
-                relay_deadline: deadline,
-                monitor_deadline: deadline,
+                relay_timeout: Duration::from_secs(5),
+                monitor_timeout: Duration::from_secs(5),
                 app_grace: Duration::from_secs(2),
                 app_forced: Duration::from_secs(2),
-                app_cleanup_deadline: deadline,
-                build_cleanup_deadline: deadline,
+                app_cleanup_timeout: Duration::from_secs(5),
+                build_cleanup_timeout: Duration::from_secs(5),
             },
         }
     }
@@ -3407,20 +3495,40 @@ mod tests {
     }
 
     fn shutdown_bounds() -> StartupShutdownBounds {
-        let deadline = Instant::now() + Duration::from_secs(1);
         StartupShutdownBounds {
-            containment_deadline: deadline,
+            containment_timeout: Duration::from_secs(1),
             session: SessionShutdownBounds {
                 tui_grace: Duration::from_millis(10),
                 tui_forced: Duration::from_millis(10),
-                relay_deadline: deadline,
-                monitor_deadline: deadline,
+                relay_timeout: Duration::from_secs(1),
+                monitor_timeout: Duration::from_secs(1),
                 app_grace: Duration::from_millis(10),
                 app_forced: Duration::from_millis(10),
-                app_cleanup_deadline: deadline,
-                build_cleanup_deadline: deadline,
+                app_cleanup_timeout: Duration::from_secs(1),
+                build_cleanup_timeout: Duration::from_secs(1),
             },
         }
+    }
+
+    #[test]
+    fn startup_abort_phases_each_derive_a_fresh_deadline() {
+        let bounds = shutdown_bounds();
+        let first_phase_started = Instant::now();
+        let later_phase_started = first_phase_started + Duration::from_secs(30);
+
+        assert_eq!(
+            bounds.containment_deadline_at(first_phase_started),
+            first_phase_started + bounds.containment_timeout
+        );
+        assert_eq!(
+            bounds.containment_deadline_at(later_phase_started),
+            later_phase_started + bounds.containment_timeout
+        );
+        assert!(
+            bounds.containment_deadline_at(later_phase_started)
+                > bounds.containment_deadline_at(first_phase_started),
+            "each startup-abort phase must arm containment when that phase begins"
+        );
     }
 
     #[test]
@@ -3456,6 +3564,13 @@ mod tests {
     #[test]
     fn guardian_half_rejects_an_inherited_b_descriptor_in_the_app_group()
     -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(TEST_GUARDIAN_DESCRIPTOR_HELPER_ENV).is_none() {
+            return run_isolated_test(
+                TEST_GUARDIAN_DESCRIPTOR_HELPER_TEST,
+                TEST_GUARDIAN_DESCRIPTOR_HELPER_ENV,
+            );
+        }
+
         let sandbox = Sandbox::new()?;
         let descendant_marker = sandbox.path().join("app-descendant.pid");
         // The delay deliberately exceeds the historical one-second readiness
@@ -3496,6 +3611,8 @@ mod tests {
         let (mut child, reservation) = command
             .launch_with_reservation(reservation, Instant::now() + Duration::from_secs(1))?;
         let containment = child.containment();
+        let app_pid = rustix::process::Pid::from_raw(containment.pid())
+            .ok_or("invalid descriptor-negative App PID")?;
 
         let descendant_deadline = Instant::now() + TEST_APP_GROUP_READINESS_BOUND;
         let group_readiness_failure = loop {
@@ -3544,6 +3661,10 @@ mod tests {
         let _drain = cleanup_test_app_socket(contained, "App descriptor-failure cleanup failed")?;
         drop((terminal, terminal_peer));
         cleanup_test_build(build, "provider build cleanup failed")?;
+        wait_for_test_process_and_group_absent(
+            app_pid,
+            Instant::now() + TEST_APP_CONTAINMENT_BOUND,
+        )?;
 
         // A readiness miss is a fixture failure, not a descriptor-isolation
         // observation. Return it only after the exact child/socket/build
@@ -3706,6 +3827,10 @@ mod tests {
     #[test]
     fn real_app_early_exit_permanently_retains_provider_authority_before_restore()
     -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(TEST_RETAINED_APP_HELPER_ENV).is_none() {
+            return run_isolated_test(TEST_RETAINED_APP_HELPER_TEST, TEST_RETAINED_APP_HELPER_ENV);
+        }
+
         let sandbox = Sandbox::new()?;
         let build = pinned_build(&sandbox, b"#!/bin/sh\nsleep 0.05\nexit 17\n")?;
         let staged_runtime = build.runtime_path_for_test().to_path_buf();

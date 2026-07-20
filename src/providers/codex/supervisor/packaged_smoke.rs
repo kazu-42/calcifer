@@ -1,6 +1,6 @@
 //! Credential-free smoke tests against the checksum-pinned official Codex package.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
@@ -905,6 +905,27 @@ fn package_recovery_checkpoint_target_markers_are_fixed_and_payload_free() {
 }
 
 #[test]
+fn package_recovery_case_failure_markers_bind_trigger_and_checkpoint_without_payloads() {
+    let mut markers = BTreeSet::new();
+    for trigger in [
+        PackageRecoveryTrigger::GenerationBoundRequest,
+        PackageRecoveryTrigger::OwnerEof,
+    ] {
+        for (checkpoint, _) in PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES {
+            let marker = package_recovery_case_failure_marker(trigger, checkpoint);
+            assert!(markers.insert(marker));
+            assert!(marker.is_ascii());
+            assert!(marker.starts_with("recovery.case-failed."));
+            assert!(!marker.contains(['/', ' ', '\n', '\r']));
+        }
+    }
+    assert_eq!(
+        markers.len(),
+        2 * PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES.len()
+    );
+}
+
+#[test]
 fn package_recovery_checkpoint_environment_is_explicit_after_env_clear() {
     let mut selected = Command::new("package-helper");
     selected.env_clear();
@@ -1150,6 +1171,7 @@ enum PackageRecoveryVerificationPhase {
     CheckpointVerified,
     ObservationOnlyVerified,
     RequestSent,
+    OwnerWriteShutdown,
     OneShotVerified,
     CoordinatorExited,
     ReportVerified,
@@ -1168,6 +1190,7 @@ impl PackageRecoveryVerificationPhase {
             Self::CheckpointVerified => "recovery.checkpoint-verified",
             Self::ObservationOnlyVerified => "recovery.observation-only-verified",
             Self::RequestSent => "recovery.request-sent",
+            Self::OwnerWriteShutdown => "recovery.owner-write-shutdown",
             Self::OneShotVerified => "recovery.one-shot-verified",
             Self::CoordinatorExited => "recovery.coordinator-exited",
             Self::ReportVerified => "recovery.report-verified",
@@ -1181,11 +1204,12 @@ impl PackageRecoveryVerificationPhase {
     }
 }
 
-const PACKAGE_RECOVERY_VERIFICATION_PHASES: [PackageRecoveryVerificationPhase; 13] = [
+const PACKAGE_RECOVERY_VERIFICATION_PHASES: [PackageRecoveryVerificationPhase; 14] = [
     PackageRecoveryVerificationPhase::CheckpointDriven,
     PackageRecoveryVerificationPhase::CheckpointVerified,
     PackageRecoveryVerificationPhase::ObservationOnlyVerified,
     PackageRecoveryVerificationPhase::RequestSent,
+    PackageRecoveryVerificationPhase::OwnerWriteShutdown,
     PackageRecoveryVerificationPhase::OneShotVerified,
     PackageRecoveryVerificationPhase::CoordinatorExited,
     PackageRecoveryVerificationPhase::ReportVerified,
@@ -1207,6 +1231,11 @@ const PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS: [&str; 9] = [
     "recovery.drive-failed.response-sentinel",
     "recovery.drive-failed.exit-input-write",
     "recovery.drive-failed.exit-input-observation",
+];
+
+const PACKAGE_RECOVERY_OBSERVATION_FAILURE_MARKERS: [&str; 2] = [
+    "recovery.observation-only-failed.coordinator-wait",
+    "recovery.observation-only-failed.coordinator-exited",
 ];
 
 const PACKAGE_SESSION_BACKEND_FAILURE_MARKERS: &[&str] = &[
@@ -1464,6 +1493,29 @@ fn classify_package_recovery_drive_stage<T, E>(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageRecoveryObservationFailure {
+    CoordinatorWait,
+    CoordinatorExited,
+}
+
+impl PackageRecoveryObservationFailure {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::CoordinatorWait => "recovery.observation-only-failed.coordinator-wait",
+            Self::CoordinatorExited => "recovery.observation-only-failed.coordinator-exited",
+        }
+    }
+}
+
+impl fmt::Display for PackageRecoveryObservationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the package observation-only proof failed")
+    }
+}
+
+impl Error for PackageRecoveryObservationFailure {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackageJobControlFailure {
     TuiStopWait,
     TuiStoppedSnapshot(PackageProcessSnapshotError),
@@ -1657,6 +1709,7 @@ fn package_recovery_verification_diagnostics_are_ordered_fixed_and_payload_free(
             "recovery.checkpoint-verified",
             "recovery.observation-only-verified",
             "recovery.request-sent",
+            "recovery.owner-write-shutdown",
             "recovery.one-shot-verified",
             "recovery.coordinator-exited",
             "recovery.report-verified",
@@ -2415,6 +2468,47 @@ fn package_failure_report_scanner_bridges_only_the_closed_recovery_drive_catalog
 }
 
 #[test]
+fn package_recovery_observation_failures_are_closed_fixed_and_scannable()
+-> Result<(), Box<dyn Error>> {
+    let variants = [
+        PackageRecoveryObservationFailure::CoordinatorWait,
+        PackageRecoveryObservationFailure::CoordinatorExited,
+    ];
+    assert_eq!(
+        variants.map(PackageRecoveryObservationFailure::marker),
+        PACKAGE_RECOVERY_OBSERVATION_FAILURE_MARKERS
+    );
+    assert!(variants.iter().all(|failure| {
+        failure
+            .marker()
+            .starts_with("recovery.observation-only-failed.")
+            && failure.to_string() == "the package observation-only proof failed"
+    }));
+
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    for marker in PACKAGE_RECOVERY_OBSERVATION_FAILURE_MARKERS {
+        let path = report.join(marker);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some(marker)
+        );
+        fs::remove_file(path)?;
+    }
+    write_private_new(
+        &report.join("recovery.observation-only-failed.user-controlled"),
+        b"classified\n",
+    )?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None
+    );
+    scratch.cleanup()
+}
+
+#[test]
 fn package_failure_report_scanner_bridges_only_the_closed_backend_catalog()
 -> Result<(), Box<dyn Error>> {
     let scratch = PackageScratch::create()?;
@@ -2587,6 +2681,16 @@ fn packaged_codex_deterministic_fixture_recovers_all_seven_production_checkpoint
 }
 
 #[test]
+fn packaged_codex_deterministic_fixture_recovers_all_seven_production_checkpoints_after_owner_eof()
+-> Result<(), Box<dyn Error>> {
+    let _process_guard = package_process_test_guard();
+    for (checkpoint, _) in PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES {
+        run_deterministic_owner_loss_recovery_case(checkpoint)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn packaged_deterministic_drive_failure_consumes_recovery_and_cleans() -> Result<(), Box<dyn Error>>
 {
     let _process_guard = package_process_test_guard();
@@ -2648,6 +2752,14 @@ fn packaged_codex_deterministic_fixture_recovers_ready_only() -> Result<(), Box<
 }
 
 #[test]
+#[ignore = "focused owner-EOF checkpoint diagnostic; exhaustive matrix is nonignored"]
+fn packaged_codex_deterministic_fixture_recovers_ready_after_owner_eof_only()
+-> Result<(), Box<dyn Error>> {
+    let _process_guard = package_process_test_guard();
+    run_deterministic_owner_loss_recovery_case(RecoveryCheckpoint::Ready)
+}
+
+#[test]
 #[ignore = "focused one-checkpoint diagnostic; exhaustive matrix is nonignored"]
 fn packaged_codex_deterministic_fixture_recovers_active_only() -> Result<(), Box<dyn Error>> {
     let _process_guard = package_process_test_guard();
@@ -2701,6 +2813,22 @@ fn packaged_codex_deterministic_fixture_recovers_retained_cleanup_pending_only()
 }
 
 fn run_deterministic_recovery_case(checkpoint: RecoveryCheckpoint) -> Result<(), Box<dyn Error>> {
+    run_deterministic_recovery_case_with_trigger(
+        checkpoint,
+        PackageRecoveryTrigger::GenerationBoundRequest,
+    )
+}
+
+fn run_deterministic_owner_loss_recovery_case(
+    checkpoint: RecoveryCheckpoint,
+) -> Result<(), Box<dyn Error>> {
+    run_deterministic_recovery_case_with_trigger(checkpoint, PackageRecoveryTrigger::OwnerEof)
+}
+
+fn run_deterministic_recovery_case_with_trigger(
+    checkpoint: RecoveryCheckpoint,
+    trigger: PackageRecoveryTrigger,
+) -> Result<(), Box<dyn Error>> {
     let scratch = PackageScratch::create()?;
     let root = scratch.root.clone();
     let backend = match PackageSessionBackend::spawn() {
@@ -2713,7 +2841,7 @@ fn run_deterministic_recovery_case(checkpoint: RecoveryCheckpoint) -> Result<(),
     let mut harness =
         OfficialTuiPackageHarness::spawn_deterministic_recovery(scratch, backend, checkpoint)?;
     let exercise = (|| -> Result<(), Box<dyn Error>> {
-        harness.request_selected_recovery()?;
+        harness.trigger_selected_recovery(trigger)?;
         let second = PackageGenerationCleanupOperations::request_recovery_once(
             &mut harness,
             Instant::now() + IO_TIMEOUT,
@@ -2728,7 +2856,8 @@ fn run_deterministic_recovery_case(checkpoint: RecoveryCheckpoint) -> Result<(),
             &report,
             PackageRecoveryVerificationPhase::OneShotVerified,
         );
-        harness.verify_selected_recovery_outcome()
+        harness.verify_selected_recovery_outcome()?;
+        harness.verify_selected_recovery_trigger(trigger)
     })();
     let exercise_failure_before_cleanup = exercise
         .as_ref()
@@ -2749,11 +2878,12 @@ fn run_deterministic_recovery_case(checkpoint: RecoveryCheckpoint) -> Result<(),
     } else {
         None
     };
-    combine_package_exercise_and_cleanup_at_phases(
+    combine_package_exercise_and_cleanup_at_recovery_case(
         exercise,
         cleanup,
         exercise_phase,
         cleanup_phase,
+        package_recovery_case_failure_marker(trigger, checkpoint),
     )?;
     if root.exists() {
         return Err(format!(
@@ -4157,6 +4287,58 @@ fn package_child_marker_is_not_visible_before_its_complete_payload_is_durable()
 }
 
 #[test]
+fn package_session_observation_is_invisible_until_complete_json_is_durable()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let marker = report.join("session-observation.json");
+    let observation = PackagedSessionObservation {
+        initial_size: Some((37, 111)),
+        input: b"complete-observation".to_vec(),
+        output_sentinel_seen: true,
+        shutdown_observed: true,
+        ..PackagedSessionObservation::default()
+    };
+    let publisher_report = report.clone();
+    let publisher_observation = observation.clone();
+    let staged = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let publisher_staged = Arc::clone(&staged);
+    let publisher_release = Arc::clone(&release);
+    let publisher = thread::spawn(move || {
+        write_package_session_observation_with_before_publish(
+            &publisher_report,
+            &publisher_observation,
+            || {
+                publisher_staged.wait();
+                publisher_release.wait();
+                Ok(())
+            },
+        )
+        .map_err(|error| error.to_string())
+    });
+
+    staged.wait();
+    let before_publish = require_rejected_test_result(
+        read_private_bounded(&marker, 128 * 1024),
+        "session observation became visible before atomic publication",
+    )?;
+    release.wait();
+    publisher
+        .join()
+        .map_err(|_| io::Error::other("package session observation publisher panicked"))?
+        .map_err(io::Error::other)?;
+
+    assert_eq!(before_publish.kind(), io::ErrorKind::NotFound);
+    let payload = read_private_bounded(&marker, 128 * 1024)?;
+    let decoded: PackagedSessionObservation = serde_json::from_slice(&payload)?;
+    assert_eq!(decoded, observation);
+    scratch.cleanup()?;
+    Ok(())
+}
+
+#[test]
 fn package_child_marker_publication_and_reader_fail_closed_for_unsafe_nodes_and_payloads()
 -> Result<(), Box<dyn Error>> {
     let scratch = PackageScratch::create()?;
@@ -4312,6 +4494,7 @@ struct PackageExerciseCleanupFailure {
     cleanup_failed: bool,
     exercise_phase: Option<&'static str>,
     cleanup_phase: Option<&'static str>,
+    recovery_case: Option<&'static str>,
 }
 
 impl fmt::Debug for PackageExerciseCleanupFailure {
@@ -4322,6 +4505,7 @@ impl fmt::Debug for PackageExerciseCleanupFailure {
             .field("cleanup_failed", &self.cleanup_failed)
             .field("exercise_phase", &self.exercise_phase)
             .field("cleanup_phase", &self.cleanup_phase)
+            .field("recovery_case", &self.recovery_case)
             .finish()
     }
 }
@@ -4343,6 +4527,9 @@ impl fmt::Display for PackageExerciseCleanupFailure {
             } else {
                 write!(formatter, " at fixed cleanup phase {phase}")?;
             }
+        }
+        if let Some(recovery_case) = self.recovery_case {
+            write!(formatter, "; fixed recovery case {recovery_case}")?;
         }
         Ok(())
     }
@@ -4371,6 +4558,38 @@ fn combine_package_exercise_and_cleanup_at_phases(
     exercise_phase: Option<&'static str>,
     cleanup_phase: Option<&'static str>,
 ) -> Result<(), Box<dyn Error>> {
+    combine_package_exercise_and_cleanup_with_diagnostics(
+        exercise,
+        cleanup,
+        exercise_phase,
+        cleanup_phase,
+        None,
+    )
+}
+
+fn combine_package_exercise_and_cleanup_at_recovery_case(
+    exercise: Result<(), Box<dyn Error>>,
+    cleanup: Result<(), Box<dyn Error>>,
+    exercise_phase: Option<&'static str>,
+    cleanup_phase: Option<&'static str>,
+    recovery_case: &'static str,
+) -> Result<(), Box<dyn Error>> {
+    combine_package_exercise_and_cleanup_with_diagnostics(
+        exercise,
+        cleanup,
+        exercise_phase,
+        cleanup_phase,
+        Some(recovery_case),
+    )
+}
+
+fn combine_package_exercise_and_cleanup_with_diagnostics(
+    exercise: Result<(), Box<dyn Error>>,
+    cleanup: Result<(), Box<dyn Error>>,
+    exercise_phase: Option<&'static str>,
+    cleanup_phase: Option<&'static str>,
+    recovery_case: Option<&'static str>,
+) -> Result<(), Box<dyn Error>> {
     match (exercise, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (exercise, cleanup) => Err(Box::new(PackageExerciseCleanupFailure {
@@ -4378,6 +4597,7 @@ fn combine_package_exercise_and_cleanup_at_phases(
             cleanup_failed: cleanup.is_err(),
             exercise_phase,
             cleanup_phase,
+            recovery_case,
         })),
     }
 }
@@ -4491,6 +4711,33 @@ fn package_exercise_and_cleanup_failures_are_aggregated_with_fixed_redacted_labe
         )
     );
     assert!(!format!("{both_phased:?}").contains("private"));
+
+    let recovery_case_marker = package_recovery_case_failure_marker(
+        PackageRecoveryTrigger::OwnerEof,
+        RecoveryCheckpoint::Suspended,
+    );
+    let recovery_case = require_rejected_test_result(
+        combine_package_exercise_and_cleanup_at_recovery_case(
+            Err("private provider payload and path".into()),
+            Ok(()),
+            Some("recovery.drive-failed.exit-input-observation"),
+            None,
+            recovery_case_marker,
+        ),
+        "a failed recovery case unexpectedly succeeded",
+    )?;
+    assert_eq!(
+        recovery_case.to_string(),
+        concat!(
+            "package exercise failed at fixed phase ",
+            "recovery.drive-failed.exit-input-observation; fixed recovery case ",
+            "recovery.case-failed.owner-eof.suspended-v1"
+        )
+    );
+    let recovery_debug = format!("{recovery_case:?}");
+    assert!(recovery_debug.contains(recovery_case_marker));
+    assert!(!recovery_debug.contains("private"));
+    assert!(recovery_case.source().is_none());
     Ok(())
 }
 
@@ -4835,6 +5082,64 @@ enum PackageRecoveryRequestObservation {
     Sent,
     AttemptConsumedBoundaryUnknown,
     AlreadyConsumed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageRecoveryTrigger {
+    GenerationBoundRequest,
+    OwnerEof,
+}
+
+const fn package_recovery_case_failure_marker(
+    trigger: PackageRecoveryTrigger,
+    checkpoint: RecoveryCheckpoint,
+) -> &'static str {
+    match (trigger, checkpoint) {
+        (PackageRecoveryTrigger::GenerationBoundRequest, RecoveryCheckpoint::StartupQueued) => {
+            "recovery.case-failed.request.startup-queued-v1"
+        }
+        (PackageRecoveryTrigger::GenerationBoundRequest, RecoveryCheckpoint::Ready) => {
+            "recovery.case-failed.request.ready-v1"
+        }
+        (PackageRecoveryTrigger::GenerationBoundRequest, RecoveryCheckpoint::Active) => {
+            "recovery.case-failed.request.active-v1"
+        }
+        (PackageRecoveryTrigger::GenerationBoundRequest, RecoveryCheckpoint::Suspended) => {
+            "recovery.case-failed.request.suspended-v1"
+        }
+        (PackageRecoveryTrigger::GenerationBoundRequest, RecoveryCheckpoint::RetainedQuiescing) => {
+            "recovery.case-failed.request.retained-quiescing-v1"
+        }
+        (
+            PackageRecoveryTrigger::GenerationBoundRequest,
+            RecoveryCheckpoint::RetainedRestorePending,
+        ) => "recovery.case-failed.request.retained-restore-pending-v1",
+        (
+            PackageRecoveryTrigger::GenerationBoundRequest,
+            RecoveryCheckpoint::RetainedCleanupPending,
+        ) => "recovery.case-failed.request.retained-cleanup-pending-v1",
+        (PackageRecoveryTrigger::OwnerEof, RecoveryCheckpoint::StartupQueued) => {
+            "recovery.case-failed.owner-eof.startup-queued-v1"
+        }
+        (PackageRecoveryTrigger::OwnerEof, RecoveryCheckpoint::Ready) => {
+            "recovery.case-failed.owner-eof.ready-v1"
+        }
+        (PackageRecoveryTrigger::OwnerEof, RecoveryCheckpoint::Active) => {
+            "recovery.case-failed.owner-eof.active-v1"
+        }
+        (PackageRecoveryTrigger::OwnerEof, RecoveryCheckpoint::Suspended) => {
+            "recovery.case-failed.owner-eof.suspended-v1"
+        }
+        (PackageRecoveryTrigger::OwnerEof, RecoveryCheckpoint::RetainedQuiescing) => {
+            "recovery.case-failed.owner-eof.retained-quiescing-v1"
+        }
+        (PackageRecoveryTrigger::OwnerEof, RecoveryCheckpoint::RetainedRestorePending) => {
+            "recovery.case-failed.owner-eof.retained-restore-pending-v1"
+        }
+        (PackageRecoveryTrigger::OwnerEof, RecoveryCheckpoint::RetainedCleanupPending) => {
+            "recovery.case-failed.owner-eof.retained-cleanup-pending-v1"
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5311,12 +5616,20 @@ impl OfficialTuiPackageHarness {
         Ok(harness)
     }
 
-    /// Drives the selected package-only lifecycle phase, consumes its exact
-    /// observation frame, then sends the sole generation-bound CFRCR request
-    /// and write-half EOF. The local state is consumed before the transport
-    /// attempt, so later cleanup can observe completion but cannot issue a
-    /// second recovery command.
+    /// Compatibility wrapper for the checksum-pinned retained-recovery case.
     fn request_selected_recovery(&mut self) -> Result<(), Box<dyn Error>> {
+        self.trigger_selected_recovery(PackageRecoveryTrigger::GenerationBoundRequest)
+    }
+
+    /// Drives the selected package-only lifecycle phase, consumes its exact
+    /// observation frame, then activates recovery through either the sole
+    /// generation-bound CFRCR request or an empty owner write-half EOF. The
+    /// local state is consumed before either transport attempt, so later
+    /// cleanup can observe completion but cannot issue a second command.
+    fn trigger_selected_recovery(
+        &mut self,
+        trigger: PackageRecoveryTrigger,
+    ) -> Result<(), Box<dyn Error>> {
         let checkpoint = self
             .recovery_checkpoint
             .ok_or("package recovery checkpoint was not selected")?;
@@ -5388,18 +5701,44 @@ impl OfficialTuiPackageHarness {
             .checked_add(PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT)
             .map(|deadline| deadline.min(fence.cleanup_fence))
             .ok_or("package recovery request deadline overflowed")?;
-        let request_result =
-            PackageGenerationCleanupOperations::request_recovery_once(self, request_deadline);
-        if matches!(request_result, Ok(PackageRecoveryRequestObservation::Sent)) {
-            record_package_recovery_verification_phase(
-                &report,
-                PackageRecoveryVerificationPhase::RequestSent,
-            );
-        }
+        let trigger_result = match trigger {
+            PackageRecoveryTrigger::GenerationBoundRequest => {
+                let request_result = PackageGenerationCleanupOperations::request_recovery_once(
+                    self,
+                    request_deadline,
+                );
+                if matches!(request_result, Ok(PackageRecoveryRequestObservation::Sent)) {
+                    record_package_recovery_verification_phase(
+                        &report,
+                        PackageRecoveryVerificationPhase::RequestSent,
+                    );
+                }
+                match request_result {
+                    Ok(PackageRecoveryRequestObservation::Sent) => Ok(()),
+                    Ok(PackageRecoveryRequestObservation::AttemptConsumedBoundaryUnknown) => {
+                        Err("package recovery request boundary was not confirmed".into())
+                    }
+                    Ok(PackageRecoveryRequestObservation::AlreadyConsumed) => {
+                        Err("package recovery request was already consumed".into())
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            PackageRecoveryTrigger::OwnerEof => {
+                let result = self.shutdown_selected_recovery_owner(request_deadline);
+                if result.is_ok() {
+                    record_package_recovery_verification_phase(
+                        &report,
+                        PackageRecoveryVerificationPhase::OwnerWriteShutdown,
+                    );
+                }
+                result
+            }
+        };
 
         // Once a selected checkpoint is valid, no diagnostic or drive error
-        // may bypass the sole CFRCR/EOF attempt. Return the earliest causal
-        // error only after that transport boundary has been consumed.
+        // may bypass the sole activation attempt. Return the earliest causal
+        // error only after that one-shot boundary has been consumed.
         drive_result?;
         if let Err(error) = checkpoint_result {
             return Err(error.into());
@@ -5407,15 +5746,21 @@ impl OfficialTuiPackageHarness {
         if let Some(Err(error)) = observation_result {
             return Err(error);
         }
-        match request_result? {
-            PackageRecoveryRequestObservation::Sent => Ok(()),
-            PackageRecoveryRequestObservation::AttemptConsumedBoundaryUnknown => {
-                Err("package recovery request boundary was not confirmed".into())
-            }
-            PackageRecoveryRequestObservation::AlreadyConsumed => {
-                Err("package recovery request was already consumed".into())
-            }
+        trigger_result
+    }
+
+    fn shutdown_selected_recovery_owner(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn Error>> {
+        if !self.recovery_request_state.begin_attempt() {
+            return Err("package recovery activation was already consumed".into());
         }
+        self.completion
+            .as_mut()
+            .ok_or_else(|| -> Box<dyn Error> { "package completion owner was missing".into() })?
+            .shutdown_recovery_owner_write(deadline)
+            .map_err(|_| "package owner write-half shutdown was not confirmed".into())
     }
 
     fn prove_selected_checkpoint_is_observation_only(&mut self) -> Result<(), Box<dyn Error>> {
@@ -5425,16 +5770,25 @@ impl OfficialTuiPackageHarness {
         // endpoint before the one-shot CFRCR/EOF attempt. The independent
         // entry-layer protocol test proves that CFCP alone cannot authorize
         // guardian recovery.
-        let exited = self
+        let report = self.root()?.join("supervisor-report");
+        let exited = match self
             .coordinator
             .as_mut()
             .ok_or("package coordinator child was missing")?
-            .try_wait()?;
+            .try_wait()
+        {
+            Ok(exited) => exited,
+            Err(_) => {
+                let failure = PackageRecoveryObservationFailure::CoordinatorWait;
+                record_package_diagnostic_marker(&report, failure.marker());
+                return Err(failure.into());
+            }
+        };
         if exited.is_some() {
             self.generation_cleanup_mut()?.exact_coordinator_wait = true;
-            return Err(
-                "package recovery checkpoint terminated the coordinator without CFRCR".into(),
-            );
+            let failure = PackageRecoveryObservationFailure::CoordinatorExited;
+            record_package_diagnostic_marker(&report, failure.marker());
+            return Err(failure.into());
         }
         Ok(())
     }
@@ -5447,7 +5801,7 @@ impl OfficialTuiPackageHarness {
             .recovery_checkpoint
             .ok_or("package recovery checkpoint was not selected")?;
         if self.recovery_request_state != PackageRecoveryRequestState::Consumed {
-            return Err("package recovery request remained reusable after CFRCR".into());
+            return Err("package recovery activation remained reusable".into());
         }
         let fence = self
             .generation_deadline_fence
@@ -5517,6 +5871,52 @@ impl OfficialTuiPackageHarness {
             &report,
             PackageRecoveryVerificationPhase::RuntimeEmpty,
         );
+        Ok(())
+    }
+
+    fn verify_selected_recovery_trigger(
+        &self,
+        trigger: PackageRecoveryTrigger,
+    ) -> Result<(), Box<dyn Error>> {
+        let report = self.root()?.join("supervisor-report");
+        let (required, forbidden): (&[&str], &[&str]) = match trigger {
+            PackageRecoveryTrigger::GenerationBoundRequest => (
+                &[
+                    "recovery.request-sent",
+                    "recovery.guardian-checkpoint.request-verified",
+                ],
+                &[
+                    "recovery.owner-write-shutdown",
+                    "recovery.guardian-checkpoint.owner-lost",
+                    "recovery.guardian-checkpoint.protocol-rejected-owner-lost",
+                ],
+            ),
+            PackageRecoveryTrigger::OwnerEof => (
+                &[
+                    "recovery.owner-write-shutdown",
+                    "recovery.guardian-checkpoint.owner-lost",
+                ],
+                &[
+                    "recovery.request-sent",
+                    "recovery.guardian-checkpoint.request-verified",
+                    "recovery.guardian-checkpoint.protocol-rejected-owner-lost",
+                ],
+            ),
+        };
+        for marker in required {
+            if !report.join(marker).is_file() {
+                return Err("package recovery activation omitted its exact cause proof".into());
+            }
+        }
+        for marker in forbidden
+            .iter()
+            .copied()
+            .chain(["guardian-recovery.retained"])
+        {
+            if report.join(marker).exists() {
+                return Err("package recovery activation admitted a conflicting cause".into());
+            }
+        }
         Ok(())
     }
 
@@ -6080,6 +6480,7 @@ impl OfficialTuiPackageHarness {
             .chain(PACKAGED_STARTUP_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_SESSION_RETAINED_OPERATION_MARKERS.iter().copied())
+            .chain(PACKAGE_RECOVERY_OBSERVATION_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_SESSION_BACKEND_FAILURE_MARKERS.iter().copied())
             .chain([
@@ -6954,10 +7355,7 @@ fn run_package_guardian_helper() -> Result<(), Box<dyn Error>> {
     };
     let observation =
         take_packaged_session_observation().ok_or("package session observer was not armed")?;
-    write_private_new(
-        &report_root.join("session-observation.json"),
-        &serde_json::to_vec(&observation)?,
-    )?;
+    write_package_session_observation(&report_root, &observation)?;
     apply_package_guardian_terminal_disposition(disposition)
 }
 
@@ -8042,6 +8440,134 @@ fn package_input_transcript_accepts_only_ordered_exact_wire_bytes() {
     }
 }
 
+#[test]
+fn package_live_input_transcript_retries_only_a_concurrent_snapshot_change()
+-> Result<(), Box<dyn Error>> {
+    let expected = PACKAGE_SUPERVISOR_EXIT_INPUT;
+    let mut reads = VecDeque::from([
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "live transcript changed while read",
+        )),
+        Ok(expected.to_vec()),
+    ]);
+    wait_for_package_input_transcript_with_reader(
+        expected,
+        Instant::now() + Duration::from_secs(1),
+        || {
+            reads
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("test read sequence was exhausted"))?
+        },
+    )?;
+    assert!(reads.is_empty());
+
+    let mut unsafe_reads = 0_u8;
+    let error = require_rejected_test_result(
+        wait_for_package_input_transcript_with_reader(
+            expected,
+            Instant::now() + Duration::from_secs(1),
+            || {
+                unsafe_reads = unsafe_reads.saturating_add(1);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "private identity changed",
+                ))
+            },
+        ),
+        "an unsafe live transcript identity was retried or accepted",
+    )?;
+    assert_eq!(unsafe_reads, 1);
+    assert_eq!(error.to_string(), "private identity changed");
+    Ok(())
+}
+
+#[test]
+fn package_private_read_retries_only_same_inode_append_progress() -> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let path = scratch.root.join("live-read-classification");
+    write_private_new(&path, b"before")?;
+    let before = fs::metadata(&path)?;
+    OpenOptions::new()
+        .append(true)
+        .open(&path)?
+        .write_all(b"-after")?;
+    let after = fs::metadata(&path)?;
+
+    let progress = require_rejected_test_result(
+        validate_private_bounded_read_completion(
+            &before,
+            &after,
+            usize::try_from(before.len())?,
+            128,
+        ),
+        "an append racing a private read was not classified as progress",
+    )?;
+    assert_eq!(progress.kind(), std::io::ErrorKind::WouldBlock);
+
+    for (bytes_read, maximum, context) in [
+        (
+            usize::try_from(before.len())?.saturating_sub(1),
+            128,
+            "truncate-then-regrow race",
+        ),
+        (
+            usize::try_from(after.len())?.saturating_add(1),
+            128,
+            "read beyond final length",
+        ),
+        (10, 10, "append beyond the configured cap"),
+    ] {
+        let unsafe_growth = require_rejected_test_result(
+            validate_private_bounded_read_completion(&before, &after, bytes_read, maximum),
+            "unsafe same-inode growth was accepted as append progress",
+        )?;
+        assert_eq!(
+            unsafe_growth.kind(),
+            std::io::ErrorKind::InvalidData,
+            "{context} was retried"
+        );
+    }
+
+    OpenOptions::new().write(true).open(&path)?.set_len(3)?;
+    let truncated = fs::metadata(&path)?;
+    let truncation = require_rejected_test_result(
+        validate_private_bounded_read_completion(&after, &truncated, 3, 128),
+        "same-inode truncation was accepted as append progress",
+    )?;
+    assert_eq!(truncation.kind(), std::io::ErrorKind::InvalidData);
+
+    let rewritten_path = scratch.root.join("same-length-rewrite");
+    write_private_new(&rewritten_path, b"before")?;
+    let mut rewritten = OpenOptions::new().write(true).open(&rewritten_path)?;
+    rewritten.set_times(
+        fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+    )?;
+    let before_rewrite = rewritten.metadata()?;
+    rewritten.write_all(b"rewrit")?;
+    rewritten.set_times(
+        fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(2)),
+    )?;
+    let after_rewrite = rewritten.metadata()?;
+    let rewrite = require_rejected_test_result(
+        validate_private_bounded_read_completion(
+            &before_rewrite,
+            &after_rewrite,
+            b"rewrit".len(),
+            128,
+        ),
+        "same-length rewrite was accepted as append progress",
+    )?;
+    assert_eq!(rewrite.kind(), std::io::ErrorKind::InvalidData);
+
+    let oversized = require_rejected_test_result(
+        validate_private_bounded_read_completion(&after, &after, 129, 128),
+        "an oversized private read was accepted as progress",
+    )?;
+    assert_eq!(oversized.kind(), std::io::ErrorKind::InvalidData);
+    scratch.cleanup()
+}
+
 fn write_package_pty_input(
     master: &PtyMaster,
     bytes: &[u8],
@@ -8175,14 +8701,34 @@ fn wait_for_package_input_transcript(
     expected: &[u8],
     deadline: Instant,
 ) -> Result<(), Box<dyn Error>> {
+    wait_for_package_input_transcript_with_reader(expected, deadline, || {
+        read_private_bounded(path, 128 * 1024)
+    })
+}
+
+fn wait_for_package_input_transcript_with_reader(
+    expected: &[u8],
+    deadline: Instant,
+    mut read: impl FnMut() -> std::io::Result<Vec<u8>>,
+) -> Result<(), Box<dyn Error>> {
     loop {
-        let bytes = read_private_bounded(path, 128 * 1024)?;
-        match classify_package_input_transcript(&bytes, expected) {
-            PackageInputTranscriptProgress::Exact => return Ok(()),
-            PackageInputTranscriptProgress::Diverged => {
-                return Err("package terminal input diverged from the exact transcript".into());
+        match read() {
+            Ok(bytes) => match classify_package_input_transcript(&bytes, expected) {
+                PackageInputTranscriptProgress::Exact => return Ok(()),
+                PackageInputTranscriptProgress::Diverged => {
+                    return Err("package terminal input diverged from the exact transcript".into());
+                }
+                PackageInputTranscriptProgress::Pending => {}
+            },
+            // `input.live` is append-only and observed concurrently with the
+            // guardian's post-forward commit. A stable descriptor whose
+            // length or mtime changed during one bounded read is expected
+            // progress, not an identity failure. Unsafe metadata and all
+            // other I/O errors remain immediately fatal.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                return Err(error.into());
             }
-            PackageInputTranscriptProgress::Pending => {}
         }
         if Instant::now() >= deadline {
             return Err("package terminal input observation exceeded its deadline".into());
@@ -11768,7 +12314,7 @@ impl<'de> Deserialize<'de> for PackageExactPromptProof {
     {
         struct PromptVisitor;
 
-        impl<'de> Visitor<'de> for PromptVisitor {
+        impl Visitor<'_> for PromptVisitor {
             type Value = PackageExactPromptProof;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -14058,6 +14604,29 @@ pub(super) fn write_private_atomic_new(path: &Path, contents: &[u8]) -> Result<(
     write_private_atomic_new_with_before_publish(path, contents, || Ok(()))
 }
 
+fn write_package_session_observation(
+    report_root: &Path,
+    observation: &PackagedSessionObservation,
+) -> Result<(), Box<dyn Error>> {
+    write_package_session_observation_with_before_publish(report_root, observation, || Ok(()))
+}
+
+fn write_package_session_observation_with_before_publish<F>(
+    report_root: &Path,
+    observation: &PackagedSessionObservation,
+    before_publish: F,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnOnce() -> Result<(), Box<dyn Error>>,
+{
+    let payload = serde_json::to_vec(observation)?;
+    write_private_atomic_new_with_before_publish(
+        &report_root.join("session-observation.json"),
+        &payload,
+        before_publish,
+    )
+}
+
 fn write_private_atomic_new_with_before_publish<F>(
     path: &Path,
     contents: &[u8],
@@ -14240,18 +14809,60 @@ fn read_private_bounded(path: &Path, maximum: usize) -> std::io::Result<Vec<u8>>
         .take(u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1))
         .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
-    if bytes.len() > maximum
+    validate_private_bounded_read_completion(&before, &after, bytes.len(), maximum)?;
+    Ok(bytes)
+}
+
+fn validate_private_bounded_read_completion(
+    before: &fs::Metadata,
+    after: &fs::Metadata,
+    bytes_read: usize,
+    maximum: usize,
+) -> std::io::Result<()> {
+    let (Ok(before_length), Ok(after_length)) =
+        (usize::try_from(before.len()), usize::try_from(after.len()))
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "package smoke private file length was invalid after read",
+        ));
+    };
+    if bytes_read > maximum
+        || after_length > maximum
+        || !after.file_type().is_file()
+        || after.uid() != before.uid()
+        || (after.permissions().mode() & 0o7777) != (before.permissions().mode() & 0o7777)
+        || after.nlink() != before.nlink()
         || before.dev() != after.dev()
         || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.modified()? != after.modified()?
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "package smoke private file changed while read",
+            "package smoke private file identity was invalid after read",
         ));
     }
-    Ok(bytes)
+    if after_length > before_length {
+        if bytes_read < before_length || bytes_read > after_length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "package smoke private file did not grow monotonically while read",
+            ));
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "package smoke private file append progressed while read",
+        ));
+    }
+    if after_length < before_length
+        || before.modified()? != after.modified()?
+        || after_length != bytes_read
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "package smoke private file changed non-monotonically while read",
+        ));
+    }
+    Ok(())
 }
 
 fn read_owned_evidence_bounded(path: &Path, maximum: usize) -> std::io::Result<Vec<u8>> {

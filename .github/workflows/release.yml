@@ -15,6 +15,7 @@ on:
       - scripts/test_package_release.py
       - scripts/test_publish_release.py
       - scripts/test_release_manifest.py
+      - scripts/test_release_workflow.py
       - scripts/test_verify_release.py
       - scripts/verify_release.py
   push:
@@ -145,6 +146,7 @@ jobs:
             "Test (ubuntu-latest)"
             "Test (macos-latest)"
             "Test (windows-latest)"
+            "Pinned Codex Package"
             "MSRV (1.85.0)"
           )
           for required_check in "${required_checks[@]}"; do

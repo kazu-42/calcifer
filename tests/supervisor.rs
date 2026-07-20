@@ -476,6 +476,27 @@ impl OuterPtyChild {
     }
 
     fn signal_anchor(&self, signal: rustix::process::Signal) -> TestResult {
+        rustix::process::kill_process_group(self.anchor_process_group()?, signal)?;
+        Ok(())
+    }
+
+    fn signal_foreground_coordinator(
+        &self,
+        signal: rustix::process::Signal,
+    ) -> TestResult<rustix::process::Pid> {
+        let anchor_group = self.anchor_process_group()?;
+        let foreground = rustix::termios::tcgetpgrp(&self.master)?;
+        if foreground == anchor_group || rustix::process::getpgid(Some(foreground))? != foreground {
+            return Err(io::Error::other(
+                "outer PTY foreground was not the distinct coordinator group",
+            )
+            .into());
+        }
+        rustix::process::kill_process_group(foreground, signal)?;
+        Ok(foreground)
+    }
+
+    fn anchor_process_group(&self) -> TestResult<rustix::process::Pid> {
         if self.reaped {
             return Err(io::Error::other("outer PTY fixture was already reaped").into());
         }
@@ -487,7 +508,16 @@ impl OuterPtyChild {
         if rustix::process::getpgid(Some(pid))? != pid {
             return Err(io::Error::other("outer PTY anchor group identity changed").into());
         }
-        rustix::process::kill_process_group(pid, signal)?;
+        Ok(pid)
+    }
+
+    fn assert_anchor_foreground(&self) -> TestResult {
+        if rustix::termios::tcgetpgrp(&self.master)? != self.anchor_process_group()? {
+            return Err(io::Error::other(
+                "entry anchor stopped without reclaiming the outer PTY foreground",
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -1595,11 +1625,68 @@ fn production_entry_anchor_tstp_cont_handoff_restores_before_stop() -> TestResul
     thread::sleep(Duration::from_millis(50));
     anchor.signal_anchor(rustix::process::Signal::TSTP)?;
     anchor.wait_until_anchor_stopped(PROCESS_TIMEOUT)?;
-    anchor.assert_restored()?;
-    anchor.signal_anchor(rustix::process::Signal::CONT)?;
-    let status = anchor.wait(PROCESS_TIMEOUT)?;
+    let stopped_terminal_proof = anchor.assert_restored();
+    let anchor_continue = anchor.signal_anchor(rustix::process::Signal::CONT);
+    let status = anchor.wait(PROCESS_TIMEOUT);
+    stopped_terminal_proof?;
+    anchor_continue?;
+    let status = status?;
     if !status.success() {
         return Err(io::Error::other("entry anchor failed the TSTP/CONT handoff").into());
+    }
+    anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+    anchor.assert_restored()?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn production_entry_anchor_relays_a_foreground_coordinator_stop_to_the_shell_job() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("entry-foreground-suspend-resume")?;
+    let mut anchor = OuterPtyChild::spawn_entry(&fixture, "suspend-resume")?;
+    anchor.wait_until_raw(PROCESS_TIMEOUT)?;
+    thread::sleep(Duration::from_millis(50));
+    let coordinator_group = anchor.signal_foreground_coordinator(rustix::process::Signal::TSTP)?;
+
+    if let Err(error) = anchor.wait_until_anchor_stopped(CONTENDER_TIMEOUT) {
+        // The expected RED failure leaves the hidden coordinator stopped. A
+        // fresh CONT lets the fixture publish completion and gives the exact
+        // anchor child a bounded, non-orphaning cleanup path before this test
+        // returns the original assertion failure.
+        let continued =
+            rustix::process::kill_process_group(coordinator_group, rustix::process::Signal::CONT);
+        let cleanup = anchor.wait(PROCESS_TIMEOUT);
+        if continued.is_err() || cleanup.is_err() {
+            return Err(io::Error::other(format!(
+                "foreground-stop assertion failed and bounded cleanup failed: {error}"
+            ))
+            .into());
+        }
+        return Err(error);
+    }
+
+    // Capture the stopped-state proofs before resuming, but never return while
+    // the distinct coordinator group is still stopped. Even a failed
+    // assertion must first give the shell-visible anchor its normal `fg`
+    // transition so the fixture can reap the hidden child.
+    let stopped_terminal_proof = anchor
+        .assert_restored()
+        .and_then(|()| anchor.assert_anchor_foreground());
+    let anchor_continue = anchor.signal_anchor(rustix::process::Signal::CONT);
+    if anchor_continue.is_err() {
+        let _ =
+            rustix::process::kill_process_group(coordinator_group, rustix::process::Signal::CONT);
+    }
+    let status = anchor.wait(PROCESS_TIMEOUT);
+    stopped_terminal_proof?;
+    anchor_continue?;
+    let status = status?;
+    if !status.success() {
+        return Err(io::Error::other(
+            "entry anchor failed the foreground coordinator TSTP/CONT relay",
+        )
+        .into());
     }
     anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
     anchor.assert_restored()?;

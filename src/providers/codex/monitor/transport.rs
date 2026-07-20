@@ -253,6 +253,16 @@ impl fmt::Debug for MonitorStartFailure {
     }
 }
 
+fn finalize_startup_readiness<F>(
+    result: Result<(), MonitorTransportError>,
+    ensure_app_live: F,
+) -> Result<(), MonitorTransportError>
+where
+    F: FnOnce() -> Result<(), MonitorTransportError>,
+{
+    result.and_then(|()| ensure_app_live())
+}
+
 impl MonitorWorker {
     pub(super) fn append_forbidden_descriptors<'source>(
         &'source self,
@@ -377,9 +387,7 @@ impl MonitorWorker {
             } else {
                 result
             };
-        if result.is_ok() && self.ensure_app_live().is_err() {
-            result = Err(MonitorTransportError::Worker);
-        }
+        result = finalize_startup_readiness(result, || self.ensure_app_live());
         if result.is_err() {
             self.request_stop();
         }
@@ -417,9 +425,7 @@ impl MonitorWorker {
         if result.is_ok() && self.shared.lifecycle.load(Ordering::Acquire) != WORKER_RUNNING {
             result = Err(self.shared.failure());
         }
-        if result.is_ok() && self.ensure_app_live().is_err() {
-            result = Err(MonitorTransportError::Worker);
-        }
+        result = finalize_startup_readiness(result, || self.ensure_app_live());
         if result.is_err() {
             self.request_stop();
         }
@@ -1173,6 +1179,7 @@ impl Write for DeadlineUnixStream {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::error::Error;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1230,6 +1237,35 @@ mod tests {
             initialize,
             test_timing(),
         )?)
+    }
+
+    #[test]
+    fn startup_readiness_preserves_existing_and_app_server_error_categories() {
+        let liveness_check_called = Cell::new(false);
+        assert_eq!(
+            finalize_startup_readiness(Err(MonitorTransportError::Protocol), || {
+                liveness_check_called.set(true);
+                Err(MonitorTransportError::AppServer)
+            }),
+            Err(MonitorTransportError::Protocol)
+        );
+        assert!(
+            !liveness_check_called.get(),
+            "an existing startup error must short-circuit the App liveness check"
+        );
+
+        for (app_liveness, expected) in [
+            (Ok(()), Ok(())),
+            (
+                Err(MonitorTransportError::AppServer),
+                Err(MonitorTransportError::AppServer),
+            ),
+        ] {
+            assert_eq!(
+                finalize_startup_readiness(Ok(()), || app_liveness),
+                expected
+            );
+        }
     }
 
     #[test]

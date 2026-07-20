@@ -1721,7 +1721,7 @@ pub(super) struct AppServerCommand<'build> {
     monitor_seed: MonitorSessionSeed,
 }
 
-impl<'build> AppServerCommand<'build> {
+impl AppServerCommand<'_> {
     fn revalidate_for_launch(&self, deadline: Instant) -> Result<(), ProviderLaunchError> {
         self.build.revalidate_session_inputs(deadline)?;
         self.build
@@ -3505,6 +3505,12 @@ mod tests {
     const TEST_APP_READY_TIMEOUT: Duration = Duration::from_secs(3);
     const TEST_APP_READY_TIMEOUT_ERROR: &str =
         "test App did not install its TERM handler before the deadline";
+    const TEST_COOPERATIVE_APP_HELPER_ENV: &str = "CALCIFER_PROVIDER_COOPERATIVE_APP_HELPER";
+    const TEST_COOPERATIVE_APP_READY_ENV: &str = "CALCIFER_PROVIDER_COOPERATIVE_APP_READY";
+    const TEST_COOPERATIVE_APP_HELPER_TEST: &str =
+        "providers::codex::supervisor::provider::tests::cooperative_app_child_helper";
+    const TEST_FORGOTTEN_RUNTIME_HELPER_ENV: &str = "CALCIFER_PROVIDER_FORGOTTEN_RUNTIME_HELPER";
+    const TEST_FORGOTTEN_RUNTIME_HELPER_TEST: &str = "providers::codex::supervisor::provider::tests::forgotten_runtime_authority_cannot_release_the_session_lease";
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(1)
@@ -3598,15 +3604,47 @@ mod tests {
         path: &Path,
         ready_marker: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let helper = fs::canonicalize(std::env::current_exe()?)?;
+        let helper = shell_quote_test_value(
+            helper
+                .to_str()
+                .ok_or("cooperative App helper path is not UTF-8")?,
+        )?;
         let ready_marker = ready_marker
             .to_str()
             .ok_or("test App readiness marker is not UTF-8")?;
-        let quoted_marker = format!("'{}'", ready_marker.replace('\'', "'\"'\"'"));
+        let quoted_marker = shell_quote_test_value(ready_marker)?;
+        let helper_test = shell_quote_test_value(TEST_COOPERATIVE_APP_HELPER_TEST)?;
         let body = format!(
-            "#!/bin/sh\ntrap 'exit 0' TERM\nfifo={quoted_marker}.fifo\nmkfifo \"$fifo\"\nexec 3<>\"$fifo\"\nrm -f \"$fifo\"\n: > {quoted_marker}\nwhile :; do read line <&3; done\n"
+            "#!/bin/sh\n{TEST_COOPERATIVE_APP_HELPER_ENV}=1 {TEST_COOPERATIVE_APP_READY_ENV}={quoted_marker} exec {helper} --exact {helper_test} --nocapture --test-threads=1\n"
         );
         test_executable(path, body.as_bytes())?;
         Ok(())
+    }
+
+    fn shell_quote_test_value(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+        if value.contains(['\n', '\r', '\0']) {
+            return Err("test helper shell value contained a control byte".into());
+        }
+        Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+    }
+
+    #[test]
+    fn cooperative_app_child_helper() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(TEST_COOPERATIVE_APP_HELPER_ENV).is_none() {
+            return Ok(());
+        }
+        let ready = std::env::var_os(TEST_COOPERATIVE_APP_READY_ENV)
+            .ok_or("cooperative App helper ready path is missing")?;
+        let mut signals =
+            signal_hook::iterator::Signals::new([signal_hook::consts::signal::SIGTERM])?;
+        fs::write(ready, b"ready")?;
+        for signal in signals.forever() {
+            if signal == signal_hook::consts::signal::SIGTERM {
+                return Ok(());
+            }
+        }
+        Err("cooperative App signal iterator ended".into())
     }
 
     fn wait_for_test_app_ready(
@@ -3620,6 +3658,31 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         Ok(())
+    }
+
+    fn wait_for_test_process_and_group_absent(
+        process: rustix::process::Pid,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            let process_absent = match rustix::process::getpgid(Some(process)) {
+                Err(rustix::io::Errno::SRCH) => true,
+                Ok(_) | Err(rustix::io::Errno::INTR) => false,
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            };
+            let group_absent = match rustix::process::test_kill_process_group(process) {
+                Err(rustix::io::Errno::SRCH) => true,
+                Ok(()) | Err(rustix::io::Errno::INTR) => false,
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            };
+            if process_absent && group_absent {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("test App process or process group remained live after cleanup".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn retain_test_cleanup_owner<T: fmt::Debug>(owner: T, context: &str) -> String {
@@ -3736,10 +3799,10 @@ mod tests {
         }
     }
 
-    fn verify_test_app_descriptor_isolation_with_owner<'source>(
+    fn verify_test_app_descriptor_isolation_with_owner(
         mut child: AppServerChild,
         reservation: AppSocketReservation,
-        forbidden: &calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+        forbidden: &calcifer_unix_child_fd::CrossProcessDescriptorSet<'_>,
     ) -> Result<
         (
             AppServerChild,
@@ -4547,6 +4610,25 @@ mod tests {
     #[test]
     fn forgotten_runtime_authority_cannot_release_the_session_lease()
     -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(TEST_FORGOTTEN_RUNTIME_HELPER_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    TEST_FORGOTTEN_RUNTIME_HELPER_TEST,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(TEST_FORGOTTEN_RUNTIME_HELPER_ENV, "1")
+                .status()?;
+            if !status.success() {
+                return Err(format!(
+                    "isolated forgotten-runtime authority test exited with {status:?}"
+                )
+                .into());
+            }
+            return Ok(());
+        }
+
         let sandbox = Sandbox::new("forgotten-runtime-authority")?;
         let installed = sandbox.path().join("installed-codex");
         let stage_parent = sandbox.path().join("stage-parent");
@@ -5025,6 +5107,7 @@ mod tests {
             assert!(!socket_path.exists());
             assert!(!runtime_path.exists());
             let _drain = complete.into_drain();
+            wait_for_test_process_and_group_absent(app_pid, deadline())?;
             owner_build.cleanup(deadline())?;
             rejected_build.cleanup(deadline())?;
         }
