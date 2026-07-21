@@ -377,6 +377,7 @@ impl ReadinessProxy {
 
     /// Starts an exact-resume relay without discarding post-bind cleanup
     /// authority on any failure edge.
+    #[cfg(test)]
     pub(super) fn spawn_exact_owned(
         socket_path: &Path,
         upstream_path: &Path,
@@ -388,6 +389,22 @@ impl ReadinessProxy {
         Self::spawn_with_expectation_owned(socket_path, upstream_path, expectation, timeout)
     }
 
+    /// Starts an exact-resume relay against one caller-minted absolute
+    /// readiness deadline. The deadline is never translated back into a
+    /// relative duration, so the worker cannot outlive its enclosing startup
+    /// envelope because of validation or scheduling time between layers.
+    pub(super) fn spawn_exact_owned_until(
+        socket_path: &Path,
+        upstream_path: &Path,
+        probe: ExactResumeProbe<'_>,
+        deadline: Instant,
+    ) -> Result<Self, Box<ReadinessProxyStartFailure>> {
+        let expectation = ReadinessExpectation::exact_resume(probe.target_thread_id, probe.cwd)
+            .map_err(ReadinessProxyStartFailure::unbound)?;
+        Self::spawn_with_expectation_owned_until(socket_path, upstream_path, expectation, deadline)
+    }
+
+    #[cfg(test)]
     fn spawn_with_expectation_owned(
         socket_path: &Path,
         upstream_path: &Path,
@@ -402,6 +419,25 @@ impl ReadinessProxy {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             ReadinessProxyStartFailure::unbound(ReadinessProxyError::InvalidArgument)
         })?;
+        Self::spawn_with_expectation_owned_until(socket_path, upstream_path, expectation, deadline)
+    }
+
+    fn spawn_with_expectation_owned_until(
+        socket_path: &Path,
+        upstream_path: &Path,
+        expectation: ReadinessExpectation,
+        deadline: Instant,
+    ) -> Result<Self, Box<ReadinessProxyStartFailure>> {
+        if socket_path == upstream_path {
+            return Err(ReadinessProxyStartFailure::unbound(
+                ReadinessProxyError::InvalidArgument,
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(ReadinessProxyStartFailure::unbound(
+                ReadinessProxyError::Timeout,
+            ));
+        }
         verify_private_socket_parent(socket_path).map_err(ReadinessProxyStartFailure::unbound)?;
         let listener = UnixListener::bind(socket_path)
             .map_err(|_| ReadinessProxyStartFailure::unbound(ReadinessProxyError::Bind))?;
@@ -4350,6 +4386,29 @@ mod tests {
         assert_eq!(failure.cleanup_error(), Some(ReadinessProxyError::Cleanup));
         assert!(failure.into_proxy().is_some());
         assert_eq!(fs::read(&proxy_path)?, b"replacement");
+        Ok(())
+    }
+
+    #[test]
+    fn expired_exact_owned_deadline_fails_before_binding() -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+
+        let failure = ReadinessProxy::spawn_exact_owned_until(
+            &proxy_path,
+            &upstream_path,
+            ExactResumeProbe::new(TARGET_THREAD_ID, Path::new(TARGET_CWD)),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .err()
+        .ok_or("an expired exact relay deadline unexpectedly started a worker")?;
+        assert_eq!(failure.error(), ReadinessProxyError::Timeout);
+        assert!(!failure.has_bound_socket());
+        assert!(!proxy_path.exists());
+        let _cleanup = failure.cleanup()?;
+        assert!(!proxy_path.exists());
         Ok(())
     }
 

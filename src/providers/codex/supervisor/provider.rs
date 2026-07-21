@@ -521,11 +521,31 @@ impl<'build> ExactRelayPlan<'build> {
     /// this relay is live, no App-socket path revalidation or cleanup may run:
     /// the runtime checker intentionally treats `tui.sock` as an unknown entry.
     /// Ordered shutdown first resolves this relay, then cleans App/runtime.
+    #[cfg(test)]
     pub(super) fn spawn(
         self,
         timeout: Duration,
         deadline: Instant,
     ) -> Result<ExactRelaySession, Box<ExactRelayStartFailure>> {
+        self.into_owned_start_plan(deadline)?.spawn(timeout)
+    }
+
+    /// Starts the relay with the absolute deadline minted by the startup
+    /// full-window gate. Provider revalidation may consume that window but can
+    /// never move its endpoint beyond the enclosing startup envelope.
+    pub(super) fn spawn_until(
+        self,
+        relay_deadline: Instant,
+        revalidation_deadline: Instant,
+    ) -> Result<ExactRelaySession, Box<ExactRelayStartFailure>> {
+        self.into_owned_start_plan(revalidation_deadline)?
+            .spawn_until(relay_deadline)
+    }
+
+    fn into_owned_start_plan(
+        self,
+        deadline: Instant,
+    ) -> Result<OwnedExactRelayStartPlan, Box<ExactRelayStartFailure>> {
         let runtime_guard = self.build.retain_runtime();
         let brand = self.build.brand;
         let route = self.route;
@@ -554,14 +574,13 @@ impl<'build> ExactRelayPlan<'build> {
                 }));
             }
         };
-        OwnedExactRelayStartPlan {
+        Ok(OwnedExactRelayStartPlan {
             route,
             target_thread_id: self.build.thread_id.clone(),
             working_directory,
             runtime_guard,
             brand,
-        }
-        .spawn(timeout)
+        })
     }
 
     #[cfg(test)]
@@ -603,10 +622,35 @@ struct OwnedExactRelayStartPlan {
 }
 
 impl OwnedExactRelayStartPlan {
+    #[cfg(test)]
     fn spawn(self, timeout: Duration) -> Result<ExactRelaySession, Box<ExactRelayStartFailure>> {
         match self.route.spawn_exact(
             ExactResumeProbe::new(&self.target_thread_id, self.working_directory.path()),
             timeout,
+        ) {
+            Ok(proxy) => Ok(ExactRelaySession {
+                proxy,
+                runtime_guard: self.runtime_guard,
+                brand: self.brand,
+            }),
+            Err(remote) => {
+                let error = remote.error();
+                Err(Box::new(ExactRelayStartFailure {
+                    owner: ExactRelayStartOwner::Retry(self),
+                    remote: Some(remote),
+                    error: ExactRelayStartError::Relay(error),
+                }))
+            }
+        }
+    }
+
+    fn spawn_until(
+        self,
+        deadline: Instant,
+    ) -> Result<ExactRelaySession, Box<ExactRelayStartFailure>> {
+        match self.route.spawn_exact_until(
+            ExactResumeProbe::new(&self.target_thread_id, self.working_directory.path()),
+            deadline,
         ) {
             Ok(proxy) => Ok(ExactRelaySession {
                 proxy,

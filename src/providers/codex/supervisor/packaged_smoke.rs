@@ -43,9 +43,9 @@ use super::entry::{
 };
 use super::guardian::{
     GuardianBounds, GuardianRunOutcome, GuardianSetupError, PACKAGED_APP_NOT_STARTED_MARKER,
-    PACKAGED_STARTUP_FAILURE_MARKERS, PACKAGED_TUI_NOT_STARTED_MARKER, PackagedGuardianSeams,
-    ProductionGuardianConfig, run_production_guardian_with_test_seams,
-    write_packaged_startup_failure_marker,
+    PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER, PACKAGED_STARTUP_FAILURE_MARKERS,
+    PACKAGED_TUI_NOT_STARTED_MARKER, PackagedGuardianSeams, ProductionGuardianConfig,
+    run_production_guardian_with_test_seams, write_packaged_startup_failure_marker,
 };
 use super::process::{ManagedGroupChild, shutdown_app_server_child};
 use super::protocol::{
@@ -488,6 +488,7 @@ const PACKAGE_SUPERVISOR_FOREGROUND_ENV: &str = "CALCIFER_PACKAGE_SUPERVISOR_FOR
 const PACKAGE_SUPERVISOR_RECOVERY_CHECKPOINT_ENV: &str =
     "CALCIFER_PACKAGE_SUPERVISOR_RECOVERY_CHECKPOINT";
 const PACKAGE_SUPERVISOR_PROVIDER_TARGET_ENV: &str = "CALCIFER_PACKAGE_SUPERVISOR_PROVIDER_TARGET";
+const PACKAGE_SUPERVISOR_STARTUP_FAULT_ENV: &str = "CALCIFER_PACKAGE_SUPERVISOR_STARTUP_FAULT";
 const PACKAGE_SUPERVISOR_COORDINATOR_ROLE: &str = "coordinator-v1";
 const PACKAGE_SUPERVISOR_GUARDIAN_ROLE: &str = "guardian-v1";
 const PACKAGE_SUPERVISOR_HELPER_TEST: &str = concat!(
@@ -542,11 +543,18 @@ const PACKAGE_SUPERVISOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 // The deterministic path still traverses compatibility, App, monitor, TUI
 // planning, and descriptor gates before the relay starts. Reserve a bounded
 // pre-relay interval plus the fixture's target-specific relay interval. If
-// pre-relay work exceeds its reserve, the absolute startup deadline still
-// clamps the relay and fails closed.
+// pre-relay work exceeds its reserve, startup rejects the generation before
+// either relay or TUI spawn instead of manufacturing a shorter relay window.
 const PACKAGE_DETERMINISTIC_PRE_RELAY_STARTUP_RESERVE: Duration = Duration::from_secs(15);
 const PACKAGE_DETERMINISTIC_RELAY_START_TIMEOUT: Duration = Duration::from_secs(30);
 const PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(45);
+// After the parent observes the Guardian's durable, private startup-arm
+// acknowledgement, retained recovery reserves this separately named
+// package-only handoff/report margin beyond the Guardian's complete startup
+// interval. The observation can only move recovery later and grants no
+// process, signal, deletion, or retry authority. This does not change the
+// Guardian's production startup timeout.
+const PACKAGE_PARENT_STARTUP_HANDOFF_MARGIN: Duration = Duration::from_secs(100);
 // Every deterministic generation reserves its complete external fence before
 // creating scratch, sockets, descriptors, or processes. Unused real time is
 // returned after exact cleanup. This in-process pool is an early admission and
@@ -575,6 +583,7 @@ const PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(1
 // diagnostic window before consuming the recovery boundary; never wait for
 // the much wider ordinary startup allowance after the drive itself failed.
 const PACKAGE_SELECTED_RECOVERY_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(10);
+const PACKAGE_FIXED_FAILURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PACKAGE_CLEANUP_STARTUP_RECOVERY_MARGIN: Duration = Duration::from_secs(100);
 // A request can arrive while the package guardian is still inside its 600s
 // startup bound and its one retained-owner retry can then traverse shutdown.
@@ -594,6 +603,7 @@ const PACKAGE_DETERMINISTIC_CLEANUP_EXTERNAL_OBSERVATION_MARGIN: Duration = Dura
 const PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV: &str =
     "CALCIFER_PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER";
 const PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_MODE: &str = "exit";
+const PACKAGE_UNPROVEN_CLEANUP_CAUSAL_EXIT_HELPER_MODE: &str = "causal-exit";
 const PACKAGE_UNPROVEN_CLEANUP_PARK_HELPER_MODE: &str = "park";
 const PACKAGE_UNPROVEN_CLEANUP_PARK_READY: &str = "package-unproven-cleanup-park-ready";
 const PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE: u8 = 86;
@@ -624,6 +634,26 @@ const PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES: [(RecoveryCheckpoint, &str); 7] = 
 enum PackageProviderTarget {
     Official,
     DeterministicFixture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageStartupFault {
+    TerminalChannelWriteRetainedStartupRestore,
+}
+
+#[derive(Default)]
+struct PackageStartupTestSeams {
+    launcher_override: Option<PathBuf>,
+    startup_fault: Option<PackageStartupFault>,
+}
+
+impl PackageStartupTestSeams {
+    fn deterministic(launcher: PathBuf, startup_fault: Option<PackageStartupFault>) -> Self {
+        Self {
+            launcher_override: Some(launcher),
+            startup_fault,
+        }
+    }
 }
 
 /// Process-level projection for the package guardian helper.
@@ -716,6 +746,67 @@ fn project_package_provider_target_environment(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageStartupFaultParseError;
+
+impl fmt::Display for PackageStartupFaultParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the package startup fault was invalid")
+    }
+}
+
+impl Error for PackageStartupFaultParseError {}
+
+const fn package_startup_fault_wire_name(fault: PackageStartupFault) -> &'static str {
+    match fault {
+        PackageStartupFault::TerminalChannelWriteRetainedStartupRestore => {
+            "terminal-channel-write-retained-startup-restore-v1"
+        }
+    }
+}
+
+fn parse_package_startup_fault(
+    value: &OsStr,
+) -> Result<PackageStartupFault, PackageStartupFaultParseError> {
+    match value.as_bytes() {
+        b"terminal-channel-write-retained-startup-restore-v1" => {
+            Ok(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore)
+        }
+        _ => Err(PackageStartupFaultParseError),
+    }
+}
+
+fn package_startup_fault_from_environment()
+-> Result<Option<PackageStartupFault>, PackageStartupFaultParseError> {
+    std::env::var_os(PACKAGE_SUPERVISOR_STARTUP_FAULT_ENV)
+        .as_deref()
+        .map(parse_package_startup_fault)
+        .transpose()
+}
+
+fn project_package_startup_fault_environment(
+    command: &mut Command,
+    fault: Option<PackageStartupFault>,
+) {
+    if let Some(fault) = fault {
+        command.env(
+            PACKAGE_SUPERVISOR_STARTUP_FAULT_ENV,
+            package_startup_fault_wire_name(fault),
+        );
+    }
+}
+
+fn validate_package_startup_fault_for_target(
+    target: PackageProviderTarget,
+    fault: Option<PackageStartupFault>,
+) -> Result<Option<PackageStartupFault>, PackageStartupFaultParseError> {
+    match (target, fault) {
+        (PackageProviderTarget::DeterministicFixture, fault) => Ok(fault),
+        (PackageProviderTarget::Official, None) => Ok(None),
+        (PackageProviderTarget::Official, Some(_)) => Err(PackageStartupFaultParseError),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackageCoordinatorReportProjection {
     FailedClean,
     CompletedClean,
@@ -734,7 +825,13 @@ impl PackageCoordinatorReportProjection {
         }
     }
 
-    const fn selected(checkpoint: Option<RecoveryCheckpoint>) -> Self {
+    const fn selected(
+        checkpoint: Option<RecoveryCheckpoint>,
+        startup_fault: Option<PackageStartupFault>,
+    ) -> Self {
+        if startup_fault.is_some() {
+            return Self::FailedClean;
+        }
         match checkpoint {
             Some(checkpoint) => Self::for_checkpoint(checkpoint),
             None => Self::CompletedClean,
@@ -1030,6 +1127,59 @@ fn package_provider_target_wire_parser_is_closed_and_explicit_after_env_clear() 
 }
 
 #[test]
+fn package_startup_fault_is_closed_explicit_and_fixture_only() {
+    let fault = PackageStartupFault::TerminalChannelWriteRetainedStartupRestore;
+    let wire_name = "terminal-channel-write-retained-startup-restore-v1";
+    assert_eq!(package_startup_fault_wire_name(fault), wire_name);
+    assert_eq!(
+        parse_package_startup_fault(OsStr::new(wire_name)),
+        Ok(fault)
+    );
+    for invalid in [
+        "",
+        "terminal-channel-write",
+        "terminal-channel-write-retained-startup-restore-v2",
+        "terminal-channel-write-retained-startup-restore-v1\n",
+        "arbitrary-v1",
+    ] {
+        assert_eq!(
+            parse_package_startup_fault(OsStr::new(invalid)),
+            Err(PackageStartupFaultParseError)
+        );
+    }
+    assert_eq!(
+        validate_package_startup_fault_for_target(
+            PackageProviderTarget::DeterministicFixture,
+            Some(fault),
+        ),
+        Ok(Some(fault))
+    );
+    assert_eq!(
+        validate_package_startup_fault_for_target(PackageProviderTarget::Official, Some(fault)),
+        Err(PackageStartupFaultParseError)
+    );
+
+    let mut selected = Command::new("package-helper");
+    selected.env_clear();
+    project_package_startup_fault_environment(&mut selected, Some(fault));
+    assert_eq!(
+        selected
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(PACKAGE_SUPERVISOR_STARTUP_FAULT_ENV))
+            .and_then(|(_, value)| value),
+        Some(OsStr::new(wire_name))
+    );
+    let mut unselected = Command::new("package-helper");
+    unselected.env_clear();
+    project_package_startup_fault_environment(&mut unselected, None);
+    assert!(
+        unselected
+            .get_envs()
+            .all(|(name, _)| name != OsStr::new(PACKAGE_SUPERVISOR_STARTUP_FAULT_ENV))
+    );
+}
+
+#[test]
 fn package_guardian_build_cleanup_timeout_is_provider_target_aware() {
     let official = package_guardian_bounds(PackageProviderTarget::Official);
     let deterministic = package_guardian_bounds(PackageProviderTarget::DeterministicFixture);
@@ -1181,6 +1331,14 @@ fn package_coordinator_report_projection_is_exhaustive_over_recovery_checkpoints
         );
         assert_eq!(projection.marker(), marker);
     }
+    assert_eq!(
+        PackageCoordinatorReportProjection::selected(
+            Some(RecoveryCheckpoint::RetainedRestorePending),
+            Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore),
+        ),
+        PackageCoordinatorReportProjection::FailedClean,
+        "a retained startup failure inherited the healthy-session completion projection"
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1339,6 +1497,130 @@ const PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS: [&str; 9] = [
     "recovery.drive-failed.exit-input-write",
     "recovery.drive-failed.exit-input-observation",
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageRecoveryDriveFailure {
+    InitialGate,
+    RawMode,
+    StartupSentinel,
+    InitialInputWrite,
+    InitialInputObservation,
+    Inference,
+    ResponseSentinel,
+    ExitInputWrite,
+    ExitInputObservation,
+}
+
+impl PackageRecoveryDriveFailure {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::InitialGate => "recovery.drive-failed.initial-gate",
+            Self::RawMode => "recovery.drive-failed.raw-mode",
+            Self::StartupSentinel => "recovery.drive-failed.startup-sentinel",
+            Self::InitialInputWrite => "recovery.drive-failed.initial-input-write",
+            Self::InitialInputObservation => "recovery.drive-failed.initial-input-observation",
+            Self::Inference => "recovery.drive-failed.inference",
+            Self::ResponseSentinel => "recovery.drive-failed.response-sentinel",
+            Self::ExitInputWrite => "recovery.drive-failed.exit-input-write",
+            Self::ExitInputObservation => "recovery.drive-failed.exit-input-observation",
+        }
+    }
+}
+
+impl fmt::Display for PackageRecoveryDriveFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the package retained-recovery drive failed")
+    }
+}
+
+impl Error for PackageRecoveryDriveFailure {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedPackageStartupFailure(&'static str);
+
+impl FixedPackageStartupFailure {
+    fn from_marker(marker: &str) -> Option<Self> {
+        fixed_package_startup_failure_marker(marker).map(Self)
+    }
+
+    const fn marker(self) -> &'static str {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageRecoveryStartupDriveFailure {
+    startup: FixedPackageStartupFailure,
+    drive: PackageRecoveryDriveFailure,
+}
+
+impl PackageRecoveryStartupDriveFailure {
+    const fn new(startup: FixedPackageStartupFailure, drive: PackageRecoveryDriveFailure) -> Self {
+        Self { startup, drive }
+    }
+}
+
+impl fmt::Display for PackageRecoveryStartupDriveFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a fixed package startup failure ended the retained-recovery drive")
+    }
+}
+
+impl Error for PackageRecoveryStartupDriveFailure {}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PackageRecoveryFailureEvidence {
+    primary: Option<PackageRecoveryDriveFailure>,
+    drive_context: Option<PackageRecoveryDriveFailure>,
+    secondary: Option<&'static str>,
+}
+
+impl PackageRecoveryFailureEvidence {
+    fn snapshot_error(&mut self, error: &(dyn Error + 'static)) {
+        if let Some(failure) = error.downcast_ref::<PackageRecoveryStartupDriveFailure>() {
+            self.primary.get_or_insert(failure.drive);
+            self.drive_context.get_or_insert(failure.drive);
+            self.snapshot_secondary(Some(failure.startup.marker()));
+        } else if let Some(failure) = error.downcast_ref::<PackageRecoveryDriveFailure>() {
+            self.primary.get_or_insert(*failure);
+            self.drive_context.get_or_insert(*failure);
+        }
+    }
+
+    fn snapshot_secondary(&mut self, candidate: Option<&'static str>) {
+        let Some(candidate) = candidate else {
+            return;
+        };
+        if self.primary.is_none()
+            || self.primary_marker() == Some(candidate)
+            || self.drive_context.map(PackageRecoveryDriveFailure::marker) == Some(candidate)
+        {
+            return;
+        }
+        self.secondary.get_or_insert(candidate);
+    }
+
+    const fn primary_marker(self) -> Option<&'static str> {
+        match self.primary {
+            Some(failure) => Some(failure.marker()),
+            None => None,
+        }
+    }
+
+    const fn drive_context(self) -> Option<PackageRecoveryDriveFailure> {
+        self.drive_context
+    }
+
+    const fn secondary_marker(self) -> Option<&'static str> {
+        self.secondary
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageInitialGateObservation {
+    Opened,
+    StartupFailure(FixedPackageStartupFailure),
+}
 
 const PACKAGE_RECOVERY_OBSERVATION_FAILURE_MARKERS: [&str; 2] = [
     "recovery.observation-only-failed.coordinator-wait",
@@ -1589,14 +1871,58 @@ fn record_package_diagnostic_marker(report: &Path, marker: &'static str) {
 
 fn classify_package_recovery_drive_stage<T, E>(
     report: &Path,
-    failure_marker: &'static str,
+    failure: PackageRecoveryDriveFailure,
     result: Result<T, E>,
-) -> Result<T, E> {
-    debug_assert!(PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS.contains(&failure_marker));
-    if result.is_err() {
-        record_package_diagnostic_marker(report, failure_marker);
+) -> Result<T, Box<dyn Error>> {
+    debug_assert!(PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS.contains(&failure.marker()));
+    match result {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            record_package_diagnostic_marker(report, failure.marker());
+            Err(Box::new(failure))
+        }
     }
-    result
+}
+
+fn classify_package_recovery_initial_gate(
+    report: &Path,
+    result: Result<PackageInitialGateObservation, Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    match result {
+        Ok(PackageInitialGateObservation::Opened) => Ok(()),
+        Ok(PackageInitialGateObservation::StartupFailure(failure)) => {
+            let drive = PackageRecoveryDriveFailure::InitialGate;
+            record_package_diagnostic_marker(report, drive.marker());
+            Err(Box::new(PackageRecoveryStartupDriveFailure::new(
+                failure, drive,
+            )))
+        }
+        Err(_) => {
+            let failure = PackageRecoveryDriveFailure::InitialGate;
+            record_package_diagnostic_marker(report, failure.marker());
+            Err(Box::new(failure))
+        }
+    }
+}
+
+fn activate_selected_recovery_after_drive<Activate>(
+    drive_result: Result<(), Box<dyn Error>>,
+    checkpoint_result: Result<(), CompletionError>,
+    observation_result: Option<Result<(), Box<dyn Error>>>,
+    activate: Activate,
+) -> Result<(), Box<dyn Error>>
+where
+    Activate: FnOnce() -> Result<(), Box<dyn Error>>,
+{
+    let activation_result = activate();
+    drive_result?;
+    if let Err(error) = checkpoint_result {
+        return Err(error.into());
+    }
+    if let Some(Err(error)) = observation_result {
+        return Err(error);
+    }
+    activation_result
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2659,6 +2985,20 @@ fn package_failure_report_scanner_bridges_only_the_closed_session_startup_catalo
         None,
         "the scanner must not return a prefix match or a raw report filename"
     );
+    fs::remove_file(report.join("startup-failure.session-readiness.subtype.user-controlled"))?;
+    for unknown in [
+        "startup-failure.session-readiness.subtype.readiness-relay",
+        "startup-failure.session-readiness.subtype.readiness-relay.timeout.extra",
+    ] {
+        let path = report.join(unknown);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "the scanner must reject prefix-only and extended relay markers"
+        );
+        fs::remove_file(path)?;
+    }
     scratch.cleanup()
 }
 
@@ -2926,6 +3266,316 @@ fn package_failure_report_scanner_bridges_only_the_closed_recovery_drive_catalog
 }
 
 #[test]
+fn package_recovery_drive_failures_are_closed_fixed_and_payload_free() -> Result<(), Box<dyn Error>>
+{
+    let variants = [
+        PackageRecoveryDriveFailure::InitialGate,
+        PackageRecoveryDriveFailure::RawMode,
+        PackageRecoveryDriveFailure::StartupSentinel,
+        PackageRecoveryDriveFailure::InitialInputWrite,
+        PackageRecoveryDriveFailure::InitialInputObservation,
+        PackageRecoveryDriveFailure::Inference,
+        PackageRecoveryDriveFailure::ResponseSentinel,
+        PackageRecoveryDriveFailure::ExitInputWrite,
+        PackageRecoveryDriveFailure::ExitInputObservation,
+    ];
+    assert_eq!(
+        variants.map(PackageRecoveryDriveFailure::marker),
+        PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS
+    );
+    let markers: BTreeSet<_> = variants
+        .iter()
+        .copied()
+        .map(PackageRecoveryDriveFailure::marker)
+        .collect();
+    assert_eq!(markers.len(), variants.len());
+    assert!(markers.iter().all(|marker| {
+        marker.is_ascii()
+            && marker.starts_with("recovery.drive-failed.")
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
+    assert!(variants.iter().all(|failure| {
+        failure.to_string() == "the package retained-recovery drive failed"
+            && !format!("{failure:?}").contains("private")
+    }));
+
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    classify_package_recovery_drive_stage(
+        &report,
+        PackageRecoveryDriveFailure::InitialGate,
+        Ok::<_, &str>(()),
+    )?;
+    assert!(
+        !report
+            .join(PackageRecoveryDriveFailure::InitialGate.marker())
+            .exists()
+    );
+    let error = require_rejected_test_result(
+        classify_package_recovery_drive_stage::<(), _>(
+            &report,
+            PackageRecoveryDriveFailure::InitialGate,
+            Err("private provider payload and path"),
+        ),
+        "a failed retained-recovery drive stage was accepted",
+    )?;
+    assert_eq!(
+        error.to_string(),
+        "the package retained-recovery drive failed"
+    );
+    assert!(!format!("{error:?}").contains("private provider"));
+    assert_eq!(
+        read_private_bounded(
+            &report.join(PackageRecoveryDriveFailure::InitialGate.marker()),
+            64,
+        )?,
+        b"classified\n"
+    );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_recovery_failure_evidence_is_immutable_distinct_and_causally_typed()
+-> Result<(), Box<dyn Error>> {
+    let drive = PackageRecoveryDriveFailure::InitialGate;
+    let later_terminal =
+        "startup-failure.session-readiness.subtype.terminal-pump.terminal-channel-write";
+    let startup = FixedPackageStartupFailure::from_marker(later_terminal)
+        .ok_or("the closed startup catalog did not construct fixed evidence")?;
+
+    let mut unselected = PackageRecoveryFailureEvidence::default();
+    unselected.snapshot_secondary(Some(later_terminal));
+    assert_eq!(
+        unselected.secondary_marker(),
+        None,
+        "a candidate without a selected primary became duplicate secondary evidence"
+    );
+
+    let mut drive_evidence = PackageRecoveryFailureEvidence::default();
+    drive_evidence.snapshot_error(&drive);
+    drive_evidence.snapshot_error(&PackageRecoveryDriveFailure::RawMode);
+    drive_evidence.snapshot_secondary(Some(drive.marker()));
+    assert_eq!(
+        drive_evidence.primary_marker(),
+        Some(PackageRecoveryDriveFailure::InitialGate.marker())
+    );
+    assert_eq!(drive_evidence.secondary_marker(), None);
+    drive_evidence.snapshot_secondary(Some(later_terminal));
+    drive_evidence.snapshot_secondary(Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[1]));
+    assert_eq!(drive_evidence.secondary_marker(), Some(later_terminal));
+
+    let startup_error = PackageRecoveryStartupDriveFailure::new(startup, drive);
+    let mut startup_evidence = PackageRecoveryFailureEvidence::default();
+    startup_evidence.snapshot_error(&startup_error);
+    startup_evidence.snapshot_secondary(Some(startup.marker()));
+    startup_evidence.snapshot_secondary(Some(drive.marker()));
+    startup_evidence.snapshot_secondary(Some("startup-failure.session-readiness"));
+    assert_eq!(startup_evidence.primary_marker(), Some(drive.marker()));
+    assert_eq!(startup_evidence.drive_context(), Some(drive));
+    assert_eq!(startup_evidence.secondary_marker(), Some(startup.marker()));
+    startup_evidence.snapshot_secondary(Some(later_terminal));
+    assert_eq!(startup_evidence.secondary_marker(), Some(later_terminal));
+    Ok(())
+}
+
+#[test]
+fn retained_drive_failure_consumes_one_activation_before_returning_the_primary_error()
+-> Result<(), Box<dyn Error>> {
+    let mut activation_calls = 0_u8;
+    let result = activate_selected_recovery_after_drive(
+        Err(Box::new(PackageRecoveryDriveFailure::InitialGate)),
+        Ok(()),
+        None,
+        || {
+            activation_calls = activation_calls.saturating_add(1);
+            Ok(())
+        },
+    );
+    let error = require_rejected_test_result(
+        result,
+        "a retained drive failure was swallowed after recovery activation",
+    )?;
+
+    assert_eq!(activation_calls, 1);
+    assert_eq!(
+        error.downcast_ref::<PackageRecoveryDriveFailure>(),
+        Some(&PackageRecoveryDriveFailure::InitialGate)
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_recovery_activation_is_once_only_with_fixed_error_precedence()
+-> Result<(), Box<dyn Error>> {
+    let mut drive_calls = 0_u8;
+    let drive_result = activate_selected_recovery_after_drive(
+        Err(Box::new(PackageRecoveryDriveFailure::InitialGate)),
+        Ok(()),
+        None,
+        || {
+            drive_calls = drive_calls.saturating_add(1);
+            Err(Box::new(PackageRecoveryObservationFailure::CoordinatorWait))
+        },
+    );
+    let drive_error = require_rejected_test_result(
+        drive_result,
+        "a drive error was replaced by a later activation result",
+    )?;
+    assert_eq!(drive_calls, 1);
+    assert_eq!(
+        drive_error.downcast_ref::<PackageRecoveryDriveFailure>(),
+        Some(&PackageRecoveryDriveFailure::InitialGate)
+    );
+
+    let mut checkpoint_calls = 0_u8;
+    let checkpoint_result = activate_selected_recovery_after_drive(
+        Ok(()),
+        Err(CompletionError::RecoveryDeadline),
+        None,
+        || {
+            checkpoint_calls = checkpoint_calls.saturating_add(1);
+            Ok(())
+        },
+    );
+    let checkpoint_error = require_rejected_test_result(
+        checkpoint_result,
+        "a checkpoint error was swallowed after activation",
+    )?;
+    assert_eq!(checkpoint_calls, 1);
+    assert_eq!(
+        checkpoint_error.downcast_ref::<CompletionError>(),
+        Some(&CompletionError::RecoveryDeadline)
+    );
+
+    let mut observation_calls = 0_u8;
+    let observation_result = activate_selected_recovery_after_drive(
+        Ok(()),
+        Ok(()),
+        Some(Err(Box::new(
+            PackageRecoveryObservationFailure::CoordinatorExited,
+        ))),
+        || {
+            observation_calls = observation_calls.saturating_add(1);
+            Ok(())
+        },
+    );
+    let observation_error = require_rejected_test_result(
+        observation_result,
+        "an observation error was swallowed after activation",
+    )?;
+    assert_eq!(observation_calls, 1);
+    assert_eq!(
+        observation_error.downcast_ref::<PackageRecoveryObservationFailure>(),
+        Some(&PackageRecoveryObservationFailure::CoordinatorExited)
+    );
+
+    let mut activation_calls = 0_u8;
+    let activation_result = activate_selected_recovery_after_drive(Ok(()), Ok(()), None, || {
+        activation_calls = activation_calls.saturating_add(1);
+        Err(Box::new(PackageRecoveryObservationFailure::CoordinatorWait))
+    });
+    let activation_error = require_rejected_test_result(
+        activation_result,
+        "an activation error was swallowed when all earlier stages succeeded",
+    )?;
+    assert_eq!(activation_calls, 1);
+    assert_eq!(
+        activation_error.downcast_ref::<PackageRecoveryObservationFailure>(),
+        Some(&PackageRecoveryObservationFailure::CoordinatorWait)
+    );
+
+    let mut success_calls = 0_u8;
+    activate_selected_recovery_after_drive(Ok(()), Ok(()), None, || {
+        success_calls = success_calls.saturating_add(1);
+        Ok(())
+    })?;
+    assert_eq!(success_calls, 1);
+    Ok(())
+}
+
+#[test]
+fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let gate = report.join("initial-gate.live");
+    let exact = "startup-failure.session-readiness.subtype.terminal-pump.terminal-channel-write";
+    let generic = "startup-failure.session-readiness";
+
+    write_private_new(&report.join(exact), b"classified\n")?;
+    write_private_new(&report.join(generic), b"classified\n")?;
+    let started = Instant::now();
+    let observation = wait_for_private_marker_or_fixed_startup_failure(
+        &report,
+        &gate,
+        b"open\n",
+        Instant::now() + IO_TIMEOUT,
+    )?;
+    assert_eq!(
+        observation,
+        PackageInitialGateObservation::StartupFailure(
+            FixedPackageStartupFailure::from_marker(exact)
+                .ok_or("the test marker was not in the closed startup catalog")?
+        ),
+        "the retained startup wait discarded the exact causal marker"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "an allowlisted startup failure did not end the retained startup wait early"
+    );
+    fs::remove_file(report.join(exact))?;
+    fs::remove_file(report.join(generic))?;
+
+    write_private_new(
+        &report.join("startup-failure.session-readiness.subtype.user-controlled"),
+        b"classified\n",
+    )?;
+    write_private_new(
+        &report.join("startup-failure.session-readiness.subtype.readiness-relay"),
+        b"classified\n",
+    )?;
+    write_private_new(&report.join(exact), b"private payload\n")?;
+    let symlink_source = report.join("untrusted-startup-symlink-source");
+    write_private_new(&symlink_source, b"classified\n")?;
+    std::os::unix::fs::symlink(
+        &symlink_source,
+        report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[1]),
+    )?;
+    let hardlink_source = report.join("untrusted-startup-hardlink-source");
+    write_private_new(&hardlink_source, b"classified\n")?;
+    fs::hard_link(
+        &hardlink_source,
+        report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[2]),
+    )?;
+    let wrong_mode = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[3]);
+    write_private_new(&wrong_mode, b"classified\n")?;
+    fs::set_permissions(&wrong_mode, fs::Permissions::from_mode(0o640))?;
+    write_private_new(
+        &report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[4]),
+        b"classified\ntrailing\n",
+    )?;
+    write_private_new(&gate, b"open\n")?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        )?,
+        PackageInitialGateObservation::Opened
+    );
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "unknown, prefix-only, or payload-bearing files became fixed diagnostics"
+    );
+    scratch.cleanup()
+}
+
+#[test]
 fn package_recovery_observation_failures_are_closed_fixed_and_scannable()
 -> Result<(), Box<dyn Error>> {
     let variants = [
@@ -3080,7 +3730,7 @@ fn packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_
     combine_package_exercise_and_cleanup_with_evidence(
         exercise,
         cleanup,
-        exercise_phase,
+        PackageOperationFailureEvidence::primary(exercise_phase),
         cleanup_phase,
         None,
         handoff_probe_phase,
@@ -3125,6 +3775,10 @@ fn packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proof
     let cleanup = cleanup_outcome.result;
     let cleanup_phase = harness.latest_fixed_cleanup_failure_detail();
     let handoff_probe_phase = harness.latest_handoff_probe_phase();
+    let recovery_secondary_failure = recovery
+        .as_ref()
+        .err()
+        .and_then(|_| harness.latest_fixed_secondary_failure_detail());
     let recovery_phase = if recovery.is_err() {
         select_package_failure_phase(
             recovery_failure_before_cleanup,
@@ -3137,7 +3791,7 @@ fn packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proof
     let result = combine_package_exercise_and_cleanup_with_evidence(
         recovery,
         cleanup,
-        recovery_phase,
+        PackageOperationFailureEvidence::new(recovery_phase, recovery_secondary_failure),
         cleanup_phase,
         None,
         handoff_probe_phase,
@@ -3214,6 +3868,103 @@ fn packaged_deterministic_drive_failure_consumes_recovery_and_cleans() -> Result
     if root.exists() {
         return Err("failed-drive recovery cleanup retained package scratch".into());
     }
+    Ok(())
+}
+
+#[test]
+fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_completes_four_proofs()
+-> Result<(), Box<dyn Error>> {
+    let _process_guard = package_process_test_guard();
+    let suite_budget = reserve_package_deterministic_generation()?;
+    let scratch = PackageScratch::create()?;
+    let root = scratch.root.clone();
+    let backend = PackageSessionBackend::spawn()?;
+    let mut harness = OfficialTuiPackageHarness::spawn_deterministic_startup_failure_recovery(
+        scratch,
+        backend,
+        suite_budget,
+    )?;
+    let report = root.join("supervisor-report");
+    let startup_marker =
+        "startup-failure.session-readiness.subtype.terminal-pump.terminal-channel-write";
+
+    let started = Instant::now();
+    let error = require_rejected_test_result(
+        harness.request_selected_recovery(),
+        "the injected early startup failure unexpectedly completed the recovery drive",
+    )?;
+    assert!(
+        started.elapsed()
+            < PACKAGE_SELECTED_RECOVERY_RECONCILIATION_TIMEOUT + Duration::from_secs(5),
+        "the early startup failure slept through the deterministic startup fence"
+    );
+    let typed = error
+        .downcast_ref::<PackageRecoveryStartupDriveFailure>()
+        .ok_or("the early startup failure lost its typed causal identity")?;
+    assert_eq!(typed.startup.marker(), startup_marker);
+    assert_eq!(typed.drive, PackageRecoveryDriveFailure::InitialGate);
+    assert_eq!(
+        harness.recovery_failure_evidence.primary_marker(),
+        Some(PackageRecoveryDriveFailure::InitialGate.marker())
+    );
+    assert_eq!(
+        harness.recovery_failure_evidence.drive_context(),
+        Some(PackageRecoveryDriveFailure::InitialGate)
+    );
+    assert_eq!(
+        harness.recovery_request_state,
+        PackageRecoveryRequestState::Consumed
+    );
+    assert!(report.join("recovery.request-sent").is_file());
+    let retained_proof_deadline = Instant::now() + IO_TIMEOUT;
+    wait_for_private_marker(
+        &report.join("guardian-retained.owner.startup-restore"),
+        b"classified\n",
+        retained_proof_deadline,
+    )?;
+    wait_for_private_marker(
+        &report.join("recovery.guardian-checkpoint.request-verified"),
+        b"classified\n",
+        retained_proof_deadline,
+    )?;
+    assert!(
+        !report
+            .join("recovery.guardian-checkpoint.published")
+            .exists()
+            && !report.join("recovery.checkpoint-verified").exists(),
+        "the startup-owner test hid behind a pre-consumed session checkpoint"
+    );
+    harness.snapshot_recovery_secondary_failure();
+    assert_eq!(
+        harness.recovery_failure_evidence.secondary_marker(),
+        Some(startup_marker),
+        "the generic startup alias masked the exact reproduced secondary evidence"
+    );
+
+    let second = PackageGenerationCleanupOperations::request_recovery_once(
+        &mut harness,
+        Instant::now() + IO_TIMEOUT,
+    )?;
+    assert_eq!(second, PackageRecoveryRequestObservation::AlreadyConsumed);
+    harness.verify_selected_recovery_outcome()?;
+    harness.finish_started_generation_cleanup_or_exit();
+    let cleanup_evidence = harness
+        .generation_cleanup
+        .ok_or("the early failure cleanup lost its four-proof evidence")?;
+    assert!(cleanup_evidence.exact_coordinator_wait);
+    assert!(cleanup_evidence.completion_verified);
+    assert!(cleanup_evidence.reported_groups_absent);
+    assert!(cleanup_evidence.runtime_empty);
+    assert_eq!(
+        cleanup_evidence.scratch_decision(),
+        PackageScratchCleanupDecision::Delete
+    );
+    harness.verify_selected_recovery_trigger(PackageRecoveryTrigger::GenerationBoundRequest)?;
+    harness.cleanup()?;
+    assert!(
+        !root.exists(),
+        "early startup recovery retained scratch after all four proofs"
+    );
     Ok(())
 }
 
@@ -4567,13 +5318,44 @@ fn package_cleanup_wake_requires_one_exact_stopped_coordinator_snapshot() {
 fn package_cleanup_budget_is_monotonic_and_below_the_external_hard_timeout()
 -> Result<(), Box<dyn Error>> {
     let origin = Instant::now();
-    let fence = PackageGenerationDeadlineFence::starting_at(origin)?;
+    let initial = PackageGenerationDeadlineFence::starting_at(origin)?;
+    let guardian_arm_observed = origin
+        .checked_add(Duration::from_secs(1))
+        .ok_or("Guardian arm observation overflowed")?;
+    let fence = initial.after_guardian_startup_armed(guardian_arm_observed)?;
     let cleanup_start = fence.recovery_start;
+    let guardian_startup_deadline = guardian_arm_observed
+        .checked_add(PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)
+        .ok_or("Guardian startup deadline overflowed")?;
     assert_eq!(
         cleanup_start,
-        origin
-            .checked_add(PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)
-            .ok_or("worst-case cleanup start overflowed")?
+        guardian_startup_deadline
+            .checked_add(PACKAGE_PARENT_STARTUP_HANDOFF_MARGIN)
+            .ok_or("post-arm handoff boundary overflowed")?,
+        "the parent recovery boundary was not anchored after the observed Guardian arm"
+    );
+    assert_eq!(
+        fence.cleanup_budget.startup_handoff_margin,
+        PACKAGE_PARENT_STARTUP_HANDOFF_MARGIN
+    );
+    assert_eq!(
+        cleanup_start.duration_since(guardian_startup_deadline),
+        PACKAGE_PARENT_STARTUP_HANDOFF_MARGIN,
+        "the explicit post-arm handoff/report margin disappeared"
+    );
+    let latest_arm_observation = initial.guardian_startup_arm_observation_deadline()?;
+    assert!(
+        initial
+            .after_guardian_startup_armed(latest_arm_observation)
+            .is_ok(),
+        "the last arm observation that preserves cleanup reserve was rejected"
+    );
+    let too_late = latest_arm_observation
+        .checked_add(Duration::from_nanos(1))
+        .ok_or("late arm observation overflowed")?;
+    assert_eq!(
+        initial.after_guardian_startup_armed(too_late),
+        Err(PackageCleanupFailure::Deadline)
     );
     let deadlines = PackageCleanupDeadlines::within_generation(fence, cleanup_start)?;
     assert_eq!(
@@ -4665,6 +5447,11 @@ fn deterministic_package_cleanup_budget_is_short_bounded_and_target_specific()
             .ok_or("deterministic recovery start overflowed")?
     );
     assert_eq!(
+        deterministic.cleanup_budget.startup_handoff_margin,
+        Duration::ZERO,
+        "the deterministic target must keep its existing fixed recovery fence"
+    );
+    assert_eq!(
         deterministic.external_fence,
         origin
             .checked_add(PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT)
@@ -4726,9 +5513,12 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             thread::park();
         }
     }
-    if std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV)
-        .is_some_and(|mode| mode == PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_MODE)
-    {
+    if std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV).is_some_and(|mode| {
+        mode == PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_MODE
+            || mode == PACKAGE_UNPROVEN_CLEANUP_CAUSAL_EXIT_HELPER_MODE
+    }) {
+        let causal = std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV)
+            .is_some_and(|mode| mode == PACKAGE_UNPROVEN_CLEANUP_CAUSAL_EXIT_HELPER_MODE);
         let (_output_sender, output_result) = mpsc::sync_channel(1);
         let mut harness = OfficialTuiPackageHarness {
             _provider_suite_budget: PackageProviderSuiteBudget::Deterministic {
@@ -4742,11 +5532,13 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             coordinator: None,
             completion: None,
             provider_target: PackageProviderTarget::DeterministicFixture,
+            startup_fault: None,
             inference_expectation: PackageInferenceExpectation::Zero,
             recovery_checkpoint: None,
             recovery_request_state: PackageRecoveryRequestState::Available,
             generation_cleanup: None,
             generation_deadline_fence: None,
+            guardian_startup_arm_observed: false,
             master: None,
             initial_termios: None,
             output_cancel: None,
@@ -4756,9 +5548,18 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             output_worker: None,
             output_finished: true,
             last_handoff_probe_phase: None,
+            recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
             last_fixed_failure_detail: None,
             last_fixed_cleanup_failure_detail: None,
         };
+        if causal {
+            harness
+                .recovery_failure_evidence
+                .snapshot_error(&PackageRecoveryDriveFailure::InitialGate);
+            harness
+                .recovery_failure_evidence
+                .snapshot_secondary(Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]));
+        }
         harness.fail_closed_unproven_generation_cleanup();
     }
 
@@ -4789,11 +5590,38 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
         "unproven package cleanup did not exit with its fixed status"
     );
     assert_eq!(output.status.signal(), None);
-    assert!(output.diagnostic.contains(
-        "package-generation-cleanup-unproven:phase=scratch-missing,failure=unclassified"
-    ));
+    assert!(output.diagnostic.contains(concat!(
+        "package-generation-cleanup-unproven:",
+        "phase=scratch-missing,failure=unclassified,secondary=none"
+    )));
     assert!(
         !output
+            .diagnostic
+            .contains(std::env::current_dir()?.to_string_lossy().as_ref())
+    );
+
+    let causal = run_bounded_unproven_cleanup_child(
+        PACKAGE_UNPROVEN_CLEANUP_CAUSAL_EXIT_HELPER_MODE,
+        PACKAGE_UNPROVEN_CLEANUP_CHILD_TIMEOUT,
+    )?;
+    assert!(!causal.timed_out, "causal unproven cleanup did not exit");
+    assert_eq!(
+        causal.status.code(),
+        Some(i32::from(PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE))
+    );
+    assert_eq!(causal.status.signal(), None);
+    assert!(causal.diagnostic.contains(&format!(
+        concat!(
+            "package-generation-cleanup-unproven:",
+            "phase=scratch-missing,failure={},secondary={}"
+        ),
+        PackageRecoveryDriveFailure::InitialGate.marker(),
+        PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]
+    )));
+    assert!(!causal.diagnostic.contains("private provider payload"));
+    assert!(!causal.diagnostic.contains("credential"));
+    assert!(
+        !causal
             .diagnostic
             .contains(std::env::current_dir()?.to_string_lossy().as_ref())
     );
@@ -4941,7 +5769,11 @@ fn package_operation_deadline_is_global_and_preserves_full_recovery_budget_under
     let fence = PackageGenerationDeadlineFence::starting_at(origin)?;
     let recovery_start = origin
         .checked_add(PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)
+        .and_then(|deadline| deadline.checked_add(PACKAGE_PARENT_STARTUP_HANDOFF_MARGIN))
         .ok_or("package recovery start overflowed")?;
+    let ordinary_startup_deadline = origin
+        .checked_add(PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)
+        .ok_or("ordinary startup deadline overflowed")?;
 
     assert_eq!(fence.recovery_start, recovery_start);
     assert_eq!(
@@ -4952,8 +5784,10 @@ fn package_operation_deadline_is_global_and_preserves_full_recovery_budget_under
     );
     assert_eq!(
         fence.exercise_deadline(origin, PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)?,
-        recovery_start
+        ordinary_startup_deadline,
+        "ordinary phase deadlines must not silently inherit the parent handoff margin"
     );
+    assert_eq!(fence.recovery_checkpoint_deadline(origin)?, recovery_start);
 
     // Progress just before the global fence must not manufacture another
     // per-phase 600 second window.
@@ -4961,11 +5795,11 @@ fn package_operation_deadline_is_global_and_preserves_full_recovery_budget_under
         .checked_sub(Duration::from_millis(1))
         .ok_or("drip progress underflowed")?;
     assert_eq!(
-        fence.exercise_deadline(drip_progress, PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)?,
+        fence.recovery_checkpoint_deadline(drip_progress)?,
         recovery_start
     );
     assert_eq!(
-        fence.exercise_deadline(recovery_start, PACKAGE_SUPERVISOR_STARTUP_TIMEOUT),
+        fence.recovery_checkpoint_deadline(recovery_start),
         Err(PackageCleanupFailure::Deadline)
     );
 
@@ -4998,6 +5832,13 @@ fn package_cleanup_deadlines_cap_at_the_recorded_generation_fence_and_reject_ove
     assert_eq!(deadlines.reported_groups_proof, fence.cleanup_fence);
     assert_eq!(
         PackageGenerationDeadlineFence::starting_at_with_timeout(origin, Duration::MAX),
+        Err(PackageCleanupFailure::Deadline)
+    );
+    let mut overflow = PackageCleanupBudget::for_target(PackageProviderTarget::Official);
+    overflow.startup = Duration::MAX;
+    overflow.startup_handoff_margin = Duration::from_nanos(1);
+    assert_eq!(
+        PackageGenerationDeadlineFence::starting_at_with_budget(origin, overflow),
         Err(PackageCleanupFailure::Deadline)
     );
     Ok(())
@@ -5200,11 +6041,13 @@ struct OfficialTuiPackageHarness {
     coordinator: Option<Child>,
     completion: Option<AnchorCompletion>,
     provider_target: PackageProviderTarget,
+    startup_fault: Option<PackageStartupFault>,
     inference_expectation: PackageInferenceExpectation,
     recovery_checkpoint: Option<RecoveryCheckpoint>,
     recovery_request_state: PackageRecoveryRequestState,
     generation_cleanup: Option<PackageGenerationCleanupEvidence>,
     generation_deadline_fence: Option<PackageGenerationDeadlineFence>,
+    guardian_startup_arm_observed: bool,
     master: Option<PtyMaster>,
     initial_termios: Option<rustix::termios::Termios>,
     output_cancel: Option<SyncSender<()>>,
@@ -5214,6 +6057,7 @@ struct OfficialTuiPackageHarness {
     output_worker: Option<JoinHandle<()>>,
     output_finished: bool,
     last_handoff_probe_phase: Option<PackageHandoffProbePhase>,
+    recovery_failure_evidence: PackageRecoveryFailureEvidence,
     last_fixed_failure_detail: Option<&'static str>,
     last_fixed_cleanup_failure_detail: Option<&'static str>,
 }
@@ -5390,10 +6234,27 @@ struct PackageExerciseCleanupFailure {
     exercise_failed: bool,
     cleanup_failed: bool,
     exercise_phase: Option<&'static str>,
+    secondary_failure_detail: Option<&'static str>,
     cleanup_phase: Option<&'static str>,
     recovery_case: Option<&'static str>,
     handoff_probe_phase: Option<PackageHandoffProbePhase>,
     preserved_evidence_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageOperationFailureEvidence {
+    primary: Option<&'static str>,
+    secondary: Option<&'static str>,
+}
+
+impl PackageOperationFailureEvidence {
+    const fn new(primary: Option<&'static str>, secondary: Option<&'static str>) -> Self {
+        Self { primary, secondary }
+    }
+
+    const fn primary(primary: Option<&'static str>) -> Self {
+        Self::new(primary, None)
+    }
 }
 
 impl fmt::Debug for PackageExerciseCleanupFailure {
@@ -5403,6 +6264,7 @@ impl fmt::Debug for PackageExerciseCleanupFailure {
             .field("exercise_failed", &self.exercise_failed)
             .field("cleanup_failed", &self.cleanup_failed)
             .field("exercise_phase", &self.exercise_phase)
+            .field("secondary_failure_detail", &self.secondary_failure_detail)
             .field("cleanup_phase", &self.cleanup_phase)
             .field("recovery_case", &self.recovery_case)
             .field("handoff_probe_phase", &self.handoff_probe_phase)
@@ -5421,6 +6283,9 @@ impl fmt::Display for PackageExerciseCleanupFailure {
         }?;
         if let Some(phase) = self.exercise_phase {
             write!(formatter, " at fixed phase {phase}")?;
+        }
+        if let Some(detail) = self.secondary_failure_detail {
+            write!(formatter, "; fixed secondary failure {detail}")?;
         }
         if let Some(phase) = self.cleanup_phase {
             if self.exercise_phase.is_some() {
@@ -5508,7 +6373,7 @@ fn combine_package_exercise_and_cleanup_with_diagnostics(
     combine_package_exercise_and_cleanup_with_evidence(
         exercise,
         cleanup,
-        exercise_phase,
+        PackageOperationFailureEvidence::primary(exercise_phase),
         cleanup_phase,
         recovery_case,
         None,
@@ -5519,7 +6384,7 @@ fn combine_package_exercise_and_cleanup_with_diagnostics(
 fn combine_package_exercise_and_cleanup_with_evidence(
     exercise: Result<(), Box<dyn Error>>,
     cleanup: Result<(), Box<dyn Error>>,
-    exercise_phase: Option<&'static str>,
+    failure_evidence: PackageOperationFailureEvidence,
     cleanup_phase: Option<&'static str>,
     recovery_case: Option<&'static str>,
     handoff_probe_phase: Option<PackageHandoffProbePhase>,
@@ -5530,7 +6395,8 @@ fn combine_package_exercise_and_cleanup_with_evidence(
         (exercise, cleanup) => Err(Box::new(PackageExerciseCleanupFailure {
             exercise_failed: exercise.is_err(),
             cleanup_failed: cleanup.is_err(),
-            exercise_phase,
+            exercise_phase: failure_evidence.primary,
+            secondary_failure_detail: failure_evidence.secondary,
             cleanup_phase,
             recovery_case,
             handoff_probe_phase,
@@ -5676,11 +6542,39 @@ fn package_exercise_and_cleanup_failures_are_aggregated_with_fixed_redacted_labe
     assert!(!recovery_debug.contains("private"));
     assert!(recovery_case.source().is_none());
 
+    let causal_recovery = require_rejected_test_result(
+        combine_package_exercise_and_cleanup_with_evidence(
+            Err("private retained-recovery detail".into()),
+            Ok(()),
+            PackageOperationFailureEvidence::new(
+                Some(PackageRecoveryDriveFailure::InitialGate.marker()),
+                Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]),
+            ),
+            None,
+            None,
+            None,
+            None,
+        ),
+        "a causal retained-recovery failure unexpectedly succeeded",
+    )?;
+    assert_eq!(
+        causal_recovery.to_string(),
+        format!(
+            "package exercise failed at fixed phase {}; fixed secondary failure {}",
+            PackageRecoveryDriveFailure::InitialGate.marker(),
+            PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]
+        )
+    );
+    assert!(!format!("{causal_recovery:?}").contains("private retained"));
+    assert!(causal_recovery.source().is_none());
+
     let preserved = require_rejected_test_result(
         combine_package_exercise_and_cleanup_with_evidence(
             Err("private PTY bytes and credentials".into()),
             Ok(()),
-            Some("startup-failure.compatibility.subtype.transport"),
+            PackageOperationFailureEvidence::primary(Some(
+                "startup-failure.compatibility.subtype.transport",
+            )),
             None,
             None,
             Some(PackageHandoffProbePhase::ForkResponseValidated),
@@ -5777,11 +6671,13 @@ fn official_tui_pre_generation_cleanup_joins_backend_and_deletes_owned_scratch_w
         coordinator: None,
         completion: None,
         provider_target: PackageProviderTarget::Official,
+        startup_fault: None,
         inference_expectation: PackageInferenceExpectation::ExactlyOne,
         recovery_checkpoint: None,
         recovery_request_state: PackageRecoveryRequestState::Available,
         generation_cleanup: None,
         generation_deadline_fence: None,
+        guardian_startup_arm_observed: false,
         master: None,
         initial_termios: None,
         output_cancel: None,
@@ -5791,6 +6687,7 @@ fn official_tui_pre_generation_cleanup_joins_backend_and_deletes_owned_scratch_w
         output_worker: None,
         output_finished: true,
         last_handoff_probe_phase: None,
+        recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
     };
@@ -5848,11 +6745,13 @@ fn official_tui_pre_generation_cleanup_aggregates_infrastructure_failures_before
         coordinator: None,
         completion: None,
         provider_target: PackageProviderTarget::Official,
+        startup_fault: None,
         inference_expectation: PackageInferenceExpectation::ExactlyOne,
         recovery_checkpoint: None,
         recovery_request_state: PackageRecoveryRequestState::Available,
         generation_cleanup: None,
         generation_deadline_fence: None,
+        guardian_startup_arm_observed: false,
         master: None,
         initial_termios: None,
         output_cancel: Some(output_cancel),
@@ -5862,6 +6761,7 @@ fn official_tui_pre_generation_cleanup_aggregates_infrastructure_failures_before
         output_worker: Some(output_worker),
         output_finished: false,
         last_handoff_probe_phase: None,
+        recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
     };
@@ -5924,6 +6824,7 @@ fn started_official_harness_for_network_cleanup_test()
         coordinator: Some(coordinator),
         completion: None,
         provider_target: PackageProviderTarget::Official,
+        startup_fault: None,
         inference_expectation: PackageInferenceExpectation::Zero,
         recovery_checkpoint: None,
         recovery_request_state: PackageRecoveryRequestState::Available,
@@ -5936,6 +6837,7 @@ fn started_official_harness_for_network_cleanup_test()
         generation_deadline_fence: Some(PackageGenerationDeadlineFence::starting_at(
             Instant::now(),
         )?),
+        guardian_startup_arm_observed: false,
         master: None,
         initial_termios: None,
         output_cancel: Some(output_cancel),
@@ -5945,6 +6847,7 @@ fn started_official_harness_for_network_cleanup_test()
         output_worker: Some(output_worker),
         output_finished: false,
         last_handoff_probe_phase: None,
+        recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
     };
@@ -6328,6 +7231,7 @@ struct PackageCleanupDeadlines {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackageCleanupBudget {
     startup: Duration,
+    startup_handoff_margin: Duration,
     external: Duration,
     normal_completion: Duration,
     recovery_request: Duration,
@@ -6443,6 +7347,7 @@ impl PackageCleanupBudget {
         match target {
             PackageProviderTarget::Official => Self {
                 startup: PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
+                startup_handoff_margin: PACKAGE_PARENT_STARTUP_HANDOFF_MARGIN,
                 external: PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT,
                 normal_completion: PACKAGE_CLEANUP_NORMAL_COMPLETION_RACE,
                 recovery_request: PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT,
@@ -6455,6 +7360,7 @@ impl PackageCleanupBudget {
             },
             PackageProviderTarget::DeterministicFixture => Self {
                 startup: PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT,
+                startup_handoff_margin: Duration::ZERO,
                 external: PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT,
                 normal_completion: PACKAGE_CLEANUP_NORMAL_COMPLETION_RACE,
                 recovery_request: PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT,
@@ -6467,6 +7373,29 @@ impl PackageCleanupBudget {
                     PACKAGE_DETERMINISTIC_CLEANUP_EXTERNAL_OBSERVATION_MARGIN,
             },
         }
+    }
+
+    fn cleanup_reserve(self) -> Result<Duration, PackageCleanupFailure> {
+        [
+            self.normal_completion,
+            self.recovery_request,
+            self.healthy_lifecycle,
+            self.coordinator_term,
+            self.coordinator_kill,
+            self.completion_proof,
+            self.reported_groups_proof,
+        ]
+        .into_iter()
+        .try_fold(Duration::ZERO, |total, duration| {
+            total.checked_add(duration)
+        })
+        .ok_or(PackageCleanupFailure::Deadline)
+    }
+
+    fn startup_through_handoff(self) -> Result<Duration, PackageCleanupFailure> {
+        self.startup
+            .checked_add(self.startup_handoff_margin)
+            .ok_or(PackageCleanupFailure::Deadline)
     }
 }
 
@@ -6507,8 +7436,9 @@ impl PackageGenerationDeadlineFence {
         origin: Instant,
         budget: PackageCleanupBudget,
     ) -> Result<Self, PackageCleanupFailure> {
+        let recovery_start_offset = budget.startup_through_handoff()?;
         let recovery_start = origin
-            .checked_add(budget.startup)
+            .checked_add(recovery_start_offset)
             .ok_or(PackageCleanupFailure::Deadline)?;
         let external_fence = origin
             .checked_add(budget.external)
@@ -6517,20 +7447,7 @@ impl PackageGenerationDeadlineFence {
             .checked_sub(budget.external_observation_margin)
             .filter(|cleanup_fence| *cleanup_fence > recovery_start)
             .ok_or(PackageCleanupFailure::Deadline)?;
-        let cleanup_reserve = [
-            budget.normal_completion,
-            budget.recovery_request,
-            budget.healthy_lifecycle,
-            budget.coordinator_term,
-            budget.coordinator_kill,
-            budget.completion_proof,
-            budget.reported_groups_proof,
-        ]
-        .into_iter()
-        .try_fold(Duration::ZERO, |total, duration| {
-            total.checked_add(duration)
-        })
-        .ok_or(PackageCleanupFailure::Deadline)?;
+        let cleanup_reserve = budget.cleanup_reserve()?;
         if recovery_start
             .checked_add(cleanup_reserve)
             .filter(|cleanup_end| *cleanup_end <= cleanup_fence)
@@ -6545,6 +7462,53 @@ impl PackageGenerationDeadlineFence {
             cleanup_fence,
             cleanup_budget: budget,
         })
+    }
+
+    fn guardian_startup_arm_observation_deadline(self) -> Result<Instant, PackageCleanupFailure> {
+        let post_arm_reserve = self
+            .cleanup_budget
+            .startup_through_handoff()?
+            .checked_add(self.cleanup_budget.cleanup_reserve()?)
+            .ok_or(PackageCleanupFailure::Deadline)?;
+        self.cleanup_fence
+            .checked_sub(post_arm_reserve)
+            .filter(|deadline| *deadline >= self.origin)
+            .ok_or(PackageCleanupFailure::Deadline)
+    }
+
+    /// Re-anchors the package parent's recovery boundary to a local
+    /// observation made only after the Guardian minted its complete startup
+    /// deadline. Because the observation is no earlier than the child arm,
+    /// adding the same startup interval plus the explicit handoff/report
+    /// margin proves the parent cannot recover first.
+    fn after_guardian_startup_armed(
+        mut self,
+        observed_at: Instant,
+    ) -> Result<Self, PackageCleanupFailure> {
+        if observed_at < self.origin
+            || observed_at > self.guardian_startup_arm_observation_deadline()?
+        {
+            return Err(PackageCleanupFailure::Deadline);
+        }
+        let recovery_start = observed_at
+            .checked_add(self.cleanup_budget.startup_through_handoff()?)
+            .ok_or(PackageCleanupFailure::Deadline)?;
+        if recovery_start
+            .checked_add(self.cleanup_budget.cleanup_reserve()?)
+            .filter(|cleanup_end| *cleanup_end <= self.cleanup_fence)
+            .is_none()
+        {
+            return Err(PackageCleanupFailure::Deadline);
+        }
+        self.recovery_start = recovery_start;
+        Ok(self)
+    }
+
+    fn recovery_checkpoint_deadline(self, now: Instant) -> Result<Instant, PackageCleanupFailure> {
+        if now < self.origin || now >= self.recovery_start {
+            return Err(PackageCleanupFailure::Deadline);
+        }
+        Ok(self.recovery_start)
     }
 
     fn exercise_deadline(
@@ -6654,6 +7618,11 @@ fn drive_package_generation_cleanup<Operations: PackageGenerationCleanupOperatio
                 return Err(PackageCleanupFailure::CompletionBoundary);
             }
             PackageCompletionObservation::Pending if !evidence.completion_verified => {
+                // This is an explicit owner-initiated abort after setup or
+                // exercise has already failed, not the retained-timeout
+                // transition. The Guardian-arm acknowledgement reanchors the
+                // selected recovery deadline; it must not make deterministic
+                // teardown wait through a still-live startup window.
                 match operations.request_recovery_once(deadlines.recovery_request)? {
                     PackageRecoveryRequestObservation::Sent
                     | PackageRecoveryRequestObservation::AttemptConsumedBoundaryUnknown
@@ -6741,7 +7710,7 @@ impl OfficialTuiPackageHarness {
             recovery_checkpoint,
             PackageProviderSuiteBudget::Official,
             PackageInferenceExpectation::ExactlyOne,
-            None,
+            PackageStartupTestSeams::default(),
         )
     }
 
@@ -6762,7 +7731,30 @@ impl OfficialTuiPackageHarness {
                 _lease: suite_budget,
             },
             PackageInferenceExpectation::for_fixture_checkpoint(recovery_checkpoint),
-            Some(launcher),
+            PackageStartupTestSeams::deterministic(launcher, None),
+        )
+    }
+
+    fn spawn_deterministic_startup_failure_recovery(
+        scratch: PackageScratch,
+        backend: PackageSessionBackend,
+        suite_budget: PackageDeterministicSuiteLease,
+    ) -> Result<Self, Box<dyn Error>> {
+        let executable = install_packaged_codex_provider_fixture(&scratch)?;
+        let launcher = install_packaged_tui_launcher_fixture(&scratch)?;
+        Self::spawn_configured(
+            executable,
+            scratch,
+            backend,
+            Some(RecoveryCheckpoint::RetainedRestorePending),
+            PackageProviderSuiteBudget::Deterministic {
+                _lease: suite_budget,
+            },
+            PackageInferenceExpectation::Zero,
+            PackageStartupTestSeams::deterministic(
+                launcher,
+                Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore),
+            ),
         )
     }
 
@@ -6773,9 +7765,10 @@ impl OfficialTuiPackageHarness {
         recovery_checkpoint: Option<RecoveryCheckpoint>,
         provider_suite_budget: PackageProviderSuiteBudget,
         inference_expectation: PackageInferenceExpectation,
-        launcher_override: Option<PathBuf>,
+        startup_seams: PackageStartupTestSeams,
     ) -> Result<Self, Box<dyn Error>> {
         let provider_target = provider_suite_budget.provider_target();
+        let startup_fault = startup_seams.startup_fault;
         let (_placeholder_sender, placeholder_result) = mpsc::sync_channel(1);
         let mut harness = Self {
             _provider_suite_budget: provider_suite_budget,
@@ -6784,11 +7777,13 @@ impl OfficialTuiPackageHarness {
             coordinator: None,
             completion: None,
             provider_target,
+            startup_fault,
             inference_expectation,
             recovery_checkpoint,
             recovery_request_state: PackageRecoveryRequestState::Available,
             generation_cleanup: None,
             generation_deadline_fence: None,
+            guardian_startup_arm_observed: false,
             master: None,
             initial_termios: None,
             output_cancel: None,
@@ -6798,6 +7793,7 @@ impl OfficialTuiPackageHarness {
             output_worker: None,
             output_finished: false,
             last_handoff_probe_phase: None,
+            recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
             last_fixed_failure_detail: None,
             last_fixed_cleanup_failure_detail: None,
         };
@@ -6827,7 +7823,7 @@ impl OfficialTuiPackageHarness {
                     .address(),
                 recovery_checkpoint,
                 provider_target,
-                launcher_override.as_deref(),
+                &startup_seams,
             )?;
             setup_phase = PackageHarnessSetupPhase::PtyConfiguration;
             let master = owner.configure_child(&mut command)?;
@@ -6927,21 +7923,31 @@ impl OfficialTuiPackageHarness {
         let checkpoint = self
             .recovery_checkpoint
             .ok_or("package recovery checkpoint was not selected")?;
+        let report = self.root()?.join("supervisor-report");
+        self.observe_guardian_startup_arm(&report)?;
         let fence = self
             .generation_deadline_fence
             .ok_or("package generation deadline fence was missing")?;
         let checkpoint_deadline = fence
-            .exercise_deadline(Instant::now(), PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)
+            .recovery_checkpoint_deadline(Instant::now())
             .map_err(|_| "package recovery checkpoint reached the generation recovery fence")?;
-        let report = self.root()?.join("supervisor-report");
         let drive_result =
             self.drive_to_selected_recovery_checkpoint(checkpoint, checkpoint_deadline);
+        if let Some(error) = drive_result.as_ref().err() {
+            self.recovery_failure_evidence
+                .snapshot_error(error.as_ref());
+        }
         if drive_result.is_ok() {
             record_package_recovery_verification_phase(
                 &report,
                 PackageRecoveryVerificationPhase::CheckpointDriven,
             );
         }
+        let fixed_startup_failure_observed = drive_result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<PackageRecoveryStartupDriveFailure>()
+                .is_some()
+        });
         let checkpoint_wait_deadline = if drive_result.is_err() {
             Instant::now()
                 .checked_add(PACKAGE_SELECTED_RECOVERY_RECONCILIATION_TIMEOUT)
@@ -6950,7 +7956,15 @@ impl OfficialTuiPackageHarness {
         } else {
             checkpoint_deadline
         };
-        let checkpoint_result = {
+        // An exact fixed startup failure is already earlier than the selected
+        // lifecycle checkpoint. Feeding a guaranteed checkpoint timeout into
+        // the completion decoder would terminalize that owner and make the
+        // one permitted reverse recovery write impossible. The caller already
+        // supplied recovery authority; the marker only short-circuits this
+        // observation wait and never authorizes activation by itself.
+        let checkpoint_result = if fixed_startup_failure_observed {
+            Ok(())
+        } else {
             let completion = self
                 .completion
                 .as_mut()
@@ -6970,19 +7984,20 @@ impl OfficialTuiPackageHarness {
                 },
             )
         };
-        if let Err(error) = checkpoint_result {
-            record_package_diagnostic_marker(
-                &report,
-                package_checkpoint_wait_failure_marker(error),
-            );
-        } else {
-            record_package_recovery_verification_phase(
-                &report,
-                PackageRecoveryVerificationPhase::CheckpointVerified,
-            );
+        if !fixed_startup_failure_observed {
+            if let Err(error) = checkpoint_result {
+                record_package_diagnostic_marker(
+                    &report,
+                    package_checkpoint_wait_failure_marker(error),
+                );
+            } else {
+                record_package_recovery_verification_phase(
+                    &report,
+                    PackageRecoveryVerificationPhase::CheckpointVerified,
+                );
+            }
         }
-        let observation_result = checkpoint_result
-            .is_ok()
+        let observation_result = (!fixed_startup_failure_observed && checkpoint_result.is_ok())
             .then(|| self.prove_selected_checkpoint_is_observation_only());
         if observation_result.as_ref().is_some_and(Result::is_ok) {
             record_package_recovery_verification_phase(
@@ -6995,52 +8010,76 @@ impl OfficialTuiPackageHarness {
             .checked_add(PACKAGE_CLEANUP_RECOVERY_REQUEST_TIMEOUT)
             .map(|deadline| deadline.min(fence.cleanup_fence))
             .ok_or("package recovery request deadline overflowed")?;
-        let trigger_result = match trigger {
-            PackageRecoveryTrigger::GenerationBoundRequest => {
-                let request_result = PackageGenerationCleanupOperations::request_recovery_once(
-                    self,
-                    request_deadline,
-                );
-                if matches!(request_result, Ok(PackageRecoveryRequestObservation::Sent)) {
-                    record_package_recovery_verification_phase(
-                        &report,
-                        PackageRecoveryVerificationPhase::RequestSent,
-                    );
-                }
-                match request_result {
-                    Ok(PackageRecoveryRequestObservation::Sent) => Ok(()),
-                    Ok(PackageRecoveryRequestObservation::AttemptConsumedBoundaryUnknown) => {
-                        Err("package recovery request boundary was not confirmed".into())
-                    }
-                    Ok(PackageRecoveryRequestObservation::AlreadyConsumed) => {
-                        Err("package recovery request was already consumed".into())
-                    }
-                    Err(error) => Err(error.into()),
-                }
-            }
-            PackageRecoveryTrigger::OwnerEof => {
-                let result = self.shutdown_selected_recovery_owner(request_deadline);
-                if result.is_ok() {
-                    record_package_recovery_verification_phase(
-                        &report,
-                        PackageRecoveryVerificationPhase::OwnerWriteShutdown,
-                    );
-                }
-                result
-            }
-        };
-
         // Once a selected checkpoint is valid, no diagnostic or drive error
         // may bypass the sole activation attempt. Return the earliest causal
         // error only after that one-shot boundary has been consumed.
-        drive_result?;
-        if let Err(error) = checkpoint_result {
-            return Err(error.into());
+        let result = activate_selected_recovery_after_drive(
+            drive_result,
+            checkpoint_result,
+            observation_result,
+            || match trigger {
+                PackageRecoveryTrigger::GenerationBoundRequest => {
+                    let request_result = PackageGenerationCleanupOperations::request_recovery_once(
+                        self,
+                        request_deadline,
+                    );
+                    if matches!(request_result, Ok(PackageRecoveryRequestObservation::Sent)) {
+                        record_package_recovery_verification_phase(
+                            &report,
+                            PackageRecoveryVerificationPhase::RequestSent,
+                        );
+                    }
+                    match request_result {
+                        Ok(PackageRecoveryRequestObservation::Sent) => Ok(()),
+                        Ok(PackageRecoveryRequestObservation::AttemptConsumedBoundaryUnknown) => {
+                            Err("package recovery request boundary was not confirmed".into())
+                        }
+                        Ok(PackageRecoveryRequestObservation::AlreadyConsumed) => {
+                            Err("package recovery request was already consumed".into())
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                }
+                PackageRecoveryTrigger::OwnerEof => {
+                    let result = self.shutdown_selected_recovery_owner(request_deadline);
+                    if result.is_ok() {
+                        record_package_recovery_verification_phase(
+                            &report,
+                            PackageRecoveryVerificationPhase::OwnerWriteShutdown,
+                        );
+                    }
+                    result
+                }
+            },
+        );
+        self.snapshot_recovery_secondary_failure();
+        result
+    }
+
+    fn observe_guardian_startup_arm(&mut self, report: &Path) -> Result<(), Box<dyn Error>> {
+        if self.guardian_startup_arm_observed {
+            return Ok(());
         }
-        if let Some(Err(error)) = observation_result {
-            return Err(error);
-        }
-        trigger_result
+        let fence = self
+            .generation_deadline_fence
+            .ok_or("package generation deadline fence was missing")?;
+        let observation_deadline = fence
+            .guardian_startup_arm_observation_deadline()
+            .map_err(|_| "package Guardian arm observation had no safe budget")?;
+        wait_for_private_marker(
+            &report.join(PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER),
+            b"armed\n",
+            observation_deadline,
+        )?;
+        let observed_at = Instant::now();
+        self.generation_deadline_fence = Some(
+            fence
+                .after_guardian_startup_armed(observed_at)
+                .map_err(|_| "package Guardian armed too late for bounded recovery")?,
+        );
+        self.guardian_startup_arm_observed = true;
+        record_package_diagnostic_marker(report, "recovery.guardian-startup-arm-observed");
+        Ok(())
     }
 
     fn shutdown_selected_recovery_owner(
@@ -7119,7 +8158,8 @@ impl OfficialTuiPackageHarness {
             &report,
             PackageRecoveryVerificationPhase::CoordinatorExited,
         );
-        let projection = PackageCoordinatorReportProjection::for_checkpoint(checkpoint);
+        let projection =
+            PackageCoordinatorReportProjection::selected(Some(checkpoint), self.startup_fault);
         wait_for_private_marker(
             &report.join("coordinator.report"),
             projection.marker(),
@@ -7248,50 +8288,58 @@ impl OfficialTuiPackageHarness {
                     PACKAGE_SUPERVISOR_EXIT_INPUT,
                 ]
                 .concat();
+                let initial_gate = wait_for_private_marker_or_fixed_startup_failure(
+                    &report,
+                    &report.join("initial-gate.live"),
+                    b"open\n",
+                    deadline,
+                );
+                classify_package_recovery_initial_gate(&report, initial_gate)?;
+                let raw_mode = self
+                    .master()
+                    .and_then(|master| wait_for_package_raw_mode(master, deadline));
                 classify_package_recovery_drive_stage(
                     &report,
-                    "recovery.drive-failed.initial-gate",
-                    wait_for_private_marker(&report.join("initial-gate.live"), b"open\n", deadline),
+                    PackageRecoveryDriveFailure::RawMode,
+                    raw_mode,
                 )?;
                 classify_package_recovery_drive_stage(
                     &report,
-                    "recovery.drive-failed.raw-mode",
-                    wait_for_package_raw_mode(self.master()?, deadline),
-                )?;
-                classify_package_recovery_drive_stage(
-                    &report,
-                    "recovery.drive-failed.startup-sentinel",
+                    PackageRecoveryDriveFailure::StartupSentinel,
                     self.wait_for_tui_startup_sentinel(deadline),
                 )?;
                 record_package_diagnostic_marker(
                     &report,
                     "recovery.drive.tui-startup-sentinel-observed",
                 );
+                let initial_input_write = self.master().and_then(|master| {
+                    write_package_pty_input(master, PACKAGE_SUPERVISOR_INITIAL_INPUT, deadline)
+                });
                 classify_package_recovery_drive_stage(
                     &report,
-                    "recovery.drive-failed.initial-input-write",
-                    write_package_pty_input(
-                        self.master()?,
-                        PACKAGE_SUPERVISOR_INITIAL_INPUT,
-                        deadline,
-                    ),
+                    PackageRecoveryDriveFailure::InitialInputWrite,
+                    initial_input_write,
                 )?;
                 classify_package_recovery_drive_stage(
                     &report,
-                    "recovery.drive-failed.initial-input-observation",
+                    PackageRecoveryDriveFailure::InitialInputObservation,
                     wait_for_package_input_transcript(
                         &report.join("input.live"),
                         PACKAGE_SUPERVISOR_INITIAL_INPUT,
                         deadline,
                     ),
                 )?;
+                let inference = self
+                    .backend
+                    .as_ref()
+                    .ok_or_else(|| -> Box<dyn Error> {
+                        "package session backend was missing".into()
+                    })
+                    .and_then(|backend| backend.wait_for_inference_completion(deadline));
                 classify_package_recovery_drive_stage(
                     &report,
-                    "recovery.drive-failed.inference",
-                    self.backend
-                        .as_ref()
-                        .ok_or("package session backend was missing")?
-                        .wait_for_inference_completion(deadline),
+                    PackageRecoveryDriveFailure::Inference,
+                    inference,
                 )?;
                 record_package_diagnostic_marker(
                     &report,
@@ -7304,25 +8352,24 @@ impl OfficialTuiPackageHarness {
                 // retained recovery checkpoint.
                 classify_package_recovery_drive_stage(
                     &report,
-                    "recovery.drive-failed.response-sentinel",
+                    PackageRecoveryDriveFailure::ResponseSentinel,
                     self.wait_for_tui_response_sentinel(deadline),
                 )?;
                 record_package_diagnostic_marker(
                     &report,
                     "recovery.drive.tui-response-sentinel-observed",
                 );
+                let exit_input_write = self.master().and_then(|master| {
+                    write_package_pty_input(master, PACKAGE_SUPERVISOR_EXIT_INPUT, deadline)
+                });
                 classify_package_recovery_drive_stage(
                     &report,
-                    "recovery.drive-failed.exit-input-write",
-                    write_package_pty_input(
-                        self.master()?,
-                        PACKAGE_SUPERVISOR_EXIT_INPUT,
-                        deadline,
-                    ),
+                    PackageRecoveryDriveFailure::ExitInputWrite,
+                    exit_input_write,
                 )?;
                 classify_package_recovery_drive_stage(
                     &report,
-                    "recovery.drive-failed.exit-input-observation",
+                    PackageRecoveryDriveFailure::ExitInputObservation,
                     wait_for_package_input_transcript(
                         &report.join("input.live"),
                         &complete_input_transcript,
@@ -7742,14 +8789,43 @@ impl OfficialTuiPackageHarness {
     }
 
     fn latest_fixed_failure_detail(&self) -> Option<&'static str> {
-        self.scratch
+        self.recovery_failure_evidence.primary_marker().or_else(|| {
+            self.scratch
+                .as_ref()
+                .and_then(|scratch| {
+                    Self::latest_fixed_failure_detail_from_report(
+                        &scratch.root.join("supervisor-report"),
+                    )
+                })
+                .or(self.last_fixed_failure_detail)
+        })
+    }
+
+    fn snapshot_recovery_secondary_failure(&mut self) {
+        let primary = self.recovery_failure_evidence.primary_marker();
+        let drive_context = self
+            .recovery_failure_evidence
+            .drive_context()
+            .map(PackageRecoveryDriveFailure::marker);
+        let candidate = self
+            .scratch
             .as_ref()
             .and_then(|scratch| {
-                Self::latest_fixed_failure_detail_from_report(
+                Self::latest_fixed_failure_detail_from_report_excluding(
                     &scratch.root.join("supervisor-report"),
+                    primary,
+                    drive_context,
                 )
             })
-            .or(self.last_fixed_failure_detail)
+            .or_else(|| {
+                self.last_fixed_failure_detail
+                    .filter(|marker| Some(*marker) != primary && Some(*marker) != drive_context)
+            });
+        self.recovery_failure_evidence.snapshot_secondary(candidate);
+    }
+
+    fn latest_fixed_secondary_failure_detail(&self) -> Option<&'static str> {
+        self.recovery_failure_evidence.secondary_marker()
     }
 
     fn latest_fixed_cleanup_failure_detail(&self) -> Option<&'static str> {
@@ -7766,6 +8842,22 @@ impl OfficialTuiPackageHarness {
     }
 
     fn latest_fixed_failure_detail_from_report(report: &Path) -> Option<&'static str> {
+        Self::latest_fixed_failure_detail_from_report_excluding(report, None, None)
+    }
+
+    fn latest_fixed_failure_detail_from_report_excluding(
+        report: &Path,
+        primary: Option<&'static str>,
+        drive_context: Option<&'static str>,
+    ) -> Option<&'static str> {
+        Self::fixed_failure_catalog().find(|marker| {
+            Some(*marker) != primary
+                && Some(*marker) != drive_context
+                && fixed_package_failure_marker_is_valid(report, marker)
+        })
+    }
+
+    fn fixed_failure_catalog() -> impl Iterator<Item = &'static str> {
         PACKAGED_COMPATIBILITY_FAILURE_MARKERS
             .iter()
             .copied()
@@ -7804,7 +8896,6 @@ impl OfficialTuiPackageHarness {
                 "startup-failure.session-readiness",
                 "guardian-recovery.retained",
             ])
-            .find(|marker| report.join(marker).is_file())
     }
 
     fn latest_fixed_phase_from_report(report: &Path) -> &'static str {
@@ -8030,6 +9121,9 @@ impl OfficialTuiPackageHarness {
         Verifier:
             FnOnce(&Path, std::net::SocketAddr) -> Result<(), PackageNetworkHermeticityFailure>,
     {
+        // Freeze any already-published session evidence before cleanup can
+        // add backend/network markers or consume the scratch owner.
+        self.snapshot_recovery_secondary_failure();
         let backend_address = self.backend.as_ref().map(PackageSessionBackend::address);
         let generation_started = match (
             self.coordinator.is_some(),
@@ -8044,6 +9138,7 @@ impl OfficialTuiPackageHarness {
             }
             (true, true, true) => {
                 self.finish_started_generation_cleanup_or_exit();
+                self.snapshot_recovery_secondary_failure();
                 // A successful four-proof gate consumes this generation. This
                 // also makes explicit cleanup followed by Drop idempotent.
                 self.generation_cleanup.take();
@@ -8141,6 +9236,7 @@ impl OfficialTuiPackageHarness {
                 )
             });
         }
+        self.snapshot_recovery_secondary_failure();
         // Preserve filesystem evidence after any failed started generation,
         // including a failure discovered only while draining PTY/backend/network
         // authorities. Pre-generation setup cleanup keeps its historical exact
@@ -8264,13 +9360,16 @@ impl OfficialTuiPackageHarness {
         // no crash dump, authorizes no marker-derived signal or deletion, and
         // closes this process's complete descriptor table at one kernel
         // boundary.
+        self.snapshot_recovery_secondary_failure();
         {
             let mut stderr = io::stderr().lock();
             let _ = writeln!(
                 stderr,
-                "package-generation-cleanup-unproven:phase={},failure={}",
+                "package-generation-cleanup-unproven:phase={},failure={},secondary={}",
                 self.latest_fixed_phase(),
-                self.latest_fixed_failure_detail().unwrap_or("unclassified")
+                self.latest_fixed_failure_detail().unwrap_or("unclassified"),
+                self.latest_fixed_secondary_failure_detail()
+                    .unwrap_or("none")
             );
             let _ = stderr.flush();
         }
@@ -8494,10 +9593,10 @@ fn package_supervisor_helper_command(
     backend: std::net::SocketAddr,
     recovery_checkpoint: Option<RecoveryCheckpoint>,
     provider_target: PackageProviderTarget,
-    launcher_override: Option<&Path>,
+    startup_seams: &PackageStartupTestSeams,
 ) -> Result<Command, Box<dyn Error>> {
     let helper = fs::canonicalize(std::env::current_exe()?)?;
-    let (launcher_environment, launcher) = match launcher_override {
+    let (launcher_environment, launcher) = match startup_seams.launcher_override.as_deref() {
         Some(launcher) => (
             PACKAGE_TUI_LAUNCHER_ENV,
             validate_package_launcher_for_target(provider_target, &scratch.root, launcher)?,
@@ -8527,6 +9626,7 @@ fn package_supervisor_helper_command(
         .current_dir(&scratch.workspace);
     project_package_recovery_checkpoint_environment(&mut command, recovery_checkpoint);
     project_package_provider_target_environment(&mut command, provider_target);
+    project_package_startup_fault_environment(&mut command, startup_seams.startup_fault);
     Ok(command)
 }
 
@@ -8548,6 +9648,10 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
     let working_directory = checked_package_subdirectory(&root, "workspace")?;
     let environment_home = checked_package_subdirectory(&root, "environment")?;
     let provider_target = package_provider_target_from_environment()?;
+    let startup_fault = validate_package_startup_fault_for_target(
+        provider_target,
+        package_startup_fault_from_environment()?,
+    )?;
     let executable = package_provider_executable(provider_target, &root)?;
     let backend = package_supervisor_backend()?;
     let recovery_checkpoint = package_recovery_checkpoint_from_environment()?;
@@ -8593,6 +9697,7 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
         backend,
         recovery_checkpoint,
         provider_target,
+        startup_fault,
     )?;
     guardian_command
         .env(PACKAGE_SUPERVISOR_CODEX_HOME_ENV, &codex_home)
@@ -8670,7 +9775,8 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
     .map_err(|_| "package production coordinator assembly failed")?;
     match coordinator.run() {
         CoordinatorRunOutcome::Terminal(result) => {
-            let projection = PackageCoordinatorReportProjection::selected(recovery_checkpoint);
+            let projection =
+                PackageCoordinatorReportProjection::selected(recovery_checkpoint, startup_fault);
             let report = result.report();
             projection.require(result.guardian_status(), report)?;
             drop(result.into_authority());
@@ -8699,6 +9805,10 @@ fn run_package_guardian_helper() -> Result<(), Box<dyn Error>> {
     let completion = CompletionTransit::take_inherited()?.into_guardian();
     let recovery_checkpoint = package_recovery_checkpoint_from_environment()?;
     let provider_target = package_provider_target_from_environment()?;
+    let startup_fault = validate_package_startup_fault_for_target(
+        provider_target,
+        package_startup_fault_from_environment()?,
+    )?;
     let root = package_supervisor_root()?;
     let (_, selected_launcher) = super::launcher::packaged_launcher_executable_from_environment()?;
     validate_package_launcher_for_target(provider_target, &root, &selected_launcher)?;
@@ -8753,6 +9863,8 @@ fn run_package_guardian_helper() -> Result<(), Box<dyn Error>> {
             fixed_report_root: &report_root,
             recovery_checkpoint,
             fixture_compatibility_stage_parent: fixture_compatibility_stage_parent.as_deref(),
+            startup_terminal_channel_write_retained: startup_fault
+                == Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore),
         },
     );
     let disposition = match outcome {
@@ -8833,6 +9945,7 @@ fn package_supervisor_helper_command_from_view(
     backend: std::net::SocketAddr,
     recovery_checkpoint: Option<RecoveryCheckpoint>,
     provider_target: PackageProviderTarget,
+    startup_fault: Option<PackageStartupFault>,
 ) -> Result<Command, Box<dyn Error>> {
     let helper = fs::canonicalize(std::env::current_exe()?)?;
     let (launcher_environment, launcher) =
@@ -8861,6 +9974,7 @@ fn package_supervisor_helper_command_from_view(
         .current_dir(scratch.workspace);
     project_package_recovery_checkpoint_environment(&mut command, recovery_checkpoint);
     project_package_provider_target_environment(&mut command, provider_target);
+    project_package_startup_fault_environment(&mut command, startup_fault);
     Ok(command)
 }
 
@@ -10291,6 +11405,83 @@ fn wait_for_package_raw_mode(master: &PtyMaster, deadline: Instant) -> Result<()
         thread::sleep(Duration::from_millis(5));
     }
     Err("package outer PTY did not enter raw mode".into())
+}
+
+fn fixed_package_failure_marker_is_valid(report: &Path, marker: &str) -> bool {
+    read_private_bounded(&report.join(marker), b"classified\n".len())
+        .is_ok_and(|payload| payload == b"classified\n")
+}
+
+fn fixed_package_startup_failure_marker(name: &str) -> Option<&'static str> {
+    PACKAGED_COMPATIBILITY_FAILURE_MARKERS
+        .iter()
+        .copied()
+        .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
+        .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
+        .chain(PACKAGED_STARTUP_FAILURE_MARKERS.iter().copied())
+        .find(|marker| *marker == name)
+}
+
+fn fixed_package_startup_failure_from_report(report: &Path) -> Option<FixedPackageStartupFailure> {
+    PACKAGED_STARTUP_FAILURE_MARKERS
+        .iter()
+        .copied()
+        .find_map(|generic| {
+            if !fixed_package_failure_marker_is_valid(report, generic) {
+                return None;
+            }
+            let detail = match generic {
+                "startup-failure.compatibility" => PACKAGED_COMPATIBILITY_FAILURE_MARKERS
+                    .iter()
+                    .copied()
+                    .find(|marker| fixed_package_failure_marker_is_valid(report, marker)),
+                "startup-failure.app-socket" => PACKAGED_APP_SOCKET_FAILURE_MARKERS
+                    .iter()
+                    .copied()
+                    .find(|marker| fixed_package_failure_marker_is_valid(report, marker)),
+                "startup-failure.session-readiness" => PACKAGED_SESSION_STARTUP_FAILURE_MARKERS
+                    .iter()
+                    .copied()
+                    .find(|marker| fixed_package_failure_marker_is_valid(report, marker)),
+                _ => None,
+            };
+            Some(FixedPackageStartupFailure(detail.unwrap_or(generic)))
+        })
+}
+
+fn wait_for_private_marker_or_fixed_startup_failure(
+    report: &Path,
+    path: &Path,
+    expected: &[u8],
+    deadline: Instant,
+) -> Result<PackageInitialGateObservation, Box<dyn Error>> {
+    let mut next_failure_scan = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now >= next_failure_scan {
+            if let Some(failure) = fixed_package_startup_failure_from_report(report) {
+                return Ok(PackageInitialGateObservation::StartupFailure(failure));
+            }
+            next_failure_scan = now
+                .checked_add(PACKAGE_FIXED_FAILURE_POLL_INTERVAL)
+                .map(|next| next.min(deadline))
+                .unwrap_or(deadline);
+        }
+        match read_private_bounded(path, expected.len().saturating_add(1)) {
+            Ok(bytes) if bytes == expected => return Ok(PackageInitialGateObservation::Opened),
+            Ok(_) => return Err("package supervisor marker payload was invalid".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if now >= deadline {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("unknown");
+            return Err(format!("package supervisor marker `{name}` exceeded its deadline").into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn wait_for_private_marker(

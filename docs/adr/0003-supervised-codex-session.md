@@ -878,6 +878,12 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
 - Connects the separate typed monitor, reviewed initialization and usage reads,
   readiness relay, and official TUI to the #52 terminal kernel without adding a
   generic provider request/response API.
+- Arms the readiness relay only when its complete configured interval fits
+  inside the single absolute startup envelope. The fixed absolute relay
+  deadline crosses provider revalidation unchanged; an insufficient interval
+  fails before relay or TUI spawn, while every closed relay failure subtype is
+  preserved in a fixed payload-free package marker and still maps to the same
+  ordered shutdown component.
 - Replaces generic App process-group cleanup as release evidence with a narrow
   direct-child contract: one `SIGTERM`, an exact code-zero wait, and a move-only
   `PinnedAppGracefulDrain`. It deliberately makes no detached-descendant absence
@@ -906,6 +912,24 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   macOS remains native functional evidence. The detached probe is released
   before App shutdown and is not absence evidence. Local Apple-silicon normal
   passed twice and retained recovery once; matrix readback remains pending.
+- After the Guardian has minted its complete startup deadline, it durably
+  publishes one private package-only arm acknowledgement. The parent observes
+  that fixed payload and reanchors its retained-recovery fence to the local
+  observation plus the full Guardian startup interval and a distinct bounded
+  handoff/report margin. The observation can only move recovery later, must
+  leave the existing cleanup reserve inside the outer hard fence, and confers
+  no process, signal, deletion, or retry authority. Explicit owner-initiated
+  teardown after setup/exercise failure remains a separate cancellation path.
+- Captures the first typed recovery-drive failure before the one permitted
+  activation and keeps it as the immutable primary causal result. An exact
+  closed-catalog startup subtype that ended the initial-gate wait is immutable
+  secondary evidence; its generic parent is published only after the subtype
+  as a commit marker and cannot mask it. Malformed, extended, payload-bearing,
+  or user-chosen files neither end the wait nor confer recovery authority. A
+  deterministic package fault now traverses the real terminal-pump failure,
+  retained `StartupRestore` owner, one-shot request, failed-clean coordinator
+  projection, and all four deletion proofs without pre-consuming a healthy
+  session checkpoint.
 - Adds a credential-free, loopback-only deterministic fixture for startup
   queued, ready, active, suspended, retained quiescing, retained restore pending,
   and retained cleanup pending. It is designed to run the exact production

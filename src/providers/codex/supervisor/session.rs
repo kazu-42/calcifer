@@ -20,6 +20,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::launcher::RemoteTuiLauncherError;
 use super::launcher::{ReadyRemoteTui, RemoteTuiShutdownFailure};
@@ -1074,6 +1076,17 @@ pub(super) enum TerminalPumpProgress {
     TuiOutputClosed,
 }
 
+#[cfg(test)]
+static PACKAGED_FAIL_NEXT_TERMINAL_CHANNEL_WRITE: AtomicBool = AtomicBool::new(false);
+
+/// Arms one process-local package fault at the production terminal-pump
+/// write edge. The package Guardian runs in its own helper process, so this
+/// cannot affect another generation or any production build.
+#[cfg(test)]
+pub(super) fn fail_next_packaged_terminal_channel_write() {
+    PACKAGED_FAIL_NEXT_TERMINAL_CHANNEL_WRITE.store(true, Ordering::SeqCst);
+}
+
 struct OutputOnlyPump {
     output: TerminalBuffer,
 }
@@ -1848,6 +1861,10 @@ fn pump_guardian_terminal_once<Tui: GuardianTuiPumpIo>(
             let pending_output =
                 prepare_packaged_output_observation(chunk.remaining_bytes_for_test());
             write_fragment_before(deadline, &mut chunk, |chunk| {
+                #[cfg(test)]
+                if PACKAGED_FAIL_NEXT_TERMINAL_CHANNEL_WRITE.swap(false, Ordering::SeqCst) {
+                    return Err(TerminalPumpFailure::TerminalChannelWrite);
+                }
                 terminal
                     .try_write(chunk)
                     .map_err(|_| TerminalPumpFailure::TerminalChannelWrite)
@@ -3121,10 +3138,26 @@ impl fmt::Debug for SessionTerminalFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SessionStartupError {
     Monitor(SessionMonitorError),
-    ReadinessRelay,
+    ReadinessRelay(ReadinessProxyError),
     Tui,
     TerminalPump(TerminalPumpFailure),
     Deadline,
+}
+
+const fn readiness_relay_startup_error(error: ReadinessProxyError) -> SessionStartupError {
+    SessionStartupError::ReadinessRelay(error)
+}
+
+fn project_relay_poll_result(
+    result: Result<Option<EffectiveThreadSettings>, ReadinessProxyError>,
+) -> Result<Option<EffectiveThreadSettings>, SessionStartupError> {
+    result.map_err(readiness_relay_startup_error)
+}
+
+fn project_relay_connection_result(
+    result: Result<(), ReadinessProxyError>,
+) -> Result<(), SessionStartupError> {
+    result.map_err(readiness_relay_startup_error)
 }
 
 /// Closed scanner catalog for package-only session-readiness diagnostics.
@@ -3142,7 +3175,21 @@ pub(super) const PACKAGED_SESSION_STARTUP_FAILURE_MARKERS: &[&str] = &[
     "startup-failure.session-readiness.subtype.monitor-transport",
     "startup-failure.session-readiness.subtype.monitor-worker",
     "startup-failure.session-readiness.subtype.monitor-app-server",
-    "startup-failure.session-readiness.subtype.readiness-relay",
+    "startup-failure.session-readiness.subtype.readiness-relay.invalid-argument",
+    "startup-failure.session-readiness.subtype.readiness-relay.bind",
+    "startup-failure.session-readiness.subtype.readiness-relay.accept",
+    "startup-failure.session-readiness.subtype.readiness-relay.connect",
+    "startup-failure.session-readiness.subtype.readiness-relay.handshake-too-large",
+    "startup-failure.session-readiness.subtype.readiness-relay.invalid-handshake",
+    "startup-failure.session-readiness.subtype.readiness-relay.frame-too-large",
+    "startup-failure.session-readiness.subtype.readiness-relay.invalid-frame",
+    "startup-failure.session-readiness.subtype.readiness-relay.invalid-message",
+    "startup-failure.session-readiness.subtype.readiness-relay.unexpected-sequence",
+    "startup-failure.session-readiness.subtype.readiness-relay.target-mismatch",
+    "startup-failure.session-readiness.subtype.readiness-relay.timeout",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport",
+    "startup-failure.session-readiness.subtype.readiness-relay.worker",
+    "startup-failure.session-readiness.subtype.readiness-relay.cleanup",
     "startup-failure.session-readiness.subtype.tui",
     "startup-failure.session-readiness.subtype.terminal-pump.deadline",
     "startup-failure.session-readiness.subtype.terminal-pump.invalid-state",
@@ -3194,8 +3241,50 @@ pub(super) const fn packaged_session_startup_failure_marker(
         SessionStartupError::Monitor(SessionMonitorError::AppServer) => {
             "startup-failure.session-readiness.subtype.monitor-app-server"
         }
-        SessionStartupError::ReadinessRelay => {
-            "startup-failure.session-readiness.subtype.readiness-relay"
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidArgument) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.invalid-argument"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Bind) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.bind"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Accept) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.accept"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Connect) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.connect"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::HandshakeTooLarge) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.handshake-too-large"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidHandshake) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.invalid-handshake"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::FrameTooLarge) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.frame-too-large"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidFrame) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.invalid-frame"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidMessage) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.invalid-message"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::UnexpectedSequence) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.unexpected-sequence"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::TargetMismatch) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.target-mismatch"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Timeout) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.timeout"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Worker) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.worker"
+        }
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Cleanup) => {
+            "startup-failure.session-readiness.subtype.readiness-relay.cleanup"
         }
         SessionStartupError::Tui => "startup-failure.session-readiness.subtype.tui",
         SessionStartupError::TerminalPump(TerminalPumpFailure::Deadline) => {
@@ -3247,7 +3336,7 @@ pub(super) struct SessionStartupFailure {
 const fn session_startup_operation_error(error: SessionStartupError) -> SessionOperationError {
     match error {
         SessionStartupError::Monitor(error) => SessionOperationError::Monitor(error),
-        SessionStartupError::ReadinessRelay => {
+        SessionStartupError::ReadinessRelay(_) => {
             SessionOperationError::Component(SessionComponent::ReadinessRelay)
         }
         SessionStartupError::Tui => SessionOperationError::Component(SessionComponent::Tui),
@@ -3329,16 +3418,11 @@ pub(super) fn assemble_started_session(
                 ));
             }
         }
-        let settings = match relay.poll_ready() {
+        let settings = match project_relay_poll_result(relay.poll_ready()) {
             Ok(settings) => settings,
-            Err(_) => {
+            Err(error) => {
                 return Err(startup_failure(
-                    build,
-                    monitor,
-                    relay,
-                    terminal,
-                    SessionStartupError::ReadinessRelay,
-                    None,
+                    build, monitor, relay, terminal, error, None,
                 ));
             }
         };
@@ -3359,13 +3443,13 @@ pub(super) fn assemble_started_session(
             Some(effective_settings),
         ));
     }
-    if relay.ensure_connected().is_err() {
+    if let Err(error) = project_relay_connection_result(relay.ensure_connected()) {
         return Err(startup_failure(
             build,
             monitor,
             relay,
             terminal,
-            SessionStartupError::ReadinessRelay,
+            error,
             Some(effective_settings),
         ));
     }
@@ -4136,8 +4220,10 @@ mod tests {
         SessionStartupError, ShutdownPhase, TerminalPumpFailure, packaged_session_operation_marker,
         packaged_session_shutdown_phase_marker, packaged_session_startup_failure_marker,
         packaged_session_termination_cause_marker, packaged_session_tui_disposition_marker,
+        project_relay_connection_result, project_relay_poll_result, readiness_relay_startup_error,
         session_shutdown_recovery_stage, session_startup_operation_error,
     };
+    use crate::providers::codex::remote::ReadinessProxyError;
 
     #[test]
     fn packaged_session_startup_failure_markers_are_closed_unique_and_fixed() {
@@ -4183,8 +4269,64 @@ mod tests {
                 "startup-failure.session-readiness.subtype.monitor-app-server",
             ),
             (
-                SessionStartupError::ReadinessRelay,
-                "startup-failure.session-readiness.subtype.readiness-relay",
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidArgument),
+                "startup-failure.session-readiness.subtype.readiness-relay.invalid-argument",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Bind),
+                "startup-failure.session-readiness.subtype.readiness-relay.bind",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Accept),
+                "startup-failure.session-readiness.subtype.readiness-relay.accept",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Connect),
+                "startup-failure.session-readiness.subtype.readiness-relay.connect",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::HandshakeTooLarge),
+                "startup-failure.session-readiness.subtype.readiness-relay.handshake-too-large",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidHandshake),
+                "startup-failure.session-readiness.subtype.readiness-relay.invalid-handshake",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::FrameTooLarge),
+                "startup-failure.session-readiness.subtype.readiness-relay.frame-too-large",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidFrame),
+                "startup-failure.session-readiness.subtype.readiness-relay.invalid-frame",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidMessage),
+                "startup-failure.session-readiness.subtype.readiness-relay.invalid-message",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::UnexpectedSequence),
+                "startup-failure.session-readiness.subtype.readiness-relay.unexpected-sequence",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::TargetMismatch),
+                "startup-failure.session-readiness.subtype.readiness-relay.target-mismatch",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Timeout),
+                "startup-failure.session-readiness.subtype.readiness-relay.timeout",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport),
+                "startup-failure.session-readiness.subtype.readiness-relay.transport",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Worker),
+                "startup-failure.session-readiness.subtype.readiness-relay.worker",
+            ),
+            (
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Cleanup),
+                "startup-failure.session-readiness.subtype.readiness-relay.cleanup",
             ),
             (
                 SessionStartupError::Tui,
@@ -4285,6 +4427,44 @@ mod tests {
             assert_eq!(
                 session_startup_operation_error(SessionStartupError::Monitor(error)),
                 SessionOperationError::Monitor(error)
+            );
+        }
+    }
+
+    #[test]
+    fn startup_relay_failure_subtypes_keep_the_existing_shutdown_component() {
+        for error in [
+            ReadinessProxyError::InvalidArgument,
+            ReadinessProxyError::Bind,
+            ReadinessProxyError::Accept,
+            ReadinessProxyError::Connect,
+            ReadinessProxyError::HandshakeTooLarge,
+            ReadinessProxyError::InvalidHandshake,
+            ReadinessProxyError::FrameTooLarge,
+            ReadinessProxyError::InvalidFrame,
+            ReadinessProxyError::InvalidMessage,
+            ReadinessProxyError::UnexpectedSequence,
+            ReadinessProxyError::TargetMismatch,
+            ReadinessProxyError::Timeout,
+            ReadinessProxyError::Transport,
+            ReadinessProxyError::Worker,
+            ReadinessProxyError::Cleanup,
+        ] {
+            assert_eq!(
+                readiness_relay_startup_error(error),
+                SessionStartupError::ReadinessRelay(error)
+            );
+            assert_eq!(
+                project_relay_poll_result(Err(error)),
+                Err(SessionStartupError::ReadinessRelay(error))
+            );
+            assert_eq!(
+                project_relay_connection_result(Err(error)),
+                Err(SessionStartupError::ReadinessRelay(error))
+            );
+            assert_eq!(
+                session_startup_operation_error(SessionStartupError::ReadinessRelay(error)),
+                SessionOperationError::Component(SessionComponent::ReadinessRelay)
             );
         }
     }

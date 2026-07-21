@@ -90,6 +90,41 @@ impl ProductionStartupBounds {
     fn remaining_timeout_at(self, requested: Duration, now: Instant) -> Duration {
         requested.min(self.deadline.saturating_duration_since(now))
     }
+
+    /// Mints one fixed relay-readiness deadline only when the complete
+    /// configured window fits inside the global startup envelope.
+    fn full_relay_deadline_at(self, now: Instant) -> Option<Instant> {
+        if self.relay_timeout.is_zero() {
+            return None;
+        }
+        let relay_deadline = now.checked_add(self.relay_timeout)?;
+        (relay_deadline <= self.deadline).then_some(relay_deadline)
+    }
+}
+
+enum RelayTuiStartBoundaryFailure<Relay, RelayError, TuiError> {
+    Deadline,
+    Relay(RelayError),
+    Tui { relay: Relay, error: TuiError },
+}
+
+/// Crosses the only boundary that may start the relay and TUI. The closures
+/// make the no-attempt deadline edge deterministic to test while retaining
+/// the exact started relay owner if the subsequent TUI launch fails.
+fn cross_relay_tui_start_boundary_at<Relay, PendingTui, RelayError, TuiError>(
+    bounds: ProductionStartupBounds,
+    now: Instant,
+    spawn_relay: impl FnOnce(Instant) -> Result<Relay, RelayError>,
+    launch_tui: impl FnOnce() -> Result<PendingTui, TuiError>,
+) -> Result<(Relay, PendingTui), RelayTuiStartBoundaryFailure<Relay, RelayError, TuiError>> {
+    let relay_deadline = bounds
+        .full_relay_deadline_at(now)
+        .ok_or(RelayTuiStartBoundaryFailure::Deadline)?;
+    let relay = spawn_relay(relay_deadline).map_err(RelayTuiStartBoundaryFailure::Relay)?;
+    match launch_tui() {
+        Ok(tui) => Ok((relay, tui)),
+        Err(error) => Err(RelayTuiStartBoundaryFailure::Tui { relay, error }),
+    }
 }
 
 /// Redacted stage classification. Exact provider errors remain sealed in the
@@ -1677,7 +1712,7 @@ fn continue_supervised_session(
         }
     };
     // Complete every potentially expensive executable and launcher check
-    // before arming the relay's relative readiness deadline. The prepared
+    // before arming the relay's absolute readiness deadline. The prepared
     // typestate crosses only the short PTY/spawn boundary below.
     let prepared_tui = match tui_command.prepare(bounds.deadline) {
         Ok(prepared) => prepared,
@@ -1693,11 +1728,25 @@ fn continue_supervised_session(
             ));
         }
     };
-    let relay_timeout = bounds.remaining_timeout(bounds.relay_timeout);
-    let relay_deadline_elapsed = relay_timeout.is_zero();
-    let relay = match relay_plan.spawn(relay_timeout, bounds.deadline) {
-        Ok(relay) => relay,
-        Err(failure) => {
+    let (relay, pending_tui) = match cross_relay_tui_start_boundary_at(
+        bounds,
+        Instant::now(),
+        |relay_deadline| relay_plan.spawn_until(relay_deadline, bounds.deadline),
+        || prepared_tui.launch(pty, bounds.deadline),
+    ) {
+        Ok(started) => started,
+        Err(RelayTuiStartBoundaryFailure::Deadline) => {
+            return Err(partial_failure(
+                StartupBuildAuthority::Live(build),
+                StartupAppAuthority::InMonitor,
+                StartupMonitorAuthority::Live(monitor),
+                StartupRelayAuthority::None,
+                StartupTuiAuthority::None,
+                terminal,
+                SupervisedStartupError::Deadline,
+            ));
+        }
+        Err(RelayTuiStartBoundaryFailure::Relay(failure)) => {
             return Err(partial_failure(
                 StartupBuildAuthority::Live(build),
                 StartupAppAuthority::InMonitor,
@@ -1705,29 +1754,22 @@ fn continue_supervised_session(
                 StartupRelayAuthority::StartFailure(failure),
                 StartupTuiAuthority::None,
                 terminal,
-                if relay_deadline_elapsed {
-                    SupervisedStartupError::Deadline
-                } else {
-                    SupervisedStartupError::RelayStart
-                },
+                SupervisedStartupError::RelayStart,
             ));
         }
-    };
-    let relay = Box::new(relay);
-    let pending_tui = match prepared_tui.launch(pty, bounds.deadline) {
-        Ok(pending) => pending,
-        Err(failure) => {
+        Err(RelayTuiStartBoundaryFailure::Tui { relay, error }) => {
             return Err(partial_failure(
                 StartupBuildAuthority::Live(build),
                 StartupAppAuthority::InMonitor,
                 StartupMonitorAuthority::Live(monitor),
-                StartupRelayAuthority::Live(relay),
-                StartupTuiAuthority::LaunchFailure(failure),
+                StartupRelayAuthority::Live(Box::new(relay)),
+                StartupTuiAuthority::LaunchFailure(error),
                 terminal,
                 SupervisedStartupError::TuiLaunch,
             ));
         }
     };
+    let relay = Box::new(relay);
     let tui_containment = pending_tui.containment();
     let pending_tui = match report_child_started_or_retain(
         pending_tui,
@@ -3534,7 +3576,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_timeouts_are_clamped_to_the_single_absolute_startup_deadline() {
+    fn compatibility_timeout_is_clamped_to_the_single_absolute_startup_deadline() {
         let now = Instant::now();
         let bounds = ProductionStartupBounds {
             deadline: now + Duration::from_millis(40),
@@ -3550,17 +3592,118 @@ mod tests {
             bounds.remaining_timeout_at(Duration::from_millis(5), now),
             Duration::from_millis(5)
         );
-        assert_eq!(
-            bounds.remaining_timeout_at(bounds.relay_timeout, bounds.deadline),
-            Duration::ZERO
+    }
+
+    #[test]
+    fn relay_tui_start_boundary_rejects_truncated_windows_without_any_attempt() {
+        use std::cell::Cell;
+
+        let now = Instant::now();
+        let relay_timeout = Duration::from_millis(10);
+        let greater = ProductionStartupBounds {
+            deadline: now + Duration::from_millis(11),
+            compatibility_timeout: Duration::from_secs(30),
+            relay_timeout,
+        };
+        let equal = ProductionStartupBounds {
+            deadline: now + relay_timeout,
+            ..greater
+        };
+        let less = ProductionStartupBounds {
+            deadline: now + Duration::from_millis(9),
+            ..greater
+        };
+        let expired = ProductionStartupBounds {
+            deadline: now - Duration::from_millis(1),
+            ..greater
+        };
+
+        for bounds in [less, expired] {
+            let relay_attempts = Cell::new(0);
+            let tui_attempts = Cell::new(0);
+            let result = cross_relay_tui_start_boundary_at(
+                bounds,
+                now,
+                |_| {
+                    relay_attempts.set(relay_attempts.get() + 1);
+                    Ok::<_, &str>(7_u8)
+                },
+                || {
+                    tui_attempts.set(tui_attempts.get() + 1);
+                    Ok::<_, &str>(11_u8)
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(RelayTuiStartBoundaryFailure::Deadline)
+            ));
+            assert_eq!(relay_attempts.get(), 0);
+            assert_eq!(tui_attempts.get(), 0);
+        }
+
+        for bounds in [equal, greater] {
+            let relay_attempts = Cell::new(0);
+            let tui_attempts = Cell::new(0);
+            let observed_deadline = Cell::new(None);
+            let result = cross_relay_tui_start_boundary_at(
+                bounds,
+                now,
+                |deadline| {
+                    observed_deadline.set(Some(deadline));
+                    relay_attempts.set(relay_attempts.get() + 1);
+                    Ok::<_, &str>(7_u8)
+                },
+                || {
+                    tui_attempts.set(tui_attempts.get() + 1);
+                    Ok::<_, &str>(11_u8)
+                },
+            );
+            assert_eq!(result.ok(), Some((7, 11)));
+            assert_eq!(observed_deadline.get(), Some(now + relay_timeout));
+            assert_eq!(relay_attempts.get(), 1);
+            assert_eq!(tui_attempts.get(), 1);
+        }
+    }
+
+    #[test]
+    fn relay_tui_start_boundary_preserves_attempt_order_and_started_owner() {
+        use std::cell::Cell;
+
+        let now = Instant::now();
+        let bounds = ProductionStartupBounds {
+            deadline: now + Duration::from_secs(2),
+            compatibility_timeout: Duration::from_secs(1),
+            relay_timeout: Duration::from_secs(1),
+        };
+        let tui_attempts = Cell::new(0);
+        let relay_failure = cross_relay_tui_start_boundary_at(
+            bounds,
+            now,
+            |_| Err::<u8, _>("relay-failure"),
+            || {
+                tui_attempts.set(tui_attempts.get() + 1);
+                Ok::<_, &str>(11_u8)
+            },
         );
-        assert_eq!(
-            bounds.remaining_timeout_at(
-                bounds.relay_timeout,
-                bounds.deadline + Duration::from_millis(1),
-            ),
-            Duration::ZERO
+        assert!(matches!(
+            relay_failure,
+            Err(RelayTuiStartBoundaryFailure::Relay("relay-failure"))
+        ));
+        assert_eq!(tui_attempts.get(), 0);
+
+        let tui_failure = cross_relay_tui_start_boundary_at(
+            bounds,
+            now,
+            |_| Ok::<_, &str>(7_u8),
+            || Err::<u8, _>("tui-failure"),
         );
+        assert!(matches!(
+            tui_failure,
+            Err(RelayTuiStartBoundaryFailure::Tui {
+                relay: 7,
+                error: "tui-failure"
+            })
+        ));
     }
 
     #[test]

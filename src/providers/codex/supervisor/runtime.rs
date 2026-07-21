@@ -955,7 +955,11 @@ impl ExactRelayRoute {
         &self.relay_address
     }
 
-    #[cfg(feature = "internal-supervisor-fixture")]
+    #[cfg(all(
+        test,
+        feature = "internal-supervisor-fixture",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     pub(super) fn spawn_exact(
         &self,
         probe: crate::providers::codex::remote::ExactResumeProbe<'_>,
@@ -969,6 +973,23 @@ impl ExactRelayRoute {
             &self.upstream_socket_path,
             probe,
             timeout,
+        )
+    }
+
+    #[cfg(feature = "internal-supervisor-fixture")]
+    pub(super) fn spawn_exact_until(
+        &self,
+        probe: crate::providers::codex::remote::ExactResumeProbe<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<
+        crate::providers::codex::remote::ReadinessProxy,
+        Box<crate::providers::codex::remote::ReadinessProxyStartFailure>,
+    > {
+        crate::providers::codex::remote::ReadinessProxy::spawn_exact_owned_until(
+            &self.relay_socket_path,
+            &self.upstream_socket_path,
+            probe,
+            deadline,
         )
     }
 

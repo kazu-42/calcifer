@@ -135,7 +135,7 @@ impl<'build> RemoteTuiLaunchCommand<'build> {
     }
 
     /// Completes every potentially expensive provider and launcher check
-    /// before the caller arms the relay's relative readiness deadline.
+    /// before the caller arms the relay's absolute readiness deadline.
     ///
     /// The returned typestate is independent of the borrowed build, but its
     /// runtime guard prevents the pinned stage from being cleaned while the
@@ -210,9 +210,9 @@ pub(super) struct PreparedRemoteTuiLaunch<'build> {
 impl PreparedRemoteTuiLaunch<'_> {
     /// Attaches a fresh PTY, gives only the launcher the one-shot readiness
     /// descriptor, and publishes no child until PID=PGID=SID is read back.
-    /// No executable hashing or provider-input validation occurs here, so a
-    /// relay deadline armed immediately before this call measures readiness
-    /// rather than storage throughput.
+    /// No executable hashing or provider-input validation occurs here. The
+    /// fixed relay deadline therefore spends its remaining window on process
+    /// launch and readiness rather than storage throughput.
     pub(super) fn launch(
         self,
         pty: PtyOwner,

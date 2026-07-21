@@ -48,7 +48,8 @@ use super::session::{
 };
 #[cfg(test)]
 use super::session::{
-    SessionShutdownTestTrigger, SessionStartupError, packaged_session_startup_failure_marker,
+    SessionShutdownTestTrigger, SessionStartupError, fail_next_packaged_terminal_channel_write,
+    packaged_session_startup_failure_marker,
 };
 use super::startup::{
     AwaitingCoordinatorRestore, PostRestoreStartupCleanup, ProductionStartupBounds,
@@ -67,6 +68,9 @@ use super::terminal::{RecoveryTty, TerminalEndpoint, TerminalError, TerminalSnap
 pub(super) const PACKAGED_APP_NOT_STARTED_MARKER: &str = "app.not-started-v1";
 #[cfg(test)]
 pub(super) const PACKAGED_TUI_NOT_STARTED_MARKER: &str = "tui.not-started-v1";
+#[cfg(test)]
+pub(super) const PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER: &str =
+    "guardian.startup-deadline-armed-v1";
 #[cfg(test)]
 pub(super) const PACKAGED_STARTUP_FAILURE_MARKERS: &[&str] = &[
     "startup-failure.terminal",
@@ -716,6 +720,10 @@ struct GuardianExecutionConfig<'a> {
     packaged_child_report_root: Option<&'a Path>,
     #[cfg(test)]
     fixture_compatibility_stage_parent: Option<&'a Path>,
+    #[cfg(test)]
+    inject_packaged_terminal_channel_write_failure: bool,
+    #[cfg(test)]
+    retain_packaged_startup_restore_once: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -771,6 +779,8 @@ struct GuardianBootstrapSeams<'a> {
     recovery_checkpoint: Option<RecoveryCheckpoint>,
     #[cfg(test)]
     fixture_compatibility_stage_parent: Option<&'a Path>,
+    #[cfg(test)]
+    startup_terminal_channel_write_retained: bool,
 }
 
 #[cfg(test)]
@@ -788,6 +798,8 @@ impl GuardianBootstrapSeams<'_> {
             recovery_checkpoint: None,
             #[cfg(test)]
             fixture_compatibility_stage_parent: None,
+            #[cfg(test)]
+            startup_terminal_channel_write_retained: false,
         }
     }
 }
@@ -798,6 +810,7 @@ pub(super) struct PackagedGuardianSeams<'a> {
     pub(super) fixed_report_root: &'a Path,
     pub(super) recovery_checkpoint: Option<RecoveryCheckpoint>,
     pub(super) fixture_compatibility_stage_parent: Option<&'a Path>,
+    pub(super) startup_terminal_channel_write_retained: bool,
 }
 
 #[cfg(test)]
@@ -809,6 +822,7 @@ impl<'a> From<PackagedGuardianSeams<'a>> for GuardianBootstrapSeams<'a> {
             fixed_report_root: Some(seams.fixed_report_root),
             recovery_checkpoint: seams.recovery_checkpoint,
             fixture_compatibility_stage_parent: seams.fixture_compatibility_stage_parent,
+            startup_terminal_channel_write_retained: seams.startup_terminal_channel_write_retained,
         }
     }
 }
@@ -899,6 +913,11 @@ fn bootstrap_guardian_core<'a>(
             packaged_child_report_root: _seams.fixed_report_root,
             #[cfg(test)]
             fixture_compatibility_stage_parent: _seams.fixture_compatibility_stage_parent,
+            #[cfg(test)]
+            inject_packaged_terminal_channel_write_failure: _seams
+                .startup_terminal_channel_write_retained,
+            #[cfg(test)]
+            retain_packaged_startup_restore_once: _seams.startup_terminal_channel_write_retained,
         },
         lifecycle,
         authorization,
@@ -1515,6 +1534,41 @@ impl ArmedProductionGuardian<'_> {
                 );
             }
         };
+        let retain_packaged_startup_restore_once = {
+            #[cfg(test)]
+            {
+                config.retain_packaged_startup_restore_once
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        #[cfg(test)]
+        if let Some(report_root) = config.packaged_child_report_root {
+            if write_private_atomic_new(
+                &report_root.join(PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER),
+                b"armed\n",
+            )
+            .is_err()
+            {
+                return retained(
+                    lifecycle,
+                    RetainedGuardianOwner::PostArm(Box::new(RetainedPostArm {
+                        authorization,
+                        terminal,
+                        recovery,
+                        snapshot,
+                    })),
+                    GuardianRetentionReason::ProtocolInvalid,
+                    RetainedRecoveryBudget::available(),
+                );
+            }
+        }
+        #[cfg(test)]
+        if config.inject_packaged_terminal_channel_write_failure {
+            fail_next_packaged_terminal_channel_write();
+        }
         let initial_size = snapshot.size();
         let (started, reporter_error, checkpoint_shutdown_requested) = {
             let mut reporter = LifecycleStartupReporter::new(&mut lifecycle);
@@ -1580,6 +1634,7 @@ impl ArmedProductionGuardian<'_> {
                     lifecycle,
                     failure,
                     LifecycleCondition::Healthy,
+                    retain_packaged_startup_restore_once,
                 ),
             };
         }
@@ -1595,7 +1650,13 @@ impl ArmedProductionGuardian<'_> {
                 let condition = reporter_error.map_or(LifecycleCondition::Healthy, |error| {
                     LifecycleCondition::from_error(error)
                 });
-                finish_startup_failure(config.bounds, lifecycle, failure, condition)
+                finish_startup_failure(
+                    config.bounds,
+                    lifecycle,
+                    failure,
+                    condition,
+                    retain_packaged_startup_restore_once,
+                )
             }
         }
     }
@@ -1635,13 +1696,8 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
             SupervisedStartupError::Deadline => "startup-failure.deadline",
         },
     };
-    write_packaged_startup_failure_marker(report_root, marker);
     if let Some(marker) = failure.packaged_compatibility_failure_marker() {
         write_packaged_startup_failure_marker(report_root, marker);
-    }
-    if failure.packaged_compatibility_failed_before_child_start() {
-        write_packaged_startup_failure_marker(report_root, PACKAGED_APP_NOT_STARTED_MARKER);
-        write_packaged_startup_failure_marker(report_root, PACKAGED_TUI_NOT_STARTED_MARKER);
     }
     if let Some(classification) = failure.packaged_tui_launch_failure_classification() {
         write_packaged_startup_failure_marker(report_root, classification.state_marker());
@@ -1650,15 +1706,31 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
     if let Some(marker) = failure.packaged_app_socket_failure_marker() {
         write_packaged_startup_failure_marker(report_root, marker);
     }
+    // Publish every more-specific fixed classification before its generic
+    // parent. The package observer probes the generic marker first, so seeing
+    // it also proves that the corresponding detail write has completed.
+    write_packaged_startup_failure_marker(report_root, marker);
+    if failure.packaged_compatibility_failed_before_child_start() {
+        write_packaged_startup_failure_marker(report_root, PACKAGED_APP_NOT_STARTED_MARKER);
+        write_packaged_startup_failure_marker(report_root, PACKAGED_TUI_NOT_STARTED_MARKER);
+    }
+}
+
+#[cfg(test)]
+const fn packaged_session_readiness_failure_markers(
+    error: SessionStartupError,
+) -> [&'static str; 2] {
+    [
+        packaged_session_startup_failure_marker(error),
+        "startup-failure.session-readiness",
+    ]
 }
 
 #[cfg(test)]
 fn record_packaged_session_readiness_failure(report_root: &Path, error: SessionStartupError) {
-    write_packaged_startup_failure_marker(report_root, "startup-failure.session-readiness");
-    write_packaged_startup_failure_marker(
-        report_root,
-        packaged_session_startup_failure_marker(error),
-    );
+    for marker in packaged_session_readiness_failure_markers(error) {
+        write_packaged_startup_failure_marker(report_root, marker);
+    }
 }
 
 #[cfg(test)]
@@ -2563,6 +2635,7 @@ fn finish_startup_failure(
     mut lifecycle: GuardianLifecycle<LifecycleEndpoint>,
     failure: SupervisedStartupFailure,
     mut condition: LifecycleCondition,
+    retain_startup_restore_once: bool,
 ) -> GuardianRunOutcome {
     let recovery_budget = RetainedRecoveryBudget::available();
     if condition == LifecycleCondition::Healthy {
@@ -2622,6 +2695,17 @@ fn finish_startup_failure(
             }
         }
     };
+    #[cfg(test)]
+    if retain_startup_restore_once {
+        return retained(
+            lifecycle,
+            RetainedGuardianOwner::StartupRestore(awaiting),
+            GuardianRetentionReason::Deadline,
+            recovery_budget,
+        );
+    }
+    #[cfg(not(test))]
+    let _ = retain_startup_restore_once;
     finish_startup_restore(bounds, lifecycle, awaiting, condition, recovery_budget)
 }
 
@@ -3253,11 +3337,12 @@ mod tests {
         checkpoint_arms_recovery_command_race, coordinator_stop_trigger, finalize_projection,
         packaged_guardian_checkpoint_boundary_failure_marker,
         packaged_guardian_checkpoint_request_failure_marker, packaged_retention_owner_marker,
-        packaged_retention_reason_marker, packaged_startup_quiesce_detail_markers,
-        receive_bounded_command, record_packaged_session_readiness_failure,
-        recovery_shutdown_trigger, restore_wait_retention_reason,
-        retained_generation_can_attempt_recovery, retained_session_recovery_checkpoint,
-        retention_reason_allows_recovery, tui_exit_drain_deadline,
+        packaged_retention_reason_marker, packaged_session_readiness_failure_markers,
+        packaged_startup_quiesce_detail_markers, receive_bounded_command,
+        record_packaged_session_readiness_failure, recovery_shutdown_trigger,
+        restore_wait_retention_reason, retained_generation_can_attempt_recovery,
+        retained_session_recovery_checkpoint, retention_reason_allows_recovery,
+        tui_exit_drain_deadline,
     };
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -3283,6 +3368,7 @@ mod tests {
         PackagedStartupQuiescePhase, provider_never_started_for_completion_test,
     };
     use crate::providers::codex::monitor::SessionMonitorError;
+    use crate::providers::codex::remote::ReadinessProxyError;
 
     type QueuedCheckpointLifecycle = (
         AnchorCompletion,
@@ -3329,7 +3415,21 @@ mod tests {
             SessionStartupError::Monitor(SessionMonitorError::Transport),
             SessionStartupError::Monitor(SessionMonitorError::Worker),
             SessionStartupError::Monitor(SessionMonitorError::AppServer),
-            SessionStartupError::ReadinessRelay,
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidArgument),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::Bind),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::Accept),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::Connect),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::HandshakeTooLarge),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidHandshake),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::FrameTooLarge),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidFrame),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::InvalidMessage),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::UnexpectedSequence),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::TargetMismatch),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::Timeout),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::Worker),
+            SessionStartupError::ReadinessRelay(ReadinessProxyError::Cleanup),
             SessionStartupError::Tui,
             SessionStartupError::TerminalPump(TerminalPumpFailure::Deadline),
             SessionStartupError::TerminalPump(TerminalPumpFailure::InvalidState),
@@ -3345,6 +3445,7 @@ mod tests {
             SessionStartupError::TerminalPump(TerminalPumpFailure::Resume),
             SessionStartupError::Deadline,
         ];
+        assert_eq!(errors.len(), PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.len());
 
         for (index, (error, subtype)) in errors
             .into_iter()
@@ -3353,6 +3454,11 @@ mod tests {
         {
             let report = scratch.path().join(index.to_string());
             fs::DirBuilder::new().mode(0o700).create(&report)?;
+            assert_eq!(
+                packaged_session_readiness_failure_markers(error),
+                [subtype, "startup-failure.session-readiness"],
+                "the generic commit marker was published before its exact subtype"
+            );
             record_packaged_session_readiness_failure(&report, error);
 
             let mut names = fs::read_dir(&report)?
