@@ -35,6 +35,15 @@ class WatchdogBudget:
     job_timeout_seconds: int
 
 
+@dataclasses.dataclass(frozen=True)
+class RepeatedSuiteBudget:
+    suite_fence_seconds: int
+    command_overhead_seconds: int
+    ordinary_slot_seconds: int
+    msrv_slot_seconds: int
+    job_timeout_seconds: int
+
+
 class _WatchdogInterrupted(BaseException):
     def __init__(self, requested: signal.Signals) -> None:
         super().__init__(requested.name)
@@ -202,6 +211,75 @@ def validate_budget(
     )
 
 
+def validate_repeated_budget(
+    *,
+    rust_source: pathlib.Path,
+    rust_constant: str,
+    msrv_runs: int,
+    command_overhead_seconds: int,
+    ordinary_watchdog_seconds: int,
+    msrv_watchdog_seconds: int,
+    term_grace_seconds: int,
+    job_timeout_minutes: int,
+    job_margin_seconds: int,
+) -> RepeatedSuiteBudget:
+    values = (
+        msrv_runs,
+        command_overhead_seconds,
+        ordinary_watchdog_seconds,
+        msrv_watchdog_seconds,
+        term_grace_seconds,
+        job_timeout_minutes,
+        job_margin_seconds,
+    )
+    if any(type(value) is not int or value <= 0 for value in values):
+        raise ValueError("repeated suite budget values must be positive integers")
+    suite_fence_seconds = read_rust_duration_seconds(rust_source, rust_constant)
+    if suite_fence_seconds <= 0:
+        raise ValueError("Rust source repeated suite fence must be positive")
+    # An execution watchdog must remain outside the largest duration admitted
+    # by the command's internal fence. Compilation and integration tests run
+    # in the same command but outside that Rust fence, so reserve their fixed
+    # allowance here rather than borrowing post-timeout cleanup time.
+    if ordinary_watchdog_seconds != (
+        suite_fence_seconds + command_overhead_seconds
+    ):
+        raise ValueError(
+            "ordinary suite watchdog slot did not match the Rust source fence "
+            "and command overhead"
+        )
+    if msrv_watchdog_seconds != (
+        suite_fence_seconds * msrv_runs + command_overhead_seconds
+    ):
+        raise ValueError(
+            "MSRV suite watchdog slot did not match the Rust source repetitions "
+            "and command overhead"
+        )
+    # The timeout path has two bounded cleanup waits: a fixed TERM grace, then
+    # at most the same duration to reap the direct child after SIGKILL. This
+    # validator accepts integer grace values, so max(grace, 1) in run_command
+    # is exactly the configured grace. Cleanup belongs to the enclosing job
+    # slot only: counting it as command runtime would let the outer watchdog
+    # preempt an otherwise valid internal execution.
+    cleanup_wait_seconds = term_grace_seconds * 2
+    ordinary_slot_seconds = ordinary_watchdog_seconds + cleanup_wait_seconds
+    msrv_slot_seconds = msrv_watchdog_seconds + cleanup_wait_seconds
+    job_timeout_seconds = job_timeout_minutes * 60
+    if ordinary_slot_seconds + msrv_slot_seconds + job_margin_seconds != (
+        job_timeout_seconds
+    ):
+        raise ValueError(
+            "repeated suite job margin did not match the fixed CI budget"
+        )
+    return RepeatedSuiteBudget(
+        suite_fence_seconds=suite_fence_seconds,
+        command_overhead_seconds=command_overhead_seconds,
+        ordinary_slot_seconds=ordinary_slot_seconds,
+        msrv_slot_seconds=msrv_slot_seconds,
+        job_timeout_seconds=job_timeout_seconds,
+    )
+
+
 def _signal_process_group(
     process: subprocess.Popen[bytes], requested: signal.Signals
 ) -> None:
@@ -326,6 +404,29 @@ def _parser() -> argparse.ArgumentParser:
     budget.add_argument("--job-timeout-minutes", required=True, type=_positive_int)
     budget.add_argument("--job-margin-seconds", required=True, type=_positive_int)
 
+    repeated_budget = subparsers.add_parser("validate-repeated-budget")
+    repeated_budget.add_argument("--rust-source", required=True, type=pathlib.Path)
+    repeated_budget.add_argument("--rust-constant", required=True)
+    repeated_budget.add_argument("--msrv-runs", required=True, type=_positive_int)
+    repeated_budget.add_argument(
+        "--command-overhead-seconds", required=True, type=_positive_int
+    )
+    repeated_budget.add_argument(
+        "--ordinary-watchdog-seconds", required=True, type=_positive_int
+    )
+    repeated_budget.add_argument(
+        "--msrv-watchdog-seconds", required=True, type=_positive_int
+    )
+    repeated_budget.add_argument(
+        "--term-grace-seconds", required=True, type=_positive_int
+    )
+    repeated_budget.add_argument(
+        "--job-timeout-minutes", required=True, type=_positive_int
+    )
+    repeated_budget.add_argument(
+        "--job-margin-seconds", required=True, type=_positive_int
+    )
+
     run = subparsers.add_parser("run")
     run.add_argument("--timeout-seconds", required=True, type=_positive_float)
     run.add_argument("--term-grace-seconds", required=True, type=_positive_float)
@@ -343,6 +444,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
             internal_fence_seconds=parsed.internal_fence_seconds,
             watchdog_seconds=parsed.watchdog_seconds,
             watchdog_margin_seconds=parsed.watchdog_margin_seconds,
+            job_timeout_minutes=parsed.job_timeout_minutes,
+            job_margin_seconds=parsed.job_margin_seconds,
+        )
+        return 0
+
+    if parsed.action == "validate-repeated-budget":
+        validate_repeated_budget(
+            rust_source=parsed.rust_source,
+            rust_constant=parsed.rust_constant,
+            msrv_runs=parsed.msrv_runs,
+            command_overhead_seconds=parsed.command_overhead_seconds,
+            ordinary_watchdog_seconds=parsed.ordinary_watchdog_seconds,
+            msrv_watchdog_seconds=parsed.msrv_watchdog_seconds,
+            term_grace_seconds=parsed.term_grace_seconds,
             job_timeout_minutes=parsed.job_timeout_minutes,
             job_margin_seconds=parsed.job_margin_seconds,
         )

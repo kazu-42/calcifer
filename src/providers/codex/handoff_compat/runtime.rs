@@ -39,6 +39,11 @@ const MAX_SCRATCH_NODES: usize = 10_000;
 const INITIALIZE_REQUEST_ID: u64 = 0;
 const FORK_REQUEST_ID: u64 = 1;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Codex 0.144.4 can spend 30 seconds draining connection RPCs, followed by
+// two sequential 10-second thread/background-task drains after stdio EOF.
+// Keep ten seconds of scheduler headroom while retaining the probe's earlier
+// absolute deadline as the authoritative outer bound.
+const COMPLETED_REQUEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const SOURCE_TIMESTAMP: &str = "2026-07-15T00:00:00Z";
 const SOURCE_FILENAME_TIMESTAMP: &str = "2026-07-15T00-00-00";
 const MODEL_PROVIDER: &str = "calcifer_smoke";
@@ -1715,6 +1720,8 @@ fn fork_synthetic_rollout(
     command.args(["app-server", "--stdio"]);
     let mut process = AppServerProcess::spawn_command(command, workspace.as_ref(), None)
         .map_err(map_usage_error)?;
+    #[cfg(test)]
+    eprintln!("handoff probe: fork app-server spawned");
     process
         .send(&json!({
             "id": INITIALIZE_REQUEST_ID,
@@ -1731,9 +1738,13 @@ fn fork_synthetic_rollout(
             }
         }))
         .map_err(map_usage_error)?;
+    #[cfg(test)]
+    eprintln!("handoff probe: initialize request sent");
     let initialize = process
         .receive_result(INITIALIZE_REQUEST_ID, deadline)
         .map_err(map_usage_error)?;
+    #[cfg(test)]
+    eprintln!("handoff probe: initialize response received");
     let version = validate_initialize_result(initialize, target_home.as_ref())
         .map_err(|error| map_usage_error(error.kind))?;
     if version != SUPPORTED_VERSION {
@@ -1756,17 +1767,13 @@ fn fork_synthetic_rollout(
             }
         }))
         .map_err(map_usage_error)?;
+    #[cfg(test)]
+    eprintln!("handoff probe: fork request sent");
     let result = process
         .receive_result(FORK_REQUEST_ID, deadline)
         .map_err(map_usage_error)?;
-    process
-        .shutdown()
-        .map_err(|_| CodexHandoffError::Transport)?;
-    source_home.revalidate()?;
-    target_home.revalidate()?;
-    environment_home.revalidate()?;
-    workspace.revalidate()?;
-    revalidate_executable_metadata(executable)?;
+    #[cfg(test)]
+    eprintln!("handoff probe: fork response received");
     let fork = validate_fork_result(
         &result,
         &source_thread_id,
@@ -1777,7 +1784,26 @@ fn fork_synthetic_rollout(
     )?;
     #[cfg(test)]
     eprintln!("handoff probe: fork response validation passed");
-
+    let shutdown_deadline = Instant::now()
+        .checked_add(COMPLETED_REQUEST_SHUTDOWN_TIMEOUT)
+        .ok_or(CodexHandoffError::Timeout)?
+        .min(deadline);
+    process
+        .shutdown_after_completed_request_until(shutdown_deadline)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                CodexHandoffError::Timeout
+            } else {
+                CodexHandoffError::Transport
+            }
+        })?;
+    #[cfg(test)]
+    eprintln!("handoff probe: fork app-server shut down");
+    source_home.revalidate()?;
+    target_home.revalidate()?;
+    environment_home.revalidate()?;
+    workspace.revalidate()?;
+    revalidate_executable_metadata(executable)?;
     fork.revalidate(source_home, target_home)?;
     #[cfg(test)]
     eprintln!("handoff probe: source and target fingerprints remained stable");
@@ -1991,13 +2017,29 @@ fn write_target_config(
         r#"model = "{MODEL_NAME}"
 model_provider = "{MODEL_PROVIDER}"
 model_catalog_json = "{}"
+personality = "pragmatic"
 approval_policy = "never"
 sandbox_mode = "read-only"
 cli_auth_credentials_store = "file"
 mcp_oauth_credentials_store = "file"
+check_for_update_on_startup = false
+
+[analytics]
+enabled = false
+
+[otel]
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+
+[tui]
+show_tooltips = false
 
 [features]
 shell_snapshot = false
+apps = false
+plugins = false
+remote_plugin = false
 
 [model_providers.{MODEL_PROVIDER}]
 name = "Calcifer compatibility probe"
@@ -3488,15 +3530,46 @@ impl PtyChild {
     }
 
     fn finish(&mut self) -> Result<PtyDrain, CodexHandoffError> {
-        if !self.reaped {
-            let termination = force_terminate_process_tree(&mut self.child);
+        let settlement = if self.reaped {
+            Ok(())
+        } else {
+            let settlement = match child_exit_observed_without_reaping(&mut self.child) {
+                // Protocol and liveness were proven before the readiness
+                // proxy was intentionally closed. A natural TUI exit after
+                // that close is a cleanup disposition, not a new protocol
+                // result, regardless of its provider-defined exit code.
+                Ok(true) => reap_exited_process_tree(&mut self.child)
+                    .map(|_| ())
+                    .map_err(|_| CodexHandoffError::Transport),
+                Ok(false) => force_terminate_process_tree(&mut self.child)
+                    .map(|_| ())
+                    .map_err(|_error| {
+                        #[cfg(test)]
+                        eprintln!(
+                            "handoff probe: TUI process-tree termination failed kind={:?} os={:?}",
+                            _error.kind(),
+                            _error.raw_os_error()
+                        );
+                        CodexHandoffError::Transport
+                    }),
+                Err(_) => {
+                    // Contain and reap if possible, but an ambiguous liveness
+                    // observation can never become compatibility success.
+                    let _ = force_terminate_process_tree(&mut self.child);
+                    Err(CodexHandoffError::Transport)
+                }
+            };
             self.reaped = child_reap_confirmed(&mut self.child);
-            termination.map_err(|_| CodexHandoffError::Transport)?;
             if !self.reaped {
                 return Err(CodexHandoffError::Transport);
             }
+            settlement
+        };
+        let output = self.collect_after_reap();
+        match (settlement, output) {
+            (Ok(()), Ok(output)) => Ok(output),
+            (Err(error), _) | (_, Err(error)) => Err(error),
         }
-        self.collect_after_reap()
     }
 
     fn collect_after_reap(&mut self) -> Result<PtyDrain, CodexHandoffError> {
@@ -3628,6 +3701,73 @@ mod tests {
             target_config,
         ));
         cleanup_test_scratch(scratch)
+    }
+
+    #[test]
+    fn compatibility_target_config_disables_out_of_scope_dynamic_features()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = ScratchRoot::create()?;
+        let target_home = scratch.create_directory("target")?;
+        let backend = "127.0.0.1:12345".parse()?;
+        let proof = write_target_config(&target_home, backend)?;
+        let contents = fs::read_to_string(target_home.join("config.toml"))?;
+        drop((proof, target_home));
+        cleanup_test_scratch(scratch)?;
+
+        let config: toml::Value = toml::from_str(&contents)?;
+        assert_eq!(
+            config
+                .get("check_for_update_on_startup")
+                .and_then(toml::Value::as_bool),
+            Some(false),
+            "the compatibility probe allowed an out-of-scope update request"
+        );
+        assert_eq!(
+            config.get("personality").and_then(toml::Value::as_str),
+            Some("pragmatic"),
+            "the compatibility probe allowed resume to mutate personality"
+        );
+        assert_eq!(
+            config
+                .get("analytics")
+                .and_then(toml::Value::as_table)
+                .and_then(|analytics| analytics.get("enabled"))
+                .and_then(toml::Value::as_bool),
+            Some(false),
+            "the compatibility probe allowed default analytics egress"
+        );
+        let otel = config
+            .get("otel")
+            .and_then(toml::Value::as_table)
+            .ok_or("the compatibility probe omitted its OTEL table")?;
+        for exporter in ["exporter", "trace_exporter", "metrics_exporter"] {
+            assert_eq!(
+                otel.get(exporter).and_then(toml::Value::as_str),
+                Some("none"),
+                "the compatibility probe did not disable {exporter}"
+            );
+        }
+        assert_eq!(
+            config
+                .get("tui")
+                .and_then(toml::Value::as_table)
+                .and_then(|tui| tui.get("show_tooltips"))
+                .and_then(toml::Value::as_bool),
+            Some(false),
+            "the compatibility probe allowed remote tooltip content to affect output"
+        );
+        let features = config
+            .get("features")
+            .and_then(toml::Value::as_table)
+            .ok_or("the compatibility probe omitted its feature table")?;
+        for feature in ["shell_snapshot", "apps", "plugins", "remote_plugin"] {
+            assert_eq!(
+                features.get(feature).and_then(toml::Value::as_bool),
+                Some(false),
+                "the compatibility probe did not disable {feature}"
+            );
+        }
+        Ok(())
     }
 
     fn valid_fork_result(
@@ -4232,6 +4372,36 @@ mod tests {
                 .bytes
                 .windows(b"calcifer-pty-ok".len())
                 .any(|window| window == b"calcifer-pty-ok")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pty_shutdown_reaps_and_collects_a_natural_exit_after_proxy_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NATURAL_EXIT_MARKER: &[u8] = b"calcifer-natural-exit";
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf calcifer-natural-exit; exit 7"]);
+        let mut child = PtyChild::spawn(command, Path::new("/tmp"))?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or("deadline overflow")?;
+        while !child_exit_observed_without_reaping(&mut child.child)? {
+            if Instant::now() >= deadline {
+                return Err("PTY child did not reach its natural exit".into());
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+
+        let output = child.shutdown()?;
+        assert!(!output.overflowed);
+        assert!(!output.failed);
+        assert!(
+            output
+                .bytes
+                .windows(NATURAL_EXIT_MARKER.len())
+                .any(|window| window == NATURAL_EXIT_MARKER)
         );
         Ok(())
     }

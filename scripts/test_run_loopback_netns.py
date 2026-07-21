@@ -91,22 +91,36 @@ class ArtifactValidationTests(unittest.TestCase):
     def test_privileged_bits_require_an_explicit_trusted_tool_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             binary = self._executable(pathlib.Path(temporary), "fixture")
-            binary.chmod(0o4700)
-            with self.assertRaisesRegex(ValueError, "privileged execution bit"):
+            metadata = binary.lstat()
+            fields = list(metadata)
+            fields[stat.ST_MODE] |= stat.S_ISUID
+            privileged_metadata = os.stat_result(fields)
+
+            # Some macOS filesystems and sandboxes clear set-user-ID when an
+            # unprivileged process changes a fixture's mode. Project the exact
+            # kernel metadata instead of making this validator contract depend
+            # on whether the development filesystem preserves that bit.
+            with mock.patch.object(
+                pathlib.Path,
+                "lstat",
+                autospec=True,
+                return_value=privileged_metadata,
+            ):
+                with self.assertRaisesRegex(ValueError, "privileged execution bit"):
+                    run_loopback_netns._inspect_artifact(
+                        str(binary),
+                        allowed_uids={os.getuid()},
+                        label="fixture",
+                        require_executable=True,
+                    )
+
                 run_loopback_netns._inspect_artifact(
                     str(binary),
                     allowed_uids={os.getuid()},
                     label="fixture",
                     require_executable=True,
+                    allow_privileged_bits=True,
                 )
-
-            run_loopback_netns._inspect_artifact(
-                str(binary),
-                allowed_uids={os.getuid()},
-                label="fixture",
-                require_executable=True,
-                allow_privileged_bits=True,
-            )
 
     def test_only_the_fixed_sudo_tool_gets_the_privileged_bit_exception(self) -> None:
         with mock.patch.object(run_loopback_netns, "_inspect_artifact") as inspect:

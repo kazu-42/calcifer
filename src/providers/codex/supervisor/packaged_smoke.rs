@@ -540,18 +540,29 @@ const PACKAGE_PS_PROCESS_FIELDS: &str = "pid=,pgid=,uid=,state=";
 const PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(180);
 const PACKAGE_SUPERVISOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 // The deterministic path still traverses compatibility, App, monitor, TUI
-// planning, and descriptor gates before the relay starts. Reserve one full
-// relay-duration for that pre-relay work. If it exceeds this reserve, the
-// absolute startup deadline still clamps the relay and fails closed.
+// planning, and descriptor gates before the relay starts. Reserve a bounded
+// pre-relay interval plus the fixture's target-specific relay interval. If
+// pre-relay work exceeds its reserve, the absolute startup deadline still
+// clamps the relay and fails closed.
 const PACKAGE_DETERMINISTIC_PRE_RELAY_STARTUP_RESERVE: Duration = Duration::from_secs(15);
-const PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(30);
+const PACKAGE_DETERMINISTIC_RELAY_START_TIMEOUT: Duration = Duration::from_secs(30);
+const PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(45);
+// Every deterministic generation reserves its complete external fence before
+// creating scratch, sockets, descriptors, or processes. Unused real time is
+// returned after exact cleanup. This in-process pool is an early admission and
+// accounting guard, not an authoritative wall-clock timeout: a single stalled
+// generation cannot return its lease. Unix CI therefore wraps the ordinary
+// libtest execution and the repeated MSRV command in process-group watchdogs.
+// Static CI validation binds one ordinary slot and two MSRV suite slots to this
+// fence, including each watchdog's fixed TERM grace and bounded post-KILL reap.
+const PACKAGE_DETERMINISTIC_SUITE_TIMEOUT: Duration = Duration::from_secs(360);
 // CI validates this fixed internal fence against a later per-command watchdog
 // and an even later dedicated-job timeout. One fence is recorded when the
 // package generation starts. Every exercise wait is capped at that fence's
 // fixed recovery start so drip progress cannot consume cleanup's reserved
 // budget or manufacture a fresh outer lifetime.
 const PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT: Duration = Duration::from_secs(25 * 60);
-const PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT: Duration = Duration::from_secs(90);
+const PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT: Duration = Duration::from_secs(105);
 // The backend starts slightly before the generation fence is recorded. Its
 // extra minute prevents its own EOF from becoming an earlier cleanup trigger;
 // the generation owner or the outer job remains the authoritative boundary.
@@ -1032,15 +1043,22 @@ fn package_guardian_build_cleanup_timeout_is_provider_target_aware() {
         official.compatibility_timeout,
         PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT
     );
+    assert_eq!(official.relay_start_timeout, Duration::from_secs(15));
     assert!(official.build_cleanup_timeout >= Duration::from_secs(180));
     assert_eq!(
         deterministic.startup_timeout,
         PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT
     );
     assert_eq!(
+        deterministic.startup_timeout,
+        Duration::from_secs(45),
+        "the deterministic fixture keeps a full 30-second relay window after pre-relay work"
+    );
+    assert_eq!(
         deterministic.compatibility_timeout,
         PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT
     );
+    assert_eq!(deterministic.relay_start_timeout, Duration::from_secs(30));
     assert_eq!(deterministic.build_cleanup_timeout, Duration::from_secs(10));
     let deterministic_minimum_startup = PACKAGE_DETERMINISTIC_PRE_RELAY_STARTUP_RESERVE
         .checked_add(deterministic.relay_start_timeout);
@@ -1049,6 +1067,53 @@ fn package_guardian_build_cleanup_timeout_is_provider_target_aware() {
             .is_some_and(|minimum| deterministic.startup_timeout >= minimum),
         "the deterministic startup fence must reserve pre-relay work plus one relay phase"
     );
+}
+
+#[test]
+fn deterministic_suite_budget_reserves_a_full_generation_and_refunds_only_unused_time()
+-> Result<(), Box<dyn Error>> {
+    let mut budget = PackageDeterministicSuiteBudget::new(Duration::from_secs(300));
+    let first = budget
+        .try_reserve(Duration::from_secs(105))
+        .ok_or("the first deterministic generation did not fit")?;
+    let second = budget
+        .try_reserve(Duration::from_secs(105))
+        .ok_or("the second deterministic generation did not fit")?;
+
+    assert_eq!(budget.available(), Duration::from_secs(90));
+    assert!(
+        budget.try_reserve(Duration::from_secs(105)).is_none(),
+        "an unbacked generation must be rejected before it starts"
+    );
+    assert_eq!(budget.available(), Duration::from_secs(90));
+
+    budget.settle(first, Duration::from_secs(10));
+    assert_eq!(budget.available(), Duration::from_secs(185));
+    budget.settle(second, Duration::from_secs(105));
+    assert_eq!(budget.available(), Duration::from_secs(185));
+    Ok(())
+}
+
+#[test]
+fn deterministic_suite_budget_debits_a_generation_overrun() -> Result<(), Box<dyn Error>> {
+    let mut budget = PackageDeterministicSuiteBudget::new(Duration::from_secs(300));
+    let reservation = budget
+        .try_reserve(Duration::from_secs(105))
+        .ok_or("the deterministic generation did not fit")?;
+
+    budget.settle(reservation, Duration::from_secs(106));
+
+    assert_eq!(budget.available(), Duration::from_secs(194));
+    Ok(())
+}
+
+#[test]
+fn deterministic_suite_budget_covers_at_least_one_complete_generation_fence() {
+    assert_eq!(
+        PACKAGE_DETERMINISTIC_SUITE_TIMEOUT,
+        Duration::from_secs(360)
+    );
+    assert!(PACKAGE_DETERMINISTIC_SUITE_TIMEOUT >= PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT);
 }
 
 #[test]
@@ -1911,6 +1976,138 @@ fn package_live_snapshot_failure_state_preserves_one_reason_and_closes_mixed_seq
 }
 
 #[test]
+fn package_live_group_snapshot_transient_errors_retry_until_two_stable_observations() {
+    let tui = PackageChildMarker {
+        pid: 101,
+        pgid: 101,
+    };
+    let valid = vec![
+        package_process_state_for_test(101, b'S'),
+        package_process_state_for_test(102, b'R'),
+    ];
+    let mut observations = VecDeque::from([
+        None,
+        Some(valid.clone()),
+        None,
+        Some(valid.clone()),
+        Some(valid),
+    ]);
+    let origin = Instant::now();
+    let clock = std::cell::Cell::new(origin);
+    let deadline = origin + Duration::from_millis(250);
+    let mut waits = Vec::new();
+    let mut observer_calls = 0;
+
+    let result = validate_live_official_tui_group_with_snapshot_observer(
+        tui,
+        deadline,
+        501,
+        |_| {
+            observer_calls += 1;
+            match observations.pop_front() {
+                Some(Some(snapshot)) => Ok(snapshot),
+                Some(None) => Err("a short-lived package descendant exited".into()),
+                None => Err("the package snapshot observer exceeded its test plan".into()),
+            }
+        },
+        |duration| {
+            waits.push(duration);
+            clock.set(clock.get() + duration);
+        },
+        || clock.get(),
+    );
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(observer_calls, 5);
+    assert!(observations.is_empty());
+    assert_eq!(waits, vec![Duration::from_millis(50); 4]);
+    assert!(clock.get() < deadline);
+}
+
+#[test]
+fn package_live_group_snapshot_errors_close_only_at_the_absolute_deadline() {
+    let tui = PackageChildMarker {
+        pid: 101,
+        pgid: 101,
+    };
+    let origin = Instant::now();
+    let clock = std::cell::Cell::new(origin);
+    let deadline = origin + Duration::from_millis(125);
+    let mut waits = Vec::new();
+    let mut observer_calls = 0;
+
+    let result = validate_live_official_tui_group_with_snapshot_observer(
+        tui,
+        deadline,
+        501,
+        |_| {
+            observer_calls += 1;
+            Err("a short-lived package descendant exited".into())
+        },
+        |duration| {
+            waits.push(duration);
+            clock.set(clock.get() + duration);
+        },
+        || clock.get(),
+    );
+
+    assert_eq!(result, Err(PackageOfficialTuiGroupFailure::Snapshot));
+    assert_eq!(observer_calls, 3);
+    assert_eq!(
+        waits,
+        vec![
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(25),
+        ]
+    );
+    assert_eq!(clock.get(), deadline);
+}
+
+#[test]
+fn package_live_group_snapshot_pair_must_complete_before_the_absolute_deadline() {
+    let tui = PackageChildMarker {
+        pid: 101,
+        pgid: 101,
+    };
+    let valid = vec![
+        package_process_state_for_test(101, b'S'),
+        package_process_state_for_test(102, b'R'),
+    ];
+    let mut observations = VecDeque::from([valid.clone(), valid]);
+    let origin = Instant::now();
+    let clock = std::cell::Cell::new(origin);
+    let deadline = origin + Duration::from_millis(100);
+    let mut observer_calls = 0;
+
+    let result = validate_live_official_tui_group_with_snapshot_observer(
+        tui,
+        deadline,
+        501,
+        |_| {
+            observer_calls += 1;
+            let snapshot = observations.pop_front().ok_or_else(|| -> Box<dyn Error> {
+                "the package snapshot observer exceeded its test plan".into()
+            })?;
+            if observer_calls == 2 {
+                clock.set(deadline);
+            }
+            Ok(snapshot)
+        },
+        |duration| clock.set(clock.get() + duration),
+        || clock.get(),
+    );
+
+    assert_eq!(
+        result,
+        Err(PackageOfficialTuiGroupFailure::NotStablyLiveNoObservation)
+    );
+    assert_eq!(observer_calls, 2);
+    assert!(observations.is_empty());
+    assert_eq!(clock.get(), deadline);
+}
+
+#[test]
 fn package_failure_report_scanner_bridges_only_the_closed_official_tui_group_catalog()
 -> Result<(), Box<dyn Error>> {
     use std::collections::BTreeSet;
@@ -2645,8 +2842,13 @@ fn packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_
         .as_ref()
         .err()
         .map(|_| harness.latest_fixed_phase());
-    let cleanup = harness.cleanup();
+    let cleanup_outcome = harness.cleanup_after_exercise(exercise.is_err());
+    let preserved_evidence_root = cleanup_outcome
+        .preserved_evidence_root()
+        .map(Path::to_path_buf);
+    let cleanup = cleanup_outcome.result;
     let cleanup_phase = harness.latest_fixed_cleanup_failure_detail();
+    let handoff_probe_phase = harness.latest_handoff_probe_phase();
     let exercise_phase = if exercise.is_err() {
         select_package_failure_phase(
             exercise_failure_before_cleanup,
@@ -2656,7 +2858,15 @@ fn packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_
     } else {
         None
     };
-    combine_package_exercise_and_cleanup_at_phases(exercise, cleanup, exercise_phase, cleanup_phase)
+    combine_package_exercise_and_cleanup_with_evidence(
+        exercise,
+        cleanup,
+        exercise_phase,
+        cleanup_phase,
+        None,
+        handoff_probe_phase,
+        preserved_evidence_root,
+    )
 }
 
 #[test]
@@ -2689,8 +2899,13 @@ fn packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proof
         .as_ref()
         .err()
         .map(|_| harness.latest_fixed_phase());
-    let cleanup = harness.cleanup();
+    let cleanup_outcome = harness.cleanup_after_exercise(recovery.is_err());
+    let preserved_evidence_root = cleanup_outcome
+        .preserved_evidence_root()
+        .map(Path::to_path_buf);
+    let cleanup = cleanup_outcome.result;
     let cleanup_phase = harness.latest_fixed_cleanup_failure_detail();
+    let handoff_probe_phase = harness.latest_handoff_probe_phase();
     let recovery_phase = if recovery.is_err() {
         select_package_failure_phase(
             recovery_failure_before_cleanup,
@@ -2700,11 +2915,14 @@ fn packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proof
     } else {
         None
     };
-    let result = combine_package_exercise_and_cleanup_at_phases(
+    let result = combine_package_exercise_and_cleanup_with_evidence(
         recovery,
         cleanup,
         recovery_phase,
         cleanup_phase,
+        None,
+        handoff_probe_phase,
+        preserved_evidence_root,
     );
     if result.is_ok() && root.exists() {
         return Err("four-proof recovery cleanup did not delete package scratch".into());
@@ -2736,6 +2954,7 @@ fn packaged_codex_deterministic_fixture_recovers_all_seven_production_checkpoint
 fn packaged_deterministic_drive_failure_consumes_recovery_and_cleans() -> Result<(), Box<dyn Error>>
 {
     let _process_guard = package_process_test_guard();
+    let suite_budget = reserve_package_deterministic_generation()?;
     let scratch = PackageScratch::create()?;
     let root = scratch.root.clone();
     let backend = PackageSessionBackend::spawn_with_disconnected_inference()?;
@@ -2743,6 +2962,7 @@ fn packaged_deterministic_drive_failure_consumes_recovery_and_cleans() -> Result
         scratch,
         backend,
         RecoveryCheckpoint::RetainedQuiescing,
+        suite_budget,
     )?;
     let exercise = (|| -> Result<(), Box<dyn Error>> {
         if harness.request_selected_recovery().is_ok() {
@@ -2871,6 +3091,7 @@ fn run_deterministic_recovery_case_with_trigger(
     checkpoint: RecoveryCheckpoint,
     trigger: PackageRecoveryTrigger,
 ) -> Result<(), Box<dyn Error>> {
+    let suite_budget = reserve_package_deterministic_generation()?;
     let scratch = PackageScratch::create()?;
     let root = scratch.root.clone();
     let backend = match PackageSessionBackend::spawn() {
@@ -2880,8 +3101,12 @@ fn run_deterministic_recovery_case_with_trigger(
             return Err(error);
         }
     };
-    let mut harness =
-        OfficialTuiPackageHarness::spawn_deterministic_recovery(scratch, backend, checkpoint)?;
+    let mut harness = OfficialTuiPackageHarness::spawn_deterministic_recovery(
+        scratch,
+        backend,
+        checkpoint,
+        suite_budget,
+    )?;
     let exercise = (|| -> Result<(), Box<dyn Error>> {
         harness.trigger_selected_recovery(trigger)?;
         let second = PackageGenerationCleanupOperations::request_recovery_once(
@@ -4226,6 +4451,12 @@ fn deterministic_package_cleanup_budget_is_short_bounded_and_target_specific()
             .checked_add(PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT)
             .ok_or("deterministic external fence overflowed")?
     );
+    assert_eq!(
+        deterministic.external_fence,
+        origin
+            .checked_add(Duration::from_secs(105))
+            .ok_or("expected deterministic external fence overflowed")?
+    );
     assert!(deterministic.recovery_start < official.recovery_start);
     assert!(deterministic.external_fence < official.external_fence);
 
@@ -4281,6 +4512,12 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
     {
         let (_output_sender, output_result) = mpsc::sync_channel(1);
         let mut harness = OfficialTuiPackageHarness {
+            _provider_suite_budget: PackageProviderSuiteBudget::Deterministic {
+                _lease: PackageDeterministicSuiteLease {
+                    started: Instant::now(),
+                    reservation: None,
+                },
+            },
             scratch: None,
             backend: None,
             coordinator: None,
@@ -4299,6 +4536,7 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             response_sentinel_observed: None,
             output_worker: None,
             output_finished: true,
+            last_handoff_probe_phase: None,
             last_fixed_failure_detail: None,
             last_fixed_cleanup_failure_detail: None,
         };
@@ -4737,6 +4975,7 @@ impl PackageInferenceExpectation {
 }
 
 struct OfficialTuiPackageHarness {
+    _provider_suite_budget: PackageProviderSuiteBudget,
     scratch: Option<PackageScratch>,
     backend: Option<PackageSessionBackend>,
     coordinator: Option<Child>,
@@ -4755,6 +4994,7 @@ struct OfficialTuiPackageHarness {
     response_sentinel_observed: Option<Receiver<()>>,
     output_worker: Option<JoinHandle<()>>,
     output_finished: bool,
+    last_handoff_probe_phase: Option<PackageHandoffProbePhase>,
     last_fixed_failure_detail: Option<&'static str>,
     last_fixed_cleanup_failure_detail: Option<&'static str>,
 }
@@ -4807,12 +5047,134 @@ impl Error for PackageHarnessCleanupFailures {
     }
 }
 
+struct PreservedPackageEvidence {
+    scratch: PackageScratch,
+}
+
+impl PreservedPackageEvidence {
+    fn new(scratch: PackageScratch) -> Result<Self, Box<dyn Error>> {
+        scratch.validate_owned_root()?;
+        Ok(Self { scratch })
+    }
+
+    fn root(&self) -> &Path {
+        &self.scratch.root
+    }
+
+    fn cleanup(self) -> Result<(), Box<dyn Error>> {
+        self.scratch.cleanup()
+    }
+}
+
+enum PackageScratchDisposition {
+    Deleted,
+    Preserved(PreservedPackageEvidence),
+    Unavailable,
+}
+
+struct PackageHarnessCleanupOutcome {
+    result: Result<(), Box<dyn Error>>,
+    scratch: PackageScratchDisposition,
+}
+
+impl PackageHarnessCleanupOutcome {
+    fn preserved_evidence_root(&self) -> Option<&Path> {
+        match &self.scratch {
+            PackageScratchDisposition::Preserved(evidence) => Some(evidence.root()),
+            PackageScratchDisposition::Deleted | PackageScratchDisposition::Unavailable => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageHarnessSetupPhase {
+    Filesystem,
+    RuntimeParentValidation,
+    PtyOpen,
+    CommandBuild,
+    PtyConfiguration,
+    OutputWorker,
+    CompletionAuthority,
+    GenerationFence,
+    CoordinatorSpawn,
+    InitialPtyWrite,
+}
+
+impl PackageHarnessSetupPhase {
+    const fn fixed_label(self) -> &'static str {
+        match self {
+            Self::Filesystem => "package-setup.filesystem",
+            Self::RuntimeParentValidation => "package-setup.runtime-parent-validation",
+            Self::PtyOpen => "package-setup.pty-open",
+            Self::CommandBuild => "package-setup.command-build",
+            Self::PtyConfiguration => "package-setup.pty-configuration",
+            Self::OutputWorker => "package-setup.output-worker",
+            Self::CompletionAuthority => "package-setup.completion-authority",
+            Self::GenerationFence => "package-setup.generation-fence",
+            Self::CoordinatorSpawn => "package-setup.coordinator-spawn",
+            Self::InitialPtyWrite => "package-setup.initial-pty-write",
+        }
+    }
+}
+
+struct PackageHarnessSetupFailure {
+    setup_phase: PackageHarnessSetupPhase,
+    generation_started: bool,
+    cleanup_failed: bool,
+    cleanup_phase: Option<&'static str>,
+    preserved_evidence_root: Option<PathBuf>,
+}
+
+impl fmt::Debug for PackageHarnessSetupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackageHarnessSetupFailure")
+            .field("setup_phase", &self.setup_phase)
+            .field("generation_started", &self.generation_started)
+            .field("cleanup_failed", &self.cleanup_failed)
+            .field("cleanup_phase", &self.cleanup_phase)
+            .field("preserved_evidence_root", &self.preserved_evidence_root)
+            .finish()
+    }
+}
+
+impl fmt::Display for PackageHarnessSetupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "package harness setup failed at fixed phase {}",
+            self.setup_phase.fixed_label()
+        )?;
+        if self.generation_started {
+            formatter.write_str(" after generation start")?;
+        }
+        if self.cleanup_failed {
+            formatter.write_str("; package cleanup failed")?;
+            if let Some(phase) = self.cleanup_phase {
+                write!(formatter, " at fixed cleanup phase {phase}")?;
+            }
+        }
+        if let Some(root) = &self.preserved_evidence_root {
+            write!(
+                formatter,
+                "; package evidence root preserved at {}",
+                root.display()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for PackageHarnessSetupFailure {}
+
 struct PackageExerciseCleanupFailure {
     exercise_failed: bool,
     cleanup_failed: bool,
     exercise_phase: Option<&'static str>,
     cleanup_phase: Option<&'static str>,
     recovery_case: Option<&'static str>,
+    handoff_probe_phase: Option<PackageHandoffProbePhase>,
+    preserved_evidence_root: Option<PathBuf>,
 }
 
 impl fmt::Debug for PackageExerciseCleanupFailure {
@@ -4824,6 +5186,8 @@ impl fmt::Debug for PackageExerciseCleanupFailure {
             .field("exercise_phase", &self.exercise_phase)
             .field("cleanup_phase", &self.cleanup_phase)
             .field("recovery_case", &self.recovery_case)
+            .field("handoff_probe_phase", &self.handoff_probe_phase)
+            .field("preserved_evidence_root", &self.preserved_evidence_root)
             .finish()
     }
 }
@@ -4848,6 +5212,20 @@ impl fmt::Display for PackageExerciseCleanupFailure {
         }
         if let Some(recovery_case) = self.recovery_case {
             write!(formatter, "; fixed recovery case {recovery_case}")?;
+        }
+        if let Some(handoff_probe_phase) = self.handoff_probe_phase {
+            write!(
+                formatter,
+                "; last fixed handoff probe phase {}",
+                handoff_probe_phase.fixed_label()
+            )?;
+        }
+        if let Some(root) = &self.preserved_evidence_root {
+            write!(
+                formatter,
+                "; package evidence root preserved at {}",
+                root.display()
+            )?;
         }
         Ok(())
     }
@@ -4908,6 +5286,26 @@ fn combine_package_exercise_and_cleanup_with_diagnostics(
     cleanup_phase: Option<&'static str>,
     recovery_case: Option<&'static str>,
 ) -> Result<(), Box<dyn Error>> {
+    combine_package_exercise_and_cleanup_with_evidence(
+        exercise,
+        cleanup,
+        exercise_phase,
+        cleanup_phase,
+        recovery_case,
+        None,
+        None,
+    )
+}
+
+fn combine_package_exercise_and_cleanup_with_evidence(
+    exercise: Result<(), Box<dyn Error>>,
+    cleanup: Result<(), Box<dyn Error>>,
+    exercise_phase: Option<&'static str>,
+    cleanup_phase: Option<&'static str>,
+    recovery_case: Option<&'static str>,
+    handoff_probe_phase: Option<PackageHandoffProbePhase>,
+    preserved_evidence_root: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     match (exercise, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (exercise, cleanup) => Err(Box::new(PackageExerciseCleanupFailure {
@@ -4916,6 +5314,8 @@ fn combine_package_exercise_and_cleanup_with_diagnostics(
             exercise_phase,
             cleanup_phase,
             recovery_case,
+            handoff_probe_phase,
+            preserved_evidence_root,
         })),
     }
 }
@@ -5056,6 +5456,34 @@ fn package_exercise_and_cleanup_failures_are_aggregated_with_fixed_redacted_labe
     assert!(recovery_debug.contains(recovery_case_marker));
     assert!(!recovery_debug.contains("private"));
     assert!(recovery_case.source().is_none());
+
+    let preserved = require_rejected_test_result(
+        combine_package_exercise_and_cleanup_with_evidence(
+            Err("private PTY bytes and credentials".into()),
+            Ok(()),
+            Some("startup-failure.compatibility.subtype.transport"),
+            None,
+            None,
+            Some(PackageHandoffProbePhase::ForkResponseValidated),
+            Some(PathBuf::from("/tmp/cf-fixed-evidence")),
+        ),
+        "a failed handoff probe unexpectedly succeeded",
+    )?;
+    assert_eq!(
+        preserved.to_string(),
+        concat!(
+            "package exercise failed at fixed phase ",
+            "startup-failure.compatibility.subtype.transport; ",
+            "last fixed handoff probe phase handoff.fork-response-validated; ",
+            "package evidence root preserved at /tmp/cf-fixed-evidence"
+        )
+    );
+    let preserved_debug = format!("{preserved:?}");
+    assert!(preserved_debug.contains("ForkResponseValidated"));
+    assert!(preserved_debug.contains("/tmp/cf-fixed-evidence"));
+    assert!(!preserved_debug.contains("private PTY bytes"));
+    assert!(!preserved_debug.contains("credentials"));
+    assert!(preserved.source().is_none());
     Ok(())
 }
 
@@ -5124,6 +5552,7 @@ fn official_tui_pre_generation_cleanup_joins_backend_and_deletes_owned_scratch_w
     let backend = PackageSessionBackend::spawn()?;
     let (_placeholder_sender, output_result) = mpsc::sync_channel(1);
     let mut harness = OfficialTuiPackageHarness {
+        _provider_suite_budget: PackageProviderSuiteBudget::Official,
         scratch: Some(scratch),
         backend: Some(backend),
         coordinator: None,
@@ -5142,6 +5571,7 @@ fn official_tui_pre_generation_cleanup_joins_backend_and_deletes_owned_scratch_w
         response_sentinel_observed: None,
         output_worker: None,
         output_finished: true,
+        last_handoff_probe_phase: None,
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
     };
@@ -5193,6 +5623,7 @@ fn official_tui_pre_generation_cleanup_aggregates_infrastructure_failures_before
     output_sender.send(Err("injected package PTY output failure".to_owned()))?;
     let output_worker = thread::spawn(|| {});
     let mut harness = OfficialTuiPackageHarness {
+        _provider_suite_budget: PackageProviderSuiteBudget::Official,
         scratch: Some(scratch),
         backend: Some(backend),
         coordinator: None,
@@ -5211,6 +5642,7 @@ fn official_tui_pre_generation_cleanup_aggregates_infrastructure_failures_before
         response_sentinel_observed: None,
         output_worker: Some(output_worker),
         output_finished: false,
+        last_handoff_probe_phase: None,
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
     };
@@ -5262,10 +5694,12 @@ fn started_official_harness_for_network_cleanup_test()
                 total_bytes: 0,
                 response_sentinel_seen: false,
                 eof: true,
+                handoff_probe_phase: None,
             }));
         }
     });
     let harness = OfficialTuiPackageHarness {
+        _provider_suite_budget: PackageProviderSuiteBudget::Official,
         scratch: Some(scratch),
         backend: Some(backend),
         coordinator: Some(coordinator),
@@ -5291,6 +5725,7 @@ fn started_official_harness_for_network_cleanup_test()
         response_sentinel_observed: None,
         output_worker: Some(output_worker),
         output_finished: false,
+        last_handoff_probe_phase: None,
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
     };
@@ -5336,27 +5771,177 @@ fn official_network_cleanup_runs_after_workers_close_and_before_scratch_deletion
 }
 
 #[test]
-fn official_network_cleanup_redacts_failure_and_still_deletes_owned_scratch()
+fn official_network_cleanup_failure_preserves_owned_evidence_after_closing_workers()
 -> Result<(), Box<dyn Error>> {
     let (mut harness, root, _backend_address, _output_joined) =
         started_official_harness_for_network_cleanup_test()?;
+    let outcome = harness.cleanup_after_exercise_with_network_verifier(false, |_, _| {
+        Err(PackageNetworkHermeticityFailure::ConfigContract)
+    });
     let error = require_rejected_test_result(
-        harness.cleanup_with_network_verifier(|_, _| {
-            Err(PackageNetworkHermeticityFailure::ConfigContract)
-        }),
+        outcome.result,
         "an injected network verification failure was accepted",
     )?;
+    let evidence = match outcome.scratch {
+        PackageScratchDisposition::Preserved(evidence) => evidence,
+        PackageScratchDisposition::Deleted => {
+            return Err("network cleanup failure deleted its diagnostic evidence".into());
+        }
+        PackageScratchDisposition::Unavailable => {
+            return Err("network cleanup failure lost its diagnostic evidence authority".into());
+        }
+    };
+    assert_eq!(evidence.root(), root);
+    assert!(root.exists());
     assert!(!error.to_string().contains("credential"));
     assert!(!format!("{error:?}").contains("credential"));
     assert_eq!(
         harness.latest_fixed_cleanup_failure_detail(),
         Some("package-network.config-contract")
     );
+    evidence.cleanup()
+}
+
+#[test]
+fn dropping_a_started_official_harness_closes_workers_and_preserves_owned_evidence()
+-> Result<(), Box<dyn Error>> {
+    let (harness, root, backend_address, output_joined) =
+        started_official_harness_for_network_cleanup_test()?;
+    drop(harness);
+
     assert!(
-        !root.exists(),
-        "network failure skipped owned scratch deletion"
+        output_joined.load(Ordering::SeqCst),
+        "unexpected Drop did not join the package PTY output worker"
     );
-    Ok(())
+    let backend_error = match TcpStream::connect(backend_address) {
+        Err(error) => error,
+        Ok(stream) => {
+            drop(stream);
+            return Err("unexpected Drop left the package backend listening".into());
+        }
+    };
+    assert_eq!(backend_error.kind(), io::ErrorKind::ConnectionRefused);
+    assert!(
+        root.exists(),
+        "unexpected Drop deleted started-generation diagnostic evidence"
+    );
+
+    let metadata = fs::symlink_metadata(&root)?;
+    PreservedPackageEvidence::new(PackageScratch {
+        identity: (metadata.dev(), metadata.ino()),
+        codex_home: root.join("codex-home"),
+        workspace: root.join("workspace"),
+        environment_home: root.join("environment"),
+        compatibility_stage_parent: root.join("s"),
+        root,
+    })?
+    .cleanup()
+}
+
+#[test]
+fn started_package_setup_failure_closes_workers_and_preserves_owned_evidence()
+-> Result<(), Box<dyn Error>> {
+    let (harness, root, backend_address, output_joined) =
+        started_official_harness_for_network_cleanup_test()?;
+    let error = require_rejected_test_result(
+        harness.finish_setup_with_network_verifier(
+            Err("private initial PTY write and credential detail".into()),
+            PackageHarnessSetupPhase::InitialPtyWrite,
+            |observed_root, observed_backend| {
+                if observed_root != root || observed_backend != backend_address {
+                    return Err(PackageNetworkHermeticityFailure::ConfigContract);
+                }
+                if !output_joined.load(Ordering::SeqCst) {
+                    return Err(PackageNetworkHermeticityFailure::ConfigContract);
+                }
+                Ok(())
+            },
+        ),
+        "a started package setup failure unexpectedly succeeded",
+    )?;
+
+    assert!(
+        output_joined.load(Ordering::SeqCst),
+        "started setup failure did not join the package PTY output worker"
+    );
+    let backend_error = match TcpStream::connect(backend_address) {
+        Err(error) => error,
+        Ok(stream) => {
+            drop(stream);
+            return Err("started setup failure left the package backend listening".into());
+        }
+    };
+    assert_eq!(backend_error.kind(), io::ErrorKind::ConnectionRefused);
+    assert!(
+        root.exists(),
+        "started setup failure deleted its diagnostic evidence"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "package harness setup failed at fixed phase package-setup.initial-pty-write \
+             after generation start; \
+             package evidence root preserved at {}",
+            root.display()
+        )
+    );
+    let debug = format!("{error:?}");
+    assert!(!debug.contains("private initial PTY write"));
+    assert!(!debug.contains("credential"));
+    assert!(error.source().is_none());
+
+    let metadata = fs::symlink_metadata(&root)?;
+    PreservedPackageEvidence::new(PackageScratch {
+        identity: (metadata.dev(), metadata.ino()),
+        codex_home: root.join("codex-home"),
+        workspace: root.join("workspace"),
+        environment_home: root.join("environment"),
+        compatibility_stage_parent: root.join("s"),
+        root,
+    })?
+    .cleanup()
+}
+
+#[test]
+fn official_failed_exercise_cleanup_closes_workers_and_preserves_owned_evidence()
+-> Result<(), Box<dyn Error>> {
+    let (mut harness, root, backend_address, output_joined) =
+        started_official_harness_for_network_cleanup_test()?;
+    let outcome = harness.cleanup_after_exercise_with_network_verifier(
+        true,
+        |observed_root, observed_backend| {
+            if observed_root != root || observed_backend != backend_address {
+                return Err(PackageNetworkHermeticityFailure::ConfigContract);
+            }
+            if !output_joined.load(Ordering::SeqCst) {
+                return Err(PackageNetworkHermeticityFailure::ConfigContract);
+            }
+            let error = match TcpStream::connect(observed_backend) {
+                Err(error) => error,
+                Ok(stream) => {
+                    drop(stream);
+                    return Err(PackageNetworkHermeticityFailure::ConfigContract);
+                }
+            };
+            if error.kind() != io::ErrorKind::ConnectionRefused {
+                return Err(PackageNetworkHermeticityFailure::ConfigContract);
+            }
+            Ok(())
+        },
+    );
+    outcome.result?;
+    let evidence = match outcome.scratch {
+        PackageScratchDisposition::Preserved(evidence) => evidence,
+        PackageScratchDisposition::Deleted => {
+            return Err("failed exercise deleted its diagnostic evidence".into());
+        }
+        PackageScratchDisposition::Unavailable => {
+            return Err("failed exercise lost its diagnostic evidence authority".into());
+        }
+    };
+    assert_eq!(evidence.root(), root);
+    assert!(root.exists());
+    evidence.cleanup()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -5533,6 +6118,105 @@ struct PackageCleanupBudget {
     completion_proof: Duration,
     reported_groups_proof: Duration,
     external_observation_margin: Duration,
+}
+
+struct PackageDeterministicSuiteBudget {
+    capacity: Duration,
+    available: Duration,
+}
+
+impl PackageDeterministicSuiteBudget {
+    const fn new(capacity: Duration) -> Self {
+        Self {
+            capacity,
+            available: capacity,
+        }
+    }
+
+    const fn available(&self) -> Duration {
+        self.available
+    }
+
+    fn try_reserve(&mut self, required: Duration) -> Option<PackageDeterministicSuiteReservation> {
+        if required.is_zero() {
+            return None;
+        }
+        self.available = self.available.checked_sub(required)?;
+        Some(PackageDeterministicSuiteReservation { reserved: required })
+    }
+
+    fn settle(&mut self, reservation: PackageDeterministicSuiteReservation, elapsed: Duration) {
+        if let Some(unused) = reservation.reserved.checked_sub(elapsed) {
+            if let Some(refunded) = self
+                .available
+                .checked_add(unused)
+                .filter(|refunded| *refunded <= self.capacity)
+            {
+                self.available = refunded;
+            }
+        } else if let Some(overrun) = elapsed.checked_sub(reservation.reserved) {
+            self.available = self.available.saturating_sub(overrun);
+        }
+    }
+}
+
+struct PackageDeterministicSuiteReservation {
+    reserved: Duration,
+}
+
+struct PackageDeterministicSuiteLease {
+    started: Instant,
+    reservation: Option<PackageDeterministicSuiteReservation>,
+}
+
+enum PackageProviderSuiteBudget {
+    Official,
+    Deterministic {
+        _lease: PackageDeterministicSuiteLease,
+    },
+}
+
+impl PackageProviderSuiteBudget {
+    const fn provider_target(&self) -> PackageProviderTarget {
+        match self {
+            Self::Official => PackageProviderTarget::Official,
+            Self::Deterministic { .. } => PackageProviderTarget::DeterministicFixture,
+        }
+    }
+}
+
+impl Drop for PackageDeterministicSuiteLease {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let elapsed = self.started.elapsed();
+        if let Ok(mut budget) = package_deterministic_suite_budget().lock() {
+            budget.settle(reservation, elapsed);
+        }
+    }
+}
+
+fn package_deterministic_suite_budget() -> &'static Mutex<PackageDeterministicSuiteBudget> {
+    static BUDGET: OnceLock<Mutex<PackageDeterministicSuiteBudget>> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        Mutex::new(PackageDeterministicSuiteBudget::new(
+            PACKAGE_DETERMINISTIC_SUITE_TIMEOUT,
+        ))
+    })
+}
+
+fn reserve_package_deterministic_generation()
+-> Result<PackageDeterministicSuiteLease, Box<dyn Error>> {
+    let reservation = package_deterministic_suite_budget()
+        .lock()
+        .map_err(|_| "package-deterministic-suite-budget-unavailable-v1")?
+        .try_reserve(PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT)
+        .ok_or("package-deterministic-suite-budget-exhausted-v1")?;
+    Ok(PackageDeterministicSuiteLease {
+        started: Instant::now(),
+        reservation: Some(reservation),
+    })
 }
 
 impl PackageCleanupBudget {
@@ -5813,6 +6497,7 @@ struct PackageOutputDrain {
     total_bytes: usize,
     response_sentinel_seen: bool,
     eof: bool,
+    handoff_probe_phase: Option<PackageHandoffProbePhase>,
 }
 
 impl OfficialTuiPackageHarness {
@@ -5835,7 +6520,7 @@ impl OfficialTuiPackageHarness {
             scratch,
             backend,
             recovery_checkpoint,
-            PackageProviderTarget::Official,
+            PackageProviderSuiteBudget::Official,
             PackageInferenceExpectation::ExactlyOne,
             None,
         )
@@ -5845,6 +6530,7 @@ impl OfficialTuiPackageHarness {
         scratch: PackageScratch,
         backend: PackageSessionBackend,
         recovery_checkpoint: RecoveryCheckpoint,
+        suite_budget: PackageDeterministicSuiteLease,
     ) -> Result<Self, Box<dyn Error>> {
         let executable = install_packaged_codex_provider_fixture(&scratch)?;
         let launcher = install_packaged_tui_launcher_fixture(&scratch)?;
@@ -5853,7 +6539,9 @@ impl OfficialTuiPackageHarness {
             scratch,
             backend,
             Some(recovery_checkpoint),
-            PackageProviderTarget::DeterministicFixture,
+            PackageProviderSuiteBudget::Deterministic {
+                _lease: suite_budget,
+            },
             PackageInferenceExpectation::for_fixture_checkpoint(recovery_checkpoint),
             Some(launcher),
         )
@@ -5864,12 +6552,14 @@ impl OfficialTuiPackageHarness {
         scratch: PackageScratch,
         backend: PackageSessionBackend,
         recovery_checkpoint: Option<RecoveryCheckpoint>,
-        provider_target: PackageProviderTarget,
+        provider_suite_budget: PackageProviderSuiteBudget,
         inference_expectation: PackageInferenceExpectation,
         launcher_override: Option<PathBuf>,
     ) -> Result<Self, Box<dyn Error>> {
+        let provider_target = provider_suite_budget.provider_target();
         let (_placeholder_sender, placeholder_result) = mpsc::sync_channel(1);
         let mut harness = Self {
+            _provider_suite_budget: provider_suite_budget,
             scratch: Some(scratch),
             backend: Some(backend),
             coordinator: None,
@@ -5888,9 +6578,11 @@ impl OfficialTuiPackageHarness {
             response_sentinel_observed: None,
             output_worker: None,
             output_finished: false,
+            last_handoff_probe_phase: None,
             last_fixed_failure_detail: None,
             last_fixed_cleanup_failure_detail: None,
         };
+        let mut setup_phase = PackageHarnessSetupPhase::Filesystem;
         let setup = (|| -> Result<(), Box<dyn Error>> {
             let scratch = harness
                 .scratch
@@ -5900,8 +6592,11 @@ impl OfficialTuiPackageHarness {
             let runtime_parent = scratch.root.join("r");
             private_directory(&report_root)?;
             private_directory(&runtime_parent)?;
+            setup_phase = PackageHarnessSetupPhase::RuntimeParentValidation;
             validate_packaged_runtime_parent(&runtime_parent)?;
+            setup_phase = PackageHarnessSetupPhase::PtyOpen;
             let owner = PtyOwner::open(PACKAGE_SUPERVISOR_INITIAL_SIZE)?;
+            setup_phase = PackageHarnessSetupPhase::CommandBuild;
             let mut command = package_supervisor_helper_command(
                 PACKAGE_SUPERVISOR_COORDINATOR_ROLE,
                 scratch,
@@ -5915,10 +6610,12 @@ impl OfficialTuiPackageHarness {
                 provider_target,
                 launcher_override.as_deref(),
             )?;
+            setup_phase = PackageHarnessSetupPhase::PtyConfiguration;
             let master = owner.configure_child(&mut command)?;
             master.enable_nonblocking()?;
             harness.initial_termios = Some(rustix::termios::tcgetattr(&master)?);
 
+            setup_phase = PackageHarnessSetupPhase::OutputWorker;
             let output_descriptor = rustix::io::fcntl_dupfd_cloexec(master.as_fd(), 3)?;
             let (output_cancel, cancellation) = mpsc::sync_channel(1);
             let (output_sender, output_result) = mpsc::sync_channel(1);
@@ -5945,8 +6642,10 @@ impl OfficialTuiPackageHarness {
             harness.output_worker = Some(output_worker);
             harness.master = Some(master);
 
+            setup_phase = PackageHarnessSetupPhase::CompletionAuthority;
             let (completion, transit) = CompletionPair::new()?.split();
             harness.completion = Some(completion);
+            setup_phase = PackageHarnessSetupPhase::GenerationFence;
             let generation_deadline_fence = PackageGenerationDeadlineFence::starting_at_for_target(
                 Instant::now(),
                 provider_target,
@@ -5961,6 +6660,7 @@ impl OfficialTuiPackageHarness {
             {
                 return Err("package backend did not cover the generation fence".into());
             }
+            setup_phase = PackageHarnessSetupPhase::CoordinatorSpawn;
             let child = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
                 command,
                 transit.as_fd(),
@@ -5980,6 +6680,7 @@ impl OfficialTuiPackageHarness {
             harness.coordinator = Some(child);
             harness.generation_cleanup = Some(PackageGenerationCleanupEvidence::default());
             harness.generation_deadline_fence = Some(generation_deadline_fence);
+            setup_phase = PackageHarnessSetupPhase::InitialPtyWrite;
             write_package_pty_input(
                 harness.master()?,
                 PACKAGE_SUPERVISOR_PRE_READY_INPUT,
@@ -5987,16 +6688,7 @@ impl OfficialTuiPackageHarness {
             )?;
             Ok(())
         })();
-        if let Err(error) = setup {
-            return match harness.cleanup() {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(format!(
-                    "package harness setup failed: {error}; setup cleanup also failed: {cleanup_error}"
-                )
-                .into()),
-            };
-        }
-        Ok(harness)
+        harness.finish_setup(setup, setup_phase)
     }
 
     /// Compatibility wrapper for the checksum-pinned retained-recovery case.
@@ -6845,6 +7537,10 @@ impl OfficialTuiPackageHarness {
         self.last_fixed_cleanup_failure_detail
     }
 
+    fn latest_handoff_probe_phase(&self) -> Option<PackageHandoffProbePhase> {
+        self.last_handoff_probe_phase
+    }
+
     fn latest_fixed_failure_or_phase_from_report(report: &Path) -> &'static str {
         Self::latest_fixed_failure_detail_from_report(report)
             .unwrap_or_else(|| Self::latest_fixed_phase_from_report(report))
@@ -7003,6 +7699,7 @@ impl OfficialTuiPackageHarness {
         }
         self.output_finished = true;
         self.output_cancel.take();
+        self.last_handoff_probe_phase = result.handoff_probe_phase;
         Ok(result)
     }
 
@@ -7043,10 +7740,73 @@ impl OfficialTuiPackageHarness {
         self.cleanup_with_network_verifier(verify_package_registry_network_hermeticity)
     }
 
+    fn finish_setup(
+        self,
+        setup: Result<(), Box<dyn Error>>,
+        setup_phase: PackageHarnessSetupPhase,
+    ) -> Result<Self, Box<dyn Error>> {
+        self.finish_setup_with_network_verifier(
+            setup,
+            setup_phase,
+            verify_package_registry_network_hermeticity,
+        )
+    }
+
+    fn finish_setup_with_network_verifier<Verifier>(
+        mut self,
+        setup: Result<(), Box<dyn Error>>,
+        setup_phase: PackageHarnessSetupPhase,
+        network_verifier: Verifier,
+    ) -> Result<Self, Box<dyn Error>>
+    where
+        Verifier:
+            FnOnce(&Path, std::net::SocketAddr) -> Result<(), PackageNetworkHermeticityFailure>,
+    {
+        let Err(_setup_error) = setup else {
+            return Ok(self);
+        };
+        let generation_started = self.coordinator.is_some()
+            || self.generation_cleanup.is_some()
+            || self.generation_deadline_fence.is_some();
+        let cleanup_outcome =
+            self.cleanup_after_exercise_with_network_verifier(generation_started, network_verifier);
+        let preserved_evidence_root = cleanup_outcome
+            .preserved_evidence_root()
+            .map(Path::to_path_buf);
+        let cleanup_failed = cleanup_outcome.result.is_err();
+        Err(Box::new(PackageHarnessSetupFailure {
+            setup_phase,
+            generation_started,
+            cleanup_failed,
+            cleanup_phase: self.latest_fixed_cleanup_failure_detail(),
+            preserved_evidence_root,
+        }))
+    }
+
+    fn cleanup_after_exercise(&mut self, exercise_failed: bool) -> PackageHarnessCleanupOutcome {
+        self.cleanup_after_exercise_with_network_verifier(
+            exercise_failed,
+            verify_package_registry_network_hermeticity,
+        )
+    }
+
     fn cleanup_with_network_verifier<Verifier>(
         &mut self,
         network_verifier: Verifier,
     ) -> Result<(), Box<dyn Error>>
+    where
+        Verifier:
+            FnOnce(&Path, std::net::SocketAddr) -> Result<(), PackageNetworkHermeticityFailure>,
+    {
+        self.cleanup_after_exercise_with_network_verifier(false, network_verifier)
+            .result
+    }
+
+    fn cleanup_after_exercise_with_network_verifier<Verifier>(
+        &mut self,
+        exercise_failed: bool,
+        network_verifier: Verifier,
+    ) -> PackageHarnessCleanupOutcome
     where
         Verifier:
             FnOnce(&Path, std::net::SocketAddr) -> Result<(), PackageNetworkHermeticityFailure>,
@@ -7084,7 +7844,9 @@ impl OfficialTuiPackageHarness {
                 let _ = cancel.try_send(());
             }
             match self.output_result.recv_timeout(Duration::from_secs(2)) {
-                Ok(Ok(_drain)) => {}
+                Ok(Ok(drain)) => {
+                    self.last_handoff_probe_phase = drain.handoff_probe_phase;
+                }
                 Ok(Err(error)) => failures.record("package PTY output drain", error.into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => failures.record(
                     "package PTY output drain",
@@ -7160,10 +7922,33 @@ impl OfficialTuiPackageHarness {
                 )
             });
         }
-        if let Some(scratch) = self.scratch.take() {
-            failures.record_result("package scratch", scratch.cleanup());
+        // Preserve filesystem evidence after any failed started generation,
+        // including a failure discovered only while draining PTY/backend/network
+        // authorities. Pre-generation setup cleanup keeps its historical exact
+        // deletion contract even when an injected cleanup operation fails.
+        let preserve_evidence =
+            exercise_failed || (generation_started && !failures.failures.is_empty());
+        let scratch = match self.scratch.take() {
+            Some(scratch) if preserve_evidence => match PreservedPackageEvidence::new(scratch) {
+                Ok(evidence) => PackageScratchDisposition::Preserved(evidence),
+                Err(error) => {
+                    failures.record("package scratch evidence", error);
+                    PackageScratchDisposition::Unavailable
+                }
+            },
+            Some(scratch) => match scratch.cleanup() {
+                Ok(()) => PackageScratchDisposition::Deleted,
+                Err(error) => {
+                    failures.record("package scratch", error);
+                    PackageScratchDisposition::Unavailable
+                }
+            },
+            None => PackageScratchDisposition::Unavailable,
+        };
+        PackageHarnessCleanupOutcome {
+            result: failures.finish(),
+            scratch,
         }
-        failures.finish()
     }
 
     fn finish_started_generation_cleanup_or_exit(&mut self) {
@@ -7456,12 +8241,30 @@ impl PackageGenerationCleanupOperations for OfficialTuiPackageHarness {
 
 impl Drop for OfficialTuiPackageHarness {
     fn drop(&mut self) {
-        if let Err(error) = self.cleanup() {
-            // Explicit success and setup-failure paths propagate cleanup
-            // errors. This fallback cannot return from Drop, but must not make
-            // an unexpected infrastructure failure invisible in test logs.
-            eprintln!("package harness cleanup failed during drop: {error}");
+        let started_generation = self.coordinator.is_some()
+            || self.generation_cleanup.is_some()
+            || self.generation_deadline_fence.is_some();
+        // Explicit success/setup paths consume the harness through cleanup
+        // before Drop. Reaching Drop with a started generation means an early
+        // return or unwind; close every live authority but retain the validated
+        // filesystem root for diagnosis. A pre-generation panic is retained as
+        // well because an invariant failure is more valuable than its scratch.
+        let outcome = self.cleanup_after_exercise(started_generation || thread::panicking());
+        let mut stderr = io::stderr().lock();
+        if let Err(error) = &outcome.result {
+            let _ = writeln!(
+                stderr,
+                "package harness cleanup failed during drop: {error}"
+            );
         }
+        if let Some(root) = outcome.preserved_evidence_root() {
+            let _ = writeln!(
+                stderr,
+                "package harness evidence preserved during drop at {}",
+                root.display()
+            );
+        }
+        let _ = stderr.flush();
     }
 }
 
@@ -7777,7 +8580,12 @@ fn package_guardian_bounds(provider_target: PackageProviderTarget) -> GuardianBo
             PackageProviderTarget::Official => PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT,
             PackageProviderTarget::DeterministicFixture => PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT,
         },
-        relay_start_timeout: Duration::from_secs(15),
+        relay_start_timeout: match provider_target {
+            PackageProviderTarget::Official => Duration::from_secs(15),
+            PackageProviderTarget::DeterministicFixture => {
+                PACKAGE_DETERMINISTIC_RELAY_START_TIMEOUT
+            }
+        },
         containment_timeout: Duration::from_secs(15),
         tui_grace: Duration::from_secs(2),
         tui_forced: Duration::from_secs(5),
@@ -7946,6 +8754,15 @@ fn package_official_configs_disable_out_of_scope_dynamic_features() -> Result<()
             config.get("personality").and_then(toml::Value::as_str),
             Some("pragmatic"),
             "package config allowed the official resume fixture to mutate personality"
+        );
+        assert_eq!(
+            config
+                .get("tui")
+                .and_then(toml::Value::as_table)
+                .and_then(|tui| tui.get("show_tooltips"))
+                .and_then(toml::Value::as_bool),
+            Some(false),
+            "package config allowed a dynamic provider tooltip request"
         );
         assert_eq!(
             config
@@ -8589,17 +9406,184 @@ impl PackageFixedOutputMatcher {
             return;
         }
         for &byte in bytes {
-            self.matched_prefix =
-                advance_package_fixed_output_match(self.pattern, self.matched_prefix, byte);
+            self.observe_byte(byte);
             if self.matched_prefix == self.pattern.len() {
-                self.seen = true;
                 return;
             }
         }
     }
 
+    fn observe_byte(&mut self, byte: u8) {
+        if self.seen || self.pattern.is_empty() {
+            return;
+        }
+        self.matched_prefix =
+            advance_package_fixed_output_match(self.pattern, self.matched_prefix, byte);
+        self.seen = self.matched_prefix == self.pattern.len();
+    }
+
     const fn seen(self) -> bool {
         self.seen
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PackageHandoffProbePhase {
+    VersionGatePassed,
+    SchemaGatePassed,
+    ForkAppServerSpawned,
+    InitializeRequestSent,
+    InitializeResponseReceived,
+    ForkRequestSent,
+    ForkResponseReceived,
+    ForkResponseValidated,
+    ForkAppServerShutdown,
+    FingerprintsStable,
+    ForkGatePassed,
+    RemoteAppServerReady,
+    ReadinessProxyReady,
+    RemoteTuiSpawned,
+    RemoteTuiReadResumeReady,
+    ReadinessProxyShutdown,
+    RemoteAppServerShutdown,
+}
+
+impl PackageHandoffProbePhase {
+    const fn fixed_label(self) -> &'static str {
+        match self {
+            Self::VersionGatePassed => "handoff.version-gate-passed",
+            Self::SchemaGatePassed => "handoff.schema-gate-passed",
+            Self::ForkAppServerSpawned => "handoff.fork-app-server-spawned",
+            Self::InitializeRequestSent => "handoff.initialize-request-sent",
+            Self::InitializeResponseReceived => "handoff.initialize-response-received",
+            Self::ForkRequestSent => "handoff.fork-request-sent",
+            Self::ForkResponseReceived => "handoff.fork-response-received",
+            Self::ForkResponseValidated => "handoff.fork-response-validated",
+            Self::ForkAppServerShutdown => "handoff.fork-app-server-shutdown",
+            Self::FingerprintsStable => "handoff.fingerprints-stable",
+            Self::ForkGatePassed => "handoff.fork-gate-passed",
+            Self::RemoteAppServerReady => "handoff.remote-app-server-ready",
+            Self::ReadinessProxyReady => "handoff.readiness-proxy-ready",
+            Self::RemoteTuiSpawned => "handoff.remote-tui-spawned",
+            Self::RemoteTuiReadResumeReady => "handoff.remote-tui-read-resume-ready",
+            Self::ReadinessProxyShutdown => "handoff.readiness-proxy-shutdown",
+            Self::RemoteAppServerShutdown => "handoff.remote-app-server-shutdown",
+        }
+    }
+}
+
+const PACKAGE_HANDOFF_PROBE_PHASES: [(PackageHandoffProbePhase, &[u8]); 17] = [
+    (
+        PackageHandoffProbePhase::VersionGatePassed,
+        b"handoff probe: version gate passed",
+    ),
+    (
+        PackageHandoffProbePhase::SchemaGatePassed,
+        b"handoff probe: schema gate passed",
+    ),
+    (
+        PackageHandoffProbePhase::ForkAppServerSpawned,
+        b"handoff probe: fork app-server spawned",
+    ),
+    (
+        PackageHandoffProbePhase::InitializeRequestSent,
+        b"handoff probe: initialize request sent",
+    ),
+    (
+        PackageHandoffProbePhase::InitializeResponseReceived,
+        b"handoff probe: initialize response received",
+    ),
+    (
+        PackageHandoffProbePhase::ForkRequestSent,
+        b"handoff probe: fork request sent",
+    ),
+    (
+        PackageHandoffProbePhase::ForkResponseReceived,
+        b"handoff probe: fork response received",
+    ),
+    (
+        PackageHandoffProbePhase::ForkResponseValidated,
+        b"handoff probe: fork response validation passed",
+    ),
+    (
+        PackageHandoffProbePhase::ForkAppServerShutdown,
+        b"handoff probe: fork app-server shut down",
+    ),
+    (
+        PackageHandoffProbePhase::FingerprintsStable,
+        b"handoff probe: source and target fingerprints remained stable",
+    ),
+    (
+        PackageHandoffProbePhase::ForkGatePassed,
+        b"handoff probe: fork gate passed",
+    ),
+    (
+        PackageHandoffProbePhase::RemoteAppServerReady,
+        b"handoff probe: remote app-server socket ready",
+    ),
+    (
+        PackageHandoffProbePhase::ReadinessProxyReady,
+        b"handoff probe: readiness proxy ready",
+    ),
+    (
+        PackageHandoffProbePhase::RemoteTuiSpawned,
+        b"handoff probe: remote TUI spawned",
+    ),
+    (
+        PackageHandoffProbePhase::RemoteTuiReadResumeReady,
+        b"handoff probe: remote TUI read/resume ready",
+    ),
+    (
+        PackageHandoffProbePhase::ReadinessProxyShutdown,
+        b"handoff probe: readiness proxy shut down while connected",
+    ),
+    (
+        PackageHandoffProbePhase::RemoteAppServerShutdown,
+        b"handoff probe: remote app-server shut down",
+    ),
+];
+
+/// Constant-space, allowlist-only progress extraction for the compatibility
+/// subprocess. Only the next expected fixed marker is eligible, so an
+/// out-of-order marker cannot become progress if its predecessors appear
+/// later. It retains one matcher prefix and a closed phase enum, never terminal
+/// bytes or provider payloads.
+struct PackageHandoffProbeProgress {
+    next_index: usize,
+    next_matcher: Option<PackageFixedOutputMatcher>,
+    latest: Option<PackageHandoffProbePhase>,
+}
+
+impl PackageHandoffProbeProgress {
+    fn new() -> Self {
+        Self {
+            next_index: 0,
+            next_matcher: Some(PackageFixedOutputMatcher::new(
+                PACKAGE_HANDOFF_PROBE_PHASES[0].1,
+            )),
+            latest: None,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            let Some(matcher) = self.next_matcher.as_mut() else {
+                return;
+            };
+            matcher.observe_byte(byte);
+            if !matcher.seen() {
+                continue;
+            }
+            self.latest = Some(PACKAGE_HANDOFF_PROBE_PHASES[self.next_index].0);
+            self.next_index += 1;
+            self.next_matcher = PACKAGE_HANDOFF_PROBE_PHASES
+                .get(self.next_index)
+                .map(|(_, marker)| PackageFixedOutputMatcher::new(marker));
+        }
+    }
+
+    const fn latest(&self) -> Option<PackageHandoffProbePhase> {
+        self.latest
     }
 }
 
@@ -8641,6 +9625,7 @@ fn drain_package_pty_output(
     let mut startup_matcher =
         PackageFixedOutputMatcher::new(PACKAGE_SUPERVISOR_STARTUP_SENTINEL.as_bytes());
     let mut response_matcher = PackagedTuiOutputMatcher::new();
+    let mut handoff_probe_progress = PackageHandoffProbeProgress::new();
     let mut startup_sentinel_observed = Some(startup_sentinel_observed);
     let mut response_sentinel_observed = Some(response_sentinel_observed);
     let mut buffer = [0_u8; 8192];
@@ -8651,6 +9636,7 @@ fn drain_package_pty_output(
                     total_bytes: total,
                     response_sentinel_seen: response_matcher.seen(),
                     eof: false,
+                    handoff_probe_phase: handoff_probe_progress.latest(),
                 });
             }
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -8664,6 +9650,7 @@ fn drain_package_pty_output(
                     total_bytes: total,
                     response_sentinel_seen: response_matcher.seen(),
                     eof: true,
+                    handoff_probe_phase: handoff_probe_progress.latest(),
                 });
             }
             Ok(count) => {
@@ -8674,6 +9661,7 @@ fn drain_package_pty_output(
                     return Err("package PTY output exceeded its fixed bound".to_owned());
                 }
                 startup_matcher.observe(&buffer[..count]);
+                handoff_probe_progress.observe(&buffer[..count]);
                 if startup_matcher.seen() {
                     if let Some(startup_sentinel_observed) = startup_sentinel_observed.take() {
                         startup_sentinel_observed.try_send(()).map_err(|_| {
@@ -8701,6 +9689,7 @@ fn drain_package_pty_output(
                     total_bytes: total,
                     response_sentinel_seen: response_matcher.seen(),
                     eof: true,
+                    handoff_probe_phase: handoff_probe_progress.latest(),
                 });
             }
             Err(_) => return Err("package PTY output read failed".to_owned()),
@@ -8721,6 +9710,51 @@ fn package_fixed_output_matcher_detects_startup_history_across_chunks_without_re
 }
 
 #[test]
+fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix() {
+    let mut progress = PackageHandoffProbeProgress::new();
+    progress.observe(b"private terminal output and credentials");
+    assert_eq!(progress.latest(), None);
+
+    progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[7].1);
+    progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[16].1);
+    assert_eq!(
+        progress.latest(),
+        None,
+        "isolated later markers must not manufacture skipped progress"
+    );
+
+    for (expected, marker) in PACKAGE_HANDOFF_PROBE_PHASES[..6].iter().copied() {
+        progress.observe(marker);
+        progress.observe(b"\n");
+        assert_eq!(progress.latest(), Some(expected));
+    }
+    progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[6].1);
+    assert_eq!(
+        progress.latest(),
+        Some(PackageHandoffProbePhase::ForkResponseReceived),
+        "an out-of-order marker must be observed again after its predecessor"
+    );
+    progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[7].1);
+    assert_eq!(
+        progress.latest(),
+        Some(PackageHandoffProbePhase::ForkResponseValidated)
+    );
+
+    progress.observe(b"handoff probe: TUI output bytes=private overflow=false failed=false");
+    assert_eq!(
+        progress.latest(),
+        Some(PackageHandoffProbePhase::ForkResponseValidated),
+        "dynamic diagnostic text must not become structured progress"
+    );
+
+    progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[8].1);
+    assert_eq!(
+        progress.latest(),
+        Some(PackageHandoffProbePhase::ForkAppServerShutdown)
+    );
+}
+
+#[test]
 fn package_pty_output_drain_publishes_distinct_startup_and_response_observations_once()
 -> Result<(), Box<dyn Error>> {
     let (reader, mut writer) = UnixStream::pair()?;
@@ -8729,6 +9763,10 @@ fn package_pty_output_drain_publishes_distinct_startup_and_response_observations
     writer.write_all(PACKAGED_TUI_OUTPUT_SENTINEL.as_bytes())?;
     writer.write_all(PACKAGE_SUPERVISOR_STARTUP_SENTINEL.as_bytes())?;
     writer.write_all(PACKAGED_TUI_OUTPUT_SENTINEL.as_bytes())?;
+    for (_, marker) in &PACKAGE_HANDOFF_PROBE_PHASES[..8] {
+        writer.write_all(marker)?;
+        writer.write_all(b"\n")?;
+    }
     drop(writer);
 
     let descriptor = rustix::io::fcntl_dupfd_cloexec(reader.as_fd(), 3)?;
@@ -8743,6 +9781,10 @@ fn package_pty_output_drain_publishes_distinct_startup_and_response_observations
     )?;
 
     assert!(drain.response_sentinel_seen);
+    assert_eq!(
+        drain.handoff_probe_phase,
+        Some(PackageHandoffProbePhase::ForkResponseValidated)
+    );
     assert_eq!(startup_observed.recv_timeout(IO_TIMEOUT), Ok(()));
     assert_eq!(
         startup_observed.try_recv(),
@@ -9699,19 +10741,89 @@ fn validate_live_official_tui_group(
     deadline: Instant,
 ) -> Result<(), PackageOfficialTuiGroupFailure> {
     let current_user = rustix::process::geteuid().as_raw();
+    validate_live_official_tui_group_with_snapshot_observer(
+        tui,
+        deadline,
+        current_user,
+        package_process_group_snapshot,
+        thread::sleep,
+        Instant::now,
+    )
+}
+
+fn wait_before_next_package_process_snapshot<Wait, Now>(
+    deadline: Instant,
+    wait: &mut Wait,
+    now: &mut Now,
+) -> bool
+where
+    Wait: FnMut(Duration),
+    Now: FnMut() -> Instant,
+{
+    let observed_at = now();
+    let remaining = deadline.saturating_duration_since(observed_at);
+    if remaining.is_zero() {
+        return false;
+    }
+    wait(remaining.min(Duration::from_millis(50)));
+    now() < deadline
+}
+
+fn validate_live_official_tui_group_with_snapshot_observer<Observe, Wait, Now>(
+    tui: PackageChildMarker,
+    deadline: Instant,
+    current_user: u32,
+    mut observe: Observe,
+    mut wait: Wait,
+    mut now: Now,
+) -> Result<(), PackageOfficialTuiGroupFailure>
+where
+    Observe: FnMut(i32) -> Result<Vec<PackageProcessState>, Box<dyn Error>>,
+    Wait: FnMut(Duration),
+    Now: FnMut() -> Instant,
+{
     let mut failure_state = PackageLiveSnapshotFailureState::NoObservation;
-    while Instant::now() < deadline {
-        let first = package_process_group_snapshot(tui.pgid)
-            .map_err(|_| PackageOfficialTuiGroupFailure::Snapshot)?;
-        thread::sleep(Duration::from_millis(50));
-        let second = package_process_group_snapshot(tui.pgid)
-            .map_err(|_| PackageOfficialTuiGroupFailure::Snapshot)?;
+    let mut snapshot_observation_failed = false;
+    while now() < deadline {
+        let first = match observe(tui.pgid) {
+            Ok(first) => first,
+            Err(_) => {
+                snapshot_observation_failed = true;
+                if !wait_before_next_package_process_snapshot(deadline, &mut wait, &mut now) {
+                    break;
+                }
+                continue;
+            }
+        };
+        if now() >= deadline
+            || !wait_before_next_package_process_snapshot(deadline, &mut wait, &mut now)
+        {
+            break;
+        }
+        let second = match observe(tui.pgid) {
+            Ok(second) => second,
+            Err(_) => {
+                snapshot_observation_failed = true;
+                if !wait_before_next_package_process_snapshot(deadline, &mut wait, &mut now) {
+                    break;
+                }
+                continue;
+            }
+        };
+        if now() >= deadline {
+            break;
+        }
+        snapshot_observation_failed = false;
         match validate_stable_live_official_tui_snapshots(tui, &first, &second, current_user) {
             Ok(()) => return Ok(()),
             Err(error) => failure_state = failure_state.observe(error),
         }
     }
-    Err(failure_state.failure())
+    if snapshot_observation_failed {
+        Err(PackageOfficialTuiGroupFailure::Snapshot)
+    } else {
+        Err(failure_state.failure())
+    }
 }
 
 fn validate_resumed_official_tui_group(
@@ -11203,6 +12315,9 @@ exporter = "none"
 trace_exporter = "none"
 metrics_exporter = "none"
 
+[tui]
+show_tooltips = false
+
 [features]
 shell_snapshot = false
 apps = false
@@ -11272,6 +12387,9 @@ enabled = false
 exporter = "none"
 trace_exporter = "none"
 metrics_exporter = "none"
+
+[tui]
+show_tooltips = false
 
 [features]
 shell_snapshot = false
@@ -14990,7 +16108,7 @@ impl PackageScratch {
         })
     }
 
-    fn cleanup(self) -> Result<(), Box<dyn Error>> {
+    fn validate_owned_root(&self) -> Result<(), Box<dyn Error>> {
         let metadata = fs::symlink_metadata(&self.root)?;
         if !metadata.file_type().is_dir()
             || metadata.uid() != rustix::process::geteuid().as_raw()
@@ -15001,6 +16119,11 @@ impl PackageScratch {
         {
             return Err("package smoke scratch ownership changed; preserving it".into());
         }
+        Ok(())
+    }
+
+    fn cleanup(self) -> Result<(), Box<dyn Error>> {
+        self.validate_owned_root()?;
         fs::remove_dir_all(&self.root)?;
         Ok(())
     }

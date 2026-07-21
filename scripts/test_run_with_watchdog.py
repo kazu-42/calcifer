@@ -77,6 +77,107 @@ class WatchdogBudgetTests(unittest.TestCase):
                     **{**arguments, "job_timeout_minutes": 44}
                 )
 
+    def test_repeated_budget_binds_source_watchdog_slots_and_job_margin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary, "packaged_smoke.rs")
+            source.write_text(
+                "const PACKAGE_DETERMINISTIC_SUITE_TIMEOUT: Duration = "
+                "Duration::from_secs(360);\n",
+                encoding="utf-8",
+            )
+            budget = run_with_watchdog.validate_repeated_budget(
+                rust_source=source,
+                rust_constant="PACKAGE_DETERMINISTIC_SUITE_TIMEOUT",
+                msrv_runs=2,
+                command_overhead_seconds=300,
+                ordinary_watchdog_seconds=660,
+                msrv_watchdog_seconds=1_020,
+                term_grace_seconds=30,
+                job_timeout_minutes=37,
+                job_margin_seconds=420,
+            )
+
+        self.assertEqual(budget.suite_fence_seconds, 360)
+        self.assertEqual(budget.ordinary_slot_seconds, 720)
+        self.assertEqual(budget.msrv_slot_seconds, 1_080)
+        self.assertEqual(budget.job_timeout_seconds, 2_220)
+
+    def test_repeated_budget_cli_accepts_the_fixed_watchdog_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary, "packaged_smoke.rs")
+            source.write_text(
+                "const PACKAGE_DETERMINISTIC_SUITE_TIMEOUT: Duration = "
+                "Duration::from_secs(360);\n",
+                encoding="utf-8",
+            )
+
+            status = run_with_watchdog.main(
+                [
+                    "validate-repeated-budget",
+                    "--rust-source",
+                    os.fspath(source),
+                    "--rust-constant",
+                    "PACKAGE_DETERMINISTIC_SUITE_TIMEOUT",
+                    "--msrv-runs",
+                    "2",
+                    "--command-overhead-seconds",
+                    "300",
+                    "--ordinary-watchdog-seconds",
+                    "660",
+                    "--msrv-watchdog-seconds",
+                    "1020",
+                    "--term-grace-seconds",
+                    "30",
+                    "--job-timeout-minutes",
+                    "37",
+                    "--job-margin-seconds",
+                    "420",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+
+    def test_repeated_budget_rejects_watchdog_or_margin_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary, "packaged_smoke.rs")
+            source.write_text(
+                "const PACKAGE_DETERMINISTIC_SUITE_TIMEOUT: Duration = "
+                "Duration::from_secs(360);\n",
+                encoding="utf-8",
+            )
+            arguments = {
+                "rust_source": source,
+                "rust_constant": "PACKAGE_DETERMINISTIC_SUITE_TIMEOUT",
+                "msrv_runs": 2,
+                "command_overhead_seconds": 300,
+                "ordinary_watchdog_seconds": 660,
+                "msrv_watchdog_seconds": 1_020,
+                "term_grace_seconds": 30,
+                "job_timeout_minutes": 37,
+                "job_margin_seconds": 420,
+            }
+
+            with self.assertRaisesRegex(ValueError, "ordinary suite watchdog slot"):
+                run_with_watchdog.validate_repeated_budget(
+                    **{**arguments, "ordinary_watchdog_seconds": 659}
+                )
+            with self.assertRaisesRegex(ValueError, "MSRV suite watchdog slot"):
+                run_with_watchdog.validate_repeated_budget(
+                    **{**arguments, "msrv_watchdog_seconds": 1_019}
+                )
+            with self.assertRaisesRegex(ValueError, "MSRV suite watchdog slot"):
+                run_with_watchdog.validate_repeated_budget(
+                    **{**arguments, "msrv_runs": 3}
+                )
+            with self.assertRaisesRegex(ValueError, "ordinary suite watchdog slot"):
+                run_with_watchdog.validate_repeated_budget(
+                    **{**arguments, "command_overhead_seconds": 299}
+                )
+            with self.assertRaisesRegex(ValueError, "repeated suite job margin"):
+                run_with_watchdog.validate_repeated_budget(
+                    **{**arguments, "job_margin_seconds": 419}
+                )
+
 
 class WatchdogProcessTests(unittest.TestCase):
     def _wait_for_identity_file(
@@ -506,6 +607,148 @@ class WatchdogWorkflowTests(unittest.TestCase):
         self.assertIn(
             "cargo test --all-targets --all-features --locked -- --test-threads=1",
             test_recipe,
+        )
+
+    def test_deterministic_budget_binds_outer_watchdog_slots_under_the_test_job(
+        self,
+    ) -> None:
+        repository = pathlib.Path(__file__).resolve().parent.parent
+        workflow = self._workflow()
+        test_job = workflow.split("\n  test:\n", 1)[1].split(
+            "\n  pinned-codex-package:\n", 1
+        )[0]
+        test_job_header = test_job.split("    steps:\n", 1)[0]
+        budget_step = test_job.split(
+            "      - name: Validate deterministic package suite budget\n", 1
+        )[1].split("      - name: Run tests\n", 1)[0]
+
+        self.assertIn("timeout-minutes: 37", test_job_header)
+        self.assertIn("SUPERVISOR_MSRV_RUNS: 2", test_job_header)
+        self.assertIn(
+            "PACKAGE_TEST_COMMAND_OVERHEAD_SECONDS: 300",
+            test_job_header,
+        )
+        self.assertIn(
+            "PACKAGE_TEST_ORDINARY_WATCHDOG_SECONDS: 660",
+            test_job_header,
+        )
+        self.assertIn(
+            "PACKAGE_TEST_MSRV_WATCHDOG_SECONDS: 1020",
+            test_job_header,
+        )
+        self.assertIn(
+            "PACKAGE_TEST_WATCHDOG_TERM_GRACE_SECONDS: 30",
+            test_job_header,
+        )
+        self.assertIn("PACKAGE_TEST_JOB_MARGIN_SECONDS: 420", test_job_header)
+        self.assertIn("validate-repeated-budget", budget_step)
+        self.assertIn(
+            "--rust-constant PACKAGE_DETERMINISTIC_SUITE_TIMEOUT",
+            budget_step,
+        )
+        self.assertIn(
+            '--msrv-runs "${SUPERVISOR_MSRV_RUNS:?}"',
+            budget_step,
+        )
+        self.assertIn(
+            "--command-overhead-seconds "
+            '"${PACKAGE_TEST_COMMAND_OVERHEAD_SECONDS:?}"',
+            budget_step,
+        )
+        self.assertIn(
+            "--ordinary-watchdog-seconds "
+            '"${PACKAGE_TEST_ORDINARY_WATCHDOG_SECONDS:?}"',
+            budget_step,
+        )
+        self.assertIn(
+            '--msrv-watchdog-seconds "${PACKAGE_TEST_MSRV_WATCHDOG_SECONDS:?}"',
+            budget_step,
+        )
+        self.assertIn(
+            "--term-grace-seconds "
+            '"${PACKAGE_TEST_WATCHDOG_TERM_GRACE_SECONDS:?}"',
+            budget_step,
+        )
+        self.assertIn("--job-timeout-minutes 37", budget_step)
+        self.assertIn(
+            '--job-margin-seconds "${PACKAGE_TEST_JOB_MARGIN_SECONDS:?}"',
+            budget_step,
+        )
+
+        ordinary_step = test_job.split("      - name: Run tests\n", 1)[1].split(
+            "      - name: Run tests on Windows\n", 1
+        )[0]
+        self.assertIn("if: runner.os != 'Windows'", ordinary_step)
+        self.assertIn("python3 scripts/run_with_watchdog.py run", ordinary_step)
+        self.assertIn(
+            '--timeout-seconds "${PACKAGE_TEST_ORDINARY_WATCHDOG_SECONDS:?}"',
+            ordinary_step,
+        )
+        self.assertIn(
+            "--term-grace-seconds "
+            '"${PACKAGE_TEST_WATCHDOG_TERM_GRACE_SECONDS:?}"',
+            ordinary_step,
+        )
+        self.assertIn(
+            "cargo +1.96.0 test --all-targets --all-features --locked -- "
+            "--test-threads=1",
+            ordinary_step,
+        )
+
+        windows_step = test_job.split(
+            "      - name: Run tests on Windows\n", 1
+        )[1].split(
+            "      - name: Run repeated supervisor regression suites at MSRV\n",
+            1,
+        )[0]
+        self.assertIn("if: runner.os == 'Windows'", windows_step)
+        self.assertNotIn("run_with_watchdog.py", windows_step)
+        self.assertIn(
+            "cargo +1.96.0 test --all-targets --all-features --locked -- "
+            "--test-threads=1",
+            windows_step,
+        )
+
+        msrv_step = test_job.split(
+            "      - name: Run repeated supervisor regression suites at MSRV\n",
+            1,
+        )[1].split("      - name: Test Linux mount-boundary enforcement\n", 1)[0]
+        self.assertIn("if: runner.os != 'Windows'", msrv_step)
+        self.assertIn("python3 scripts/run_with_watchdog.py run", msrv_step)
+        self.assertIn(
+            '--timeout-seconds "${PACKAGE_TEST_MSRV_WATCHDOG_SECONDS:?}"',
+            msrv_step,
+        )
+        self.assertIn(
+            "--term-grace-seconds "
+            '"${PACKAGE_TEST_WATCHDOG_TERM_GRACE_SECONDS:?}"',
+            msrv_step,
+        )
+        self.assertIn("make supervisor-msrv", msrv_step)
+
+        budget = run_with_watchdog.validate_repeated_budget(
+            rust_source=repository
+            / "src/providers/codex/supervisor/packaged_smoke.rs",
+            rust_constant="PACKAGE_DETERMINISTIC_SUITE_TIMEOUT",
+            msrv_runs=2,
+            command_overhead_seconds=300,
+            ordinary_watchdog_seconds=660,
+            msrv_watchdog_seconds=1_020,
+            term_grace_seconds=30,
+            job_timeout_minutes=37,
+            job_margin_seconds=420,
+        )
+        self.assertEqual(budget.job_timeout_seconds, 37 * 60)
+
+        makefile = (repository / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("SUPERVISOR_MSRV_RUNS ?= 2", makefile)
+        supervisor_recipe = makefile.split("supervisor-msrv:\n", 1)[1].split(
+            "\nrelease-package-test:\n", 1
+        )[0]
+        self.assertEqual(
+            supervisor_recipe.count("cargo +$(MSRV) test --lib"),
+            1,
+            "each configured MSRV run must execute the library suite exactly once",
         )
 
     def test_all_six_package_tests_keep_exact_discovery_and_execution(self) -> None:

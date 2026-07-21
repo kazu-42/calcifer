@@ -1785,6 +1785,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader, Cursor, Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
     use std::process::{ChildStdin, Command, Stdio};
     use std::rc::Rc;
@@ -1815,6 +1816,10 @@ mod tests {
     // the production coordinator keeps its own two-second operation bounds.
     const TEST_PRODUCTION_MATRIX_PARENT_TIMEOUT: Duration = Duration::from_secs(25);
     const PRODUCTION_MATRIX_HELPER_ENV: &str = "CALCIFER_COORDINATOR_MATRIX_HELPER";
+    const PRODUCTION_MATRIX_SCAN_GROUP_HELPER_ENV: &str =
+        "CALCIFER_COORDINATOR_MATRIX_SCAN_GROUP_HELPER";
+    const PRODUCTION_MATRIX_SCAN_GROUP_HELPER_TEST: &str = "providers::codex::supervisor::coordinator::tests::production_coordinator_matrix_scan_group_helper";
+    const MATRIX_SCAN_GROUP_READINESS_SENTINEL: u8 = b'R';
     const PRODUCTION_MATRIX_OUTPUT: &[u8] = b"calcifer-production-coordinator-output";
 
     #[test]
@@ -2487,6 +2492,82 @@ mod tests {
     }
 
     #[test]
+    fn matrix_scan_group_readiness_requires_the_writer_to_close()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut group = spawn_matrix_readiness_test_group()?;
+        let (readiness, mut writer) = UnixStream::pair()?;
+        let (sent_sender, sent_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = writer.write_all(&[MATRIX_SCAN_GROUP_READINESS_SENTINEL]);
+            let _ = sent_sender.send(result);
+            let _ = release_receiver.recv();
+        });
+        sent_receiver.recv_timeout(TEST_TIMEOUT)??;
+
+        let result = await_matrix_scan_group_readiness(
+            &mut group,
+            readiness,
+            Instant::now() + Duration::from_millis(30),
+        );
+        let _ = release_sender.send(());
+        writer.join().map_err(|_| "readiness writer panicked")?;
+        let error = result
+            .err()
+            .ok_or("an open readiness writer must not publish the process group")?;
+        assert_eq!(
+            error.to_string(),
+            "matrix process group readiness timed out"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn matrix_scan_group_readiness_uses_one_absolute_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut group = spawn_matrix_readiness_test_group()?;
+        let (readiness, mut writer) = UnixStream::pair()?;
+        let (started_sender, started_receiver) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _ = started_sender.send(());
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = writer.write_all(&[MATRIX_SCAN_GROUP_READINESS_SENTINEL]);
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        started_receiver.recv_timeout(TEST_TIMEOUT)?;
+
+        let started = Instant::now();
+        let result = await_matrix_scan_group_readiness(
+            &mut group,
+            readiness,
+            started + Duration::from_millis(200),
+        );
+        writer.join().map_err(|_| "readiness writer panicked")?;
+        let error = result
+            .err()
+            .ok_or("an open readiness writer must not publish the process group")?;
+        assert_eq!(
+            error.to_string(),
+            "matrix process group readiness timed out"
+        );
+        Ok(())
+    }
+
+    fn spawn_matrix_readiness_test_group() -> Result<MatrixScanGroup, Box<dyn std::error::Error>> {
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn()?;
+        drop(command);
+        let raw_pid = i32::try_from(child.id())?;
+        Ok(MatrixScanGroup { child, raw_pid })
+    }
+
+    #[test]
     fn production_coordinator_rejects_inherited_a_before_opening_input()
     -> Result<(), Box<dyn std::error::Error>> {
         run_matrix_parent(ProductionMatrixCase::CoordinatorAuthorityLeak)
@@ -2505,6 +2586,41 @@ mod tests {
             eprintln!("matrix-helper-error:{error}");
             std::process::exit(91);
         }
+    }
+
+    #[test]
+    fn production_coordinator_matrix_scan_group_helper() {
+        if std::env::var_os(PRODUCTION_MATRIX_SCAN_GROUP_HELPER_ENV).is_none() {
+            return;
+        }
+        let exit_code = if run_matrix_scan_group_helper().is_ok() {
+            0
+        } else {
+            91
+        };
+        std::process::exit(exit_code);
+    }
+
+    fn run_matrix_scan_group_helper() -> Result<(), Box<dyn std::error::Error>> {
+        let inherited = calcifer_unix_child_fd::take_inherited_readiness_fd()?;
+        let mut readiness = UnixStream::from(inherited);
+        let mut sleeper_command = Command::new("/bin/sleep");
+        calcifer_unix_child_fd::scrub_readiness_fd_env(&mut sleeper_command);
+        let mut sleeper = sleeper_command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        readiness.write_all(&[MATRIX_SCAN_GROUP_READINESS_SENTINEL])?;
+        readiness.shutdown(std::net::Shutdown::Write)?;
+
+        let status = sleeper.wait()?;
+        if !status.success() {
+            return Err("matrix process group sleeper failed".into());
+        }
+        Ok(())
     }
 
     fn run_matrix_parent(case: ProductionMatrixCase) -> Result<(), Box<dyn std::error::Error>> {
@@ -2683,10 +2799,10 @@ mod tests {
         } else {
             None
         };
-        let app_group = spawn_matrix_scan_group(&root, "app")?;
+        let app_group = spawn_matrix_scan_group("app")?;
         let app_group_pid = app_group.raw_pid;
         drop(inherited_a);
-        let tui_group = spawn_matrix_scan_group(&root, "tui")?;
+        let tui_group = spawn_matrix_scan_group("tui")?;
         let tui_group_pid = tui_group.raw_pid;
         let mut child = Command::new("/bin/sh")
             .args(["-c", case.child_script()])
@@ -3131,30 +3247,40 @@ mod tests {
         }
     }
 
-    fn spawn_matrix_scan_group(
-        root: &std::path::Path,
-        role: &str,
-    ) -> Result<MatrixScanGroup, Box<dyn std::error::Error>> {
-        let marker = root.join(format!("{role}-group-ready"));
-        let mut command = Command::new("/bin/sh");
+    fn spawn_matrix_scan_group(role: &str) -> Result<MatrixScanGroup, Box<dyn std::error::Error>> {
+        // Path visibility is not a close barrier: a scanner can observe the
+        // descriptor that created a marker before the shell drops it. The
+        // helper publishes only after its descendant exec, and EOF proves that
+        // its one-shot readiness writer is quiescent before scanning begins.
+        let (readiness, inherited_readiness) = UnixStream::pair()?;
+        let mut command = Command::new(std::env::current_exe()?);
         command
             .args([
-                "-c",
-                "/bin/sleep 30 & child=$!; : > \"$CALCIFER_MATRIX_GROUP_READY\"; wait \"$child\"",
+                "--exact",
+                PRODUCTION_MATRIX_SCAN_GROUP_HELPER_TEST,
+                "--nocapture",
+                "--test-threads=1",
             ])
-            .env("CALCIFER_MATRIX_GROUP_READY", &marker)
+            .env(PRODUCTION_MATRIX_SCAN_GROUP_HELPER_ENV, "1")
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = command.spawn()?;
+        let child = calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
+            command,
+            inherited_readiness.as_fd(),
+        )?;
+        drop(inherited_readiness);
         let raw_pid = i32::try_from(child.id())?;
-        let group = MatrixScanGroup { child, raw_pid };
+        let mut group = MatrixScanGroup { child, raw_pid };
         let deadline = Instant::now() + TEST_PROCESS_GROUP_SCAN_TIMEOUT;
+        await_matrix_scan_group_readiness(&mut group, readiness, deadline)
+            .map_err(|error| format!("matrix {role} process group readiness failed: {error}"))?;
+
         let empty_forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
         let mut last_transient_error = None;
         loop {
-            let stable = if marker.is_file() {
+            let stable =
                 match calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
                     raw_pid,
                     &empty_forbidden,
@@ -3173,12 +3299,8 @@ mod tests {
                             format!("matrix process group scan failed: {error:?}").into()
                         );
                     }
-                }
-            } else {
-                false
-            };
+                };
             if stable {
-                std::fs::remove_file(&marker)?;
                 return Ok(group);
             }
             if Instant::now() >= deadline {
@@ -3188,6 +3310,58 @@ mod tests {
                 .into());
             }
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn await_matrix_scan_group_readiness(
+        group: &mut MatrixScanGroup,
+        mut readiness: UnixStream,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if group.child.try_wait()?.is_some() {
+            return Err("matrix process group exited before readiness".into());
+        }
+        let mut bytes = [0_u8; 2];
+        let byte_count =
+            read_matrix_scan_group_readiness_before(&mut readiness, &mut bytes, deadline)?;
+        if byte_count != 1 || bytes[0] != MATRIX_SCAN_GROUP_READINESS_SENTINEL {
+            return Err("matrix process group readiness was invalid".into());
+        }
+        if read_matrix_scan_group_readiness_before(&mut readiness, &mut bytes, deadline)? != 0 {
+            return Err("matrix process group readiness was invalid".into());
+        }
+        if group.child.try_wait()?.is_some() {
+            return Err("matrix process group exited before readiness".into());
+        }
+        Ok(())
+    }
+
+    fn read_matrix_scan_group_readiness_before(
+        readiness: &mut UnixStream,
+        bytes: &mut [u8],
+        deadline: Instant,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("matrix process group readiness timed out".into());
+            }
+            readiness
+                .set_read_timeout(Some(deadline.saturating_duration_since(now)))
+                .map_err(|_| "matrix process group readiness timeout setup failed")?;
+            match readiness.read(bytes) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err("matrix process group readiness timed out".into());
+                }
+                Err(_) => return Err("matrix process group readiness read failed".into()),
+                Ok(byte_count) => return Ok(byte_count),
+            }
         }
     }
 

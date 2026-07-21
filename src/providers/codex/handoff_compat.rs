@@ -892,12 +892,17 @@ mod tests {
             .map(PathBuf::from)
             .ok_or("CALCIFER_CODEX_COMPAT_BINARY must name the pinned Codex binary")?;
 
-        let capability = verify_codex_handoff_compatibility_for_test(
-            &executable,
-            std::time::Duration::from_secs(180),
-        )?;
+        let timeout = std::time::Duration::from_secs(180);
+        let capability = verify_codex_handoff_compatibility_for_test(&executable, timeout)?;
         assert_eq!(capability.id(), "codex-handoff/0.144.4/v1");
         assert_eq!(capability.version(), "0.144.4");
+        let cleanup_deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or("the direct compatibility cleanup deadline overflowed")?;
+        capability
+            .into_pinned_executable()
+            .cleanup(cleanup_deadline)
+            .map_err(|failure| failure.error())?;
         Ok(())
     }
 }
