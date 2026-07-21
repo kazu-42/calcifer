@@ -1956,6 +1956,225 @@ fn package_official_tui_group_failures_are_closed_fixed_and_payload_free() {
 }
 
 #[test]
+fn package_official_tui_descriptor_scan_retries_only_live_target_churn() {
+    use calcifer_unix_child_fd::ProcessGroupDescriptorScanError;
+
+    let origin = Instant::now();
+    let clock = std::cell::Cell::new(origin);
+    let deadline = origin + Duration::from_millis(250);
+    let mut observations = VecDeque::from([
+        Err(ProcessGroupDescriptorScanError::DescriptorChanged),
+        Err(ProcessGroupDescriptorScanError::ProcessChanged),
+        Ok(7_u8),
+    ]);
+    let mut observation_calls = 0;
+    let mut attempt_deadlines = Vec::new();
+    let mut liveness_checks = 0;
+    let mut waits = Vec::new();
+
+    let result = retry_package_official_tui_descriptor_scan(
+        deadline,
+        |attempt_deadline| {
+            observation_calls += 1;
+            attempt_deadlines.push(attempt_deadline);
+            observations
+                .pop_front()
+                .unwrap_or(Err(ProcessGroupDescriptorScanError::ObservationFailed))
+        },
+        || {
+            liveness_checks += 1;
+            Ok(())
+        },
+        |duration| {
+            waits.push(duration);
+            clock.set(clock.get() + duration);
+        },
+        || clock.get(),
+    );
+
+    assert_eq!(result, Ok(7));
+    assert_eq!(observation_calls, 3);
+    assert_eq!(attempt_deadlines, vec![deadline; 3]);
+    assert_eq!(liveness_checks, 6);
+    assert_eq!(waits, vec![Duration::from_millis(50); 2]);
+    assert!(observations.is_empty());
+    assert!(clock.get() < deadline);
+}
+
+#[test]
+fn package_official_tui_descriptor_scan_never_retries_policy_failures() {
+    use calcifer_unix_child_fd::ProcessGroupDescriptorScanError;
+
+    for error in [
+        ProcessGroupDescriptorScanError::UnsupportedDescriptor,
+        ProcessGroupDescriptorScanError::ForbiddenDescriptor,
+    ] {
+        let origin = Instant::now();
+        let mut observation_calls = 0;
+        let mut liveness_checks = 0;
+        let mut waits = 0;
+        let result = retry_package_official_tui_descriptor_scan::<(), _, _, _, _>(
+            origin + Duration::from_secs(1),
+            |_| {
+                observation_calls += 1;
+                Err(error)
+            },
+            || {
+                liveness_checks += 1;
+                Ok(())
+            },
+            |_| waits += 1,
+            || origin,
+        );
+
+        assert_eq!(
+            result,
+            Err(PackageOfficialTuiGroupFailure::Descriptor(error))
+        );
+        assert_eq!(observation_calls, 1);
+        assert_eq!(liveness_checks, 1);
+        assert_eq!(waits, 0);
+    }
+}
+
+#[test]
+fn package_official_tui_descriptor_scan_stops_retry_when_job_identity_is_lost() {
+    use calcifer_unix_child_fd::ProcessGroupDescriptorScanError;
+
+    let origin = Instant::now();
+    let mut observation_calls = 0;
+    let mut liveness_checks = 0;
+    let mut waits = 0;
+    let result = retry_package_official_tui_descriptor_scan::<(), _, _, _, _>(
+        origin + Duration::from_secs(1),
+        |_| {
+            observation_calls += 1;
+            Err(ProcessGroupDescriptorScanError::DescriptorChanged)
+        },
+        || {
+            liveness_checks += 1;
+            if liveness_checks == 1 {
+                Ok(())
+            } else {
+                Err(PackageOfficialTuiGroupFailure::JobIdentity)
+            }
+        },
+        |_| waits += 1,
+        || origin,
+    );
+
+    assert_eq!(result, Err(PackageOfficialTuiGroupFailure::JobIdentity));
+    assert_eq!(observation_calls, 1);
+    assert_eq!(liveness_checks, 2);
+    assert_eq!(waits, 0);
+}
+
+#[test]
+fn package_official_tui_descriptor_scan_success_must_finish_before_the_deadline() {
+    use calcifer_unix_child_fd::ProcessGroupDescriptorScanError;
+
+    let origin = Instant::now();
+    let clock = std::cell::Cell::new(origin);
+    let deadline = origin + Duration::from_millis(100);
+    let mut liveness_checks = 0;
+    let result = retry_package_official_tui_descriptor_scan::<u8, _, _, _, _>(
+        deadline,
+        |_| {
+            clock.set(deadline);
+            Ok(7)
+        },
+        || {
+            liveness_checks += 1;
+            Ok(())
+        },
+        |_| panic!("a successful scan must not enter the retry wait"),
+        || clock.get(),
+    );
+
+    assert_eq!(
+        result,
+        Err(PackageOfficialTuiGroupFailure::Descriptor(
+            ProcessGroupDescriptorScanError::Deadline
+        ))
+    );
+    assert_eq!(liveness_checks, 2);
+}
+
+#[test]
+fn package_official_tui_descriptor_scan_rejects_identity_loss_after_success() {
+    let origin = Instant::now();
+    let mut observation_calls = 0;
+    let mut liveness_checks = 0;
+    let result = retry_package_official_tui_descriptor_scan::<u8, _, _, _, _>(
+        origin + Duration::from_secs(1),
+        |_| {
+            observation_calls += 1;
+            Ok(7)
+        },
+        || {
+            liveness_checks += 1;
+            if liveness_checks == 1 {
+                Ok(())
+            } else {
+                Err(PackageOfficialTuiGroupFailure::JobIdentity)
+            }
+        },
+        |_| panic!("a successful scan must not enter the retry wait"),
+        || origin,
+    );
+
+    assert_eq!(result, Err(PackageOfficialTuiGroupFailure::JobIdentity));
+    assert_eq!(observation_calls, 1);
+    assert_eq!(liveness_checks, 2);
+}
+
+#[test]
+fn package_official_tui_descriptor_scan_closes_persistent_churn_at_one_deadline() {
+    use calcifer_unix_child_fd::ProcessGroupDescriptorScanError;
+
+    let origin = Instant::now();
+    let clock = std::cell::Cell::new(origin);
+    let deadline = origin + Duration::from_millis(125);
+    let mut observation_calls = 0;
+    let mut liveness_checks = 0;
+    let mut waits = Vec::new();
+    let result = retry_package_official_tui_descriptor_scan::<(), _, _, _, _>(
+        deadline,
+        |_| {
+            observation_calls += 1;
+            Err(ProcessGroupDescriptorScanError::DescriptorChanged)
+        },
+        || {
+            liveness_checks += 1;
+            Ok(())
+        },
+        |duration| {
+            waits.push(duration);
+            clock.set(clock.get() + duration);
+        },
+        || clock.get(),
+    );
+
+    assert_eq!(
+        result,
+        Err(PackageOfficialTuiGroupFailure::Descriptor(
+            ProcessGroupDescriptorScanError::Deadline
+        ))
+    );
+    assert_eq!(observation_calls, 3);
+    assert_eq!(liveness_checks, 6);
+    assert_eq!(
+        waits,
+        vec![
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(25),
+        ]
+    );
+    assert_eq!(clock.get(), deadline);
+}
+
+#[test]
 fn package_live_snapshot_failure_state_preserves_one_reason_and_closes_mixed_sequences() {
     let state = PackageLiveSnapshotFailureState::NoObservation
         .observe(PackageProcessSnapshotError::LiveState)
@@ -10709,6 +10928,30 @@ fn validate_official_tui_group(
     tui: PackageChildMarker,
     deadline: Instant,
 ) -> Result<(), PackageOfficialTuiGroupFailure> {
+    validate_official_tui_job_identity(tui)?;
+    let empty = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+    let proof = retry_package_official_tui_descriptor_scan(
+        deadline,
+        |attempt_deadline| {
+            calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
+                tui.pgid,
+                &empty,
+                attempt_deadline,
+            )
+        },
+        || validate_official_tui_job_identity(tui),
+        thread::sleep,
+        Instant::now,
+    )?;
+    if proof.member_count() == 0 {
+        return Err(PackageOfficialTuiGroupFailure::Empty);
+    }
+    validate_live_official_tui_group(tui, deadline)
+}
+
+fn validate_official_tui_job_identity(
+    tui: PackageChildMarker,
+) -> Result<(), PackageOfficialTuiGroupFailure> {
     if tui.pid != tui.pgid {
         return Err(PackageOfficialTuiGroupFailure::Leader);
     }
@@ -10725,15 +10968,62 @@ fn validate_official_tui_group(
     {
         return Err(PackageOfficialTuiGroupFailure::JobIdentity);
     }
-    let empty = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
-    let proof = calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
-        tui.pgid, &empty, deadline,
-    )
-    .map_err(PackageOfficialTuiGroupFailure::Descriptor)?;
-    if proof.member_count() == 0 {
-        return Err(PackageOfficialTuiGroupFailure::Empty);
+    Ok(())
+}
+
+fn retry_package_official_tui_descriptor_scan<T, Observe, Validate, Wait, Now>(
+    deadline: Instant,
+    mut observe: Observe,
+    mut validate_job_identity: Validate,
+    mut wait: Wait,
+    mut now: Now,
+) -> Result<T, PackageOfficialTuiGroupFailure>
+where
+    Observe: FnMut(Instant) -> Result<T, calcifer_unix_child_fd::ProcessGroupDescriptorScanError>,
+    Validate: FnMut() -> Result<(), PackageOfficialTuiGroupFailure>,
+    Wait: FnMut(Duration),
+    Now: FnMut() -> Instant,
+{
+    use calcifer_unix_child_fd::ProcessGroupDescriptorScanError;
+
+    loop {
+        if now() >= deadline {
+            return Err(PackageOfficialTuiGroupFailure::Descriptor(
+                ProcessGroupDescriptorScanError::Deadline,
+            ));
+        }
+        validate_job_identity()?;
+        match observe(deadline) {
+            Ok(proof) => {
+                validate_job_identity()?;
+                if now() >= deadline {
+                    return Err(PackageOfficialTuiGroupFailure::Descriptor(
+                        ProcessGroupDescriptorScanError::Deadline,
+                    ));
+                }
+                return Ok(proof);
+            }
+            Err(
+                ProcessGroupDescriptorScanError::ProcessChanged
+                | ProcessGroupDescriptorScanError::DescriptorChanged,
+            ) => {
+                // The official TUI opens and closes ordinary descriptors while
+                // it finishes startup. A torn double snapshot is expected
+                // churn, not evidence that a forbidden authority crossed the
+                // boundary. Retry only while the reported TUI PID/PGID/SID
+                // tuple remains live on both sides of every attempt. Every
+                // policy, permission, bound, unsupported-kind, and forbidden
+                // descriptor failure remains immediately fatal.
+                validate_job_identity()?;
+                if !wait_before_next_bounded_observation(deadline, &mut wait, &mut now) {
+                    return Err(PackageOfficialTuiGroupFailure::Descriptor(
+                        ProcessGroupDescriptorScanError::Deadline,
+                    ));
+                }
+            }
+            Err(error) => return Err(PackageOfficialTuiGroupFailure::Descriptor(error)),
+        }
     }
-    validate_live_official_tui_group(tui, deadline)
 }
 
 fn validate_live_official_tui_group(
@@ -10751,7 +11041,7 @@ fn validate_live_official_tui_group(
     )
 }
 
-fn wait_before_next_package_process_snapshot<Wait, Now>(
+fn wait_before_next_bounded_observation<Wait, Now>(
     deadline: Instant,
     wait: &mut Wait,
     now: &mut Now,
@@ -10789,14 +11079,13 @@ where
             Ok(first) => first,
             Err(_) => {
                 snapshot_observation_failed = true;
-                if !wait_before_next_package_process_snapshot(deadline, &mut wait, &mut now) {
+                if !wait_before_next_bounded_observation(deadline, &mut wait, &mut now) {
                     break;
                 }
                 continue;
             }
         };
-        if now() >= deadline
-            || !wait_before_next_package_process_snapshot(deadline, &mut wait, &mut now)
+        if now() >= deadline || !wait_before_next_bounded_observation(deadline, &mut wait, &mut now)
         {
             break;
         }
@@ -10804,7 +11093,7 @@ where
             Ok(second) => second,
             Err(_) => {
                 snapshot_observation_failed = true;
-                if !wait_before_next_package_process_snapshot(deadline, &mut wait, &mut now) {
+                if !wait_before_next_bounded_observation(deadline, &mut wait, &mut now) {
                     break;
                 }
                 continue;

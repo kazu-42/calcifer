@@ -291,6 +291,8 @@ jobs:
             --connect-timeout 20 \
             --max-time 300 \
             --retry 3 \
+            --retry-all-errors \
+            --retry-max-time 180 \
             --retry-delay 2 \
             --show-error \
             --silent \

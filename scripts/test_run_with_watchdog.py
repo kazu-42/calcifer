@@ -969,6 +969,28 @@ class WatchdogWorkflowTests(unittest.TestCase):
         self.assertLess(registered, download)
         self.assertLess(download, retained)
 
+    def test_pinned_package_download_retries_transport_resets_within_a_fixed_window(
+        self,
+    ) -> None:
+        workflow = self._workflow()
+        prepare_step = workflow.split(
+            "      - name: Prepare checksum-pinned Codex package\n", 1
+        )[1].split("      - name: Run pinned Codex contract probes\n", 1)[0]
+
+        self.assertEqual(prepare_step.count("--max-time 300"), 1)
+        self.assertEqual(prepare_step.count("--retry 3"), 1)
+        self.assertEqual(prepare_step.count("--retry-all-errors"), 1)
+        self.assertEqual(prepare_step.count("--retry-max-time 180"), 1)
+        self.assertLess(
+            prepare_step.index("--retry 3"),
+            prepare_step.index("--retry-all-errors"),
+        )
+        self.assertLess(
+            prepare_step.index("--retry-all-errors"),
+            prepare_step.index("--retry-max-time 180"),
+        )
+        self.assertIn('actual_sha256="$(sha256sum', prepare_step)
+
     def test_failed_watchdog_retains_scratch_for_ephemeral_runner_teardown(
         self,
     ) -> None:
