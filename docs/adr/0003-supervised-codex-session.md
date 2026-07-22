@@ -961,6 +961,15 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   fixed diagnostic; the harness neither blocks indefinitely nor detaches wait
   authority. Published process groups are identity-checked, killed, and proven
   absent before their markers and root may be removed.
+- Builds the PTY descriptor regression group from two parent-owned helpers
+  rather than treating `Command::spawn` as proof that a descendant has
+  completed its post-exec runtime setup. Each helper publishes one fixed byte
+  and write EOF from its own exec'd process, then holds its descriptor table
+  behind a private lease until both scans finish. The parent retains both exact
+  `Child` handles, releases the leases only after the negative and positive PTY
+  identity proofs, and then uses a bounded group kill plus exact reap. Loader-
+  time descriptor closes can therefore neither race the scan nor leave a
+  detached helper.
 - Checks the retained-recovery initial-gate deadline before every marker scan,
   every allowlisted pathname probe inside that scan, marker read, and exact
   coordinator-child observation, and rechecks it after each operation before

@@ -1902,22 +1902,119 @@ mod tests {
     const RESTORE_FLUSH_PROBE: &[u8] = b"\n";
     const PTY_SCAN_HELPER_ENV: &str = "CALCIFER_TERMINAL_PTY_SCAN_HELPER";
     const PTY_SCAN_READY: [u8; 1] = [b'R'];
+    const PTY_SCAN_CHILD_REAP: Duration = Duration::from_secs(15);
 
     struct PtyScanGroup {
-        child: Child,
+        leader: Option<Child>,
+        member: Option<Child>,
         process_group: i32,
+        leader_lease: UnixStream,
+        member_lease: Option<UnixStream>,
     }
 
-    impl Drop for PtyScanGroup {
-        fn drop(&mut self) {
+    impl PtyScanGroup {
+        fn release_and_reap(&mut self) -> Result<(), Box<dyn Error>> {
+            self.leader_lease.shutdown(Shutdown::Write)?;
+            if let Some(member_lease) = &self.member_lease {
+                member_lease.shutdown(Shutdown::Write)?;
+            }
+            self.kill_and_reap_or_exit();
+            Ok(())
+        }
+
+        fn kill_and_reap_or_exit(&mut self) {
             if let Some(process_group) = rustix::process::Pid::from_raw(self.process_group) {
                 let _ = rustix::process::kill_process_group(
                     process_group,
                     rustix::process::Signal::KILL,
                 );
             }
-            let _ = self.child.wait();
+            let deadline = Instant::now() + PTY_SCAN_CHILD_REAP;
+            while self.leader.is_some() || self.member.is_some() {
+                let leader = reap_pty_scan_child(&mut self.leader);
+                let member = reap_pty_scan_child(&mut self.member);
+                if leader.is_err() || member.is_err() {
+                    eprintln!("calcifer: PTY scan helper exact reap was not proven");
+                    calcifer_unix_child_fd::exit_process_without_destructors(93);
+                }
+                if self.leader.is_none() && self.member.is_none() {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    eprintln!("calcifer: PTY scan helper exact reap was not proven");
+                    calcifer_unix_child_fd::exit_process_without_destructors(93);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
+    }
+
+    impl Drop for PtyScanGroup {
+        fn drop(&mut self) {
+            if self.leader.is_some() || self.member.is_some() {
+                self.kill_and_reap_or_exit();
+            }
+        }
+    }
+
+    fn reap_pty_scan_child(child: &mut Option<Child>) -> io::Result<()> {
+        let Some(owner) = child.as_mut() else {
+            return Ok(());
+        };
+        if owner.try_wait()?.is_some() {
+            *child = None;
+        }
+        Ok(())
+    }
+
+    fn terminate_single_pty_scan_child_or_exit(mut child: Child) {
+        let _ = child.kill();
+        let deadline = Instant::now() + PTY_SCAN_CHILD_REAP;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(None) | Err(_) => {
+                    eprintln!("calcifer: PTY scan child exact reap was not proven");
+                    calcifer_unix_child_fd::exit_process_without_destructors(93);
+                }
+            }
+        }
+    }
+
+    fn pty_scan_helper_command(process_group: i32) -> io::Result<Command> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "providers::codex::supervisor::terminal::tests::forbidden_pty_master_does_not_alias_two_exec_confirmed_group_members",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PTY_SCAN_HELPER_ENV, "1")
+            .process_group(process_group);
+        Ok(command)
+    }
+
+    fn read_pty_scan_readiness(observer: &mut UnixStream) -> io::Result<()> {
+        let mut ready = [0_u8; PTY_SCAN_READY.len()];
+        observer.read_exact(&mut ready)?;
+        if ready != PTY_SCAN_READY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTY scan child published invalid readiness",
+            ));
+        }
+        let mut trailing = [0_u8; 1];
+        if observer.read(&mut trailing)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTY scan child published trailing readiness data",
+            ));
+        }
+        Ok(())
     }
 
     #[test]
@@ -1945,92 +2042,99 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_pty_master_does_not_alias_the_child_and_descendant_slave()
+    fn forbidden_pty_master_does_not_alias_two_exec_confirmed_group_members()
     -> Result<(), Box<dyn Error>> {
         if std::env::var_os(PTY_SCAN_HELPER_ENV).is_some() {
             let inherited = calcifer_unix_child_fd::take_inherited_readiness_fd()?;
-            let mut descendant_command = Command::new("/bin/sleep");
-            descendant_command.arg("30").env_remove(PTY_SCAN_HELPER_ENV);
-            calcifer_unix_child_fd::scrub_readiness_fd_env(&mut descendant_command);
-            let mut descendant = descendant_command.spawn()?;
-
-            // Command::spawn has observed the descendant's successful exec,
-            // and shutdown publishes EOF without closing either of this
-            // leader's stable socket descriptors. The parent can therefore
-            // begin its double snapshot without a readiness-related FD-table
-            // mutation still pending in either process-group member.
             let mut readiness = UnixStream::from(inherited);
             readiness.write_all(&PTY_SCAN_READY)?;
             readiness.shutdown(Shutdown::Write)?;
-            if !descendant.wait()?.success() {
-                return Err("PTY scan descendant did not exit successfully".into());
+            let mut lease = [0_u8; 1];
+            if readiness.read(&mut lease)? != 0 {
+                return Err("PTY scan helper received unexpected lease data".into());
             }
             return Ok(());
         }
 
         let owner = PtyOwner::open(TerminalSize::new(24, 80))?;
         let slave_copy = fcntl_dupfd_cloexec(&owner.slave, 3)?;
+        let member_stdin = fcntl_dupfd_cloexec(&owner.slave, 3)?;
+        let member_stdout = fcntl_dupfd_cloexec(&owner.slave, 3)?;
+        let member_stderr = fcntl_dupfd_cloexec(&owner.slave, 3)?;
         let mut slave_forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
         slave_forbidden.capture(slave_copy.as_fd())?;
 
-        let (mut readiness_observer, inherited_readiness) = UnixStream::pair()?;
-        readiness_observer.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .args([
-                "--exact",
-                "providers::codex::supervisor::terminal::tests::forbidden_pty_master_does_not_alias_the_child_and_descendant_slave",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(PTY_SCAN_HELPER_ENV, "1")
-            .process_group(0);
-        let master = owner.configure_child(&mut command)?;
+        let (leader_lease, inherited_leader_lease) = UnixStream::pair()?;
+        leader_lease.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut leader_command = pty_scan_helper_command(0)?;
+        let master = owner.configure_child(&mut leader_command)?;
         let master_forbidden = master.capture_forbidden_descriptor_set_before_tui()?;
-        let child = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
-            command,
-            inherited_readiness.as_fd(),
+        let leader = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
+            leader_command,
+            inherited_leader_lease.as_fd(),
         ) {
             Ok(child) => child,
             Err(error) => {
-                // A parent-side inheritance readback failure can race the
-                // helper spawning its descendant. Transfer any started direct
-                // child into the group-wide owner before returning so the
-                // generic direct-child fallback cannot leave that descendant
-                // alive until its sleep expires.
                 if let Some(started) = error.into_started_child() {
-                    let mut child = started.into_child();
+                    let child = started.into_child();
                     let process_group = match i32::try_from(child.id()) {
                         Ok(process_group) => process_group,
                         Err(_) => {
-                            let _ = child.kill();
-                            child.wait()?;
+                            terminate_single_pty_scan_child_or_exit(child);
                             return Err("PTY scan child process group was invalid".into());
                         }
                     };
-                    drop(PtyScanGroup {
-                        child,
+                    let mut failed_group = PtyScanGroup {
+                        leader: Some(child),
+                        member: None,
                         process_group,
-                    });
+                        leader_lease,
+                        member_lease: None,
+                    };
+                    failed_group.kill_and_reap_or_exit();
                 }
                 return Err("PTY scan child failed during inherited descriptor setup".into());
             }
         };
-        drop(inherited_readiness);
-        let process_group = i32::try_from(child.id())?;
-        let group = PtyScanGroup {
-            child,
+        drop(inherited_leader_lease);
+        let process_group = i32::try_from(leader.id())?;
+        let mut group = PtyScanGroup {
+            leader: Some(leader),
+            member: None,
             process_group,
+            leader_lease,
+            member_lease: None,
         };
-        let mut ready = [0_u8; PTY_SCAN_READY.len()];
-        readiness_observer.read_exact(&mut ready)?;
-        if ready != PTY_SCAN_READY {
-            return Err("PTY scan child published invalid readiness".into());
-        }
-        let mut trailing = [0_u8; 1];
-        if readiness_observer.read(&mut trailing)? != 0 {
-            return Err("PTY scan child published trailing readiness data".into());
-        }
+        read_pty_scan_readiness(&mut group.leader_lease)?;
+
+        let (member_lease, inherited_member_lease) = UnixStream::pair()?;
+        member_lease.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut member_command = pty_scan_helper_command(process_group)?;
+        member_command
+            .stdin(Stdio::from(member_stdin))
+            .stdout(Stdio::from(member_stdout))
+            .stderr(Stdio::from(member_stderr));
+        let member = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
+            member_command,
+            inherited_member_lease.as_fd(),
+        ) {
+            Ok(member) => member,
+            Err(error) => {
+                if let Some(started) = error.into_started_child() {
+                    group.member = Some(started.into_child());
+                }
+                return Err("PTY scan member failed during inherited descriptor setup".into());
+            }
+        };
+        drop(inherited_member_lease);
+        group.member = Some(member);
+        group.member_lease = Some(member_lease);
+        read_pty_scan_readiness(
+            group
+                .member_lease
+                .as_mut()
+                .ok_or("PTY scan member lease was missing")?,
+        )?;
 
         // Readiness has its own socket timeout. Start the scanner's absolute
         // deadline only after the complete byte-plus-EOF boundary so a loaded
@@ -2052,6 +2156,7 @@ mod tests {
             ),
             Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor)
         );
+        group.release_and_reap()?;
         Ok(())
     }
 
