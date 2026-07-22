@@ -9,6 +9,8 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::ExitStatusExt;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -311,19 +313,54 @@ impl CoordinatorDriveError {
 }
 
 #[cfg(test)]
+pub(super) const PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS: [&str; 19] = [
+    "coordinator-retained.error.deadline",
+    "coordinator-retained.error.lifecycle",
+    "coordinator-retained.error.protocol",
+    "coordinator-retained.error.snapshot",
+    "coordinator-retained.error.terminal.setup",
+    "coordinator-retained.error.terminal.deadline",
+    "coordinator-retained.error.terminal.outer-eof",
+    "coordinator-retained.error.terminal.channel-read",
+    "coordinator-retained.error.terminal.channel-write",
+    "coordinator-retained.error.terminal.outer-read",
+    "coordinator-retained.error.terminal.outer-write",
+    "coordinator-retained.error.terminal.raw-transition",
+    "coordinator-retained.error.terminal.foreground",
+    "coordinator-retained.error.terminal.window-size",
+    "coordinator-retained.error.terminal.restore",
+    "coordinator-retained.error.terminal.shutdown",
+    "coordinator-retained.error.signal",
+    "coordinator-retained.error.guardian",
+    "coordinator-retained.error.descriptor-isolation",
+];
+
+#[cfg(test)]
+pub(super) const PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS: [&str; 8] = [
+    "coordinator-retained.reason.lifecycle-lost",
+    "coordinator-retained.reason.protocol-invalid",
+    "coordinator-retained.reason.guardian-exited",
+    "coordinator-retained.reason.shutdown-deadline",
+    "coordinator-retained.reason.children-not-reaped",
+    "coordinator-retained.reason.worker-not-joined",
+    "coordinator-retained.reason.cleanup-unconfirmed",
+    "coordinator-retained.reason.invariant-unconfirmed",
+];
+
+#[cfg(test)]
 const fn packaged_coordinator_failure_marker(error: CoordinatorDriveError) -> &'static str {
     match error {
-        CoordinatorDriveError::Deadline => "coordinator-retained.error.deadline",
-        CoordinatorDriveError::Lifecycle => "coordinator-retained.error.lifecycle",
-        CoordinatorDriveError::Protocol => "coordinator-retained.error.protocol",
-        CoordinatorDriveError::Snapshot => "coordinator-retained.error.snapshot",
+        CoordinatorDriveError::Deadline => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[0],
+        CoordinatorDriveError::Lifecycle => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[1],
+        CoordinatorDriveError::Protocol => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[2],
+        CoordinatorDriveError::Snapshot => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[3],
         CoordinatorDriveError::Terminal(error) => {
             packaged_coordinator_terminal_failure_marker(error)
         }
-        CoordinatorDriveError::Signal => "coordinator-retained.error.signal",
-        CoordinatorDriveError::Guardian => "coordinator-retained.error.guardian",
+        CoordinatorDriveError::Signal => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[16],
+        CoordinatorDriveError::Guardian => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[17],
         CoordinatorDriveError::DescriptorIsolation(_) => {
-            "coordinator-retained.error.descriptor-isolation"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[18]
         }
     }
 }
@@ -333,46 +370,67 @@ const fn packaged_coordinator_terminal_failure_marker(
     error: CoordinatorTerminalError,
 ) -> &'static str {
     match error {
-        CoordinatorTerminalError::Setup => "coordinator-retained.error.terminal.setup",
-        CoordinatorTerminalError::Deadline => "coordinator-retained.error.terminal.deadline",
+        CoordinatorTerminalError::Setup => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[4],
+        CoordinatorTerminalError::Deadline => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[5],
         CoordinatorTerminalError::OuterTerminalEof => {
-            "coordinator-retained.error.terminal.outer-eof"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[6]
         }
         CoordinatorTerminalError::TerminalChannelRead => {
-            "coordinator-retained.error.terminal.channel-read"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[7]
         }
         CoordinatorTerminalError::TerminalChannelWrite => {
-            "coordinator-retained.error.terminal.channel-write"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[8]
         }
         CoordinatorTerminalError::OuterTerminalRead => {
-            "coordinator-retained.error.terminal.outer-read"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[9]
         }
         CoordinatorTerminalError::OuterTerminalWrite => {
-            "coordinator-retained.error.terminal.outer-write"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10]
         }
-        CoordinatorTerminalError::RawTransition => {
-            "coordinator-retained.error.terminal.raw-transition"
-        }
-        CoordinatorTerminalError::Foreground => "coordinator-retained.error.terminal.foreground",
-        CoordinatorTerminalError::WindowSize => "coordinator-retained.error.terminal.window-size",
-        CoordinatorTerminalError::Restore => "coordinator-retained.error.terminal.restore",
-        CoordinatorTerminalError::Shutdown => "coordinator-retained.error.terminal.shutdown",
+        CoordinatorTerminalError::RawTransition => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[11],
+        CoordinatorTerminalError::Foreground => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[12],
+        CoordinatorTerminalError::WindowSize => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[13],
+        CoordinatorTerminalError::Restore => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[14],
+        CoordinatorTerminalError::Shutdown => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[15],
     }
 }
 
 #[cfg(test)]
 const fn packaged_coordinator_retention_reason_marker(reason: RetentionReason) -> &'static str {
     match reason {
-        RetentionReason::LifecycleLost => "coordinator-retained.reason.lifecycle-lost",
-        RetentionReason::ProtocolInvalid => "coordinator-retained.reason.protocol-invalid",
-        RetentionReason::GuardianExited => "coordinator-retained.reason.guardian-exited",
-        RetentionReason::ShutdownDeadline => "coordinator-retained.reason.shutdown-deadline",
-        RetentionReason::ChildrenNotReaped => "coordinator-retained.reason.children-not-reaped",
-        RetentionReason::WorkerNotJoined => "coordinator-retained.reason.worker-not-joined",
-        RetentionReason::CleanupUnconfirmed => "coordinator-retained.reason.cleanup-unconfirmed",
-        RetentionReason::InvariantUnconfirmed => {
-            "coordinator-retained.reason.invariant-unconfirmed"
-        }
+        RetentionReason::LifecycleLost => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[0],
+        RetentionReason::ProtocolInvalid => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[1],
+        RetentionReason::GuardianExited => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[2],
+        RetentionReason::ShutdownDeadline => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[3],
+        RetentionReason::ChildrenNotReaped => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[4],
+        RetentionReason::WorkerNotJoined => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[5],
+        RetentionReason::CleanupUnconfirmed => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[6],
+        RetentionReason::InvariantUnconfirmed => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[7],
+    }
+}
+
+#[cfg(test)]
+const fn packaged_coordinator_retained_marker_names(
+    error: CoordinatorDriveError,
+    reason: RetentionReason,
+) -> [&'static str; 2] {
+    // Preserve commit order: the exact coordinator error is durable before
+    // the broader retention reason is projected. These names are diagnostic
+    // observations only and never grant cleanup or profile authority.
+    [
+        packaged_coordinator_failure_marker(error),
+        packaged_coordinator_retention_reason_marker(reason),
+    ]
+}
+
+#[cfg(test)]
+fn publish_packaged_coordinator_retained_markers(
+    error: CoordinatorDriveError,
+    reason: RetentionReason,
+    mut publish: impl FnMut(&'static str),
+) {
+    for marker in packaged_coordinator_retained_marker_names(error, reason) {
+        publish(marker);
     }
 }
 
@@ -970,10 +1028,7 @@ impl RetainedCoordinatorGeneration {
 
     #[cfg(test)]
     pub(super) const fn packaged_marker_names(&self) -> [&'static str; 2] {
-        [
-            packaged_coordinator_failure_marker(self.failure),
-            packaged_coordinator_retention_reason_marker(self.reason),
-        ]
+        packaged_coordinator_retained_marker_names(self.failure, self.reason)
     }
 
     pub(super) fn into_retained_lease(self) -> RetainedCoordinatorLease {
@@ -1111,6 +1166,10 @@ pub(super) struct ProductionCoordinator {
     session_failed: bool,
     #[cfg(test)]
     descriptor_isolation_test_seam: Option<DescriptorIsolationTestSeam>,
+    #[cfg(test)]
+    packaged_retention_report_root: Option<PathBuf>,
+    #[cfg(test)]
+    retain_after_packaged_startup_failure: bool,
 }
 
 enum ActiveOutcome {
@@ -1188,6 +1247,10 @@ impl ProductionCoordinator {
             session_failed: false,
             #[cfg(test)]
             descriptor_isolation_test_seam,
+            #[cfg(test)]
+            packaged_retention_report_root: None,
+            #[cfg(test)]
+            retain_after_packaged_startup_failure: false,
         })
     }
 
@@ -1201,6 +1264,19 @@ impl ProductionCoordinator {
         seam: DescriptorIsolationTestSeam,
     ) -> Result<Self, Box<CoordinatorSetupFailure>> {
         Self::assemble_with_test_seam(authority, guardian, lifecycle, terminal, bounds, Some(seam))
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_packaged_retention_diagnostics(
+        mut self,
+        report_root: PathBuf,
+        retain_after_startup_failure: bool,
+    ) -> Self {
+        // This test-only sink receives fixed marker names only. It is not a
+        // process, lease, cleanup, retry, or recovery authority.
+        self.packaged_retention_report_root = Some(report_root);
+        self.retain_after_packaged_startup_failure = retain_after_startup_failure;
+        self
     }
 
     pub(super) fn run(mut self) -> CoordinatorRunOutcome {
@@ -1306,7 +1382,15 @@ impl ProductionCoordinator {
                             .map_err(classify_protocol_error)?,
                     );
                 }
-                GuardianEvent::Failed { .. } => return Ok(BootstrapOutcome::Failed),
+                GuardianEvent::Failed { .. } => {
+                    #[cfg(test)]
+                    if self.retain_after_packaged_startup_failure {
+                        return Err(CoordinatorDriveError::Terminal(
+                            CoordinatorTerminalError::Deadline,
+                        ));
+                    }
+                    return Ok(BootstrapOutcome::Failed);
+                }
                 _ => return Err(CoordinatorDriveError::Protocol),
             }
         }
@@ -1860,6 +1944,10 @@ impl ProductionCoordinator {
             session_failed: _,
             #[cfg(test)]
                 descriptor_isolation_test_seam: _,
+            #[cfg(test)]
+                packaged_retention_report_root: _,
+            #[cfg(test)]
+                retain_after_packaged_startup_failure: _,
         } = self;
         let restoration = match terminal {
             Some(CoordinatorTerminalOwner::Finished(restoration)) => restoration,
@@ -1902,6 +1990,17 @@ impl ProductionCoordinator {
                 terminal
             }
         };
+
+        #[cfg(test)]
+        if let Some(report_root) = self.packaged_retention_report_root.as_deref() {
+            // Publish after the exact retention reason is final but before
+            // the bounded Guardian wait. The package parent can otherwise
+            // observe Guardian retention and terminate this helper before
+            // `run()` returns its retained generation.
+            publish_packaged_coordinator_retained_markers(error, reason, |marker| {
+                super::packaged_smoke::record_package_diagnostic_marker(report_root, marker);
+            });
+        }
 
         if self.guardian_status.is_none() {
             let deadline = self
@@ -1994,100 +2093,105 @@ mod tests {
 
     #[test]
     fn packaged_retention_diagnostics_are_closed_fixed_and_payload_free() {
+        let errors = [
+            CoordinatorDriveError::Deadline,
+            CoordinatorDriveError::Lifecycle,
+            CoordinatorDriveError::Protocol,
+            CoordinatorDriveError::Snapshot,
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Setup),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Deadline),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::OuterTerminalEof),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::TerminalChannelRead),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::TerminalChannelWrite),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::OuterTerminalRead),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::OuterTerminalWrite),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::RawTransition),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Foreground),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::WindowSize),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Restore),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Shutdown),
+            CoordinatorDriveError::Signal,
+            CoordinatorDriveError::Guardian,
+            CoordinatorDriveError::DescriptorIsolation(
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor,
+            ),
+        ];
+        let reasons = [
+            RetentionReason::LifecycleLost,
+            RetentionReason::ProtocolInvalid,
+            RetentionReason::GuardianExited,
+            RetentionReason::ShutdownDeadline,
+            RetentionReason::ChildrenNotReaped,
+            RetentionReason::WorkerNotJoined,
+            RetentionReason::CleanupUnconfirmed,
+            RetentionReason::InvariantUnconfirmed,
+        ];
+
         assert_eq!(
-            [
-                CoordinatorDriveError::Deadline,
-                CoordinatorDriveError::Lifecycle,
-                CoordinatorDriveError::Protocol,
-                CoordinatorDriveError::Snapshot,
-                CoordinatorDriveError::Terminal(CoordinatorTerminalError::Restore),
-                CoordinatorDriveError::Signal,
-                CoordinatorDriveError::Guardian,
-                CoordinatorDriveError::DescriptorIsolation(
-                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor,
-                ),
-            ]
-            .map(packaged_coordinator_failure_marker),
-            [
-                "coordinator-retained.error.deadline",
-                "coordinator-retained.error.lifecycle",
-                "coordinator-retained.error.protocol",
-                "coordinator-retained.error.snapshot",
-                "coordinator-retained.error.terminal.restore",
-                "coordinator-retained.error.signal",
-                "coordinator-retained.error.guardian",
-                "coordinator-retained.error.descriptor-isolation",
-            ]
+            errors.map(packaged_coordinator_failure_marker),
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS
         );
         assert_eq!(
-            [
-                CoordinatorTerminalError::Setup,
-                CoordinatorTerminalError::Deadline,
-                CoordinatorTerminalError::OuterTerminalEof,
-                CoordinatorTerminalError::TerminalChannelRead,
-                CoordinatorTerminalError::TerminalChannelWrite,
-                CoordinatorTerminalError::OuterTerminalRead,
-                CoordinatorTerminalError::OuterTerminalWrite,
-                CoordinatorTerminalError::RawTransition,
-                CoordinatorTerminalError::Foreground,
-                CoordinatorTerminalError::WindowSize,
-                CoordinatorTerminalError::Restore,
-                CoordinatorTerminalError::Shutdown,
-            ]
-            .map(|error| packaged_coordinator_failure_marker(
-                CoordinatorDriveError::Terminal(error)
-            )),
-            [
-                "coordinator-retained.error.terminal.setup",
-                "coordinator-retained.error.terminal.deadline",
-                "coordinator-retained.error.terminal.outer-eof",
-                "coordinator-retained.error.terminal.channel-read",
-                "coordinator-retained.error.terminal.channel-write",
-                "coordinator-retained.error.terminal.outer-read",
-                "coordinator-retained.error.terminal.outer-write",
-                "coordinator-retained.error.terminal.raw-transition",
-                "coordinator-retained.error.terminal.foreground",
-                "coordinator-retained.error.terminal.window-size",
-                "coordinator-retained.error.terminal.restore",
-                "coordinator-retained.error.terminal.shutdown",
-            ]
-        );
-        assert_eq!(
-            [
-                RetentionReason::LifecycleLost,
-                RetentionReason::ProtocolInvalid,
-                RetentionReason::GuardianExited,
-                RetentionReason::ShutdownDeadline,
-                RetentionReason::ChildrenNotReaped,
-                RetentionReason::WorkerNotJoined,
-                RetentionReason::CleanupUnconfirmed,
-                RetentionReason::InvariantUnconfirmed,
-            ]
-            .map(packaged_coordinator_retention_reason_marker),
-            [
-                "coordinator-retained.reason.lifecycle-lost",
-                "coordinator-retained.reason.protocol-invalid",
-                "coordinator-retained.reason.guardian-exited",
-                "coordinator-retained.reason.shutdown-deadline",
-                "coordinator-retained.reason.children-not-reaped",
-                "coordinator-retained.reason.worker-not-joined",
-                "coordinator-retained.reason.cleanup-unconfirmed",
-                "coordinator-retained.reason.invariant-unconfirmed",
-            ]
+            reasons.map(packaged_coordinator_retention_reason_marker),
+            PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS
         );
 
         let synthetic_secret = "synthetic-private-profile@example.invalid";
-        for marker in [
-            packaged_coordinator_failure_marker(CoordinatorDriveError::Protocol),
-            packaged_coordinator_retention_reason_marker(RetentionReason::ProtocolInvalid),
-        ] {
+        let markers = PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS
+            .iter()
+            .chain(PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        for (index, marker) in markers.iter().copied().enumerate() {
+            assert_eq!(
+                markers
+                    .iter()
+                    .filter(|candidate| **candidate == marker)
+                    .count(),
+                1,
+                "closed coordinator catalog marker {index} was duplicated: {marker}"
+            );
             assert!(!marker.contains(synthetic_secret));
+            assert!(marker.starts_with("coordinator-retained."));
+            assert!(!marker.ends_with('.'));
+            assert!(!marker.contains(".."));
             assert!(
                 marker
                     .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-' || byte == b'.')
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-' || byte == b'.'),
+                "closed coordinator catalog marker {index} was not fixed payload-free syntax: {marker}"
             );
         }
+
+        for error in errors {
+            for reason in reasons {
+                let names = packaged_coordinator_retained_marker_names(error, reason);
+                assert_eq!(names[0], packaged_coordinator_failure_marker(error));
+                assert_eq!(
+                    names[1],
+                    packaged_coordinator_retention_reason_marker(reason)
+                );
+                assert!(PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS.contains(&names[0]));
+                assert!(PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS.contains(&names[1]));
+                assert!(names[0].starts_with("coordinator-retained.error."));
+                assert!(names[1].starts_with("coordinator-retained.reason."));
+            }
+        }
+
+        let error = CoordinatorDriveError::Terminal(CoordinatorTerminalError::Deadline);
+        let reason = RetentionReason::InvariantUnconfirmed;
+        let mut published = Vec::new();
+        publish_packaged_coordinator_retained_markers(error, reason, |marker| {
+            published.push(marker);
+        });
+        assert_eq!(
+            published,
+            [
+                packaged_coordinator_failure_marker(error),
+                packaged_coordinator_retention_reason_marker(reason),
+            ],
+            "the broader retention reason was published before the exact coordinator error"
+        );
     }
 
     #[test]
