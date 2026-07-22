@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use super::protocol::{TerminalSnapshotFingerprint, VerifiedOpenGateAck, VerifiedReady};
 use super::terminal::{
     GateClosed as InputGateClosed, GateOpen as InputGateOpen, GateReady as InputGateReady,
-    InputGate, RawTerminalProof, RestoredTerminalProof, TerminalBuffer, TerminalChunk,
-    TerminalEndpoint, TerminalRead, TerminalShutdown, TerminalSize, TerminalSnapshot, TerminalTty,
-    TerminalWrite, terminal_size,
+    InputGate, PendingTerminalOutput, PendingTerminalRead, RawTerminalProof, RestoredTerminalProof,
+    TerminalBuffer, TerminalChunk, TerminalEndpoint, TerminalRead, TerminalShutdown, TerminalSize,
+    TerminalSnapshot, TerminalTty, TerminalWrite, terminal_size,
 };
 
 const PUMP_RETRY: Duration = Duration::from_millis(1);
@@ -180,6 +180,7 @@ impl<Owner> std::error::Error for CoordinatorTerminalFailure<Owner> {}
 pub(super) enum CoordinatorPumpProgress {
     Idle,
     Output,
+    OutputPending,
     OutputClosed,
     Input,
 }
@@ -221,7 +222,8 @@ pub(super) struct CoordinatorTerminal<State> {
     tty: TerminalTty,
     endpoint: TerminalEndpoint,
     snapshot: TerminalSnapshot,
-    output: TerminalBuffer,
+    output: PendingTerminalOutput,
+    output_stall_deadline: Option<Instant>,
     output_closed: bool,
     state: State,
 }
@@ -259,7 +261,8 @@ impl CoordinatorTerminal<OutputOnly> {
             tty,
             endpoint,
             snapshot,
-            output: TerminalBuffer::new(),
+            output: PendingTerminalOutput::new(),
+            output_stall_deadline: None,
             output_closed: false,
             state: OutputOnly {
                 gate: InputGate::closed(),
@@ -479,15 +482,57 @@ impl CoordinatorTerminal<Restored> {
             endpoint,
             snapshot,
             output,
+            output_stall_deadline,
             output_closed,
             state,
         } = self;
-        drop((tty, endpoint, snapshot, output, output_closed));
+        drop((
+            tty,
+            endpoint,
+            snapshot,
+            output,
+            output_stall_deadline,
+            output_closed,
+        ));
         Ok(state.proof)
     }
 }
 
 impl<State> CoordinatorTerminal<State> {
+    /// Scrubs buffered output while retaining the exact typed terminal owner,
+    /// descriptors, and restoration state. This is deliberately separate from
+    /// `Drop`: fail-closed retention may park the owner for process lifetime.
+    pub(super) fn scrub_pending_output(mut self) -> Self {
+        self.output.scrub();
+        self.output_stall_deadline = None;
+        self
+    }
+
+    pub(super) const fn has_pending_output(&self) -> bool {
+        self.output.is_pending()
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_output_is_scrubbed_for_test(&self) -> bool {
+        self.output_stall_deadline.is_none() && self.output.is_zeroized_for_test()
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_output_shape_for_test(&self) -> (usize, usize, bool) {
+        self.output.retained_shape_for_test()
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_pending_output_for_test(
+        &mut self,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), super::terminal::TerminalError> {
+        self.output.load_for_test(bytes)?;
+        self.output_stall_deadline = Some(deadline);
+        Ok(())
+    }
+
     /// Appends both coordinator-owned terminal descriptors to a source-pinned
     /// provider-child denyset. The semantic snapshot contains no descriptor.
     pub(super) fn append_forbidden_descriptors<'source>(
@@ -524,37 +569,39 @@ impl<State> CoordinatorTerminal<State> {
                 .is_ok_and(|foreground| foreground == rustix::process::getpgrp())
     }
 
-    /// Pumps at most one fixed terminal-channel fragment to the outer tty in
-    /// every state, including before readiness and after input quiescence.
+    /// Pumps at most one nonblocking write from one fixed terminal-channel
+    /// fragment to the outer tty in every state.
+    ///
+    /// A transient outer-terminal stall retains the exact fragment and offset
+    /// across turns so the coordinator can service lifecycle and signal work.
+    /// The first pending turn also fixes one absolute stall deadline; retries
+    /// never extend it.
     pub(super) fn pump_output_once(
         mut self,
-        deadline: Instant,
+        stall_timeout: Duration,
+        outer_deadline: Instant,
     ) -> Result<CoordinatorPumpTurn<Self>, Box<CoordinatorTerminalFailure<Self>>> {
-        if Instant::now() >= deadline {
+        if stall_timeout.is_zero() {
             return Err(terminal_failure(self, CoordinatorTerminalError::Deadline));
         }
-        if self.output_closed {
-            return Ok(CoordinatorPumpTurn {
-                owner: self,
-                progress: CoordinatorPumpProgress::OutputClosed,
-            });
-        }
-        let result = match self.endpoint.read_into(&mut self.output) {
-            Ok(TerminalRead::Data(mut chunk)) => {
-                write_fragment_before(deadline, &mut chunk, |chunk| {
-                    self.tty
-                        .try_write(chunk)
-                        .map_err(|_| CoordinatorTerminalError::OuterTerminalWrite)
-                })
-                .map(|()| CoordinatorPumpProgress::Output)
-            }
-            Ok(TerminalRead::WouldBlock) => Ok(CoordinatorPumpProgress::Idle),
-            Ok(TerminalRead::EndOfStream) => {
-                self.output_closed = true;
-                Ok(CoordinatorPumpProgress::OutputClosed)
-            }
-            Err(_) => Err(CoordinatorTerminalError::TerminalChannelRead),
-        };
+        let result = pump_output_state_once(
+            &mut self.output,
+            &mut self.output_stall_deadline,
+            &mut self.output_closed,
+            stall_timeout,
+            outer_deadline,
+            Instant::now,
+            |output| {
+                output
+                    .read_from(&self.endpoint)
+                    .map_err(|_| CoordinatorTerminalError::TerminalChannelRead)
+            },
+            |output| {
+                output
+                    .try_write_to(&self.tty)
+                    .map_err(|_| CoordinatorTerminalError::OuterTerminalWrite)
+            },
+        );
         match result {
             Ok(progress) => Ok(CoordinatorPumpTurn {
                 owner: self,
@@ -570,6 +617,7 @@ impl<State> CoordinatorTerminal<State> {
             endpoint,
             snapshot,
             output,
+            output_stall_deadline,
             output_closed,
             state,
         } = self;
@@ -578,8 +626,74 @@ impl<State> CoordinatorTerminal<State> {
             endpoint,
             snapshot,
             output,
+            output_stall_deadline,
             output_closed,
             state: transition(state),
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the helper makes clock, read, and write observations independently testable"
+)]
+fn pump_output_state_once(
+    output: &mut PendingTerminalOutput,
+    stall_deadline: &mut Option<Instant>,
+    output_closed: &mut bool,
+    stall_timeout: Duration,
+    outer_deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut read: impl FnMut(
+        &mut PendingTerminalOutput,
+    ) -> Result<PendingTerminalRead, CoordinatorTerminalError>,
+    mut write: impl FnMut(&mut PendingTerminalOutput) -> Result<TerminalWrite, CoordinatorTerminalError>,
+) -> Result<CoordinatorPumpProgress, CoordinatorTerminalError> {
+    let observed = now();
+    if output.is_pending() {
+        let deadline = (*stall_deadline).ok_or(CoordinatorTerminalError::Deadline)?;
+        if observed >= deadline || observed >= outer_deadline {
+            return Err(CoordinatorTerminalError::Deadline);
+        }
+    } else {
+        if observed >= outer_deadline {
+            return Err(CoordinatorTerminalError::Deadline);
+        }
+        if *output_closed {
+            return Ok(CoordinatorPumpProgress::OutputClosed);
+        }
+        match read(output)? {
+            PendingTerminalRead::Data => {
+                let observed = now();
+                let local_deadline = observed
+                    .checked_add(stall_timeout)
+                    .ok_or(CoordinatorTerminalError::Deadline)?;
+                let fixed_deadline = local_deadline.min(outer_deadline);
+                *stall_deadline = Some(fixed_deadline);
+                if observed >= fixed_deadline {
+                    return Err(CoordinatorTerminalError::Deadline);
+                }
+            }
+            PendingTerminalRead::WouldBlock => return Ok(CoordinatorPumpProgress::Idle),
+            PendingTerminalRead::EndOfStream => {
+                *output_closed = true;
+                return Ok(CoordinatorPumpProgress::OutputClosed);
+            }
+        }
+    }
+
+    let deadline = (*stall_deadline).ok_or(CoordinatorTerminalError::Deadline)?;
+    let observed = now();
+    if observed >= deadline || observed >= outer_deadline {
+        return Err(CoordinatorTerminalError::Deadline);
+    }
+    match write(output)? {
+        TerminalWrite::Complete => {
+            *stall_deadline = None;
+            Ok(CoordinatorPumpProgress::Output)
+        }
+        TerminalWrite::Progress { .. } | TerminalWrite::WouldBlock => {
+            Ok(CoordinatorPumpProgress::OutputPending)
         }
     }
 }
@@ -622,6 +736,7 @@ impl<State> fmt::Debug for CoordinatorTerminal<State> {
             &self.endpoint,
             &self.snapshot,
             &self.output,
+            self.output_stall_deadline,
             self.output_closed,
             &self.state,
         );
@@ -654,6 +769,186 @@ mod tests {
     const FINAL_OUTPUT_SENTINEL: &[u8] = b"calcifer-coordinator-final-output";
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
     type TestCoordinatorReceiver = CoordinatorReceiver<Cursor<Vec<u8>>>;
+
+    #[test]
+    fn pending_output_deadline_is_capped_once_and_expiry_performs_no_io()
+    -> Result<(), Box<dyn Error>> {
+        let base = Instant::now();
+        let outer_deadline = base + Duration::from_millis(30);
+        let mut observations = [
+            base,
+            base,
+            base,
+            base + Duration::from_millis(10),
+            base + Duration::from_millis(10),
+            outer_deadline,
+        ]
+        .into_iter();
+        let mut output = PendingTerminalOutput::new();
+        let mut stall_deadline = None;
+        let mut output_closed = false;
+        let mut reads = 0_usize;
+        let mut writes = 0_usize;
+
+        let progress = pump_output_state_once(
+            &mut output,
+            &mut stall_deadline,
+            &mut output_closed,
+            Duration::from_secs(1),
+            outer_deadline,
+            || {
+                observations
+                    .next()
+                    .unwrap_or_else(|| panic!("missing test clock observation"))
+            },
+            |output| {
+                reads += 1;
+                output
+                    .load_for_test(b"fixed-pending-sentinel")
+                    .map_err(|_| CoordinatorTerminalError::TerminalChannelRead)?;
+                Ok(PendingTerminalRead::Data)
+            },
+            |_| {
+                writes += 1;
+                Ok(TerminalWrite::WouldBlock)
+            },
+        )?;
+        assert_eq!(progress, CoordinatorPumpProgress::OutputPending);
+        assert_eq!(stall_deadline, Some(outer_deadline));
+
+        let progress = pump_output_state_once(
+            &mut output,
+            &mut stall_deadline,
+            &mut output_closed,
+            Duration::from_secs(2),
+            outer_deadline,
+            || {
+                observations
+                    .next()
+                    .unwrap_or_else(|| panic!("missing test clock observation"))
+            },
+            |_| {
+                reads += 1;
+                Ok(PendingTerminalRead::WouldBlock)
+            },
+            |_| {
+                writes += 1;
+                Ok(TerminalWrite::WouldBlock)
+            },
+        )?;
+        assert_eq!(progress, CoordinatorPumpProgress::OutputPending);
+        assert_eq!(stall_deadline, Some(outer_deadline));
+        assert_eq!((reads, writes), (1, 2));
+
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                Duration::from_secs(2),
+                outer_deadline,
+                || {
+                    observations
+                        .next()
+                        .unwrap_or_else(|| panic!("missing test clock observation"))
+                },
+                |_| {
+                    reads += 1;
+                    Ok(PendingTerminalRead::WouldBlock)
+                },
+                |_| {
+                    writes += 1;
+                    Ok(TerminalWrite::WouldBlock)
+                },
+            ),
+            Err(CoordinatorTerminalError::Deadline)
+        );
+        assert_eq!((reads, writes), (1, 2));
+        assert_eq!(output.remaining_bytes_for_test(), b"fixed-pending-sentinel");
+        Ok(())
+    }
+
+    #[test]
+    fn output_crossing_outer_fence_returns_the_exact_pending_shape_without_write()
+    -> Result<(), Box<dyn Error>> {
+        let before = Instant::now();
+        let outer_deadline = before + Duration::from_millis(10);
+        let after = outer_deadline + Duration::from_millis(1);
+        let mut observations = [before, after].into_iter();
+        let mut output = PendingTerminalOutput::new();
+        let mut stall_deadline = None;
+        let mut output_closed = false;
+        let mut reads = 0_usize;
+        let mut writes = 0_usize;
+
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                Duration::from_secs(1),
+                outer_deadline,
+                || {
+                    observations
+                        .next()
+                        .unwrap_or_else(|| panic!("missing test clock observation"))
+                },
+                |output| {
+                    reads += 1;
+                    output
+                        .load_for_test(b"crossed-fence-pending-frame")
+                        .map_err(|_| CoordinatorTerminalError::TerminalChannelRead)?;
+                    Ok(PendingTerminalRead::Data)
+                },
+                |_| {
+                    writes += 1;
+                    Ok(TerminalWrite::WouldBlock)
+                },
+            ),
+            Err(CoordinatorTerminalError::Deadline)
+        );
+        assert_eq!((reads, writes), (1, 0));
+        assert!(output.is_pending());
+
+        output.scrub();
+        stall_deadline = None;
+        let mut empty_reads = 0_usize;
+        let mut empty_writes = 0_usize;
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                Duration::from_secs(1),
+                outer_deadline,
+                || after,
+                |_| {
+                    empty_reads += 1;
+                    Ok(PendingTerminalRead::WouldBlock)
+                },
+                |_| {
+                    empty_writes += 1;
+                    Ok(TerminalWrite::WouldBlock)
+                },
+            ),
+            Err(CoordinatorTerminalError::Deadline)
+        );
+        assert_eq!((empty_reads, empty_writes), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_output_scrub_removes_payload_without_waiting_for_drop() -> Result<(), Box<dyn Error>>
+    {
+        let mut output = PendingTerminalOutput::new();
+        output.load_for_test(b"retained-private-terminal-sentinel")?;
+        assert!(output.is_pending());
+        output.scrub();
+        assert!(output.is_zeroized_for_test());
+        assert_eq!(output.retained_shape_for_test(), (0, 0, true));
+        assert!(output.remaining_bytes_for_test().is_empty());
+        Ok(())
+    }
 
     #[test]
     fn coordinator_terminal_exposes_the_reviewed_linear_states() {
@@ -787,7 +1082,7 @@ mod tests {
             .map_err(|_| "capture coordinator terminal")?;
 
         // An expired turn fails without losing the exact OutputOnly owner.
-        let failure = match owner.pump_output_once(Instant::now()) {
+        let failure = match owner.pump_output_once(TEST_TIMEOUT, Instant::now()) {
             Err(failure) => failure,
             Ok(_) => return Err("expired output turn unexpectedly succeeded".into()),
         };
@@ -798,7 +1093,7 @@ mod tests {
         write_to_endpoint(&guardian, OUTPUT_SENTINEL, Instant::now() + TEST_TIMEOUT)
             .map_err(|_| "write initial terminal output")?;
         let turn = owner
-            .pump_output_once(Instant::now() + TEST_TIMEOUT)
+            .pump_output_once(TEST_TIMEOUT, Instant::now() + TEST_TIMEOUT)
             .map_err(|_| "pump initial terminal output")?;
         assert_eq!(turn.progress(), CoordinatorPumpProgress::Output);
         let owner = turn.into_owner();
@@ -918,12 +1213,12 @@ mod tests {
             .shutdown(TerminalShutdown::Write)
             .map_err(|_| "shutdown final output")?;
         let final_output = resumed_active
-            .pump_output_once(Instant::now() + TEST_TIMEOUT)
+            .pump_output_once(TEST_TIMEOUT, Instant::now() + TEST_TIMEOUT)
             .map_err(|_| "pump final output")?;
         assert_eq!(final_output.progress(), CoordinatorPumpProgress::Output);
         let output_closed = final_output
             .into_owner()
-            .pump_output_once(Instant::now() + TEST_TIMEOUT)
+            .pump_output_once(TEST_TIMEOUT, Instant::now() + TEST_TIMEOUT)
             .map_err(|_| "observe final output eof")?;
         assert_eq!(
             output_closed.progress(),
@@ -956,12 +1251,12 @@ mod tests {
             .map_err(|_| "capture disconnected coordinator")?;
         drop(disconnected_guardian);
         let closed = disconnected
-            .pump_output_once(Instant::now() + TEST_TIMEOUT)
+            .pump_output_once(TEST_TIMEOUT, Instant::now() + TEST_TIMEOUT)
             .map_err(|_| "observe disconnected eof")?;
         assert_eq!(closed.progress(), CoordinatorPumpProgress::OutputClosed);
         let closed = closed
             .into_owner()
-            .pump_output_once(Instant::now() + TEST_TIMEOUT)
+            .pump_output_once(TEST_TIMEOUT, Instant::now() + TEST_TIMEOUT)
             .map_err(|_| "observe sticky disconnected eof")?;
         assert_eq!(closed.progress(), CoordinatorPumpProgress::OutputClosed);
         let disconnected = closed.into_owner();

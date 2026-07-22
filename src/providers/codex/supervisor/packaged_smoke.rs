@@ -545,6 +545,7 @@ const PACKAGE_PS_PROCESS_FIELDS: &str = "pid=,pgid=,uid=,state=";
 // startup bound is deliberately wider than production's unchanged defaults.
 const PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(180);
 const PACKAGE_SUPERVISOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+const PACKAGE_SUPERVISOR_OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 // The deterministic path still traverses compatibility, App, monitor, TUI
 // planning, and descriptor gates before the relay starts. Reserve a bounded
 // pre-relay interval plus the fixture's target-specific relay interval. If
@@ -11895,6 +11896,7 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
                 CoordinatorBounds::new(
                     PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
                     Duration::from_millis(20),
+                    PACKAGE_SUPERVISOR_OUTPUT_STALL_TIMEOUT,
                 )?,
             )
             .unwrap_or_else(|failure| {
@@ -11929,6 +11931,7 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
     let bounds = CoordinatorBounds::new(
         PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
         Duration::from_millis(20),
+        PACKAGE_SUPERVISOR_OUTPUT_STALL_TIMEOUT,
     )?;
     // The exact early-startup regression forces the native descriptor scan to
     // remain in its documented ProcessChanged retry state. The coordinator
