@@ -8,6 +8,8 @@ mod profiles;
 mod project_config;
 mod provider_identity;
 mod providers;
+#[allow(dead_code)] // Issue #31 definitions-only phase; remove with its first consumer.
+mod routing;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
