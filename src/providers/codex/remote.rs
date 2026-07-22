@@ -218,6 +218,40 @@ impl ReadinessTransportTracker {
         self.selected_failure().unwrap_or(error)
     }
 
+    /// Atomically closes the caller-side readiness deadline against worker
+    /// publication. A worker publishes success while holding the same
+    /// selection lock but deliberately leaves the relay open, so the final
+    /// nonblocking receive must happen before timeout selection.
+    fn arbitrate_deadline(
+        &self,
+        readiness: &Receiver<Result<EffectiveThreadSettings, ReadinessProxyError>>,
+    ) -> Result<EffectiveThreadSettings, ReadinessProxyError> {
+        let mut selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *selection {
+            RelayFailureSelection::Failed(error) => Err(error),
+            RelayFailureSelection::Stopped => Err(ReadinessProxyError::UnexpectedSequence),
+            RelayFailureSelection::Open => {
+                let result = match readiness.try_recv() {
+                    Ok(result) => result,
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                        Err(ReadinessProxyError::Timeout)
+                    }
+                };
+                match result {
+                    Ok(settings) => Ok(settings),
+                    Err(error) => {
+                        let error = self.authoritative(error);
+                        *selection = RelayFailureSelection::Failed(error);
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
     /// Selects one authoritative run outcome and closes origin publication.
     /// A transport failure that committed first wins; otherwise this semantic
     /// failure wins and later cleanup wakeups cannot mint an origin. An
@@ -1061,9 +1095,8 @@ impl ReadinessProxy {
             Err(TryRecvError::Empty) => {}
         }
         if Instant::now() >= self.deadline {
-            return self
-                .record_readiness(Err(ReadinessProxyError::Timeout))
-                .map(Some);
+            let result = self.transport.arbitrate_deadline(&self.readiness);
+            return self.record_readiness(result).map(Some);
         }
         if self
             .worker
@@ -1095,22 +1128,25 @@ impl ReadinessProxy {
         if let Some(result) = self.poll_ready()? {
             return Ok(result);
         }
-        let wait = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(ReadinessProxyError::Timeout);
-        let result = match wait.and_then(|wait| {
-            self.readiness
-                .recv_timeout(wait)
-                .map_err(|error| match error {
-                    RecvTimeoutError::Timeout => ReadinessProxyError::Timeout,
-                    RecvTimeoutError::Disconnected => self
-                        .transport
-                        .preserve_selected(ReadinessProxyError::Worker),
-                })
-        }) {
-            Ok(result) => result,
-            Err(error) => Err(error),
+        let wait = self.deadline.checked_duration_since(Instant::now());
+        self.wait_for_readiness_after_poll(wait)
+    }
+
+    fn wait_for_readiness_after_poll(
+        &mut self,
+        wait: Option<Duration>,
+    ) -> Result<EffectiveThreadSettings, ReadinessProxyError> {
+        let result = match wait {
+            Some(wait) => match self.readiness.recv_timeout(wait) {
+                Ok(result) => result,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.transport.arbitrate_deadline(&self.readiness)
+                }
+                Err(RecvTimeoutError::Disconnected) => Err(self
+                    .transport
+                    .preserve_selected(ReadinessProxyError::Worker)),
+            },
+            None => self.transport.arbitrate_deadline(&self.readiness),
         };
         self.record_readiness(result)
     }
@@ -3208,6 +3244,154 @@ mod tests {
         );
         assert_eq!(transport.first(), None);
         assert_eq!(lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+    }
+
+    #[test]
+    fn deadline_arbitration_covers_open_disconnected_and_stopped_receiver_states()
+    -> Result<(), Box<dyn Error>> {
+        let transport = ReadinessTransportTracker::new();
+        let (_connected_sender, empty_readiness) = mpsc::sync_channel(1);
+        assert_eq!(
+            transport.arbitrate_deadline(&empty_readiness),
+            Err(ReadinessProxyError::Timeout)
+        );
+        assert_eq!(
+            transport.selected_failure(),
+            Some(ReadinessProxyError::Timeout)
+        );
+
+        let transport = ReadinessTransportTracker::new();
+        let (disconnected_sender, disconnected_readiness) = mpsc::sync_channel(1);
+        drop(disconnected_sender);
+        assert_eq!(
+            transport.arbitrate_deadline(&disconnected_readiness),
+            Err(ReadinessProxyError::Timeout)
+        );
+        assert_eq!(
+            transport.selected_failure(),
+            Some(ReadinessProxyError::Timeout)
+        );
+        assert_eq!(transport.first(), None);
+
+        let transport = ReadinessTransportTracker::new();
+        let (failure_sender, failure_readiness) = mpsc::sync_channel(1);
+        let expected =
+            ReadinessProxyError::Transport(ReadinessTransportOrigin::ObservationDelivery);
+        failure_sender.send(Err(expected))?;
+        assert_eq!(
+            transport.arbitrate_deadline(&failure_readiness),
+            Err(expected)
+        );
+        assert_eq!(transport.selected_failure(), Some(expected));
+
+        let lifecycle = AtomicU8::new(RELAY_RUNNING);
+        let transport = ReadinessTransportTracker::new();
+        let (stopped_sender, stopped_readiness) = mpsc::sync_channel(1);
+        let queued = ReadinessProxyError::Transport(ReadinessTransportOrigin::ClientEof);
+        stopped_sender.send(Err(queued))?;
+        assert_eq!(transport.stop(&lifecycle), RELAY_RUNNING);
+        assert_eq!(
+            transport.arbitrate_deadline(&stopped_readiness),
+            Err(ReadinessProxyError::UnexpectedSequence)
+        );
+        assert_eq!(transport.first(), None);
+        assert_eq!(transport.selected_failure(), None);
+        assert_eq!(
+            *transport
+                .selection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            RelayFailureSelection::Stopped
+        );
+        assert_eq!(stopped_readiness.try_recv(), Ok(Err(queued)));
+        assert_eq!(
+            transport.disconnect(&lifecycle, ReadinessTransportOrigin::ClientEof),
+            None
+        );
+        assert_eq!(transport.first(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn deadline_arbitration_waits_for_inflight_readiness_publication_without_sleep()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(AtomicU8::new(RELAY_RUNNING));
+        let transport = Arc::new(ReadinessTransportTracker::new());
+        let (readiness_sender, readiness) = mpsc::sync_channel(1);
+        let expected_settings = observed_settings();
+        let publisher_settings = expected_settings.clone();
+        let publisher_lifecycle = Arc::clone(&lifecycle);
+        let publisher_transport = Arc::clone(&transport);
+        let (publication_entered_sender, publication_entered_receiver) = mpsc::sync_channel(0);
+        let (release_publication_sender, release_publication_receiver) = mpsc::sync_channel(0);
+        let publisher = thread::spawn(move || {
+            publisher_transport.publish_readiness(&publisher_lifecycle, || {
+                readiness_sender
+                    .send(Ok(publisher_settings))
+                    .map_err(|_| ReadinessProxyError::Worker)?;
+                publication_entered_sender
+                    .send(())
+                    .map_err(|_| ReadinessProxyError::Worker)?;
+                release_publication_receiver
+                    .recv()
+                    .map_err(|_| ReadinessProxyError::Worker)
+            })
+        });
+        publication_entered_receiver.recv()?;
+        assert!(matches!(
+            transport.selection.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+
+        let arbitrator_transport = Arc::clone(&transport);
+        let (arbitration_started_sender, arbitration_started_receiver) = mpsc::sync_channel(0);
+        let (arbitration_done_sender, arbitration_done_receiver) = mpsc::sync_channel(0);
+        let arbitrator = thread::spawn(move || {
+            arbitration_started_sender
+                .send(())
+                .map_err(|_| "arbitration-start receiver disappeared")?;
+            let result = arbitrator_transport.arbitrate_deadline(&readiness);
+            arbitration_done_sender
+                .send(result.clone())
+                .map_err(|_| "arbitration-result receiver disappeared")?;
+            Ok::<_, &'static str>(result)
+        });
+        arbitration_started_receiver.recv()?;
+        assert_eq!(
+            arbitration_done_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        );
+
+        release_publication_sender.send(())?;
+        assert_eq!(
+            publisher
+                .join()
+                .map_err(|_| "readiness publisher panicked")?,
+            Ok(())
+        );
+        assert_eq!(
+            arbitration_done_receiver.recv()?,
+            Ok(expected_settings.clone())
+        );
+        assert_eq!(
+            arbitrator
+                .join()
+                .map_err(|_| "deadline arbitrator panicked")??,
+            Ok(expected_settings)
+        );
+        assert_eq!(transport.selected_failure(), None);
+
+        let expected = transport
+            .disconnect(&lifecycle, ReadinessTransportOrigin::ClientEof)
+            .ok_or("post-readiness transport failure was not selected")?;
+        assert_eq!(
+            expected,
+            ReadinessProxyError::Transport(ReadinessTransportOrigin::ClientEof)
+        );
+        assert_eq!(transport.selected_failure(), Some(expected));
+        assert_eq!(transport.first(), Some(ReadinessTransportOrigin::ClientEof));
+        assert_eq!(lifecycle.load(Ordering::Acquire), RELAY_DISCONNECTED);
+        Ok(())
     }
 
     #[test]
@@ -5591,6 +5775,90 @@ mod tests {
         assert_eq!(proxy.poll_ready(), Err(ReadinessProxyError::Timeout));
         assert_eq!(proxy.poll_ready(), Err(ReadinessProxyError::Timeout));
         assert_eq!(proxy.lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+        proxy.shutdown(shutdown_deadline()?)?;
+        assert!(!proxy_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn blocking_readiness_wait_timeout_is_sticky_and_cleans_up_the_socket()
+    -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        let mut proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_secs(1))?;
+        let (readiness_sender, readiness) = mpsc::sync_channel(1);
+        proxy.readiness = readiness;
+        proxy.deadline = Instant::now()
+            .checked_add(Duration::from_millis(50))
+            .ok_or("blocking readiness deadline overflowed")?;
+        assert!(Instant::now() < proxy.deadline);
+        assert_eq!(proxy.readiness.try_recv(), Err(TryRecvError::Empty));
+
+        assert_eq!(
+            proxy.wait_until_ready_with_settings(),
+            Err(ReadinessProxyError::Timeout)
+        );
+        assert_eq!(proxy.poll_ready(), Err(ReadinessProxyError::Timeout));
+        assert_eq!(proxy.lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+
+        drop(readiness_sender);
+        proxy.shutdown(shutdown_deadline()?)?;
+        assert!(!proxy_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn already_expired_readiness_wait_branch_is_sticky_and_cleans_up_the_socket()
+    -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        let mut proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_secs(1))?;
+        let (readiness_sender, readiness) = mpsc::sync_channel(1);
+        proxy.readiness = readiness;
+        proxy.deadline = Instant::now();
+        assert_eq!(proxy.readiness.try_recv(), Err(TryRecvError::Empty));
+
+        assert_eq!(
+            proxy.wait_for_readiness_after_poll(None),
+            Err(ReadinessProxyError::Timeout)
+        );
+        assert_eq!(proxy.poll_ready(), Err(ReadinessProxyError::Timeout));
+        assert_eq!(proxy.lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+
+        drop(readiness_sender);
+        proxy.shutdown(shutdown_deadline()?)?;
+        assert!(!proxy_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn poll_deadline_preserves_a_precommitted_transport_failure_and_cleanup_authority()
+    -> Result<(), Box<dyn Error>> {
+        let temp = TestDirectory::new()?;
+        let upstream_path = temp.path().join("upstream.sock");
+        let proxy_path = temp.path().join("proxy.sock");
+        let _upstream = UnixListener::bind(&upstream_path)?;
+        let mut proxy = spawn_test_proxy(&proxy_path, &upstream_path, Duration::from_secs(1))?;
+        let (readiness_sender, readiness) = mpsc::sync_channel(1);
+        proxy.readiness = readiness;
+
+        let expected = proxy
+            .transport
+            .disconnect(&proxy.lifecycle, ReadinessTransportOrigin::ClientEof)
+            .ok_or("the transport failure was not committed")?;
+        assert_eq!(proxy.lifecycle.load(Ordering::Acquire), RELAY_DISCONNECTED);
+        assert_eq!(proxy.readiness.try_recv(), Err(TryRecvError::Empty));
+        proxy.deadline = Instant::now();
+
+        assert_eq!(proxy.poll_ready(), Err(expected));
+        assert_eq!(proxy.poll_ready(), Err(expected));
+        assert_eq!(proxy.lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+
+        drop(readiness_sender);
         proxy.shutdown(shutdown_deadline()?)?;
         assert!(!proxy_path.exists());
         Ok(())
