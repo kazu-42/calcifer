@@ -27,6 +27,9 @@ use super::process::{ChildAuthority, PinnedAppGracefulDrain};
 const RUNTIME_CREATE_ATTEMPTS: usize = 8;
 const RUNTIME_QUARANTINE_ATTEMPTS: usize = 8;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const RUNTIME_DIRECTORY_PREFIX: &str = ".calcifer-supervisor-";
+#[cfg(test)]
+const FIXTURE_PARENT_DIRECTORY_PREFIX: &str = ".calcifer-coordinator-matrix-parent-";
 const APP_SOCKET_NAME: &str = "app.sock";
 const TUI_RELAY_SOCKET_NAME: &str = "tui.sock";
 const APP_SOCKET_QUARANTINE_PREFIX: &str = ".calcifer-app-socket-quarantine-";
@@ -99,8 +102,33 @@ impl NodeIdentity {
         }
     }
 
-    fn matches_private_metadata(self, metadata: &fs::Metadata) -> bool {
-        Self::private_directory_metadata(metadata) == Ok(self)
+    #[cfg(test)]
+    fn fixture_anchor_metadata(metadata: &fs::Metadata) -> Result<Self, RuntimeError> {
+        let identity = Self::from_metadata(metadata);
+        let owner_is_trusted =
+            metadata.uid() == 0 || metadata.uid() == rustix::process::geteuid().as_raw();
+        let writable_by_others = identity.mode & 0o022 != 0;
+        let sticky_when_shared = !writable_by_others || identity.mode & 0o1000 != 0;
+        if metadata.file_type().is_dir() && owner_is_trusted && sticky_when_shared {
+            Ok(identity)
+        } else {
+            Err(RuntimeError::UnsafeParent)
+        }
+    }
+
+    #[cfg(test)]
+    fn fixture_anchor_stat(stat: &Stat) -> Result<Self, RuntimeError> {
+        let identity = Self::from_stat(stat);
+        let owner_is_trusted =
+            stat.st_uid == 0 || stat.st_uid == rustix::process::geteuid().as_raw();
+        let writable_by_others = identity.mode & 0o022 != 0;
+        let sticky_when_shared = !writable_by_others || identity.mode & 0o1000 != 0;
+        if FileType::from_raw_mode(stat.st_mode).is_dir() && owner_is_trusted && sticky_when_shared
+        {
+            Ok(identity)
+        } else {
+            Err(RuntimeError::UnsafeParent)
+        }
     }
 
     fn matches_private_stat(self, stat: &Stat) -> bool {
@@ -258,10 +286,27 @@ struct StableParent {
     path: PathBuf,
     descriptor: OwnedFd,
     identity: NodeIdentity,
+    policy: StableParentPolicy,
+}
+
+#[derive(Clone, Copy)]
+enum StableParentPolicy {
+    Private,
+    #[cfg(test)]
+    FixtureAnchor,
 }
 
 impl StableParent {
     fn open_private(parent: &Path) -> Result<Self, RuntimeError> {
+        Self::open_with_policy(parent, StableParentPolicy::Private)
+    }
+
+    #[cfg(test)]
+    fn open_fixture_anchor(parent: &Path) -> Result<Self, RuntimeError> {
+        Self::open_with_policy(parent, StableParentPolicy::FixtureAnchor)
+    }
+
+    fn open_with_policy(parent: &Path, policy: StableParentPolicy) -> Result<Self, RuntimeError> {
         let canonical_parent = fs::canonicalize(parent).map_err(|_| RuntimeError::UnsafeParent)?;
         if canonical_parent != parent {
             return Err(RuntimeError::UnsafeParent);
@@ -269,14 +314,12 @@ impl StableParent {
 
         let visible_before =
             fs::symlink_metadata(parent).map_err(|_| RuntimeError::UnsafeParent)?;
-        let visible_identity = NodeIdentity::private_directory_metadata(&visible_before)
-            .map_err(|_| RuntimeError::UnsafeParent)?;
+        let visible_identity = policy.metadata_identity(&visible_before)?;
         let descriptor = open(parent, directory_open_flags(), Mode::empty())
             .map_err(|_| RuntimeError::UnsafeParent)?;
         let opened_stat = fstat(&descriptor).map_err(|_| RuntimeError::UnsafeParent)?;
-        let opened_identity = NodeIdentity::private_directory_stat(&opened_stat)
-            .map_err(|_| RuntimeError::UnsafeParent)?;
-        if opened_identity != visible_identity || !open_inode_acl_is_empty(&descriptor) {
+        let opened_identity = policy.stat_identity(&opened_stat)?;
+        if opened_identity != visible_identity || !policy.acl_is_safe(&descriptor) {
             return Err(RuntimeError::UnsafeParent);
         }
 
@@ -284,6 +327,7 @@ impl StableParent {
             path: parent.to_path_buf(),
             descriptor,
             identity: opened_identity,
+            policy,
         };
         stable.verify()?;
         Ok(stable)
@@ -291,16 +335,48 @@ impl StableParent {
 
     fn verify(&self) -> Result<(), RuntimeError> {
         let opened = fstat(&self.descriptor).map_err(|_| RuntimeError::UnsafeParent)?;
-        if !self.identity.matches_private_stat(&opened)
-            || !open_inode_acl_is_empty(&self.descriptor)
+        if self.policy.stat_identity(&opened)? != self.identity
+            || !self.policy.acl_is_safe(&self.descriptor)
         {
             return Err(RuntimeError::UnsafeParent);
         }
         let visible = fs::symlink_metadata(&self.path).map_err(|_| RuntimeError::UnsafeParent)?;
-        if self.identity.matches_private_metadata(&visible) {
+        if self.policy.metadata_identity(&visible)? == self.identity {
             Ok(())
         } else {
             Err(RuntimeError::UnsafeParent)
+        }
+    }
+}
+
+impl StableParentPolicy {
+    fn metadata_identity(self, metadata: &fs::Metadata) -> Result<NodeIdentity, RuntimeError> {
+        match self {
+            Self::Private => NodeIdentity::private_directory_metadata(metadata)
+                .map_err(|_| RuntimeError::UnsafeParent),
+            #[cfg(test)]
+            Self::FixtureAnchor => NodeIdentity::fixture_anchor_metadata(metadata),
+        }
+    }
+
+    fn stat_identity(self, stat: &Stat) -> Result<NodeIdentity, RuntimeError> {
+        match self {
+            Self::Private => {
+                NodeIdentity::private_directory_stat(stat).map_err(|_| RuntimeError::UnsafeParent)
+            }
+            #[cfg(test)]
+            Self::FixtureAnchor => NodeIdentity::fixture_anchor_stat(stat),
+        }
+    }
+
+    fn acl_is_safe(self, descriptor: impl AsFd) -> bool {
+        match self {
+            Self::Private => open_inode_acl_is_empty(descriptor),
+            #[cfg(test)]
+            // A shared temporary anchor may legitimately carry an ACL. The
+            // UUID child is opened with NOFOLLOW, then has inherited ACLs
+            // cleared and is revalidated before it becomes a private parent.
+            Self::FixtureAnchor => true,
         }
     }
 }
@@ -400,8 +476,28 @@ impl PrivateRuntime {
         let stable_parent =
             StableParent::open_private(parent).map_err(RuntimeCreateFailure::not_created)?;
 
+        Self::create_below(stable_parent, RUNTIME_DIRECTORY_PREFIX, &mut post_mkdir)
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_fixture_parent(anchor: &Path) -> Result<Self, RuntimeCreateFailure> {
+        let stable_anchor =
+            StableParent::open_fixture_anchor(anchor).map_err(RuntimeCreateFailure::not_created)?;
+        Self::create_below(stable_anchor, FIXTURE_PARENT_DIRECTORY_PREFIX, &mut |_| {
+            Ok(())
+        })
+    }
+
+    fn create_below<F>(
+        stable_parent: StableParent,
+        prefix: &str,
+        post_mkdir: &mut F,
+    ) -> Result<Self, RuntimeCreateFailure>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
         for _ in 0..RUNTIME_CREATE_ATTEMPTS {
-            let name = format!(".calcifer-supervisor-{}", Uuid::new_v4());
+            let name = format!("{prefix}{}", Uuid::new_v4());
             match mkdirat(
                 &stable_parent.descriptor,
                 name.as_str(),
@@ -416,7 +512,7 @@ impl PrivateRuntime {
                         directory: None,
                         identity: None,
                     };
-                    return Self::finish_created_runtime(created, &mut post_mkdir);
+                    return Self::finish_created_runtime(created, post_mkdir);
                 }
                 Err(rustix::io::Errno::EXIST) => {}
                 Err(_) => {
@@ -425,6 +521,27 @@ impl PrivateRuntime {
             }
         }
         Err(RuntimeCreateFailure::not_created(RuntimeError::Create))
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate_fixture_path(root: &Path, anchor: &Path) -> Result<(), RuntimeError> {
+        let parent = root.parent().ok_or(RuntimeError::UnsafeIdentity)?;
+        if parent.parent() != Some(anchor)
+            || !parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(FIXTURE_PARENT_DIRECTORY_PREFIX))
+            || !root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(RUNTIME_DIRECTORY_PREFIX))
+        {
+            return Err(RuntimeError::UnsafeIdentity);
+        }
+
+        StableParent::open_fixture_anchor(anchor)?.verify()?;
+        StableParent::open_private(parent)?.verify()?;
+        StableParent::open_private(root)?.verify()
     }
 
     fn finish_created_runtime<F>(
@@ -3070,6 +3187,85 @@ mod tests {
 
         let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
         assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_parent_adapts_a_sticky_anchor_without_relaxing_runtime_parents()
+    -> Result<(), Box<dyn Error>> {
+        let temporary_anchor = fs::canonicalize(std::env::temp_dir())?;
+        let outer = PrivateRuntime::create_fixture_parent(&temporary_anchor)?;
+        let outer_path = outer.path().to_path_buf();
+        let shared = outer_path.join("shared-temp");
+        fs::DirBuilder::new().mode(0o700).create(&shared)?;
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777))?;
+
+        let unsafe_parent = PrivateRuntime::create_fixture_parent(&shared)
+            .err()
+            .ok_or("a non-sticky shared anchor was accepted")?;
+        assert_eq!(unsafe_parent.error(), RuntimeError::UnsafeParent);
+        assert!(!unsafe_parent.has_created_path());
+
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777))?;
+        let shared = fs::canonicalize(shared)?;
+        let direct_failure = PrivateRuntime::create(&shared)
+            .err()
+            .ok_or("the production constructor accepted a shared anchor")?;
+        assert_eq!(direct_failure.error(), RuntimeError::UnsafeParent);
+        assert!(!direct_failure.has_created_path());
+
+        let fixture_parent = PrivateRuntime::create_fixture_parent(&shared)?;
+        let fixture_parent_path = fixture_parent.path().to_path_buf();
+        let metadata = fs::symlink_metadata(&fixture_parent_path)?;
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o700);
+        assert!(
+            fixture_parent_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(FIXTURE_PARENT_DIRECTORY_PREFIX))
+        );
+
+        let runtime = PrivateRuntime::create(&fixture_parent_path)?;
+        let runtime_path = runtime.path().to_path_buf();
+        PrivateRuntime::validate_fixture_path(&runtime_path, &shared)?;
+        runtime.cleanup().map_err(|failure| failure.error())?;
+        fixture_parent
+            .cleanup()
+            .map_err(|failure| failure.error())?;
+        fs::remove_dir(&shared)?;
+        outer.cleanup().map_err(|failure| failure.error())?;
+
+        assert!(!runtime_path.try_exists()?);
+        assert!(!fixture_parent_path.try_exists()?);
+        assert!(!outer_path.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_parent_cleanup_preserves_a_visible_replacement() -> Result<(), Box<dyn Error>> {
+        let anchor = fs::canonicalize(std::env::temp_dir())?;
+        let parent = PrivateRuntime::create_fixture_parent(&anchor)?;
+        let visible = parent.path().to_path_buf();
+        let parked = anchor.join(format!(".calcifer-matrix-parent-parked-{}", Uuid::new_v4()));
+        fs::rename(&visible, &parked)?;
+        fs::DirBuilder::new().mode(0o700).create(&visible)?;
+        let sentinel = visible.join("replacement-must-survive");
+        fs::write(&sentinel, b"replacement")?;
+
+        let failure = parent
+            .cleanup()
+            .err()
+            .ok_or("fixture parent cleanup deleted a replacement")?;
+        assert_eq!(failure.error(), RuntimeError::IdentityMismatch);
+        assert_eq!(fs::read(&sentinel)?, b"replacement");
+
+        let parent = failure.into_runtime();
+        fs::remove_file(&sentinel)?;
+        fs::remove_dir(&visible)?;
+        fs::rename(&parked, &visible)?;
+        parent.cleanup().map_err(|failure| failure.error())?;
+        assert!(!visible.try_exists()?);
         Ok(())
     }
 

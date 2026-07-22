@@ -954,6 +954,17 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   only with an open-inode unlink postcondition. Mounts, links, special nodes,
   foreign owners, replacement races, and inconclusive postconditions retain
   cleanup authority instead of minting a clean root.
+- Does not assume the platform temporary directory is owner-private. The
+  test-only matrix adapter pins the canonical temporary anchor, requires its
+  owner to be root or the current effective user, and requires the sticky bit
+  whenever group or other write access is present. It creates and validates a
+  distinct current-user mode-0700, ACL-free private parent beneath that anchor;
+  the unchanged production runtime constructor receives only that private
+  parent. Matrix cleanup consumes the inner runtime proof before it may consume
+  the parent proof, and both levels reuse the same descriptor-relative
+  quarantine, exact-inode revalidation, and open-inode unlink postcondition.
+  This admits Linux `/tmp` without weakening the production private-parent
+  invariant or permitting a path replacement to become deletion authority.
 - Gives every matrix wait an absolute `EINTR` fence. After an execution timeout,
   the exact helper receives `SIGKILL` and is polled with `Child::try_wait` only
   through a separate fixed cleanup interval. Failure to prove the direct reap

@@ -2895,14 +2895,20 @@ mod tests {
             .borrow()
             .clone()
             .ok_or("the test root was not observed")?;
+        let parent = root
+            .parent()
+            .ok_or("the private matrix parent was not observed")?
+            .to_path_buf();
         assert!(!root.try_exists()?);
+        assert!(!parent.try_exists()?);
         Ok(())
     }
 
     #[test]
     fn matrix_test_root_post_mkdir_validation_failure_retains_cleanup_authority()
     -> Result<(), Box<dyn std::error::Error>> {
-        let parent = std::fs::canonicalize(std::env::temp_dir())?;
+        let test_parent = create_matrix_test_parent()?;
+        let parent = test_parent.path().to_path_buf();
         let observed_root = Rc::new(RefCell::new(None));
         let capture = Rc::clone(&observed_root);
         let failure = match PrivateRuntime::create_with_post_mkdir(&parent, |root| {
@@ -2935,7 +2941,9 @@ mod tests {
             )
             .into());
         }
+        test_parent.cleanup().map_err(|failure| failure.error())?;
         assert!(!root.try_exists()?);
+        assert!(!parent.try_exists()?);
         Ok(())
     }
 
@@ -3524,22 +3532,9 @@ mod tests {
     }
 
     fn validate_matrix_child_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let parent = std::fs::canonicalize(std::env::temp_dir())?;
-        let name = root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("matrix test root name was invalid")?;
-        let metadata = std::fs::symlink_metadata(root)?;
-        if root.parent() != Some(parent.as_path())
-            || !name.starts_with(".calcifer-supervisor-")
-            || std::fs::canonicalize(root)? != root
-            || !metadata.file_type().is_dir()
-            || std::os::unix::fs::MetadataExt::uid(&metadata) != rustix::process::geteuid().as_raw()
-            || std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o7777 != 0o700
-        {
-            return Err("matrix test root identity was invalid".into());
-        }
-        Ok(())
+        let anchor = std::fs::canonicalize(std::env::temp_dir())?;
+        PrivateRuntime::validate_fixture_path(root, &anchor)
+            .map_err(|_| "matrix test root identity was invalid".into())
     }
 
     fn run_matrix_guardian_peer(
@@ -3965,23 +3960,30 @@ mod tests {
     struct MatrixTestRoot {
         path: PathBuf,
         runtime: Option<PrivateRuntime>,
+        parent: Option<PrivateRuntime>,
     }
 
     impl MatrixTestRoot {
         fn create() -> Result<Self, Box<dyn std::error::Error>> {
-            let parent = std::fs::canonicalize(std::env::temp_dir())?;
-            let runtime = match PrivateRuntime::create(&parent) {
+            let parent = create_matrix_test_parent()?;
+            let runtime = match PrivateRuntime::create(parent.path()) {
                 Ok(runtime) => runtime,
                 Err(failure) => {
                     let primary = failure.error();
-                    if !failure.has_created_path() {
-                        return Err(format!("matrix test root creation failed: {primary}").into());
-                    }
-                    return match failure.cleanup_created() {
-                        Ok(_) => Err(format!("matrix test root creation failed: {primary}").into()),
-                        Err(failure) => Err(format!(
+                    if failure.has_created_path() {
+                        if let Err(failure) = failure.cleanup_created() {
+                            return Err(format!(
                             "matrix test root creation failed: {primary}; provisional cleanup failed: {:?}",
                             failure.cleanup_error()
+                        )
+                            .into());
+                        }
+                    }
+                    return match parent.cleanup() {
+                        Ok(_) => Err(format!("matrix test root creation failed: {primary}").into()),
+                        Err(failure) => Err(format!(
+                            "matrix test root creation failed: {primary}; private parent cleanup failed: {}",
+                            failure.error()
                         )
                         .into()),
                     };
@@ -3990,6 +3992,7 @@ mod tests {
             Ok(Self {
                 path: runtime.path().to_path_buf(),
                 runtime: Some(runtime),
+                parent: Some(parent),
             })
         }
 
@@ -3998,19 +4001,19 @@ mod tests {
         }
 
         fn cleanup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-            let Some(runtime) = self.runtime.take() else {
-                return Ok(());
-            };
-            match runtime.cleanup_fixture_tree() {
-                Ok(_) => Ok(()),
-                Err(failure) => {
-                    let error = failure.error();
-                    let runtime = failure.into_runtime();
-                    self.path = runtime.path().to_path_buf();
-                    self.runtime = Some(runtime);
-                    Err(format!("matrix test root cleanup failed: {error}").into())
+            if let Some(runtime) = self.runtime.take() {
+                match runtime.cleanup_fixture_tree() {
+                    Ok(_) => {}
+                    Err(failure) => {
+                        let error = failure.error();
+                        let runtime = failure.into_runtime();
+                        self.path = runtime.path().to_path_buf();
+                        self.runtime = Some(runtime);
+                        return Err(format!("matrix test root cleanup failed: {error}").into());
+                    }
                 }
             }
+            self.cleanup_parent()
         }
 
         fn cleanup_with_before_cleanup<F>(
@@ -4020,17 +4023,31 @@ mod tests {
         where
             F: FnMut(&Path) -> std::io::Result<()>,
         {
-            let Some(runtime) = self.runtime.take() else {
+            if let Some(runtime) = self.runtime.take() {
+                match runtime.cleanup_fixture_tree_with_before_cleanup(before_cleanup) {
+                    Ok(_) => {}
+                    Err(failure) => {
+                        let error = failure.error();
+                        let runtime = failure.into_runtime();
+                        self.path = runtime.path().to_path_buf();
+                        self.runtime = Some(runtime);
+                        return Err(format!("matrix test root cleanup failed: {error}").into());
+                    }
+                }
+            }
+            self.cleanup_parent()
+        }
+
+        fn cleanup_parent(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            let Some(parent) = self.parent.take() else {
                 return Ok(());
             };
-            match runtime.cleanup_fixture_tree_with_before_cleanup(before_cleanup) {
+            match parent.cleanup() {
                 Ok(_) => Ok(()),
                 Err(failure) => {
                     let error = failure.error();
-                    let runtime = failure.into_runtime();
-                    self.path = runtime.path().to_path_buf();
-                    self.runtime = Some(runtime);
-                    Err(format!("matrix test root cleanup failed: {error}").into())
+                    self.parent = Some(failure.into_runtime());
+                    Err(format!("matrix test parent cleanup failed: {error}").into())
                 }
             }
         }
@@ -4039,6 +4056,27 @@ mod tests {
     impl Drop for MatrixTestRoot {
         fn drop(&mut self) {
             let _ = self.cleanup();
+        }
+    }
+
+    fn create_matrix_test_parent() -> Result<PrivateRuntime, Box<dyn std::error::Error>> {
+        let anchor = std::fs::canonicalize(std::env::temp_dir())?;
+        match PrivateRuntime::create_fixture_parent(&anchor) {
+            Ok(parent) => Ok(parent),
+            Err(failure) => {
+                let primary = failure.error();
+                if !failure.has_created_path() {
+                    return Err(format!("matrix test parent creation failed: {primary}").into());
+                }
+                match failure.cleanup_created() {
+                    Ok(_) => Err(format!("matrix test parent creation failed: {primary}").into()),
+                    Err(failure) => Err(format!(
+                        "matrix test parent creation failed: {primary}; provisional cleanup failed: {:?}",
+                        failure.cleanup_error()
+                    )
+                    .into()),
+                }
+            }
         }
     }
 
