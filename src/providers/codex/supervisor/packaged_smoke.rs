@@ -5042,6 +5042,209 @@ fn packaged_codex_deterministic_fixture_recovers_all_seven_production_checkpoint
     Ok(())
 }
 
+const PACKAGE_DISCONNECTED_INFERENCE_RECOVERY_MARKERS: [(&str, &[u8]); 3] = [
+    ("tui-fixture.inference-failed", b"classified\n"),
+    ("recovery.checkpoint-verified", b"reached\n"),
+    ("recovery.request-sent", b"reached\n"),
+];
+
+fn reconcile_disconnected_inference_recovery_evidence_with<ReadMarker, Now, Sleep>(
+    report: &Path,
+    deadline: Instant,
+    mut read_marker: ReadMarker,
+    mut now: Now,
+    mut sleep: Sleep,
+) -> Result<(), Box<dyn Error>>
+where
+    ReadMarker: FnMut(&Path, usize) -> io::Result<Vec<u8>>,
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    for (marker, expected) in PACKAGE_DISCONNECTED_INFERENCE_RECOVERY_MARKERS {
+        wait_for_private_marker_before_deadline_with_reader_clock_and_sleep(
+            &report.join(marker),
+            expected,
+            deadline,
+            &mut read_marker,
+            &mut now,
+            &mut sleep,
+        )?;
+    }
+    if report
+        .join("recovery.checkpoint-failed.invalid-frame")
+        .exists()
+    {
+        return Err("the selected checkpoint entered the completion decoder".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn disconnected_inference_reconciliation_waits_for_delayed_child_publication_after_backend_validation()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let logical_now = std::cell::Cell::new(Instant::now());
+    let deadline = logical_now.get() + Duration::from_millis(20);
+    let backend_request_validated = std::cell::Cell::new(true);
+    let child_failure_published = std::cell::Cell::new(false);
+    let child_reads = std::cell::Cell::new(0_u8);
+    let publication_sleeps = std::cell::Cell::new(0_u8);
+    let observed = std::cell::RefCell::new(Vec::new());
+    reconcile_disconnected_inference_recovery_evidence_with(
+        &report,
+        deadline,
+        |path, max_len| {
+            let marker = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            observed.borrow_mut().push(marker.to_owned());
+            let expected = PACKAGE_DISCONNECTED_INFERENCE_RECOVERY_MARKERS
+                .into_iter()
+                .find_map(|(candidate, expected)| (candidate == marker).then_some(expected))
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            assert_eq!(max_len, expected.len().saturating_add(1));
+            if marker == "tui-fixture.inference-failed" {
+                assert!(
+                    backend_request_validated.get(),
+                    "the child failure was observed before backend request validation"
+                );
+                child_reads.set(child_reads.get().saturating_add(1));
+                if !child_failure_published.get() {
+                    return Err(io::Error::from(io::ErrorKind::NotFound));
+                }
+            }
+            Ok(expected.to_vec())
+        },
+        || logical_now.get(),
+        |delay| {
+            assert_eq!(child_reads.get(), 1);
+            assert!(!child_failure_published.replace(true));
+            publication_sleeps.set(publication_sleeps.get().saturating_add(1));
+            logical_now.set(logical_now.get() + delay);
+        },
+    )?;
+    assert_eq!(
+        observed.into_inner(),
+        [
+            "tui-fixture.inference-failed",
+            "tui-fixture.inference-failed",
+            "recovery.checkpoint-verified",
+            "recovery.request-sent",
+        ],
+        "reconciliation did not poll the delayed child marker before parent evidence"
+    );
+    assert_eq!(child_reads.get(), 2);
+    assert_eq!(publication_sleeps.get(), 1);
+    scratch.cleanup()
+}
+
+#[test]
+fn disconnected_inference_reconciliation_preserves_the_complete_cleanup_reserve()
+-> Result<(), Box<dyn Error>> {
+    let origin = Instant::now();
+    let fence = PackageGenerationDeadlineFence::starting_at(origin)?;
+    let logical_now = std::cell::Cell::new(
+        fence
+            .recovery_start
+            .checked_sub(Duration::from_millis(1))
+            .ok_or("the recovery fence could not be rewound")?,
+    );
+    let marker_reads = std::cell::Cell::new(0_u8);
+    let result = reconcile_disconnected_inference_recovery_evidence_with(
+        Path::new("unused-logical-report"),
+        fence.recovery_start,
+        |_, _| {
+            marker_reads.set(marker_reads.get().saturating_add(1));
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        },
+        || logical_now.get(),
+        |delay| {
+            let remaining = fence
+                .recovery_start
+                .saturating_duration_since(logical_now.get());
+            assert_eq!(delay, remaining, "poll sleep crossed the recovery fence");
+            logical_now.set(logical_now.get() + delay);
+        },
+    );
+    let error =
+        require_rejected_test_result(result, "a missing child marker crossed the recovery fence")?;
+    assert!(error.to_string().contains("exceeded its deadline"));
+    assert_eq!(logical_now.get(), fence.recovery_start);
+    assert_eq!(
+        marker_reads.get(),
+        1,
+        "reconciliation started another read after the recovery fence"
+    );
+
+    let cleanup_reserve = fence.cleanup_budget.cleanup_reserve()?;
+    let expected_cleanup_end = fence
+        .recovery_start
+        .checked_add(cleanup_reserve)
+        .ok_or("the cleanup reserve overflowed")?;
+    let cleanup = PackageCleanupDeadlines::within_generation(fence, logical_now.get())?;
+    assert_eq!(cleanup.reported_groups_proof, expected_cleanup_end);
+    assert!(expected_cleanup_end <= fence.cleanup_fence);
+    Ok(())
+}
+
+#[test]
+fn private_marker_wait_rejects_a_successful_read_that_crosses_its_deadline()
+-> Result<(), Box<dyn Error>> {
+    let before = Instant::now();
+    let deadline = before + Duration::from_millis(1);
+    let logical_now = std::cell::Cell::new(before);
+    let reads = std::cell::Cell::new(0_u8);
+    let sleeps = std::cell::Cell::new(0_u8);
+    let result = wait_for_private_marker_before_deadline_with_reader_clock_and_sleep(
+        Path::new("logical-marker"),
+        b"ready\n",
+        deadline,
+        |_, _| {
+            reads.set(reads.get().saturating_add(1));
+            logical_now.set(deadline);
+            Ok(b"ready\n".to_vec())
+        },
+        || logical_now.get(),
+        |_| {
+            sleeps.set(sleeps.get().saturating_add(1));
+        },
+    );
+    let error =
+        require_rejected_test_result(result, "a marker read that crossed the fence was accepted")?;
+    assert!(error.to_string().contains("exceeded its deadline"));
+    assert_eq!(reads.get(), 1);
+    assert_eq!(sleeps.get(), 0);
+    Ok(())
+}
+
+#[test]
+fn private_marker_wait_rejects_the_deadline_before_starting_a_read() -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now();
+    let reads = std::cell::Cell::new(0_u8);
+    let sleeps = std::cell::Cell::new(0_u8);
+    let result = wait_for_private_marker_before_deadline_with_reader_clock_and_sleep(
+        Path::new("logical-marker"),
+        b"ready\n",
+        deadline,
+        |_, _| {
+            reads.set(reads.get().saturating_add(1));
+            Ok(b"ready\n".to_vec())
+        },
+        || deadline,
+        |_| {
+            sleeps.set(sleeps.get().saturating_add(1));
+        },
+    );
+    let error = require_rejected_test_result(result, "a marker read started at the deadline")?;
+    assert!(error.to_string().contains("exceeded its deadline"));
+    assert_eq!(reads.get(), 0);
+    assert_eq!(sleeps.get(), 0);
+    Ok(())
+}
+
 #[test]
 fn packaged_deterministic_drive_failure_consumes_recovery_and_cleans() -> Result<(), Box<dyn Error>>
 {
@@ -5057,37 +5260,92 @@ fn packaged_deterministic_drive_failure_consumes_recovery_and_cleans() -> Result
         suite_budget,
     )?;
     let exercise = (|| -> Result<(), Box<dyn Error>> {
-        if harness.request_selected_recovery().is_ok() {
-            return Err("the injected TUI drive failure unexpectedly succeeded".into());
+        let report = root.join("supervisor-report");
+        harness.observe_guardian_startup_arm(&report)?;
+        let evidence_deadline = harness
+            .generation_deadline_fence
+            .ok_or("the package generation deadline fence was missing")?
+            .exercise_deadline(
+                Instant::now(),
+                PACKAGE_SELECTED_RECOVERY_RECONCILIATION_TIMEOUT,
+            )
+            .map_err(|_| "disconnected inference evidence had no exercise budget")?;
+        let request_error = harness
+            .request_selected_recovery()
+            .err()
+            .ok_or("the injected TUI drive failure unexpectedly succeeded")?;
+        let drive_failure = request_error
+            .downcast_ref::<PackageRecoveryDriveFailure>()
+            .ok_or("the injected TUI drive failure lost its fixed type")?;
+        if *drive_failure != PackageRecoveryDriveFailure::Inference {
+            return Err("the injected TUI drive failed at the wrong fixed stage".into());
         }
         if harness.recovery_request_state != PackageRecoveryRequestState::Consumed {
             return Err("the failed drive left recovery reusable".into());
         }
-        let report = root.join("supervisor-report");
-        for marker in [
-            "tui-fixture.inference-failed",
-            "recovery.checkpoint-verified",
-            "recovery.request-sent",
-        ] {
-            if !report.join(marker).is_file() {
-                return Err("the failed drive omitted a fixed recovery marker".into());
-            }
-        }
-        if report
-            .join("recovery.checkpoint-failed.invalid-frame")
-            .exists()
-        {
-            return Err("the selected checkpoint entered the completion decoder".into());
-        }
-        Ok(())
+        reconcile_disconnected_inference_recovery_evidence_with(
+            &report,
+            evidence_deadline,
+            read_private_bounded,
+            Instant::now,
+            thread::sleep,
+        )
     })();
-    let cleanup = harness.cleanup();
+    let exercise_failure_before_cleanup = exercise
+        .as_ref()
+        .err()
+        .and_then(|_| harness.latest_fixed_failure_detail());
+    let exercise_secondary_failure_before_cleanup = exercise
+        .as_ref()
+        .err()
+        .and_then(|_| harness.latest_fixed_secondary_failure_detail());
+    let exercise_phase_before_cleanup = exercise
+        .as_ref()
+        .err()
+        .map(|_| harness.latest_fixed_phase());
+    let cleanup_outcome = cleanup_deterministic_recovery_case(&mut harness, exercise.is_err());
+    let preserved_evidence_root = cleanup_outcome
+        .preserved_evidence_root()
+        .map(Path::to_path_buf);
+    let cleanup = cleanup_outcome.result;
     let cleanup_phase = harness.latest_fixed_cleanup_failure_detail();
-    combine_package_exercise_and_cleanup_at_phases(exercise, cleanup, None, cleanup_phase)?;
-    if root.exists() {
+    let exercise_secondary_failure = exercise_secondary_failure_before_cleanup.or_else(|| {
+        exercise
+            .as_ref()
+            .err()
+            .and_then(|_| harness.latest_fixed_secondary_failure_detail())
+    });
+    let exercise_phase = if exercise.is_err() {
+        select_package_failure_phase(
+            exercise_failure_before_cleanup,
+            exercise_phase_before_cleanup,
+            harness.latest_fixed_failure_detail(),
+        )
+    } else {
+        None
+    };
+    let exercise_retry_observations = if exercise.is_err() {
+        harness.latest_fixed_retry_observations()
+    } else {
+        PackageInitialGateRetryObservations::NONE
+    };
+    let result = combine_package_exercise_and_cleanup_with_evidence(
+        exercise,
+        cleanup,
+        PackageOperationFailureEvidence::new(exercise_phase, exercise_secondary_failure)
+            .with_retry_observations(exercise_retry_observations),
+        cleanup_phase,
+        Some(package_recovery_case_failure_marker(
+            PackageRecoveryTrigger::GenerationBoundRequest,
+            RecoveryCheckpoint::RetainedQuiescing,
+        )),
+        harness.latest_handoff_probe_phase(),
+        preserved_evidence_root,
+    );
+    if result.is_ok() && root.exists() {
         return Err("failed-drive recovery cleanup retained package scratch".into());
     }
-    Ok(())
+    result
 }
 
 #[test]
@@ -7437,9 +7695,56 @@ struct OfficialTuiPackageHarness {
 
 #[derive(Debug)]
 struct PackageHarnessCleanupFailure {
-    phase: &'static str,
+    phase: PackageHarnessCleanupPhase,
     source: Box<dyn Error>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageHarnessCleanupPhase {
+    PtyOutputDrain,
+    PtyOutputWorker,
+    InferenceEvidence,
+    BackendTransport,
+    NetworkHermeticity,
+    ScratchEvidence,
+    ScratchDelete,
+}
+
+impl PackageHarnessCleanupPhase {
+    const fn description(self) -> &'static str {
+        match self {
+            Self::PtyOutputDrain => "package PTY output drain",
+            Self::PtyOutputWorker => "package PTY output worker",
+            Self::InferenceEvidence => "package inference evidence",
+            Self::BackendTransport => "package session backend transport",
+            Self::NetworkHermeticity => "package network hermeticity",
+            Self::ScratchEvidence => "package scratch evidence",
+            Self::ScratchDelete => "package scratch",
+        }
+    }
+
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::PtyOutputDrain => "package-cleanup.pty-output-drain",
+            Self::PtyOutputWorker => "package-cleanup.pty-output-worker",
+            Self::InferenceEvidence => "package-cleanup.inference-evidence",
+            Self::BackendTransport => "package-cleanup.backend-transport",
+            Self::NetworkHermeticity => "package-cleanup.network-hermeticity",
+            Self::ScratchEvidence => "package-cleanup.scratch-evidence",
+            Self::ScratchDelete => "package-cleanup.scratch-delete",
+        }
+    }
+}
+
+const PACKAGE_HARNESS_CLEANUP_PHASES: [PackageHarnessCleanupPhase; 7] = [
+    PackageHarnessCleanupPhase::PtyOutputDrain,
+    PackageHarnessCleanupPhase::PtyOutputWorker,
+    PackageHarnessCleanupPhase::InferenceEvidence,
+    PackageHarnessCleanupPhase::BackendTransport,
+    PackageHarnessCleanupPhase::NetworkHermeticity,
+    PackageHarnessCleanupPhase::ScratchEvidence,
+    PackageHarnessCleanupPhase::ScratchDelete,
+];
 
 #[derive(Debug, Default)]
 struct PackageHarnessCleanupFailures {
@@ -7447,15 +7752,23 @@ struct PackageHarnessCleanupFailures {
 }
 
 impl PackageHarnessCleanupFailures {
-    fn record(&mut self, phase: &'static str, source: Box<dyn Error>) {
+    fn record(&mut self, phase: PackageHarnessCleanupPhase, source: Box<dyn Error>) {
         self.failures
             .push(PackageHarnessCleanupFailure { phase, source });
     }
 
-    fn record_result(&mut self, phase: &'static str, result: Result<(), Box<dyn Error>>) {
+    fn record_result(
+        &mut self,
+        phase: PackageHarnessCleanupPhase,
+        result: Result<(), Box<dyn Error>>,
+    ) {
         if let Err(error) = result {
             self.record(phase, error);
         }
+    }
+
+    fn first_fixed_marker(&self) -> Option<&'static str> {
+        self.failures.first().map(|failure| failure.phase.marker())
     }
 
     fn finish(self) -> Result<(), Box<dyn Error>> {
@@ -7471,7 +7784,12 @@ impl fmt::Display for PackageHarnessCleanupFailures {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("package harness cleanup failed")?;
         for failure in &self.failures {
-            write!(formatter, "; {}: {}", failure.phase, failure.source)?;
+            write!(
+                formatter,
+                "; {}: {}",
+                failure.phase.description(),
+                failure.source
+            )?;
         }
         Ok(())
     }
@@ -7481,6 +7799,20 @@ impl Error for PackageHarnessCleanupFailures {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.failures.first().map(|failure| failure.source.as_ref())
     }
+}
+
+#[test]
+fn package_harness_cleanup_phases_are_closed_fixed_and_payload_free() {
+    let markers = PACKAGE_HARNESS_CLEANUP_PHASES.map(PackageHarnessCleanupPhase::marker);
+    let unique = markers.into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(unique.len(), PACKAGE_HARNESS_CLEANUP_PHASES.len());
+    assert!(unique.into_iter().all(|marker| {
+        marker.is_ascii()
+            && marker.starts_with("package-cleanup.")
+            && marker.len() <= 96
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
 }
 
 struct PreservedPackageEvidence {
@@ -8231,6 +8563,11 @@ fn official_tui_pre_generation_cleanup_aggregates_infrastructure_failures_before
     };
     assert!(error.contains("package PTY output"), "{error}");
     assert!(error.contains("package session backend"), "{error}");
+    assert_eq!(
+        harness.latest_fixed_cleanup_failure_detail(),
+        Some("package-cleanup.pty-output-drain"),
+        "a later cleanup failure replaced the earliest fixed cleanup phase"
+    );
     assert!(
         !root.exists(),
         "later owned scratch cleanup was skipped after an earlier failure"
@@ -10320,6 +10657,12 @@ impl OfficialTuiPackageHarness {
         self.last_fixed_cleanup_failure_detail
     }
 
+    fn snapshot_first_cleanup_failure_marker(&mut self, failures: &PackageHarnessCleanupFailures) {
+        if let Some(marker) = failures.first_fixed_marker() {
+            self.last_fixed_cleanup_failure_detail.get_or_insert(marker);
+        }
+    }
+
     fn latest_handoff_probe_phase(&self) -> Option<PackageHandoffProbePhase> {
         self.last_handoff_probe_phase
     }
@@ -10652,13 +10995,15 @@ impl OfficialTuiPackageHarness {
                 Ok(Ok(drain)) => {
                     self.last_handoff_probe_phase = drain.handoff_probe_phase;
                 }
-                Ok(Err(error)) => failures.record("package PTY output drain", error.into()),
+                Ok(Err(error)) => {
+                    failures.record(PackageHarnessCleanupPhase::PtyOutputDrain, error.into())
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => failures.record(
-                    "package PTY output drain",
+                    PackageHarnessCleanupPhase::PtyOutputDrain,
                     "package PTY output cleanup exceeded its deadline".into(),
                 ),
                 Err(mpsc::RecvTimeoutError::Disconnected) => failures.record(
-                    "package PTY output drain",
+                    PackageHarnessCleanupPhase::PtyOutputDrain,
                     "package PTY output result authority disappeared".into(),
                 ),
             }
@@ -10666,17 +11011,18 @@ impl OfficialTuiPackageHarness {
             if let Some(worker) = self.output_worker.take() {
                 if worker.join().is_err() {
                     failures.record(
-                        "package PTY output worker",
+                        PackageHarnessCleanupPhase::PtyOutputWorker,
                         "package PTY output worker panicked".into(),
                     );
                 }
             }
         }
+        self.snapshot_first_cleanup_failure_marker(&failures);
         self.master.take();
         if let Some(backend) = self.backend.take() {
             match backend.cancel_and_join_transport() {
                 Ok(observation) => failures.record_result(
-                    "package inference evidence",
+                    PackageHarnessCleanupPhase::InferenceEvidence,
                     require_package_generation_inference_evidence(
                         generation_started,
                         self.inference_expectation,
@@ -10697,10 +11043,11 @@ impl OfficialTuiPackageHarness {
                         self.last_fixed_cleanup_failure_detail
                             .get_or_insert(failure.marker);
                     }
-                    failures.record("package session backend transport", error);
+                    failures.record(PackageHarnessCleanupPhase::BackendTransport, error);
                 }
             }
         }
+        self.snapshot_first_cleanup_failure_marker(&failures);
         if let Err(failure) = run_package_network_hermeticity_gate(
             generation_started,
             self.provider_target,
@@ -10718,8 +11065,12 @@ impl OfficialTuiPackageHarness {
                 .get_or_insert(failure.marker());
             self.last_fixed_cleanup_failure_detail
                 .get_or_insert(failure.marker());
-            failures.record("package network hermeticity", Box::new(failure));
+            failures.record(
+                PackageHarnessCleanupPhase::NetworkHermeticity,
+                Box::new(failure),
+            );
         }
+        self.snapshot_first_cleanup_failure_marker(&failures);
         if self.last_fixed_failure_detail.is_none() {
             self.last_fixed_failure_detail = self.scratch.as_ref().and_then(|scratch| {
                 Self::latest_fixed_failure_detail_from_report(
@@ -10738,19 +11089,20 @@ impl OfficialTuiPackageHarness {
             Some(scratch) if preserve_evidence => match PreservedPackageEvidence::new(scratch) {
                 Ok(evidence) => PackageScratchDisposition::Preserved(evidence),
                 Err(error) => {
-                    failures.record("package scratch evidence", error);
+                    failures.record(PackageHarnessCleanupPhase::ScratchEvidence, error);
                     PackageScratchDisposition::Unavailable
                 }
             },
             Some(scratch) => match scratch.cleanup() {
                 Ok(()) => PackageScratchDisposition::Deleted,
                 Err(error) => {
-                    failures.record("package scratch", error);
+                    failures.record(PackageHarnessCleanupPhase::ScratchDelete, error);
                     PackageScratchDisposition::Unavailable
                 }
             },
             None => PackageScratchDisposition::Unavailable,
         };
+        self.snapshot_first_cleanup_failure_marker(&failures);
         PackageHarnessCleanupOutcome {
             result: failures.finish(),
             scratch,
@@ -13517,6 +13869,57 @@ fn wait_for_private_marker(
             return Err(format!("package supervisor marker `{name}` exceeded its deadline").into());
         }
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_private_marker_before_deadline_with_reader_clock_and_sleep<ReadMarker, Now, Sleep>(
+    path: &Path,
+    expected: &[u8],
+    deadline: Instant,
+    mut read_marker: ReadMarker,
+    mut now: Now,
+    mut sleep: Sleep,
+) -> Result<(), Box<dyn Error>>
+where
+    ReadMarker: FnMut(&Path, usize) -> io::Result<Vec<u8>>,
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    loop {
+        if now() >= deadline {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("unknown");
+            return Err(format!("package supervisor marker `{name}` exceeded its deadline").into());
+        }
+        let read = read_marker(path, expected.len().saturating_add(1));
+        if now() >= deadline {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("unknown");
+            return Err(format!("package supervisor marker `{name}` exceeded its deadline").into());
+        }
+        match read {
+            Ok(bytes) if bytes == expected => return Ok(()),
+            Ok(_) => {
+                let name = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("unknown");
+                return Err(
+                    format!("package supervisor marker `{name}` payload was invalid").into(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let before_sleep = now();
+        if before_sleep >= deadline {
+            continue;
+        }
+        sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(before_sleep)));
     }
 }
 
