@@ -82,6 +82,8 @@ const PACKAGE_BINARY_ENV: &str = "CALCIFER_CODEX_COMPAT_BINARY";
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const PACKAGE_BACKEND_INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const PACKAGE_BACKEND_READ_SLICE: Duration = Duration::from_millis(100);
+const PACKAGE_APP_SERVER_READ_SLICE: Duration = Duration::from_millis(100);
+const PACKAGE_LIBTEST_TUI_READ_SLICE: Duration = Duration::from_millis(100);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
 const GRACE_OBSERVATION: Duration = Duration::from_millis(300);
 const MAX_HTTP_REQUEST_BYTES: usize = 1024 * 1024;
@@ -6136,8 +6138,10 @@ fn package_libtest_provider_app_server_accepts_monitor_and_tui_websockets()
         .stderr(Stdio::null());
     let mut child = command.spawn()?;
 
+    let mut parent_origin = PackageLibtestAppExerciseOrigin::MonitorConnect;
     let exercise = (|| -> Result<(), Box<dyn Error>> {
         let mut monitor = connect_app_server(&socket, Instant::now() + IO_TIMEOUT)?;
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorInitializeSend;
         send_request(
             &mut monitor,
             0,
@@ -6151,53 +6155,65 @@ fn package_libtest_provider_app_server_accepts_monitor_and_tui_websockets()
                 "capabilities": { "experimentalApi": false }
             }),
         )?;
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorInitializeReceive;
         let initialized = receive_result(&mut monitor, 0, Instant::now() + IO_TIMEOUT)?;
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorInitializeValidate;
         require_pinned_initialize(&initialized, &scratch.codex_home)?;
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorInitializedSend;
         monitor.send(Message::text(r#"{"method":"initialized"}"#))?;
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorUsageSend;
         monitor.send(Message::text(
             r#"{"id":1,"method":"account/rateLimits/read"}"#,
         ))?;
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorUsageReceive;
         let usage = receive_result(&mut monitor, 1, Instant::now() + IO_TIMEOUT)?;
-        assert_eq!(
-            usage.pointer("/rateLimits/primary/usedPercent"),
-            Some(&json!(42))
-        );
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorUsageValidate;
+        if usage.pointer("/rateLimits/primary/usedPercent") != Some(&json!(42)) {
+            return Err("libtest App Server usage response drifted".into());
+        }
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorRefreshSend;
         monitor.send(Message::text(
             r#"{"id":2,"method":"account/rateLimits/read"}"#,
         ))?;
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorRefreshReceive;
         let refreshed = receive_result(&mut monitor, 2, Instant::now() + IO_TIMEOUT)?;
-        assert_eq!(
-            refreshed.pointer("/rateLimits/primary/usedPercent"),
-            Some(&json!(42))
-        );
+        parent_origin = PackageLibtestAppExerciseOrigin::MonitorRefreshValidate;
+        if refreshed.pointer("/rateLimits/primary/usedPercent") != Some(&json!(42)) {
+            return Err("libtest App Server refreshed usage response drifted".into());
+        }
 
+        parent_origin = PackageLibtestAppExerciseOrigin::TuiConnect;
         let mut tui = connect_app_server(&socket, Instant::now() + IO_TIMEOUT)?;
+        parent_origin = PackageLibtestAppExerciseOrigin::TuiReadSend;
         send_request(
             &mut tui,
             11,
             "thread/read",
             json!({ "threadId": PACKAGE_SUPERVISOR_THREAD_ID }),
         )?;
+        parent_origin = PackageLibtestAppExerciseOrigin::TuiReadReceive;
         let read = receive_result(&mut tui, 11, Instant::now() + IO_TIMEOUT)?;
-        assert_eq!(
-            read.pointer("/thread/id").and_then(Value::as_str),
-            Some(PACKAGE_SUPERVISOR_THREAD_ID)
-        );
+        parent_origin = PackageLibtestAppExerciseOrigin::TuiReadValidate;
+        if read.pointer("/thread/id").and_then(Value::as_str) != Some(PACKAGE_SUPERVISOR_THREAD_ID)
+        {
+            return Err("libtest App Server thread/read response drifted".into());
+        }
+        parent_origin = PackageLibtestAppExerciseOrigin::TuiResumeSend;
         send_request(
             &mut tui,
             12,
             "thread/resume",
             json!({ "threadId": PACKAGE_SUPERVISOR_THREAD_ID }),
         )?;
+        parent_origin = PackageLibtestAppExerciseOrigin::TuiResumeReceive;
         let resumed = receive_result(&mut tui, 12, Instant::now() + IO_TIMEOUT)?;
-        assert_eq!(
-            resumed.pointer("/thread/id").and_then(Value::as_str),
-            Some(PACKAGE_SUPERVISOR_THREAD_ID)
-        );
-        assert_eq!(
-            resumed.get("cwd").and_then(Value::as_str),
-            scratch.workspace.to_str()
-        );
+        parent_origin = PackageLibtestAppExerciseOrigin::TuiResumeValidate;
+        if resumed.pointer("/thread/id").and_then(Value::as_str)
+            != Some(PACKAGE_SUPERVISOR_THREAD_ID)
+            || resumed.get("cwd").and_then(Value::as_str) != scratch.workspace.to_str()
+        {
+            return Err("libtest App Server thread/resume response drifted".into());
+        }
         drop((monitor, tui));
         Ok(())
     })();
@@ -6209,11 +6225,10 @@ fn package_libtest_provider_app_server_accepts_monitor_and_tui_websockets()
     let last_phase = latest_package_libtest_app_phase(&scratch.root.join("supervisor-report"));
     let cleanup = scratch.cleanup();
     if exercise.is_err() {
-        return Err(format!(
-            "libtest App Server exercise failed after fixed phase {}",
-            last_phase.unwrap_or("app-fixture.not-started")
-        )
-        .into());
+        return Err(Box::new(PackageLibtestAppExerciseFailure {
+            child_phase: last_phase.unwrap_or("app-fixture.not-started"),
+            parent_origin,
+        }));
     }
     if !status.success() {
         return Err("libtest App Server did not exit cleanly on SIGTERM".into());
@@ -16357,21 +16372,9 @@ fn connect_app_server(
     socket_path: &Path,
     deadline: Instant,
 ) -> Result<PackageAppWebSocket, Box<dyn Error>> {
-    loop {
+    let stream = loop {
         match UnixStream::connect(socket_path) {
-            Ok(stream) => {
-                stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-                stream.set_write_timeout(Some(IO_TIMEOUT))?;
-                let config = WebSocketConfig::default()
-                    .max_message_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES))
-                    .max_frame_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES));
-                let (websocket, _) = client_with_config(
-                    "ws://localhost/rpc",
-                    ToolRequestWriteObserver::new(stream),
-                    Some(config),
-                )?;
-                return Ok(websocket);
-            }
+            Ok(stream) => break stream,
             Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
             {
@@ -16390,7 +16393,46 @@ fn connect_app_server(
         if Instant::now() >= deadline {
             return Err("official App Server socket did not become ready".into());
         }
+    };
+
+    // Once handshake bytes may have crossed this connected stream, only its
+    // owned MidHandshake state may advance. Never reconnect and replay bytes.
+    complete_package_app_server_websocket(stream, deadline)
+}
+
+fn complete_package_app_server_websocket(
+    stream: UnixStream,
+    deadline: Instant,
+) -> Result<PackageAppWebSocket, Box<dyn Error>> {
+    if Instant::now() >= deadline {
+        return Err("official App Server WebSocket handshake timed out".into());
     }
+    // Configure the post-handshake protocol bounds before O_NONBLOCK. The
+    // nonblocking handshake ignores these slices; restoring blocking mode
+    // below makes the fixed protocol timeouts active without another fallible
+    // timeout mutation after bytes have crossed the stream.
+    stream.set_read_timeout(Some(PACKAGE_APP_SERVER_READ_SLICE))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.set_nonblocking(true)?;
+    let handshake = client_with_config(
+        "ws://localhost/rpc",
+        ToolRequestWriteObserver::new(stream),
+        Some(package_libtest_websocket_config()),
+    );
+    let termination = AtomicBool::new(false);
+    let mut websocket =
+        match complete_package_libtest_client_handshake(handshake, &termination, deadline) {
+            Ok(Some(websocket)) => websocket,
+            Ok(None) => return Err("official App Server WebSocket handshake stopped".into()),
+            Err(PackageLibtestHandshakeFailure::Timeout) => {
+                return Err("official App Server WebSocket handshake timed out".into());
+            }
+            Err(PackageLibtestHandshakeFailure::Protocol) => {
+                return Err("official App Server WebSocket handshake failed".into());
+            }
+        };
+    websocket.get_mut().inner.set_nonblocking(false)?;
+    Ok(websocket)
 }
 
 fn send_request<S: Read + Write>(
@@ -18886,6 +18928,94 @@ enum PackageLibtestTuiPhase {
     ExitInputObserved,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageLibtestAppExerciseOrigin {
+    MonitorConnect,
+    MonitorInitializeSend,
+    MonitorInitializeReceive,
+    MonitorInitializeValidate,
+    MonitorInitializedSend,
+    MonitorUsageSend,
+    MonitorUsageReceive,
+    MonitorUsageValidate,
+    MonitorRefreshSend,
+    MonitorRefreshReceive,
+    MonitorRefreshValidate,
+    TuiConnect,
+    TuiReadSend,
+    TuiReadReceive,
+    TuiReadValidate,
+    TuiResumeSend,
+    TuiResumeReceive,
+    TuiResumeValidate,
+}
+
+impl PackageLibtestAppExerciseOrigin {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::MonitorConnect => "app-exercise.monitor-connect",
+            Self::MonitorInitializeSend => "app-exercise.monitor-initialize-send",
+            Self::MonitorInitializeReceive => "app-exercise.monitor-initialize-receive",
+            Self::MonitorInitializeValidate => "app-exercise.monitor-initialize-validate",
+            Self::MonitorInitializedSend => "app-exercise.monitor-initialized-send",
+            Self::MonitorUsageSend => "app-exercise.monitor-usage-send",
+            Self::MonitorUsageReceive => "app-exercise.monitor-usage-receive",
+            Self::MonitorUsageValidate => "app-exercise.monitor-usage-validate",
+            Self::MonitorRefreshSend => "app-exercise.monitor-refresh-send",
+            Self::MonitorRefreshReceive => "app-exercise.monitor-refresh-receive",
+            Self::MonitorRefreshValidate => "app-exercise.monitor-refresh-validate",
+            Self::TuiConnect => "app-exercise.tui-connect",
+            Self::TuiReadSend => "app-exercise.tui-read-send",
+            Self::TuiReadReceive => "app-exercise.tui-read-receive",
+            Self::TuiReadValidate => "app-exercise.tui-read-validate",
+            Self::TuiResumeSend => "app-exercise.tui-resume-send",
+            Self::TuiResumeReceive => "app-exercise.tui-resume-receive",
+            Self::TuiResumeValidate => "app-exercise.tui-resume-validate",
+        }
+    }
+}
+
+const PACKAGE_LIBTEST_APP_EXERCISE_ORIGINS: [PackageLibtestAppExerciseOrigin; 18] = [
+    PackageLibtestAppExerciseOrigin::MonitorConnect,
+    PackageLibtestAppExerciseOrigin::MonitorInitializeSend,
+    PackageLibtestAppExerciseOrigin::MonitorInitializeReceive,
+    PackageLibtestAppExerciseOrigin::MonitorInitializeValidate,
+    PackageLibtestAppExerciseOrigin::MonitorInitializedSend,
+    PackageLibtestAppExerciseOrigin::MonitorUsageSend,
+    PackageLibtestAppExerciseOrigin::MonitorUsageReceive,
+    PackageLibtestAppExerciseOrigin::MonitorUsageValidate,
+    PackageLibtestAppExerciseOrigin::MonitorRefreshSend,
+    PackageLibtestAppExerciseOrigin::MonitorRefreshReceive,
+    PackageLibtestAppExerciseOrigin::MonitorRefreshValidate,
+    PackageLibtestAppExerciseOrigin::TuiConnect,
+    PackageLibtestAppExerciseOrigin::TuiReadSend,
+    PackageLibtestAppExerciseOrigin::TuiReadReceive,
+    PackageLibtestAppExerciseOrigin::TuiReadValidate,
+    PackageLibtestAppExerciseOrigin::TuiResumeSend,
+    PackageLibtestAppExerciseOrigin::TuiResumeReceive,
+    PackageLibtestAppExerciseOrigin::TuiResumeValidate,
+];
+
+#[derive(Debug)]
+struct PackageLibtestAppExerciseFailure {
+    child_phase: &'static str,
+    parent_origin: PackageLibtestAppExerciseOrigin,
+}
+
+impl fmt::Display for PackageLibtestAppExerciseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "libtest App Server exercise failed after fixed phase {}; \
+             fixed parent exercise origin {}",
+            self.child_phase,
+            self.parent_origin.marker()
+        )
+    }
+}
+
+impl Error for PackageLibtestAppExerciseFailure {}
+
 impl PackageLibtestTuiPhase {
     const fn marker(self) -> &'static str {
         match self {
@@ -18985,6 +19115,63 @@ fn package_libtest_app_phase_markers_are_closed_and_fixed() {
             "app-fixture.tui-worker-failed",
             "app-fixture.complete",
         ]
+    );
+}
+
+#[test]
+fn package_libtest_app_exercise_origins_are_closed_payload_free_and_independent_of_child_phase() {
+    assert_eq!(
+        PACKAGE_LIBTEST_APP_EXERCISE_ORIGINS.map(PackageLibtestAppExerciseOrigin::marker),
+        [
+            "app-exercise.monitor-connect",
+            "app-exercise.monitor-initialize-send",
+            "app-exercise.monitor-initialize-receive",
+            "app-exercise.monitor-initialize-validate",
+            "app-exercise.monitor-initialized-send",
+            "app-exercise.monitor-usage-send",
+            "app-exercise.monitor-usage-receive",
+            "app-exercise.monitor-usage-validate",
+            "app-exercise.monitor-refresh-send",
+            "app-exercise.monitor-refresh-receive",
+            "app-exercise.monitor-refresh-validate",
+            "app-exercise.tui-connect",
+            "app-exercise.tui-read-send",
+            "app-exercise.tui-read-receive",
+            "app-exercise.tui-read-validate",
+            "app-exercise.tui-resume-send",
+            "app-exercise.tui-resume-receive",
+            "app-exercise.tui-resume-validate",
+        ]
+    );
+    assert!(
+        PACKAGE_LIBTEST_APP_EXERCISE_ORIGINS
+            .iter()
+            .map(|origin| origin.marker())
+            .all(|marker| marker.is_ascii()
+                && marker.starts_with("app-exercise.")
+                && !marker.contains('/')
+                && !marker.contains(' '))
+    );
+
+    let tui_failure = PackageLibtestAppExerciseFailure {
+        child_phase: PackageLibtestAppPhase::Complete.marker(),
+        parent_origin: PackageLibtestAppExerciseOrigin::TuiConnect,
+    };
+    assert_eq!(
+        tui_failure.to_string(),
+        "libtest App Server exercise failed after fixed phase app-fixture.complete; \
+         fixed parent exercise origin app-exercise.tui-connect"
+    );
+    assert!(tui_failure.source().is_none());
+    let monitor_failure = PackageLibtestAppExerciseFailure {
+        child_phase: PackageLibtestAppPhase::Complete.marker(),
+        parent_origin: PackageLibtestAppExerciseOrigin::MonitorConnect,
+    };
+    assert_ne!(tui_failure.to_string(), monitor_failure.to_string());
+    assert!(
+        monitor_failure
+            .to_string()
+            .contains("fixed phase app-fixture.complete")
     );
 }
 
@@ -19175,6 +19362,11 @@ type PackageLibtestServerHandshake = tungstenite::handshake::server::ServerHands
 >;
 type PackageLibtestServerHandshakeResult =
     Result<WebSocket<UnixStream>, tungstenite::HandshakeError<PackageLibtestServerHandshake>>;
+type PackageLibtestClientHandshake<S> = tungstenite::handshake::client::ClientHandshake<S>;
+type PackageLibtestClientHandshakeResult<S> = Result<
+    (WebSocket<S>, tungstenite::handshake::client::Response),
+    tungstenite::HandshakeError<PackageLibtestClientHandshake<S>>,
+>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackageLibtestHandshakeFailure {
@@ -19228,6 +19420,55 @@ fn complete_package_libtest_server_handshake(
                     return Err(PackageLibtestHandshakeFailure::Timeout);
                 }
                 thread::sleep(remaining.min(Duration::from_millis(1)));
+                result = handshake.handshake();
+            }
+        }
+    }
+}
+
+fn complete_package_libtest_client_handshake<S: Read + Write>(
+    mut result: PackageLibtestClientHandshakeResult<S>,
+    termination: &AtomicBool,
+    deadline: Instant,
+) -> Result<Option<WebSocket<S>>, PackageLibtestHandshakeFailure> {
+    loop {
+        match result {
+            Ok((websocket, _response)) => {
+                return if termination.load(Ordering::Acquire) {
+                    Ok(None)
+                } else if Instant::now() >= deadline {
+                    Err(PackageLibtestHandshakeFailure::Timeout)
+                } else {
+                    Ok(Some(websocket))
+                };
+            }
+            Err(tungstenite::HandshakeError::Failure(error)) => {
+                let termination_requested = termination.load(Ordering::Acquire);
+                return if termination_requested
+                    && package_libtest_handshake_should_stop(&error, termination_requested)
+                {
+                    Ok(None)
+                } else {
+                    Err(PackageLibtestHandshakeFailure::Protocol)
+                };
+            }
+            Err(tungstenite::HandshakeError::Interrupted(handshake)) => {
+                if termination.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(PackageLibtestHandshakeFailure::Timeout);
+                };
+                if remaining.is_zero() {
+                    return Err(PackageLibtestHandshakeFailure::Timeout);
+                }
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+                if termination.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                if Instant::now() >= deadline {
+                    return Err(PackageLibtestHandshakeFailure::Timeout);
+                }
                 result = handshake.handshake();
             }
         }
@@ -19313,6 +19554,375 @@ fn package_libtest_server_handshake_resumes_interrupted_state_with_fixed_bounds(
         false,
     ));
     Ok(())
+}
+
+#[test]
+fn package_libtest_client_handshake_resumes_an_explicit_interrupted_state()
+-> Result<(), Box<dyn Error>> {
+    let (client, server) = UnixStream::pair()?;
+    client.set_nonblocking(true)?;
+    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let server = thread::spawn(move || -> Result<(), String> {
+        release_receiver
+            .recv()
+            .map_err(|_| "TUI fixture handshake release disconnected".to_owned())?;
+        let websocket = accept_with_config(server, Some(package_libtest_websocket_config()))
+            .map_err(|_| "released TUI fixture server handshake failed".to_owned())?;
+        drop(websocket);
+        Ok(())
+    });
+
+    let interrupted = client_with_config(
+        "ws://localhost",
+        client,
+        Some(package_libtest_websocket_config()),
+    );
+    assert!(matches!(
+        &interrupted,
+        Err(tungstenite::HandshakeError::Interrupted(_))
+    ));
+    release_sender.send(())?;
+    let termination = AtomicBool::new(false);
+    let websocket = complete_package_libtest_client_handshake(
+        interrupted,
+        &termination,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .map_err(|_| "bounded client handshake failed")?
+    .ok_or("the active interrupted TUI handshake was misclassified as terminated")?;
+    assert_eq!(
+        websocket.get_config().max_message_size,
+        Some(MAX_WEBSOCKET_MESSAGE_BYTES)
+    );
+    assert_eq!(
+        websocket.get_config().max_frame_size,
+        Some(MAX_WEBSOCKET_MESSAGE_BYTES)
+    );
+    assert!(!websocket.get_config().accept_unmasked_frames);
+    drop(websocket);
+    server
+        .join()
+        .map_err(|_| "released TUI fixture server panicked")??;
+    Ok(())
+}
+
+#[test]
+fn package_app_client_handshake_resumes_an_explicit_interrupted_observer_state()
+-> Result<(), Box<dyn Error>> {
+    let (client, server) = UnixStream::pair()?;
+    client.set_nonblocking(true)?;
+    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let server = thread::spawn(move || -> Result<(), String> {
+        release_receiver
+            .recv()
+            .map_err(|_| "App Server handshake release disconnected".to_owned())?;
+        let websocket = accept_with_config(server, Some(package_libtest_websocket_config()))
+            .map_err(|_| "released App Server handshake failed".to_owned())?;
+        drop(websocket);
+        Ok(())
+    });
+
+    let interrupted = client_with_config(
+        "ws://localhost/rpc",
+        ToolRequestWriteObserver::new(client),
+        Some(package_libtest_websocket_config()),
+    );
+    assert!(matches!(
+        &interrupted,
+        Err(tungstenite::HandshakeError::Interrupted(_))
+    ));
+    release_sender.send(())?;
+    let termination = AtomicBool::new(false);
+    let mut websocket = complete_package_libtest_client_handshake(
+        interrupted,
+        &termination,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .map_err(|_| "bounded observed App Server handshake failed")?
+    .ok_or("the observed App Server handshake was misclassified as terminated")?;
+    assert_eq!(
+        websocket.get_config().max_message_size,
+        Some(MAX_WEBSOCKET_MESSAGE_BYTES)
+    );
+    assert_eq!(
+        websocket.get_config().max_frame_size,
+        Some(MAX_WEBSOCKET_MESSAGE_BYTES)
+    );
+    assert!(!websocket.get_config().accept_unmasked_frames);
+    websocket.get_mut().begin_request_epoch();
+    assert!(
+        !websocket.get_ref().request_epoch_wrote_bytes(),
+        "handshake traffic contaminated detached-tool request classification"
+    );
+    websocket.get_mut().end_request_epoch();
+    drop(websocket);
+    server
+        .join()
+        .map_err(|_| "released App Server handshake server panicked")??;
+    Ok(())
+}
+
+#[test]
+fn package_app_client_handshake_enforces_deadline_and_protocol_failure()
+-> Result<(), Box<dyn Error>> {
+    let (client, _server) = UnixStream::pair()?;
+    client.set_nonblocking(true)?;
+    let interrupted = client_with_config(
+        "ws://localhost/rpc",
+        ToolRequestWriteObserver::new(client),
+        Some(package_libtest_websocket_config()),
+    );
+    assert!(matches!(
+        &interrupted,
+        Err(tungstenite::HandshakeError::Interrupted(_))
+    ));
+    let termination = AtomicBool::new(false);
+    assert!(matches!(
+        complete_package_libtest_client_handshake(interrupted, &termination, Instant::now()),
+        Err(PackageLibtestHandshakeFailure::Timeout)
+    ));
+
+    let failure: Result<
+        (
+            WebSocket<PackageAppStream>,
+            tungstenite::handshake::client::Response,
+        ),
+        tungstenite::HandshakeError<
+            tungstenite::handshake::client::ClientHandshake<PackageAppStream>,
+        >,
+    > = Err(tungstenite::HandshakeError::Failure(
+        tungstenite::Error::Protocol(tungstenite::error::ProtocolError::WrongHttpMethod),
+    ));
+    assert!(matches!(
+        complete_package_libtest_client_handshake(
+            failure,
+            &termination,
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Err(PackageLibtestHandshakeFailure::Protocol)
+    ));
+    Ok(())
+}
+
+#[test]
+fn package_app_client_handshake_restores_blocking_protocol_io() -> Result<(), Box<dyn Error>> {
+    let (client, server) = UnixStream::pair()?;
+    let server = thread::spawn(move || -> Result<(), String> {
+        let websocket = accept_with_config(server, Some(package_libtest_websocket_config()))
+            .map_err(|_| "App Server handshake failed".to_owned())?;
+        drop(websocket);
+        Ok(())
+    });
+
+    let websocket =
+        complete_package_app_server_websocket(client, Instant::now() + Duration::from_secs(1))?;
+    assert_eq!(
+        websocket.get_ref().inner.read_timeout()?,
+        Some(PACKAGE_APP_SERVER_READ_SLICE)
+    );
+    assert_eq!(websocket.get_ref().inner.write_timeout()?, Some(IO_TIMEOUT));
+    assert!(
+        !rustix::fs::fcntl_getfl(&websocket.get_ref().inner)?
+            .contains(rustix::fs::OFlags::NONBLOCK),
+        "the established App Server protocol remained nonblocking"
+    );
+    assert_eq!(
+        websocket.get_config().max_message_size,
+        Some(MAX_WEBSOCKET_MESSAGE_BYTES)
+    );
+    assert_eq!(
+        websocket.get_config().max_frame_size,
+        Some(MAX_WEBSOCKET_MESSAGE_BYTES)
+    );
+    assert!(!websocket.get_config().accept_unmasked_frames);
+    drop(websocket);
+    server
+        .join()
+        .map_err(|_| "App Server handshake server panicked")??;
+    Ok(())
+}
+
+#[test]
+fn package_libtest_client_handshake_enforces_expired_deadline() -> Result<(), Box<dyn Error>> {
+    let (client, _server) = UnixStream::pair()?;
+    client.set_nonblocking(true)?;
+    let interrupted = client_with_config(
+        "ws://localhost",
+        client,
+        Some(package_libtest_websocket_config()),
+    );
+    assert!(matches!(
+        &interrupted,
+        Err(tungstenite::HandshakeError::Interrupted(_))
+    ));
+
+    let termination = AtomicBool::new(false);
+    assert!(matches!(
+        complete_package_libtest_client_handshake(interrupted, &termination, Instant::now(),),
+        Err(PackageLibtestHandshakeFailure::Timeout)
+    ));
+    Ok(())
+}
+
+#[test]
+fn package_libtest_client_handshake_termination_wins_over_failure_and_success()
+-> Result<(), Box<dyn Error>> {
+    let termination = AtomicBool::new(true);
+    let failure: PackageLibtestClientHandshakeResult<UnixStream> =
+        Err(tungstenite::HandshakeError::Failure(
+            tungstenite::Error::Protocol(tungstenite::error::ProtocolError::HandshakeIncomplete),
+        ));
+    assert!(
+        complete_package_libtest_client_handshake(
+            failure,
+            &termination,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .map_err(|_| "terminated client failure classification failed")?
+        .is_none()
+    );
+
+    let active = AtomicBool::new(false);
+    let failure: PackageLibtestClientHandshakeResult<UnixStream> =
+        Err(tungstenite::HandshakeError::Failure(
+            tungstenite::Error::Protocol(tungstenite::error::ProtocolError::HandshakeIncomplete),
+        ));
+    assert!(matches!(
+        complete_package_libtest_client_handshake(
+            failure,
+            &active,
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Err(PackageLibtestHandshakeFailure::Protocol)
+    ));
+
+    let (client, _server) = UnixStream::pair()?;
+    let websocket = WebSocket::from_raw_socket(
+        client,
+        tungstenite::protocol::Role::Client,
+        Some(package_libtest_websocket_config()),
+    );
+    let response = tungstenite::http::Response::builder()
+        .status(tungstenite::http::StatusCode::SWITCHING_PROTOCOLS)
+        .body(None)?;
+    let success: PackageLibtestClientHandshakeResult<UnixStream> = Ok((websocket, response));
+    assert!(
+        complete_package_libtest_client_handshake(
+            success,
+            &termination,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .map_err(|_| "terminated client success classification failed")?
+        .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn package_libtest_tui_handshake_sends_nothing_when_already_terminated()
+-> Result<(), Box<dyn Error>> {
+    let (client, mut server) = UnixStream::pair()?;
+    server.set_nonblocking(true)?;
+    let termination = AtomicBool::new(true);
+    assert!(connect_package_libtest_tui_websocket(client, &termination)?.is_none());
+
+    let mut byte = [0_u8; 1];
+    match server.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Ok(_) => return Err("terminated TUI handshake wrote request bytes".into()),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[test]
+fn package_libtest_tui_handshake_restores_blocking_protocol_io() -> Result<(), Box<dyn Error>> {
+    let (client, server) = UnixStream::pair()?;
+    let server = thread::spawn(move || -> Result<(), String> {
+        let websocket = accept_with_config(server, Some(package_libtest_websocket_config()))
+            .map_err(|_| "TUI fixture server handshake failed".to_owned())?;
+        drop(websocket);
+        Ok(())
+    });
+
+    let termination = AtomicBool::new(false);
+    let websocket = connect_package_libtest_tui_websocket(client, &termination)?
+        .ok_or("the active TUI handshake was misclassified as terminated")?;
+    assert_eq!(
+        websocket.get_ref().read_timeout()?,
+        Some(PACKAGE_LIBTEST_TUI_READ_SLICE),
+        "the established TUI protocol did not restore its cancellable read slice"
+    );
+    assert_eq!(websocket.get_ref().write_timeout()?, Some(IO_TIMEOUT));
+    assert!(
+        !rustix::fs::fcntl_getfl(websocket.get_ref())?.contains(rustix::fs::OFlags::NONBLOCK),
+        "the established TUI protocol remained nonblocking"
+    );
+    drop(websocket);
+    server.join().map_err(|_| "TUI fixture server panicked")??;
+    Ok(())
+}
+
+#[test]
+fn package_app_client_handshake_does_not_reconnect_after_request_bytes()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let socket = scratch.root.join("app-handshake-no-reconnect.sock");
+    let listener = UnixListener::bind(&socket)?;
+    let server = thread::spawn(move || -> Result<(), String> {
+        let (mut first, _) = listener
+            .accept()
+            .map_err(|_| "App Server did not accept the first connection".to_owned())?;
+        first
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(|_| "App Server request read timeout setup failed".to_owned())?;
+        let mut request = [0_u8; 4096];
+        let request_bytes = first
+            .read(&mut request)
+            .map_err(|_| "App Server did not read handshake request bytes".to_owned())?;
+        if request_bytes == 0 {
+            return Err("App Server observed no handshake request bytes".to_owned());
+        }
+        first
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .map_err(|_| "App Server protocol rejection failed".to_owned())?;
+        drop(first);
+
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "App Server reconnect observer setup failed".to_owned())?;
+        let observation_deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match listener.accept() {
+                Ok(_) => {
+                    return Err(
+                        "App Server client reconnected after writing handshake bytes".to_owned(),
+                    );
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && Instant::now() < observation_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(_) => return Err("App Server reconnect observation failed".to_owned()),
+            }
+        }
+    });
+
+    let connection = connect_app_server(&socket, Instant::now() + Duration::from_secs(1));
+    let server: Result<(), Box<dyn Error>> = match server.join() {
+        Ok(server) => server.map_err(Into::into),
+        Err(_) => Err("App Server reconnect observer panicked".into()),
+    };
+    let cleanup = scratch.cleanup();
+    if connection.is_ok() {
+        return Err("App Server accepted a rejected WebSocket handshake".into());
+    }
+    server?;
+    cleanup
 }
 
 fn serve_package_libtest_websocket(
@@ -19690,6 +20300,50 @@ fn wait_package_libtest_disconnect(
     }
 }
 
+fn connect_package_libtest_tui_websocket(
+    stream: UnixStream,
+    termination: &AtomicBool,
+) -> Result<Option<WebSocket<UnixStream>>, Box<dyn Error>> {
+    if termination.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let deadline = Instant::now()
+        .checked_add(IO_TIMEOUT)
+        .ok_or("libtest TUI handshake deadline overflowed")?;
+    // Install the post-handshake slices before toggling nonblocking mode so
+    // success needs only one fallible socket-state restoration. O_NONBLOCK
+    // takes precedence during the resumable handshake; restoring blocking
+    // mode below reactivates the configured protocol timeouts.
+    stream
+        .set_read_timeout(Some(PACKAGE_LIBTEST_TUI_READ_SLICE))
+        .map_err(|_| "libtest TUI protocol read timeout setup failed")?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|_| "libtest TUI protocol write timeout setup failed")?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|_| "libtest TUI handshake nonblocking setup failed")?;
+    if termination.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let handshake = client_with_config(
+        "ws://localhost",
+        stream,
+        Some(package_libtest_websocket_config()),
+    );
+    let Some(mut websocket) =
+        complete_package_libtest_client_handshake(handshake, termination, deadline)
+            .map_err(|_| "libtest TUI WebSocket handshake failed")?
+    else {
+        return Ok(None);
+    };
+    websocket
+        .get_mut()
+        .set_nonblocking(false)
+        .map_err(|_| "libtest TUI protocol blocking restore failed")?;
+    Ok(Some(websocket))
+}
+
 fn run_package_libtest_remote_tui(remote: &Path, thread_id: &str) -> Result<(), Box<dyn Error>> {
     let root = std::env::var(PACKAGE_LIBTEST_PROVIDER_ROOT_ENV)?;
     let root = parse_package_libtest_provider_root(Some(&root))?;
@@ -19717,12 +20371,10 @@ fn run_package_libtest_remote_tui(remote: &Path, thread_id: &str) -> Result<(), 
     }
 
     let stream = UnixStream::connect(remote)?;
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES))
-        .max_frame_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES));
-    let (mut websocket, _) = client_with_config("ws://localhost", stream, Some(config))?;
+    let Some(mut websocket) = connect_package_libtest_tui_websocket(stream, &termination.pending)?
+    else {
+        return Ok(());
+    };
     send_package_libtest_json(
         &mut websocket,
         json!({
