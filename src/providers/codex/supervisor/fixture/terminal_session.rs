@@ -191,20 +191,76 @@ pub(super) fn run_terminal_anchor(scenario: Scenario) -> Result<ExitCode, Fixtur
     let mut coordinator = command.spawn().map_err(|_| FixtureError::Process)?;
     let deadline = bounded_deadline(ANCHOR_TIMEOUT);
     let mut child_reaped = false;
-    let result = drive_terminal_anchor(&mut coordinator, scenario, deadline, &mut child_reaped);
-    if result.is_err() {
-        if !child_reaped {
-            let _ = coordinator.kill();
-            if wait_exact_child(&mut coordinator, bounded_deadline(PHASE_TIMEOUT)).is_err() {
-                let _ = restore_anchor_terminal(&anchor_snapshot);
+    let mut foreground_reclaim_active = false;
+    let error = match drive_terminal_anchor(
+        &mut coordinator,
+        scenario,
+        deadline,
+        &mut child_reaped,
+        &mut foreground_reclaim_active,
+    ) {
+        Ok(TerminalAnchorOutcome::Exit(code)) => return Ok(code),
+        Ok(TerminalAnchorOutcome::RestoreAfterForegroundReclaim(proof)) => {
+            if restore_anchor_after_foreground_reclaim(proof, &anchor_snapshot).is_err() {
                 RetainedTerminalAnchorState {
                     coordinator,
                     snapshot: anchor_snapshot,
                 }
                 .park()
             }
+            return Err(FixtureError::Process);
         }
-        if restore_anchor_terminal(&anchor_snapshot).is_err() {
+        Err(FixtureError::ForegroundReclaimResolutionUnresolved) => {
+            let _ = write_marker(
+                "anchor.foreground-reclaim-resolution-retained",
+                b"retained\n",
+            );
+            // A missing, malformed, or late Guardian proof is not permission
+            // to restore or exit. Retain the exact direct Child handle and
+            // immutable anchor snapshot until the parent reaps this anchor.
+            RetainedTerminalAnchorState {
+                coordinator,
+                snapshot: anchor_snapshot,
+            }
+            .park()
+        }
+        Err(error) if foreground_reclaim_active => {
+            match retry_foreground_reclaim_resolution_after_drive_error(
+                &mut coordinator,
+                deadline,
+                &mut child_reaped,
+            ) {
+                Ok(proof) => {
+                    if restore_anchor_after_foreground_reclaim(proof, &anchor_snapshot).is_err() {
+                        RetainedTerminalAnchorState {
+                            coordinator,
+                            snapshot: anchor_snapshot,
+                        }
+                        .park()
+                    }
+                    return Err(error);
+                }
+                Err(failure) => {
+                    let _ =
+                        write_marker("anchor.foreground-reclaim-resolution-error", failure.code());
+                    let _ = write_marker(
+                        "anchor.foreground-reclaim-resolution-retained",
+                        b"retained\n",
+                    );
+                    RetainedTerminalAnchorState {
+                        coordinator,
+                        snapshot: anchor_snapshot,
+                    }
+                    .park()
+                }
+            }
+        }
+        Err(error) => error,
+    };
+    if !child_reaped {
+        let _ = coordinator.kill();
+        if wait_exact_child(&mut coordinator, bounded_deadline(PHASE_TIMEOUT)).is_err() {
+            let _ = restore_anchor_terminal(&anchor_snapshot);
             RetainedTerminalAnchorState {
                 coordinator,
                 snapshot: anchor_snapshot,
@@ -212,7 +268,25 @@ pub(super) fn run_terminal_anchor(scenario: Scenario) -> Result<ExitCode, Fixtur
             .park()
         }
     }
-    result
+    if restore_anchor_terminal(&anchor_snapshot).is_err() {
+        RetainedTerminalAnchorState {
+            coordinator,
+            snapshot: anchor_snapshot,
+        }
+        .park()
+    }
+    Err(error)
+}
+
+enum TerminalAnchorOutcome {
+    Exit(ExitCode),
+    RestoreAfterForegroundReclaim(ForegroundReclaimResolutionProof),
+}
+
+/// Move-only evidence that every post-reap observation completed before the
+/// anchor deadline and the exact Guardian resolution publication was timely.
+struct ForegroundReclaimResolutionProof {
+    _private: (),
 }
 
 struct RetainedTerminalAnchorState {
@@ -237,12 +311,20 @@ fn restore_anchor_terminal(snapshot: &TerminalSnapshot) -> Result<(), FixtureErr
     write_restored_marker_idempotent()
 }
 
+fn restore_anchor_after_foreground_reclaim(
+    _proof: ForegroundReclaimResolutionProof,
+    snapshot: &TerminalSnapshot,
+) -> Result<(), FixtureError> {
+    restore_anchor_terminal(snapshot)
+}
+
 fn drive_terminal_anchor(
     coordinator: &mut Child,
     scenario: Scenario,
     deadline: Instant,
     child_reaped: &mut bool,
-) -> Result<ExitCode, FixtureError> {
+    foreground_reclaim_active: &mut bool,
+) -> Result<TerminalAnchorOutcome, FixtureError> {
     let coordinator_group = wait_for_direct_child_group(coordinator, deadline, child_reaped)?;
     rustix::termios::tcsetpgrp(io::stdin(), coordinator_group)
         .map_err(|_| FixtureError::Process)?;
@@ -275,29 +357,32 @@ fn drive_terminal_anchor(
                     // foreground before the guardian can observe lifecycle
                     // EOF. The current raw attributes deliberately remain in
                     // place as the no-clobber sentinel.
-                    reclaim_anchor_foreground()?;
+                    reclaim_anchor_foreground_for_foreground_reclaim(foreground_reclaim_active)?;
                     write_marker("anchor.foreground-reclaimed", b"reclaimed\n")?;
                     coordinator.kill().map_err(|_| FixtureError::Process)?;
+                    if test_capability_released("test.fail-foreground-reclaim-first-wait")? {
+                        write_marker("anchor.foreground-reclaim-first-wait-failed", b"injected\n")?;
+                        return Err(FixtureError::Process);
+                    }
                     let status = wait_exact_child(coordinator, deadline)?;
                     *child_reaped = true;
-                    if status.success() {
-                        return Err(FixtureError::Invariant);
+                    let proof = if status.success() {
+                        Err(ForegroundReclaimResolutionFailure::CoordinatorStatus)
+                    } else {
+                        acquire_foreground_reclaim_resolution_proof(deadline)
+                    };
+                    match proof {
+                        Ok(proof) => {
+                            return Ok(TerminalAnchorOutcome::RestoreAfterForegroundReclaim(proof));
+                        }
+                        Err(failure) => {
+                            let _ = write_marker(
+                                "anchor.foreground-reclaim-resolution-error",
+                                failure.code(),
+                            );
+                            return Err(FixtureError::ForegroundReclaimResolutionUnresolved);
+                        }
                     }
-                    write_marker("coordinator.killed", b"killed\n")?;
-                    wait_for_exact_marker_until(
-                        "terminal.restore-error",
-                        b"not_foreground_process_group",
-                        deadline,
-                    )?;
-                    write_marker("anchor.restore-refused-observed", b"observed\n")?;
-                    wait_for_exact_marker_until(
-                        "test.resolve-foreground-reclaim",
-                        b"release\n",
-                        deadline,
-                    )?;
-                    // Returning an error transfers final recovery to the
-                    // anchor snapshot owned by `run_terminal_anchor`.
-                    return Err(FixtureError::Process);
                 }
 
                 coordinator.kill().map_err(|_| FixtureError::Process)?;
@@ -316,7 +401,7 @@ fn drive_terminal_anchor(
                     wait_for_exact_marker_until("guardian.cleaned", b"complete\n", deadline)?;
                 }
                 reclaim_anchor_foreground()?;
-                return Ok(ExitCode::from(EXIT_FAILURE));
+                return Ok(TerminalAnchorOutcome::Exit(ExitCode::from(EXIT_FAILURE)));
             }
             // Test capabilities are created with a truncate-and-write helper.
             // A concurrent reader can briefly observe an empty or partial
@@ -332,7 +417,7 @@ fn drive_terminal_anchor(
             Ok(Some(status)) => {
                 *child_reaped = true;
                 reclaim_anchor_foreground()?;
-                return propagate_exit_status(status);
+                return propagate_exit_status(status).map(TerminalAnchorOutcome::Exit);
             }
             Ok(None) => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -503,6 +588,37 @@ fn reclaim_anchor_foreground() -> Result<(), FixtureError> {
     let result = rustix::termios::tcsetpgrp(io::stdin(), group)
         .map_err(|_| FixtureError::Process)
         .and_then(|()| {
+            if rustix::termios::tcgetpgrp(io::stdin()).map_err(|_| FixtureError::Process)? == group
+            {
+                Ok(())
+            } else {
+                Err(FixtureError::Invariant)
+            }
+        });
+    drop(guard);
+    result
+}
+
+fn reclaim_anchor_foreground_for_foreground_reclaim(
+    foreground_reclaim_active: &mut bool,
+) -> Result<(), FixtureError> {
+    let guard = calcifer_unix_child_fd::block_sigttou_for_current_thread()
+        .map_err(|_| FixtureError::Process)?;
+    // Once SIGTTOU is blocked, even an ambiguous failed foreground attempt
+    // must never return to generic restore. Set the issue-specific fail-closed
+    // boundary before tcsetpgrp and every fallible verification step.
+    *foreground_reclaim_active = true;
+    let group = rustix::process::getpgrp();
+    let result = rustix::termios::tcsetpgrp(io::stdin(), group)
+        .map_err(|_| FixtureError::Process)
+        .and_then(|()| {
+            if test_capability_released("test.fail-foreground-reclaim-verification")? {
+                write_marker(
+                    "anchor.foreground-reclaim-verification-failed",
+                    b"injected\n",
+                )?;
+                return Err(FixtureError::Process);
+            }
             if rustix::termios::tcgetpgrp(io::stdin()).map_err(|_| FixtureError::Process)? == group
             {
                 Ok(())
@@ -925,20 +1041,151 @@ fn wait_for_exact_marker_until(
     if expected.len() > 32 {
         return Err(FixtureError::Invariant);
     }
+    let path = marker_path(name)?;
     loop {
-        let path = marker_path(name)?;
-        match fs::read(&path) {
-            Ok(value) if value == expected => return Ok(()),
-            Ok(_) if Instant::now() >= deadline => return Err(FixtureError::Storage),
-            Ok(_) => thread::sleep(EVENT_POLL),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if Instant::now() >= deadline {
-                    return Err(FixtureError::Deadline);
-                }
-                thread::sleep(EVENT_POLL);
-            }
-            Err(_) => return Err(FixtureError::Storage),
+        if exact_marker_observed(&path, expected, deadline)? {
+            return Ok(());
         }
+        thread::sleep(EVENT_POLL);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundReclaimResolutionFailure {
+    CoordinatorStatus,
+    Missing,
+    Malformed,
+    Late,
+    Observation,
+}
+
+impl ForegroundReclaimResolutionFailure {
+    const fn code(self) -> &'static [u8] {
+        match self {
+            Self::CoordinatorStatus => b"coordinator\n",
+            Self::Missing => b"missing\n",
+            Self::Malformed => b"malformed\n",
+            Self::Late => b"late\n",
+            Self::Observation => b"observation\n",
+        }
+    }
+}
+
+fn retry_foreground_reclaim_resolution_after_drive_error(
+    coordinator: &mut Child,
+    deadline: Instant,
+    child_reaped: &mut bool,
+) -> Result<ForegroundReclaimResolutionProof, ForegroundReclaimResolutionFailure> {
+    if !*child_reaped {
+        // Retry only through the exact direct Child handle. A failed first
+        // kill/wait attempt cannot fall back to marker PID or process-group
+        // authority, and a failed retry cannot authorize terminal restore.
+        let _ = coordinator.kill();
+        let status = wait_exact_child(coordinator, bounded_deadline(PHASE_TIMEOUT))
+            .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+        *child_reaped = true;
+        if status.success() {
+            return Err(ForegroundReclaimResolutionFailure::CoordinatorStatus);
+        }
+    }
+    acquire_foreground_reclaim_resolution_proof(deadline)
+}
+
+fn acquire_foreground_reclaim_resolution_proof(
+    deadline: Instant,
+) -> Result<ForegroundReclaimResolutionProof, ForegroundReclaimResolutionFailure> {
+    if test_capability_released("test.hold-foreground-reclaim-pre-proof")
+        .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?
+    {
+        write_marker("anchor.foreground-reclaim-pre-proof-held", b"waiting\n")
+            .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+        wait_for_exact_marker_until(
+            "test.release-foreground-reclaim-pre-proof",
+            b"release\n",
+            deadline,
+        )
+        .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+    }
+    write_marker("coordinator.killed", b"killed\n")
+        .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+    wait_for_exact_marker_until(
+        "terminal.restore-error",
+        b"not_foreground_process_group",
+        deadline,
+    )
+    .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+    write_marker("anchor.restore-refused-observed", b"observed\n")
+        .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+    wait_for_exact_marker_until("test.resolve-foreground-reclaim", b"release\n", deadline)
+        .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+    wait_for_foreground_reclaim_resolution_until(deadline)
+}
+
+fn wait_for_foreground_reclaim_resolution_until(
+    deadline: Instant,
+) -> Result<ForegroundReclaimResolutionProof, ForegroundReclaimResolutionFailure> {
+    let resolution = marker_path("guardian.foreground-reclaim-resolved")
+        .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+    let mut probe_acknowledged = false;
+    loop {
+        // This synthetic probe only proves that the living anchor remains in
+        // its observation loop after the shared trigger. It cannot replace
+        // the Guardian-owned fixed resolution proof below.
+        if !probe_acknowledged
+            && test_capability_released("test.probe-foreground-reclaim-anchor")
+                .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?
+        {
+            write_marker("anchor.foreground-reclaim-resolution-held", b"waiting\n")
+                .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+            probe_acknowledged = true;
+        }
+        let forced_expiry = test_capability_released("test.expire-foreground-reclaim-resolution")
+            .map_err(|_| ForegroundReclaimResolutionFailure::Observation)?;
+        let value = match fs::read(&resolution) {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Err(ForegroundReclaimResolutionFailure::Observation),
+        };
+        let expired = forced_expiry || Instant::now() >= deadline;
+        if classify_foreground_reclaim_resolution(value.as_deref(), expired)? {
+            return Ok(ForegroundReclaimResolutionProof { _private: () });
+        }
+        thread::sleep(EVENT_POLL);
+    }
+}
+
+fn classify_foreground_reclaim_resolution(
+    value: Option<&[u8]>,
+    expired: bool,
+) -> Result<bool, ForegroundReclaimResolutionFailure> {
+    match (value, expired) {
+        (Some(value), false) if value == b"self-exit\n" => Ok(true),
+        (None, false) | (Some(_), false) => Ok(false),
+        (None, true) => Err(ForegroundReclaimResolutionFailure::Missing),
+        (Some(value), true) if value == b"self-exit\n" => {
+            Err(ForegroundReclaimResolutionFailure::Late)
+        }
+        (Some(_), true) => Err(ForegroundReclaimResolutionFailure::Malformed),
+    }
+}
+
+fn exact_marker_observed(
+    path: &Path,
+    expected: &[u8],
+    deadline: Instant,
+) -> Result<bool, FixtureError> {
+    match fs::read(path) {
+        Ok(value) if value == expected => Ok(true),
+        Ok(_) if Instant::now() >= deadline => Err(FixtureError::Storage),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if Instant::now() >= deadline {
+                Err(FixtureError::Deadline)
+            } else {
+                Ok(false)
+            }
+        }
+        Err(_) => Err(FixtureError::Storage),
     }
 }
 
@@ -1661,6 +1908,47 @@ mod signal_flag_tests {
             .map_err(|_| io::Error::other("signal flag publisher panicked"))?;
         assert!(!flag.take());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod foreground_reclaim_tests {
+    use super::*;
+
+    #[test]
+    fn resolution_observation_accepts_only_a_timely_exact_fixed_proof() {
+        assert_eq!(
+            classify_foreground_reclaim_resolution(Some(b"self-exit\n"), false),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn missing_and_partial_resolution_remain_pending_before_the_deadline() {
+        assert_eq!(
+            classify_foreground_reclaim_resolution(None, false),
+            Ok(false)
+        );
+        assert_eq!(
+            classify_foreground_reclaim_resolution(Some(b"self-"), false),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn expired_missing_malformed_and_late_resolution_fail_closed() {
+        assert_eq!(
+            classify_foreground_reclaim_resolution(None, true),
+            Err(ForegroundReclaimResolutionFailure::Missing)
+        );
+        assert_eq!(
+            classify_foreground_reclaim_resolution(Some(b"not-a-proof\n"), true),
+            Err(ForegroundReclaimResolutionFailure::Malformed)
+        );
+        assert_eq!(
+            classify_foreground_reclaim_resolution(Some(b"self-exit\n"), true),
+            Err(ForegroundReclaimResolutionFailure::Late)
+        );
     }
 }
 
@@ -5123,11 +5411,16 @@ impl RetainedTerminalGuardianState<'_> {
     }
 }
 
-/// Move-only evidence for the sole fixture state where cooperative guardian
-/// release is safe: the terminal restore was rejected because another living
-/// process group owns the foreground, every direct app/TUI child was exactly
-/// reaped, and no pump authority remains. The release marker is only a trigger
-/// observed *after* this proof exists; it is never treated as authority.
+/// Move-only evidence for the fixture states where cooperative guardian
+/// release is safe: every direct app/TUI child was exactly reaped, no pump
+/// authority remains, and terminal restore has a typed refusal. The normal
+/// refusal proves another living process group owns the foreground. The
+/// synthetic regression-only refusal records that the recovery terminal was
+/// revoked after an injected pre-reap fault; it exists solely so a failing
+/// test can release the otherwise orphaned Guardian without marker-PID
+/// authority.
+/// The release marker is only a trigger observed *after* this proof exists; it
+/// is never treated as authority.
 /// `FixtureWorker` is currently an in-process, receive-blocked marker thread;
 /// if it ever owns an external process or durable mutation, a bounded
 /// stop/join proof must become another required field here before cooperative
@@ -5135,11 +5428,12 @@ impl RetainedTerminalGuardianState<'_> {
 struct ForegroundReclaimRetentionProof {
     _pumps_stopped: GuardianPumpsStopped,
     reaped_children: ReapedChildren,
-    _not_foreground: NotForegroundRestoreRefusal,
+    _restore_refusal: ForegroundReclaimRestoreRefusal,
 }
 
-struct NotForegroundRestoreRefusal {
-    _private: (),
+enum ForegroundReclaimRestoreRefusal {
+    NotForegroundProcessGroup,
+    SyntheticPreReapFaultTerminalRevoked,
 }
 
 struct RetainedForegroundReclaimGuardianState<'endpoint> {
@@ -5164,24 +5458,60 @@ impl RetainedForegroundReclaimGuardianState<'_> {
             self.proof.reaped_children.app_server(),
             self.proof.reaped_children.tui(),
             &self.proof._pumps_stopped,
-            &self.proof._not_foreground,
+            &self.proof._restore_refusal,
         );
         if write_marker("guardian.foreground-reclaim-retained", b"children-reaped\n").is_err() {
-            std::mem::forget(self);
-            loop {
-                thread::park();
-            }
+            self.retain_forever()
         }
         loop {
-            if test_capability_released("test.resolve-foreground-reclaim").unwrap_or(false)
-                && write_marker("guardian.foreground-reclaim-resolved", b"self-exit\n").is_ok()
-            {
+            if test_capability_released("test.resolve-foreground-reclaim").unwrap_or(false) {
+                // Publish an observation-only barrier while every retained
+                // authority and the typed refusal proof are still owned. The
+                // optional hold is a deterministic scheduling fault for the
+                // real-PTY regression; neither marker authorizes cleanup.
+                if write_marker(
+                    "guardian.foreground-reclaim-trigger-observed",
+                    b"observed\n",
+                )
+                .is_err()
+                {
+                    self.retain_forever()
+                }
+                if test_capability_released("test.exit-guardian-before-resolution-proof")
+                    .unwrap_or(false)
+                {
+                    // Fault injection only: deliberately drop every retained
+                    // Guardian authority without publishing completion. The
+                    // anchor must retain its own exact Child + snapshot state.
+                    std::process::exit(i32::from(EXIT_FAILURE));
+                }
+                if test_capability_released("test.hold-foreground-reclaim-publication")
+                    .unwrap_or(false)
+                    && wait_for_exact_marker_until(
+                        "test.release-foreground-reclaim-publication",
+                        b"release\n",
+                        bounded_deadline(ANCHOR_TIMEOUT),
+                    )
+                    .is_err()
+                {
+                    self.retain_forever()
+                }
+                if write_marker("guardian.foreground-reclaim-resolved", b"self-exit\n").is_err() {
+                    self.retain_forever()
+                }
                 // The refusal proof intentionally remains on disk, but
                 // process exit closes B and the sole recovery descriptor.
                 // No recovery-disarmed/restored proof is fabricated.
                 std::process::exit(i32::from(EXIT_FAILURE));
             }
             thread::sleep(EVENT_POLL);
+        }
+    }
+
+    fn retain_forever(self) -> ! {
+        std::mem::forget(self);
+        loop {
+            thread::park();
         }
     }
 }
@@ -5730,7 +6060,41 @@ fn finish_terminal_guardian_inner(
                             proof: ForegroundReclaimRetentionProof {
                                 _pumps_stopped: pumps_stopped,
                                 reaped_children: children,
-                                _not_foreground: NotForegroundRestoreRefusal { _private: () },
+                                _restore_refusal:
+                                    ForegroundReclaimRestoreRefusal::NotForegroundProcessGroup,
+                            },
+                        }
+                        .park()
+                    }
+                    GuardedRestoreError::Terminal(TerminalError::NotTerminal)
+                        if error_marker_written
+                            && FOREGROUND_RECLAIM_RESOLUTION_ENABLED.load(Ordering::Acquire)
+                            && (test_capability_released(
+                                "test.fail-foreground-reclaim-first-wait",
+                            )
+                            .unwrap_or(false)
+                                || test_capability_released(
+                                    "test.fail-foreground-reclaim-verification",
+                                )
+                                .unwrap_or(false)) =>
+                    {
+                        // Regression-cleanup only: the old unsafe path restored
+                        // and exited the outer anchor after an injected
+                        // pre-reap fault. Children and pumps are already proven
+                        // quiesced here, so Drop may ask this exact Guardian to
+                        // self-exit without ever signaling an observed PID.
+                        RetainedForegroundReclaimGuardianState {
+                            endpoint,
+                            provider_lease,
+                            recovery,
+                            snapshot,
+                            runtime,
+                            worker,
+                            proof: ForegroundReclaimRetentionProof {
+                                _pumps_stopped: pumps_stopped,
+                                reaped_children: children,
+                                _restore_refusal: ForegroundReclaimRestoreRefusal::
+                                    SyntheticPreReapFaultTerminalRevoked,
                             },
                         }
                         .park()
