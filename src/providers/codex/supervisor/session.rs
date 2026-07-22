@@ -56,6 +56,8 @@ use crate::providers::codex::CodexUsage;
 use crate::providers::codex::monitor::{
     SessionMonitor, SessionMonitorError, SessionMonitorShutdownOwner, SessionUsageLimitSignal,
 };
+#[cfg(test)]
+use crate::providers::codex::remote::ReadinessTransportOrigin;
 use crate::providers::codex::remote::{EffectiveThreadSettings, ReadinessProxyError};
 
 const TERMINAL_PUMP_RETRY: Duration = Duration::from_millis(1);
@@ -1032,7 +1034,7 @@ impl SessionLivenessError {
     const fn relay(error: ReadinessProxyError) -> Self {
         Self {
             operation: SessionOperationError::Component(SessionComponent::ReadinessRelay),
-            relay_transport: matches!(error, ReadinessProxyError::Transport),
+            relay_transport: matches!(error, ReadinessProxyError::Transport(_)),
             tui_exited: false,
         }
     }
@@ -2061,7 +2063,7 @@ fn relay_shutdown_operation_error(
     error: Option<ReadinessProxyError>,
 ) -> Option<SessionOperationError> {
     match error {
-        Some(ReadinessProxyError::Transport)
+        Some(ReadinessProxyError::Transport(_))
             if termination_cause == Some(SessionTerminationCause::NaturalTuiEof) =>
         {
             None
@@ -3187,6 +3189,25 @@ pub(super) const PACKAGED_SESSION_STARTUP_FAILURE_MARKERS: &[&str] = &[
     "startup-failure.session-readiness.subtype.readiness-relay.unexpected-sequence",
     "startup-failure.session-readiness.subtype.readiness-relay.target-mismatch",
     "startup-failure.session-readiness.subtype.readiness-relay.timeout",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-configure",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-clone",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-eof",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-read",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-write",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.upstream-clone",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.upstream-eof",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.upstream-read",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.upstream-write",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.observation-delivery",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.observation-channel-disconnected",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.lifecycle-disconnected",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.worker-finished",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-client-poll",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-client-peek",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-client-eof",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-upstream-poll",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-upstream-peek",
+    "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-upstream-eof",
     "startup-failure.session-readiness.subtype.readiness-relay.transport",
     "startup-failure.session-readiness.subtype.readiness-relay.worker",
     "startup-failure.session-readiness.subtype.readiness-relay.cleanup",
@@ -3277,7 +3298,7 @@ pub(super) const fn packaged_session_startup_failure_marker(
         SessionStartupError::ReadinessRelay(ReadinessProxyError::Timeout) => {
             "startup-failure.session-readiness.subtype.readiness-relay.timeout"
         }
-        SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport) => {
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport(_)) => {
             "startup-failure.session-readiness.subtype.readiness-relay.transport"
         }
         SessionStartupError::ReadinessRelay(ReadinessProxyError::Worker) => {
@@ -3324,6 +3345,75 @@ pub(super) const fn packaged_session_startup_failure_marker(
             "startup-failure.session-readiness.subtype.terminal-pump.resume"
         }
         SessionStartupError::Deadline => "startup-failure.session-readiness.subtype.deadline",
+    }
+}
+
+/// Returns the package-only fixed origin nested beneath the stable relay
+/// transport category. Production shutdown continues to consume only
+/// `ReadinessProxyError::Transport`; this marker is observation, never socket,
+/// process, retry, or cleanup authority.
+#[cfg(test)]
+pub(super) const fn packaged_readiness_transport_origin_marker(
+    origin: ReadinessTransportOrigin,
+) -> &'static str {
+    match origin {
+        ReadinessTransportOrigin::ClientConfigure => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-configure"
+        }
+        ReadinessTransportOrigin::ClientClone => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-clone"
+        }
+        ReadinessTransportOrigin::ClientEof => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-eof"
+        }
+        ReadinessTransportOrigin::ClientRead => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-read"
+        }
+        ReadinessTransportOrigin::ClientWrite => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-write"
+        }
+        ReadinessTransportOrigin::UpstreamClone => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.upstream-clone"
+        }
+        ReadinessTransportOrigin::UpstreamEof => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.upstream-eof"
+        }
+        ReadinessTransportOrigin::UpstreamRead => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.upstream-read"
+        }
+        ReadinessTransportOrigin::UpstreamWrite => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.upstream-write"
+        }
+        ReadinessTransportOrigin::ObservationDelivery => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.observation-delivery"
+        }
+        ReadinessTransportOrigin::ObservationChannelDisconnected => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.observation-channel-disconnected"
+        }
+        ReadinessTransportOrigin::LifecycleDisconnected => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.lifecycle-disconnected"
+        }
+        ReadinessTransportOrigin::WorkerFinished => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.worker-finished"
+        }
+        ReadinessTransportOrigin::HealthClientPoll => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-client-poll"
+        }
+        ReadinessTransportOrigin::HealthClientPeek => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-client-peek"
+        }
+        ReadinessTransportOrigin::HealthClientEof => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-client-eof"
+        }
+        ReadinessTransportOrigin::HealthUpstreamPoll => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-upstream-poll"
+        }
+        ReadinessTransportOrigin::HealthUpstreamPeek => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-upstream-peek"
+        }
+        ReadinessTransportOrigin::HealthUpstreamEof => {
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.health-upstream-eof"
+        }
     }
 }
 
@@ -4217,16 +4307,18 @@ mod tests {
     use super::{
         PACKAGED_SESSION_RETAINED_OPERATION_MARKERS, PACKAGED_SESSION_STARTUP_FAILURE_MARKERS,
         SessionComponent, SessionMonitorError, SessionOperationError, SessionShutdownRecoveryStage,
-        SessionStartupError, ShutdownPhase, TerminalPumpFailure, packaged_session_operation_marker,
+        SessionStartupError, ShutdownPhase, TerminalPumpFailure,
+        packaged_readiness_transport_origin_marker, packaged_session_operation_marker,
         packaged_session_shutdown_phase_marker, packaged_session_startup_failure_marker,
         packaged_session_termination_cause_marker, packaged_session_tui_disposition_marker,
         project_relay_connection_result, project_relay_poll_result, readiness_relay_startup_error,
         session_shutdown_recovery_stage, session_startup_operation_error,
     };
-    use crate::providers::codex::remote::ReadinessProxyError;
+    use crate::providers::codex::remote::{ReadinessProxyError, ReadinessTransportOrigin};
 
     #[test]
-    fn packaged_session_startup_failure_markers_are_closed_unique_and_fixed() {
+    fn packaged_session_startup_failure_markers_are_closed_unique_and_fixed()
+    -> Result<(), Box<dyn std::error::Error>> {
         let cases = [
             (
                 SessionStartupError::Monitor(SessionMonitorError::InvalidArgument),
@@ -4317,7 +4409,9 @@ mod tests {
                 "startup-failure.session-readiness.subtype.readiness-relay.timeout",
             ),
             (
-                SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport),
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport(
+                    ReadinessTransportOrigin::ClientConfigure,
+                )),
                 "startup-failure.session-readiness.subtype.readiness-relay.transport",
             ),
             (
@@ -4386,17 +4480,62 @@ mod tests {
             ),
         ];
 
-        let mapped = cases.map(|(error, expected)| {
+        let generic_mapped = cases.map(|(error, expected)| {
             let marker = packaged_session_startup_failure_marker(error);
             assert_eq!(marker, expected);
             marker
         });
+
+        let transport_index = generic_mapped
+            .iter()
+            .position(|marker| {
+                *marker == "startup-failure.session-readiness.subtype.readiness-relay.transport"
+            })
+            .ok_or("the generic transport marker was omitted")?;
+        let exact_transport =
+            ReadinessTransportOrigin::ALL.map(packaged_readiness_transport_origin_marker);
+        let mut mapped = generic_mapped.to_vec();
+        mapped.splice(transport_index..transport_index, exact_transport);
         assert_eq!(mapped.as_slice(), PACKAGED_SESSION_STARTUP_FAILURE_MARKERS);
 
-        let mut unique = mapped.to_vec();
+        let mut unique = mapped.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), cases.len());
+        assert_eq!(unique.len(), mapped.len());
+        assert_eq!(
+            ReadinessTransportOrigin::ALL.map(ReadinessTransportOrigin::fixed_label),
+            [
+                "client-configure",
+                "client-clone",
+                "client-eof",
+                "client-read",
+                "client-write",
+                "upstream-clone",
+                "upstream-eof",
+                "upstream-read",
+                "upstream-write",
+                "observation-delivery",
+                "observation-channel-disconnected",
+                "lifecycle-disconnected",
+                "worker-finished",
+                "health-client-poll",
+                "health-client-peek",
+                "health-client-eof",
+                "health-upstream-poll",
+                "health-upstream-peek",
+                "health-upstream-eof",
+            ]
+        );
+        const TRANSPORT_ORIGIN_PREFIX: &str =
+            "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.";
+        for origin in ReadinessTransportOrigin::ALL {
+            assert_eq!(
+                packaged_readiness_transport_origin_marker(origin)
+                    .strip_prefix(TRANSPORT_ORIGIN_PREFIX),
+                Some(origin.fixed_label()),
+                "the package marker changed the meaning of a fixed transport origin"
+            );
+        }
         assert!(
             PACKAGED_SESSION_STARTUP_FAILURE_MARKERS
                 .iter()
@@ -4408,6 +4547,7 @@ mod tests {
                             .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'-' | b'.'))
                 })
         );
+        Ok(())
     }
 
     #[test]
@@ -4446,7 +4586,7 @@ mod tests {
             ReadinessProxyError::UnexpectedSequence,
             ReadinessProxyError::TargetMismatch,
             ReadinessProxyError::Timeout,
-            ReadinessProxyError::Transport,
+            ReadinessProxyError::Transport(ReadinessTransportOrigin::ClientEof),
             ReadinessProxyError::Worker,
             ReadinessProxyError::Cleanup,
         ] {
@@ -4970,7 +5110,9 @@ mod tests {
                 || (component == SessionComponent::Tui && self.also_fail_tui)
             {
                 if component == SessionComponent::ReadinessRelay {
-                    Err(SessionLivenessError::relay(ReadinessProxyError::Transport))
+                    Err(SessionLivenessError::relay(ReadinessProxyError::Transport(
+                        ReadinessTransportOrigin::ClientEof,
+                    )))
                 } else if component == SessionComponent::Tui {
                     Err(SessionLivenessError::tui(RemoteTuiLauncherError::NotLive))
                 } else {
@@ -5842,20 +5984,22 @@ mod tests {
             ReadinessProxyError::UnexpectedSequence,
             ReadinessProxyError::TargetMismatch,
             ReadinessProxyError::Timeout,
-            ReadinessProxyError::Transport,
+            ReadinessProxyError::Transport(ReadinessTransportOrigin::ClientEof),
             ReadinessProxyError::Worker,
             ReadinessProxyError::Cleanup,
         ];
         for error in proxy_errors {
             assert_eq!(
                 SessionLivenessError::relay(error).relay_transport,
-                error == ReadinessProxyError::Transport
+                matches!(error, ReadinessProxyError::Transport(_))
             );
         }
 
         let failure = Box::new(SessionLivenessFailure {
             session: assembled(FakeComponents::healthy()),
-            error: SessionLivenessError::relay(ReadinessProxyError::Transport),
+            error: SessionLivenessError::relay(ReadinessProxyError::Transport(
+                ReadinessTransportOrigin::ClientEof,
+            )),
         });
         let session = match failure.into_relay_transport_session() {
             Ok(session) => session,
@@ -5902,14 +6046,18 @@ mod tests {
         assert_eq!(
             relay_shutdown_operation_error(
                 Some(SessionTerminationCause::NaturalTuiEof),
-                Some(ReadinessProxyError::Transport),
+                Some(ReadinessProxyError::Transport(
+                    ReadinessTransportOrigin::ClientEof,
+                )),
             ),
             None
         );
         assert_eq!(
             relay_shutdown_operation_error(
                 Some(SessionTerminationCause::CoordinatorStop),
-                Some(ReadinessProxyError::Transport),
+                Some(ReadinessProxyError::Transport(
+                    ReadinessTransportOrigin::ClientEof,
+                )),
             ),
             relay_error
         );

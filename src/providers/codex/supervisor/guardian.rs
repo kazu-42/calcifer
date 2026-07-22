@@ -16,6 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::profiles::{Profile, Registry};
+#[cfg(test)]
+use crate::providers::codex::remote::ReadinessProxyError;
 
 use super::channel::{ChannelError, LifecycleEndpoint, bootstrap_guardian_from_stdin};
 #[cfg(test)]
@@ -44,7 +46,7 @@ use super::session::{
 #[cfg(test)]
 use super::session::{
     SessionShutdownTestTrigger, SessionStartupError, fail_next_packaged_terminal_channel_write,
-    packaged_session_startup_failure_marker,
+    packaged_readiness_transport_origin_marker, packaged_session_startup_failure_marker,
 };
 use super::startup::{
     AwaitingCoordinatorRestore, PostRestoreStartupCleanup, ProductionStartupBounds,
@@ -1793,16 +1795,26 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
 #[cfg(test)]
 const fn packaged_session_readiness_failure_markers(
     error: SessionStartupError,
-) -> [&'static str; 2] {
+) -> [Option<&'static str>; 3] {
+    let transport_origin = match error {
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport(origin)) => {
+            Some(packaged_readiness_transport_origin_marker(origin))
+        }
+        _ => None,
+    };
     [
-        packaged_session_startup_failure_marker(error),
-        "startup-failure.session-readiness",
+        transport_origin,
+        Some(packaged_session_startup_failure_marker(error)),
+        Some("startup-failure.session-readiness"),
     ]
 }
 
 #[cfg(test)]
 fn record_packaged_session_readiness_failure(report_root: &Path, error: SessionStartupError) {
-    for marker in packaged_session_readiness_failure_markers(error) {
+    for marker in packaged_session_readiness_failure_markers(error)
+        .into_iter()
+        .flatten()
+    {
         write_packaged_startup_failure_marker(report_root, marker);
     }
 }
@@ -3435,13 +3447,13 @@ mod tests {
     use super::super::session::{
         PACKAGED_SESSION_STARTUP_FAILURE_MARKERS, SessionLifecycleProjection,
         SessionOperationError, SessionShutdownRecoveryStage, SessionStartupError,
-        TerminalPumpFailure,
+        TerminalPumpFailure, packaged_session_startup_failure_marker,
     };
     use super::super::startup::{
         PackagedStartupQuiescePhase, provider_never_started_for_completion_test,
     };
     use crate::providers::codex::monitor::SessionMonitorError;
-    use crate::providers::codex::remote::ReadinessProxyError;
+    use crate::providers::codex::remote::{ReadinessProxyError, ReadinessTransportOrigin};
 
     type QueuedCheckpointLifecycle = (
         AnchorCompletion,
@@ -3474,10 +3486,10 @@ mod tests {
     }
 
     #[test]
-    fn packaged_session_readiness_failure_writes_generic_and_one_fixed_subtype()
+    fn packaged_session_readiness_failure_writes_transport_origin_before_fixed_parents()
     -> Result<(), Box<dyn std::error::Error>> {
         let scratch = StartupFailureReportRoot::new()?;
-        let errors = [
+        let mut errors = vec![
             SessionStartupError::Monitor(SessionMonitorError::InvalidArgument),
             SessionStartupError::Monitor(SessionMonitorError::Handshake),
             SessionStartupError::Monitor(SessionMonitorError::Protocol),
@@ -3500,7 +3512,6 @@ mod tests {
             SessionStartupError::ReadinessRelay(ReadinessProxyError::UnexpectedSequence),
             SessionStartupError::ReadinessRelay(ReadinessProxyError::TargetMismatch),
             SessionStartupError::ReadinessRelay(ReadinessProxyError::Timeout),
-            SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport),
             SessionStartupError::ReadinessRelay(ReadinessProxyError::Worker),
             SessionStartupError::ReadinessRelay(ReadinessProxyError::Cleanup),
             SessionStartupError::Tui,
@@ -3518,19 +3529,46 @@ mod tests {
             SessionStartupError::TerminalPump(TerminalPumpFailure::Resume),
             SessionStartupError::Deadline,
         ];
-        assert_eq!(errors.len(), PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.len());
+        let transport_insert = errors
+            .iter()
+            .position(|error| {
+                *error == SessionStartupError::ReadinessRelay(ReadinessProxyError::Worker)
+            })
+            .ok_or("the relay worker case was omitted")?;
+        errors.splice(
+            transport_insert..transport_insert,
+            ReadinessTransportOrigin::ALL.map(|origin| {
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport(origin))
+            }),
+        );
 
-        for (index, (error, subtype)) in errors
-            .into_iter()
-            .zip(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
-            .enumerate()
-        {
+        for (index, error) in errors.into_iter().enumerate() {
             let report = scratch.path().join(index.to_string());
             fs::DirBuilder::new().mode(0o700).create(&report)?;
+            let ordered = packaged_session_readiness_failure_markers(error);
+            let published = ordered.into_iter().flatten().collect::<Vec<_>>();
+            assert_eq!(published.last(), Some(&"startup-failure.session-readiness"));
             assert_eq!(
-                packaged_session_readiness_failure_markers(error),
-                [subtype, "startup-failure.session-readiness"],
-                "the generic commit marker was published before its exact subtype"
+                published.get(published.len().saturating_sub(2)),
+                Some(&packaged_session_startup_failure_marker(error)),
+                "the generic commit marker was published before its fixed subtype"
+            );
+            if let SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport(origin)) =
+                error
+            {
+                assert_eq!(
+                    published.first(),
+                    Some(&super::packaged_readiness_transport_origin_marker(origin)),
+                    "the transport parent was published before its exact origin"
+                );
+                assert_eq!(published.len(), 3);
+            } else {
+                assert_eq!(published.len(), 2);
+            }
+            assert!(
+                published[..published.len() - 1]
+                    .iter()
+                    .all(|marker| PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.contains(marker))
             );
             record_packaged_session_readiness_failure(&report, error);
 
@@ -3538,7 +3576,7 @@ mod tests {
                 .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
                 .collect::<Result<Vec<_>, _>>()?;
             names.sort_unstable();
-            let mut expected = vec!["startup-failure.session-readiness", subtype];
+            let mut expected = published;
             expected.sort_unstable();
             assert_eq!(names, expected);
 

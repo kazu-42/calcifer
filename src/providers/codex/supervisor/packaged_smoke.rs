@@ -3203,6 +3203,18 @@ fn package_failure_report_scanner_bridges_only_the_closed_session_startup_catalo
         );
         fs::remove_file(path)?;
     }
+    let exact_transport =
+        "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-eof";
+    let generic_transport = "startup-failure.session-readiness.subtype.readiness-relay.transport";
+    write_private_new(&report.join(exact_transport), b"classified\n")?;
+    write_private_new(&report.join(generic_transport), b"classified\n")?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some(exact_transport),
+        "the scanner discarded the first exact transport origin"
+    );
+    fs::remove_file(report.join(exact_transport))?;
+    fs::remove_file(report.join(generic_transport))?;
     assert_eq!(
         OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
         Some("startup-failure.session-readiness")
@@ -3222,6 +3234,8 @@ fn package_failure_report_scanner_bridges_only_the_closed_session_startup_catalo
     for unknown in [
         "startup-failure.session-readiness.subtype.readiness-relay",
         "startup-failure.session-readiness.subtype.readiness-relay.timeout.extra",
+        "startup-failure.session-readiness.subtype.readiness-relay.transport.origin",
+        "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-eof.extra",
     ] {
         let path = report.join(unknown);
         write_private_new(&path, b"classified\n")?;
@@ -3818,6 +3832,8 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
     private_directory(&report)?;
     let gate = report.join("initial-gate.live");
     let exact = "startup-failure.session-readiness.subtype.terminal-pump.terminal-channel-write";
+    let relay_origin =
+        "startup-failure.session-readiness.subtype.readiness-relay.transport.origin.client-eof";
     let generic = "startup-failure.session-readiness";
 
     write_private_new(&report.join(exact), b"classified\n")?;
@@ -3880,7 +3896,7 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
     fs::remove_file(&gate)?;
     fs::remove_file(report.join(exact))?;
 
-    write_private_new(&report.join(exact), b"private payload\n")?;
+    write_private_new(&report.join(relay_origin), b"private payload\n")?;
     assert_eq!(
         wait_for_private_marker_or_fixed_startup_failure(
             &report,
@@ -3891,11 +3907,11 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
         Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted),
         "an invalid allowlisted startup detail was treated as absent"
     );
-    fs::remove_file(report.join(exact))?;
+    fs::remove_file(report.join(relay_origin))?;
 
     let symlink_source = report.join("untrusted-startup-symlink-source");
     write_private_new(&symlink_source, b"classified\n")?;
-    let symlink_marker = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[1]);
+    let symlink_marker = report.join(relay_origin);
     std::os::unix::fs::symlink(&symlink_source, &symlink_marker)?;
     assert_eq!(
         wait_for_private_marker_or_fixed_startup_failure(
@@ -3912,7 +3928,7 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
 
     let hardlink_source = report.join("untrusted-startup-hardlink-source");
     write_private_new(&hardlink_source, b"classified\n")?;
-    let hardlink_marker = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[2]);
+    let hardlink_marker = report.join(relay_origin);
     fs::hard_link(&hardlink_source, &hardlink_marker)?;
     assert_eq!(
         wait_for_private_marker_or_fixed_startup_failure(
@@ -3927,7 +3943,7 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
     fs::remove_file(hardlink_marker)?;
     fs::remove_file(hardlink_source)?;
 
-    let wrong_mode = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[3]);
+    let wrong_mode = report.join(relay_origin);
     write_private_new(&wrong_mode, b"classified\n")?;
     fs::set_permissions(&wrong_mode, fs::Permissions::from_mode(0o640))?;
     assert_eq!(
@@ -3942,7 +3958,7 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
     );
     fs::remove_file(wrong_mode)?;
 
-    let fifo_marker = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[5]);
+    let fifo_marker = report.join(relay_origin);
     let fifo_status = Command::new("/usr/bin/mkfifo").arg(&fifo_marker).status()?;
     if !fifo_status.success() {
         return Err("could not create the package startup FIFO fixture".into());
@@ -3966,7 +3982,7 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
     fs::remove_file(fifo_marker)?;
 
     let socket_source = scratch.root.join("z");
-    let socket_marker = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[6]);
+    let socket_marker = report.join(relay_origin);
     let socket_listener = UnixListener::bind(&socket_source)?;
     fs::set_permissions(&socket_source, fs::Permissions::from_mode(0o600))?;
     fs::rename(&socket_source, &socket_marker)?;
@@ -3983,7 +3999,7 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
     drop(socket_listener);
     fs::remove_file(socket_marker)?;
 
-    let trailing_payload = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[4]);
+    let trailing_payload = report.join(relay_origin);
     write_private_new(&trailing_payload, b"classified\ntrailing\n")?;
     assert_eq!(
         wait_for_private_marker_or_fixed_startup_failure(

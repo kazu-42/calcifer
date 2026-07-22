@@ -3428,7 +3428,7 @@ fn map_proxy_error(error: ReadinessProxyError) -> CodexHandoffError {
         ReadinessProxyError::Bind
         | ReadinessProxyError::Accept
         | ReadinessProxyError::Connect
-        | ReadinessProxyError::Transport
+        | ReadinessProxyError::Transport(_)
         | ReadinessProxyError::Worker
         | ReadinessProxyError::Cleanup => CodexHandoffError::Transport,
     }

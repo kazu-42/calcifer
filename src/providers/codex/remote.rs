@@ -41,6 +41,335 @@ const RELAY_RUNNING: u8 = 0;
 const RELAY_DISCONNECTED: u8 = 1;
 const RELAY_STOPPING: u8 = 2;
 
+const TRANSPORT_ORIGIN_UNSET: u8 = 0;
+
+/// A closed, payload-free origin for a readiness-relay transport failure.
+///
+/// These values carry no cleanup or lifecycle authority. Their only purpose is
+/// to preserve the first exact transport boundary for fixed diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum ReadinessTransportOrigin {
+    ClientConfigure = 1,
+    ClientClone = 2,
+    ClientEof = 3,
+    ClientRead = 4,
+    ClientWrite = 5,
+    UpstreamClone = 6,
+    UpstreamEof = 7,
+    UpstreamRead = 8,
+    UpstreamWrite = 9,
+    ObservationDelivery = 10,
+    ObservationChannelDisconnected = 11,
+    LifecycleDisconnected = 12,
+    WorkerFinished = 13,
+    HealthClientPoll = 14,
+    HealthClientPeek = 15,
+    HealthClientEof = 16,
+    HealthUpstreamPoll = 17,
+    HealthUpstreamPeek = 18,
+    HealthUpstreamEof = 19,
+}
+
+impl ReadinessTransportOrigin {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 19] = [
+        Self::ClientConfigure,
+        Self::ClientClone,
+        Self::ClientEof,
+        Self::ClientRead,
+        Self::ClientWrite,
+        Self::UpstreamClone,
+        Self::UpstreamEof,
+        Self::UpstreamRead,
+        Self::UpstreamWrite,
+        Self::ObservationDelivery,
+        Self::ObservationChannelDisconnected,
+        Self::LifecycleDisconnected,
+        Self::WorkerFinished,
+        Self::HealthClientPoll,
+        Self::HealthClientPeek,
+        Self::HealthClientEof,
+        Self::HealthUpstreamPoll,
+        Self::HealthUpstreamPeek,
+        Self::HealthUpstreamEof,
+    ];
+
+    #[cfg(test)]
+    pub(super) const fn fixed_label(self) -> &'static str {
+        match self {
+            Self::ClientConfigure => "client-configure",
+            Self::ClientClone => "client-clone",
+            Self::ClientEof => "client-eof",
+            Self::ClientRead => "client-read",
+            Self::ClientWrite => "client-write",
+            Self::UpstreamClone => "upstream-clone",
+            Self::UpstreamEof => "upstream-eof",
+            Self::UpstreamRead => "upstream-read",
+            Self::UpstreamWrite => "upstream-write",
+            Self::ObservationDelivery => "observation-delivery",
+            Self::ObservationChannelDisconnected => "observation-channel-disconnected",
+            Self::LifecycleDisconnected => "lifecycle-disconnected",
+            Self::WorkerFinished => "worker-finished",
+            Self::HealthClientPoll => "health-client-poll",
+            Self::HealthClientPeek => "health-client-peek",
+            Self::HealthClientEof => "health-client-eof",
+            Self::HealthUpstreamPoll => "health-upstream-poll",
+            Self::HealthUpstreamPeek => "health-upstream-peek",
+            Self::HealthUpstreamEof => "health-upstream-eof",
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::ClientConfigure),
+            2 => Some(Self::ClientClone),
+            3 => Some(Self::ClientEof),
+            4 => Some(Self::ClientRead),
+            5 => Some(Self::ClientWrite),
+            6 => Some(Self::UpstreamClone),
+            7 => Some(Self::UpstreamEof),
+            8 => Some(Self::UpstreamRead),
+            9 => Some(Self::UpstreamWrite),
+            10 => Some(Self::ObservationDelivery),
+            11 => Some(Self::ObservationChannelDisconnected),
+            12 => Some(Self::LifecycleDisconnected),
+            13 => Some(Self::WorkerFinished),
+            14 => Some(Self::HealthClientPoll),
+            15 => Some(Self::HealthClientPeek),
+            16 => Some(Self::HealthClientEof),
+            17 => Some(Self::HealthUpstreamPoll),
+            18 => Some(Self::HealthUpstreamPeek),
+            19 => Some(Self::HealthUpstreamEof),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadinessTransportTracker {
+    first: AtomicU8,
+    selection: Mutex<RelayFailureSelection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayFailureSelection {
+    Open,
+    Failed(ReadinessProxyError),
+    Stopped,
+}
+
+#[derive(Clone, Debug)]
+struct RelayControl {
+    lifecycle: Arc<AtomicU8>,
+    transport: Arc<ReadinessTransportTracker>,
+}
+
+impl ReadinessTransportTracker {
+    const fn new() -> Self {
+        Self {
+            first: AtomicU8::new(TRANSPORT_ORIGIN_UNSET),
+            selection: Mutex::new(RelayFailureSelection::Open),
+        }
+    }
+
+    fn first(&self) -> Option<ReadinessTransportOrigin> {
+        ReadinessTransportOrigin::from_code(self.first.load(Ordering::Acquire))
+    }
+
+    fn record(&self, origin: ReadinessTransportOrigin) -> ReadinessTransportOrigin {
+        match self.first.compare_exchange(
+            TRANSPORT_ORIGIN_UNSET,
+            origin as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => origin,
+            Err(recorded) => ReadinessTransportOrigin::from_code(recorded).unwrap_or(origin),
+        }
+    }
+
+    fn error(&self, origin: ReadinessTransportOrigin) -> ReadinessProxyError {
+        ReadinessProxyError::Transport(self.record(origin))
+    }
+
+    fn authoritative(&self, error: ReadinessProxyError) -> ReadinessProxyError {
+        match error {
+            ReadinessProxyError::Transport(origin) => self.error(origin),
+            error => self
+                .first()
+                .map(ReadinessProxyError::Transport)
+                .unwrap_or(error),
+        }
+    }
+
+    fn selected_failure(&self) -> Option<ReadinessProxyError> {
+        let selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *selection {
+            RelayFailureSelection::Failed(selected) => Some(selected),
+            RelayFailureSelection::Open | RelayFailureSelection::Stopped => None,
+        }
+    }
+
+    fn preserve_selected(&self, error: ReadinessProxyError) -> ReadinessProxyError {
+        self.selected_failure().unwrap_or(error)
+    }
+
+    /// Selects one authoritative run outcome and closes origin publication.
+    /// A transport failure that committed first wins; otherwise this semantic
+    /// failure wins and later cleanup wakeups cannot mint an origin. An
+    /// intentional stop is equally sticky: a worker that observed RUNNING
+    /// before the stop cannot reopen the selection with a late failure.
+    fn select_failure(&self, error: ReadinessProxyError) -> ProxyRunError {
+        let mut selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *selection {
+            RelayFailureSelection::Open => {
+                let error = self.authoritative(error);
+                *selection = RelayFailureSelection::Failed(error);
+                ProxyRunError::Failed(error)
+            }
+            RelayFailureSelection::Failed(selected) => ProxyRunError::Failed(selected),
+            RelayFailureSelection::Stopped => ProxyRunError::Stopped,
+        }
+    }
+
+    fn publish_readiness<F>(&self, lifecycle: &AtomicU8, publish: F) -> Result<(), ProxyRunError>
+    where
+        F: FnOnce() -> Result<(), ReadinessProxyError>,
+    {
+        let mut selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING {
+            return Err(ProxyRunError::Stopped);
+        }
+        match *selection {
+            RelayFailureSelection::Failed(error) => Err(ProxyRunError::Failed(error)),
+            RelayFailureSelection::Stopped => Err(ProxyRunError::Stopped),
+            RelayFailureSelection::Open if lifecycle.load(Ordering::Acquire) == RELAY_RUNNING => {
+                match publish() {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let error = self.authoritative(error);
+                        *selection = RelayFailureSelection::Failed(error);
+                        Err(ProxyRunError::Failed(error))
+                    }
+                }
+            }
+            RelayFailureSelection::Open => {
+                let error = self.authoritative(ReadinessProxyError::Worker);
+                *selection = RelayFailureSelection::Failed(error);
+                Err(ProxyRunError::Failed(error))
+            }
+        }
+    }
+
+    /// Publishes a failure before changing RUNNING to DISCONNECTED.
+    ///
+    /// The same gate is held by `stop`, so an intentional shutdown either
+    /// happens before this method (and records no origin) or after the exact
+    /// origin and disconnected state are both committed.
+    fn fail_while_running(
+        &self,
+        lifecycle: &AtomicU8,
+        error: ReadinessProxyError,
+    ) -> Option<ReadinessProxyError> {
+        let mut selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING {
+            return None;
+        }
+        match *selection {
+            RelayFailureSelection::Failed(_) => None,
+            RelayFailureSelection::Stopped => None,
+            RelayFailureSelection::Open if lifecycle.load(Ordering::Acquire) == RELAY_RUNNING => {
+                let error = self.authoritative(error);
+                *selection = RelayFailureSelection::Failed(error);
+                lifecycle.store(RELAY_DISCONNECTED, Ordering::Release);
+                Some(error)
+            }
+            RelayFailureSelection::Open => None,
+        }
+    }
+
+    fn disconnect(
+        &self,
+        lifecycle: &AtomicU8,
+        origin: ReadinessTransportOrigin,
+    ) -> Option<ReadinessProxyError> {
+        self.fail_while_running(lifecycle, ReadinessProxyError::Transport(origin))
+    }
+
+    fn classify_disconnected(&self, origin: ReadinessTransportOrigin) -> ReadinessProxyError {
+        let mut selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *selection {
+            RelayFailureSelection::Failed(error) => error,
+            RelayFailureSelection::Open => {
+                let error = self.error(origin);
+                *selection = RelayFailureSelection::Failed(error);
+                error
+            }
+            RelayFailureSelection::Stopped => ReadinessProxyError::UnexpectedSequence,
+        }
+    }
+
+    fn stop(&self, lifecycle: &AtomicU8) -> u8 {
+        let mut selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *selection == RelayFailureSelection::Open {
+            *selection = RelayFailureSelection::Stopped;
+        }
+        let previous = lifecycle.load(Ordering::Acquire);
+        if previous != RELAY_STOPPING {
+            lifecycle.store(RELAY_STOPPING, Ordering::Release);
+        }
+        previous
+    }
+
+    fn stop_with_disconnected_origin(
+        &self,
+        lifecycle: &AtomicU8,
+        origin: ReadinessTransportOrigin,
+    ) -> (u8, Option<ReadinessProxyError>) {
+        let mut selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = lifecycle.load(Ordering::Acquire);
+        let error = match *selection {
+            RelayFailureSelection::Failed(error) => Some(error),
+            RelayFailureSelection::Open if previous == RELAY_DISCONNECTED => {
+                let error = self.error(origin);
+                *selection = RelayFailureSelection::Failed(error);
+                Some(error)
+            }
+            RelayFailureSelection::Open => {
+                *selection = RelayFailureSelection::Stopped;
+                None
+            }
+            RelayFailureSelection::Stopped => None,
+        };
+        if previous != RELAY_STOPPING {
+            lifecycle.store(RELAY_STOPPING, Ordering::Release);
+        }
+        (previous, error)
+    }
+}
+
 /// A redacted failure from the isolated readiness proxy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReadinessProxyError {
@@ -56,11 +385,12 @@ pub(super) enum ReadinessProxyError {
     UnexpectedSequence,
     TargetMismatch,
     Timeout,
-    Transport,
+    Transport(ReadinessTransportOrigin),
     Worker,
     Cleanup,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyRunError {
     Stopped,
     Failed(ReadinessProxyError),
@@ -87,7 +417,7 @@ impl fmt::Display for ReadinessProxyError {
             Self::UnexpectedSequence => "the readiness JSON-RPC sequence was invalid",
             Self::TargetMismatch => "the readiness response named a different thread",
             Self::Timeout => "the readiness proxy timed out",
-            Self::Transport => "the readiness proxy transport failed",
+            Self::Transport(_) => "the readiness proxy transport failed",
             Self::Worker => "the readiness proxy worker failed",
             Self::Cleanup => "the readiness proxy socket could not be cleaned up",
         })
@@ -110,6 +440,7 @@ pub(super) struct ReadinessProxy {
     readiness: Receiver<Result<EffectiveThreadSettings, ReadinessProxyError>>,
     readiness_result: Option<Result<EffectiveThreadSettings, ReadinessProxyError>>,
     lifecycle: Arc<AtomicU8>,
+    transport: Arc<ReadinessTransportTracker>,
     health: Arc<Mutex<Option<RelayHealth>>>,
     worker: Option<JoinHandle<Result<(), ReadinessProxyError>>>,
     joined_result: Option<Result<(), ReadinessProxyError>>,
@@ -505,7 +836,11 @@ impl ReadinessProxy {
         };
         let (readiness_sender, readiness) = mpsc::sync_channel(1);
         let lifecycle = Arc::new(AtomicU8::new(RELAY_RUNNING));
-        let worker_lifecycle = Arc::clone(&lifecycle);
+        let transport = Arc::new(ReadinessTransportTracker::new());
+        let worker_control = RelayControl {
+            lifecycle: Arc::clone(&lifecycle),
+            transport: Arc::clone(&transport),
+        };
         let health = Arc::new(Mutex::new(None));
         let worker_health = Arc::clone(&health);
         let worker_socket_path = socket_path.to_owned();
@@ -520,7 +855,7 @@ impl ReadinessProxy {
                     &worker_upstream_path,
                     &worker_expectation,
                     deadline,
-                    &worker_lifecycle,
+                    &worker_control,
                     &worker_health,
                     &readiness_sender,
                 );
@@ -549,6 +884,7 @@ impl ReadinessProxy {
             readiness,
             readiness_result: None,
             lifecycle,
+            transport,
             health,
             worker: Some(worker),
             joined_result: None,
@@ -630,7 +966,11 @@ impl ReadinessProxy {
 
         let (readiness_sender, readiness) = mpsc::sync_channel(1);
         let lifecycle = Arc::new(AtomicU8::new(RELAY_RUNNING));
-        let worker_lifecycle = Arc::clone(&lifecycle);
+        let transport = Arc::new(ReadinessTransportTracker::new());
+        let worker_control = RelayControl {
+            lifecycle: Arc::clone(&lifecycle),
+            transport: Arc::clone(&transport),
+        };
         let health = Arc::new(Mutex::new(None));
         let worker_health = Arc::clone(&health);
         let worker_socket_path = socket_path.to_owned();
@@ -645,7 +985,7 @@ impl ReadinessProxy {
                     &worker_upstream_path,
                     &worker_expectation,
                     deadline,
-                    &worker_lifecycle,
+                    &worker_control,
                     &worker_health,
                     &readiness_sender,
                 );
@@ -668,6 +1008,7 @@ impl ReadinessProxy {
             readiness,
             readiness_result: None,
             lifecycle,
+            transport,
             health,
             worker: Some(worker),
             joined_result: None,
@@ -712,9 +1053,10 @@ impl ReadinessProxy {
         match self.readiness.try_recv() {
             Ok(result) => return self.record_readiness(result).map(Some),
             Err(TryRecvError::Disconnected) => {
-                return self
-                    .record_readiness(Err(ReadinessProxyError::Worker))
-                    .map(Some);
+                let error = self
+                    .transport
+                    .preserve_selected(ReadinessProxyError::Worker);
+                return self.record_readiness(Err(error)).map(Some);
             }
             Err(TryRecvError::Empty) => {}
         }
@@ -738,9 +1080,12 @@ impl ReadinessProxy {
         // A finished sender can still have left one bounded verdict queued.
         match self.readiness.try_recv() {
             Ok(result) => self.record_readiness(result).map(Some),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self
-                .record_readiness(Err(ReadinessProxyError::Worker))
-                .map(Some),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                let error = self
+                    .transport
+                    .preserve_selected(ReadinessProxyError::Worker);
+                self.record_readiness(Err(error)).map(Some)
+            }
         }
     }
 
@@ -759,7 +1104,9 @@ impl ReadinessProxy {
                 .recv_timeout(wait)
                 .map_err(|error| match error {
                     RecvTimeoutError::Timeout => ReadinessProxyError::Timeout,
-                    RecvTimeoutError::Disconnected => ReadinessProxyError::Worker,
+                    RecvTimeoutError::Disconnected => self
+                        .transport
+                        .preserve_selected(ReadinessProxyError::Worker),
                 })
         }) {
             Ok(result) => result,
@@ -773,12 +1120,7 @@ impl ReadinessProxy {
         result: Result<EffectiveThreadSettings, ReadinessProxyError>,
     ) -> Result<EffectiveThreadSettings, ReadinessProxyError> {
         if result.is_err() {
-            let _ = self.lifecycle.compare_exchange(
-                RELAY_RUNNING,
-                RELAY_STOPPING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            self.transport.stop(&self.lifecycle);
         }
         self.readiness_result = Some(result.clone());
         result
@@ -809,52 +1151,63 @@ impl ReadinessProxy {
         if !matches!(self.readiness_result.as_ref(), Some(Ok(_))) {
             return Err(ReadinessProxyError::UnexpectedSequence);
         }
-        if self.lifecycle.load(Ordering::Acquire) != RELAY_RUNNING {
-            return Err(ReadinessProxyError::Transport);
+        match self.lifecycle.load(Ordering::Acquire) {
+            RELAY_RUNNING => {}
+            RELAY_DISCONNECTED => {
+                return Err(self
+                    .transport
+                    .classify_disconnected(ReadinessTransportOrigin::LifecycleDisconnected));
+            }
+            _ => return Err(ReadinessProxyError::UnexpectedSequence),
         }
         let Some(worker) = self.worker.as_ref() else {
-            return Err(ReadinessProxyError::Transport);
+            return Err(self
+                .transport
+                .disconnect(&self.lifecycle, ReadinessTransportOrigin::WorkerFinished)
+                .unwrap_or_else(|| {
+                    self.transport
+                        .preserve_selected(ReadinessProxyError::UnexpectedSequence)
+                }));
         };
         if !worker.is_finished() {
-            let health = self
-                .health
-                .lock()
-                .map_err(|_| ReadinessProxyError::Worker)?;
-            let health = health.as_ref().ok_or(ReadinessProxyError::Worker)?;
-            if health.is_connected()? {
+            let health = self.health.lock().map_err(|_| {
+                self.transport
+                    .preserve_selected(ReadinessProxyError::Worker)
+            })?;
+            let health = health.as_ref().ok_or_else(|| {
+                self.transport
+                    .preserve_selected(ReadinessProxyError::Worker)
+            })?;
+            if health.is_connected(&self.lifecycle, &self.transport)? {
                 return Ok(());
             }
-            mark_relay_disconnected(&self.lifecycle);
-            return Err(ReadinessProxyError::Transport);
+            return Err(self
+                .transport
+                .classify_disconnected(ReadinessTransportOrigin::LifecycleDisconnected));
         }
         // Liveness checks never consume exact join authority. Shutdown owns the
         // join plus the subsequent socket-cleanup proof as one retryable phase.
-        Err(ReadinessProxyError::Transport)
+        Err(self
+            .transport
+            .disconnect(&self.lifecycle, ReadinessTransportOrigin::WorkerFinished)
+            .unwrap_or_else(|| {
+                self.transport
+                    .preserve_selected(ReadinessProxyError::UnexpectedSequence)
+            }))
     }
 
     fn request_stop(&mut self) {
-        loop {
-            let lifecycle = self.lifecycle.load(Ordering::Acquire);
-            if lifecycle == RELAY_STOPPING {
-                break;
-            }
-            if lifecycle == RELAY_DISCONNECTED
-                && !self.readiness_result.as_ref().is_some_and(Result::is_err)
-            {
-                self.shutdown_error
-                    .get_or_insert(ReadinessProxyError::Transport);
-            }
-            if self
-                .lifecycle
-                .compare_exchange(
-                    lifecycle,
-                    RELAY_STOPPING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                break;
+        if self.readiness_result.as_ref().is_some_and(Result::is_err) {
+            self.transport.stop(&self.lifecycle);
+            return;
+        }
+        let (previous, error) = self.transport.stop_with_disconnected_origin(
+            &self.lifecycle,
+            ReadinessTransportOrigin::LifecycleDisconnected,
+        );
+        if previous == RELAY_DISCONNECTED {
+            if let Some(error) = error {
+                self.shutdown_error.get_or_insert(error);
             }
         }
     }
@@ -894,7 +1247,9 @@ impl ReadinessProxy {
             let joined = match self.worker.take() {
                 Some(worker) => match worker.join() {
                     Ok(result) => result,
-                    Err(_) => Err(ReadinessProxyError::Worker),
+                    Err(_) => Err(self
+                        .transport
+                        .preserve_selected(ReadinessProxyError::Worker)),
                 },
                 None => Err(ReadinessProxyError::Worker),
             };
@@ -1024,12 +1379,58 @@ struct RelayHealth {
 }
 
 impl RelayHealth {
-    fn is_connected(&self) -> Result<bool, ReadinessProxyError> {
-        Ok(socket_is_connected(&self.client)? && socket_is_connected(&self.upstream)?)
+    fn is_connected(
+        &self,
+        lifecycle: &AtomicU8,
+        transport: &ReadinessTransportTracker,
+    ) -> Result<bool, ReadinessProxyError> {
+        Ok(
+            socket_is_connected(&self.client, HealthEndpoint::Client, lifecycle, transport)?
+                && socket_is_connected(
+                    &self.upstream,
+                    HealthEndpoint::Upstream,
+                    lifecycle,
+                    transport,
+                )?,
+        )
     }
 }
 
-fn socket_is_connected(stream: &UnixStream) -> Result<bool, ReadinessProxyError> {
+#[derive(Clone, Copy)]
+enum HealthEndpoint {
+    Client,
+    Upstream,
+}
+
+impl HealthEndpoint {
+    const fn poll_origin(self) -> ReadinessTransportOrigin {
+        match self {
+            Self::Client => ReadinessTransportOrigin::HealthClientPoll,
+            Self::Upstream => ReadinessTransportOrigin::HealthUpstreamPoll,
+        }
+    }
+
+    const fn peek_origin(self) -> ReadinessTransportOrigin {
+        match self {
+            Self::Client => ReadinessTransportOrigin::HealthClientPeek,
+            Self::Upstream => ReadinessTransportOrigin::HealthUpstreamPeek,
+        }
+    }
+
+    const fn eof_origin(self) -> ReadinessTransportOrigin {
+        match self {
+            Self::Client => ReadinessTransportOrigin::HealthClientEof,
+            Self::Upstream => ReadinessTransportOrigin::HealthUpstreamEof,
+        }
+    }
+}
+
+fn socket_is_connected(
+    stream: &UnixStream,
+    endpoint: HealthEndpoint,
+    lifecycle: &AtomicU8,
+    transport: &ReadinessTransportTracker,
+) -> Result<bool, ReadinessProxyError> {
     let mut poll_fds = [rustix::event::PollFd::new(
         stream,
         rustix::event::PollFlags::IN,
@@ -1038,7 +1439,11 @@ fn socket_is_connected(stream: &UnixStream) -> Result<bool, ReadinessProxyError>
         match rustix::event::poll(&mut poll_fds, Some(&rustix::event::Timespec::default())) {
             Ok(_) => break,
             Err(rustix::io::Errno::INTR) => {}
-            Err(_) => return Err(ReadinessProxyError::Transport),
+            Err(_) => {
+                return transport
+                    .disconnect(lifecycle, endpoint.poll_origin())
+                    .map_or(Ok(false), Err);
+            }
         }
     }
     if poll_fds[0].revents().intersects(
@@ -1046,6 +1451,7 @@ fn socket_is_connected(stream: &UnixStream) -> Result<bool, ReadinessProxyError>
             | rustix::event::PollFlags::HUP
             | rustix::event::PollFlags::NVAL,
     ) {
+        let _ = transport.disconnect(lifecycle, endpoint.eof_origin());
         return Ok(false);
     }
 
@@ -1056,10 +1462,17 @@ fn socket_is_connected(stream: &UnixStream) -> Result<bool, ReadinessProxyError>
             &mut byte[..],
             rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
         ) {
-            Ok((_, 0)) => return Ok(false),
+            Ok((_, 0)) => {
+                let _ = transport.disconnect(lifecycle, endpoint.eof_origin());
+                return Ok(false);
+            }
             Ok((_, _)) | Err(rustix::io::Errno::AGAIN) => return Ok(true),
             Err(rustix::io::Errno::INTR) => {}
-            Err(_) => return Err(ReadinessProxyError::Transport),
+            Err(_) => {
+                return transport
+                    .disconnect(lifecycle, endpoint.peek_origin())
+                    .map_or(Ok(false), Err);
+            }
         }
     }
 }
@@ -1191,7 +1604,7 @@ fn run_proxy(
     upstream_path: &Path,
     expectation: &ReadinessExpectation,
     deadline: Instant,
-    lifecycle: &Arc<AtomicU8>,
+    control: &RelayControl,
     health: &Arc<Mutex<Option<RelayHealth>>>,
     readiness_sender: &SyncSender<Result<EffectiveThreadSettings, ReadinessProxyError>>,
 ) -> Result<(), ProxyRunError> {
@@ -1201,14 +1614,22 @@ fn run_proxy(
         upstream_path,
         expectation,
         deadline,
-        lifecycle,
+        control,
         health,
         &mut notifier,
     );
+    let result = result.map_err(|error| select_run_error(&control.transport, error));
     if let Err(ProxyRunError::Failed(error)) = &result {
         notifier.failure(*error);
     }
     result
+}
+
+fn select_run_error(transport: &ReadinessTransportTracker, error: ProxyRunError) -> ProxyRunError {
+    match error {
+        ProxyRunError::Stopped => ProxyRunError::Stopped,
+        ProxyRunError::Failed(error) => transport.select_failure(error),
+    }
 }
 
 fn run_proxy_inner(
@@ -1216,30 +1637,32 @@ fn run_proxy_inner(
     upstream_path: &Path,
     expectation: &ReadinessExpectation,
     deadline: Instant,
-    lifecycle: &Arc<AtomicU8>,
+    control: &RelayControl,
     health: &Arc<Mutex<Option<RelayHealth>>>,
     notifier: &mut ReadyNotifier<'_>,
 ) -> Result<(), ProxyRunError> {
-    let client = accept_client(listener, deadline, lifecycle)?;
+    let lifecycle = &control.lifecycle;
+    let transport = &control.transport;
+    let client = accept_client(listener, deadline, control)?;
     let upstream = connect_upstream(upstream_path, deadline, lifecycle)?;
     let client_reader = client
         .try_clone()
-        .map_err(|_| ReadinessProxyError::Transport)?;
+        .map_err(|_| transport_failure(control, ReadinessTransportOrigin::ClientClone))?;
     let client_writer = client
         .try_clone()
-        .map_err(|_| ReadinessProxyError::Transport)?;
+        .map_err(|_| transport_failure(control, ReadinessTransportOrigin::ClientClone))?;
     let upstream_reader = upstream
         .try_clone()
-        .map_err(|_| ReadinessProxyError::Transport)?;
+        .map_err(|_| transport_failure(control, ReadinessTransportOrigin::UpstreamClone))?;
     let upstream_writer = upstream
         .try_clone()
-        .map_err(|_| ReadinessProxyError::Transport)?;
+        .map_err(|_| transport_failure(control, ReadinessTransportOrigin::UpstreamClone))?;
     let health_client = client
         .try_clone()
-        .map_err(|_| ReadinessProxyError::Transport)?;
+        .map_err(|_| transport_failure(control, ReadinessTransportOrigin::ClientClone))?;
     let health_upstream = upstream
         .try_clone()
-        .map_err(|_| ReadinessProxyError::Transport)?;
+        .map_err(|_| transport_failure(control, ReadinessTransportOrigin::UpstreamClone))?;
     *health.lock().map_err(|_| ReadinessProxyError::Worker)? = Some(RelayHealth {
         client: health_client,
         upstream: health_upstream,
@@ -1254,7 +1677,7 @@ fn run_proxy_inner(
     let client_inspecting = Arc::clone(&inspecting);
     let client_sender = event_sender.clone();
     let client_order = Arc::clone(&observation_order);
-    let client_lifecycle = Arc::clone(lifecycle);
+    let client_control = control.clone();
     let client_pump = thread::Builder::new()
         .name("calcifer-readiness-client-pump".to_owned())
         .spawn(move || {
@@ -1265,14 +1688,19 @@ fn run_proxy_inner(
                 &client_inspecting,
                 &client_sender,
                 &client_order,
-                &client_lifecycle,
+                &client_control,
             );
-        })
-        .map_err(|_| ReadinessProxyError::Worker)?;
+        });
+    let client_pump = match client_pump {
+        Ok(pump) => pump,
+        Err(_) => {
+            return Err(transport.select_failure(ReadinessProxyError::Worker));
+        }
+    };
 
     let server_inspecting = Arc::clone(&inspecting);
     let server_order = Arc::clone(&observation_order);
-    let server_lifecycle = Arc::clone(lifecycle);
+    let server_control = control.clone();
     let server_pump = match thread::Builder::new()
         .name("calcifer-readiness-server-pump".to_owned())
         .spawn(move || {
@@ -1283,15 +1711,16 @@ fn run_proxy_inner(
                 &server_inspecting,
                 &event_sender,
                 &server_order,
-                &server_lifecycle,
+                &server_control,
             );
         }) {
         Ok(pump) => pump,
         Err(_) => {
+            let error = transport.select_failure(ReadinessProxyError::Worker);
             let _ = client.shutdown(Shutdown::Both);
             let _ = upstream.shutdown(Shutdown::Both);
             let _ = client_pump.join();
-            return Err(ReadinessProxyError::Worker.into());
+            return Err(error);
         }
     };
 
@@ -1302,7 +1731,7 @@ fn run_proxy_inner(
             break Err(ProxyRunError::Stopped);
         }
         if !ready && Instant::now() >= deadline {
-            break Err(ReadinessProxyError::Timeout.into());
+            break Err(transport.select_failure(ReadinessProxyError::Timeout));
         }
         let wait = if ready {
             POLL_INTERVAL
@@ -1314,26 +1743,33 @@ fn run_proxy_inner(
         match event_receiver.recv_timeout(wait) {
             Ok(PumpEvent::Observed(event)) if !ready => match state.observe(*event) {
                 Ok(true) => {
-                    let settings = state
-                        .effective_settings()
-                        .cloned()
-                        .ok_or(ReadinessProxyError::InvalidMessage)?;
-                    inspecting.store(false, Ordering::Release);
-                    notifier.success(settings)?;
+                    let Some(settings) = state.effective_settings().cloned() else {
+                        break Err(transport.select_failure(ReadinessProxyError::InvalidMessage));
+                    };
+                    if let Err(error) = transport.publish_readiness(lifecycle, || {
+                        inspecting.store(false, Ordering::Release);
+                        notifier.success(settings)
+                    }) {
+                        break Err(error);
+                    }
                     ready = true;
                 }
                 Ok(false) => {}
-                Err(error) => break Err(error.into()),
+                Err(error) => break Err(transport.select_failure(error)),
             },
             Ok(PumpEvent::Observed(_)) => {}
-            Ok(PumpEvent::Ended) if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING => {
+            Ok(PumpEvent::Ended(_)) if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING => {
                 break Err(ProxyRunError::Stopped);
             }
-            Ok(PumpEvent::Ended) => break Err(ReadinessProxyError::Transport.into()),
+            Ok(PumpEvent::Ended(error)) => {
+                break Err(transport.select_failure(error));
+            }
             Ok(PumpEvent::Failed(_)) if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING => {
                 break Err(ProxyRunError::Stopped);
             }
-            Ok(PumpEvent::Failed(error)) => break Err(error.into()),
+            Ok(PumpEvent::Failed(error)) => {
+                break Err(transport.select_failure(error));
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected)
                 if lifecycle.load(Ordering::Acquire) == RELAY_STOPPING =>
@@ -1341,7 +1777,11 @@ fn run_proxy_inner(
                 break Err(ProxyRunError::Stopped);
             }
             Err(RecvTimeoutError::Disconnected) => {
-                break Err(ReadinessProxyError::Transport.into());
+                let error = transport_failure(
+                    control,
+                    ReadinessTransportOrigin::ObservationChannelDisconnected,
+                );
+                break Err(select_run_error(transport, error));
             }
         }
     };
@@ -1353,25 +1793,42 @@ fn run_proxy_inner(
     let client_join = client_pump.join();
     let server_join = server_pump.join();
     if client_join.is_err() || server_join.is_err() {
-        return Err(ReadinessProxyError::Worker.into());
+        return match result {
+            Err(ProxyRunError::Failed(error)) => {
+                Err(ProxyRunError::Failed(transport.preserve_selected(error)))
+            }
+            Err(ProxyRunError::Stopped) | Ok(()) => Err(ReadinessProxyError::Worker.into()),
+        };
     }
     result
+}
+
+fn transport_failure(control: &RelayControl, origin: ReadinessTransportOrigin) -> ProxyRunError {
+    match control.transport.disconnect(&control.lifecycle, origin) {
+        Some(error) => ProxyRunError::Failed(error),
+        None => control
+            .transport
+            .selected_failure()
+            .map(ProxyRunError::Failed)
+            .unwrap_or(ProxyRunError::Stopped),
+    }
 }
 
 fn accept_client(
     listener: &UnixListener,
     deadline: Instant,
-    lifecycle: &AtomicU8,
+    control: &RelayControl,
 ) -> Result<UnixStream, ProxyRunError> {
+    let lifecycle = &control.lifecycle;
     loop {
         if lifecycle.load(Ordering::Acquire) != RELAY_RUNNING {
             return Err(ProxyRunError::Stopped);
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                stream
-                    .set_nonblocking(false)
-                    .map_err(|_| ReadinessProxyError::Transport)?;
+                stream.set_nonblocking(false).map_err(|_| {
+                    transport_failure(control, ReadinessTransportOrigin::ClientConfigure)
+                })?;
                 return Ok(stream);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1420,9 +1877,32 @@ enum Direction {
     ServerToClient,
 }
 
+impl Direction {
+    const fn reader_eof_origin(self) -> ReadinessTransportOrigin {
+        match self {
+            Self::ClientToServer => ReadinessTransportOrigin::ClientEof,
+            Self::ServerToClient => ReadinessTransportOrigin::UpstreamEof,
+        }
+    }
+
+    const fn reader_error_origin(self) -> ReadinessTransportOrigin {
+        match self {
+            Self::ClientToServer => ReadinessTransportOrigin::ClientRead,
+            Self::ServerToClient => ReadinessTransportOrigin::UpstreamRead,
+        }
+    }
+
+    const fn writer_error_origin(self) -> ReadinessTransportOrigin {
+        match self {
+            Self::ClientToServer => ReadinessTransportOrigin::UpstreamWrite,
+            Self::ServerToClient => ReadinessTransportOrigin::ClientWrite,
+        }
+    }
+}
+
 enum PumpEvent {
     Observed(Box<ObservedEvent>),
-    Ended,
+    Ended(ReadinessProxyError),
     Failed(ReadinessProxyError),
 }
 
@@ -1433,30 +1913,41 @@ fn pump(
     inspecting: &AtomicBool,
     sender: &SyncSender<PumpEvent>,
     observation_order: &Mutex<()>,
-    lifecycle: &AtomicU8,
+    control: &RelayControl,
 ) {
+    let lifecycle = &control.lifecycle;
+    let transport = &control.transport;
     let mut inspector = ProtocolInspector::new(direction);
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     loop {
         let count = match reader.read(&mut buffer) {
             Ok(0) => {
-                mark_relay_disconnected(lifecycle);
-                let _ = sender.send(PumpEvent::Ended);
+                let Some(error) = transport.disconnect(lifecycle, direction.reader_eof_origin())
+                else {
+                    return;
+                };
+                let _ = sender.send(PumpEvent::Ended(error));
                 return;
             }
             Ok(count) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
-                mark_relay_disconnected(lifecycle);
-                let _ = sender.send(PumpEvent::Failed(ReadinessProxyError::Transport));
+                let Some(error) = transport.disconnect(lifecycle, direction.reader_error_origin())
+                else {
+                    return;
+                };
+                let _ = sender.send(PumpEvent::Failed(error));
                 return;
             }
         };
         let bytes = &buffer[..count];
         if !inspecting.load(Ordering::Acquire) {
             if writer.write_all(bytes).is_err() {
-                mark_relay_disconnected(lifecycle);
-                let _ = sender.send(PumpEvent::Failed(ReadinessProxyError::Transport));
+                let Some(error) = transport.disconnect(lifecycle, direction.writer_error_origin())
+                else {
+                    return;
+                };
+                let _ = sender.send(PumpEvent::Failed(error));
                 return;
             }
             continue;
@@ -1465,36 +1956,39 @@ fn pump(
         let events = match inspector.feed(bytes) {
             Ok(events) => events,
             Err(error) => {
-                mark_relay_disconnected(lifecycle);
+                let Some(error) = transport.fail_while_running(lifecycle, error) else {
+                    return;
+                };
                 let _ = sender.send(PumpEvent::Failed(error));
                 return;
             }
         };
         let Ok(_ordering_guard) = observation_order.lock() else {
-            mark_relay_disconnected(lifecycle);
-            let _ = sender.send(PumpEvent::Failed(ReadinessProxyError::Worker));
+            let Some(error) = transport.fail_while_running(lifecycle, ReadinessProxyError::Worker)
+            else {
+                return;
+            };
+            let _ = sender.send(PumpEvent::Failed(error));
             return;
         };
         if writer.write_all(bytes).is_err() {
-            mark_relay_disconnected(lifecycle);
-            let _ = sender.send(PumpEvent::Failed(ReadinessProxyError::Transport));
+            let Some(error) = transport.disconnect(lifecycle, direction.writer_error_origin())
+            else {
+                return;
+            };
+            let _ = sender.send(PumpEvent::Failed(error));
             return;
         }
         if send_observed(events, sender).is_err() {
-            mark_relay_disconnected(lifecycle);
-            let _ = sender.send(PumpEvent::Failed(ReadinessProxyError::Transport));
+            let Some(error) =
+                transport.disconnect(lifecycle, ReadinessTransportOrigin::ObservationDelivery)
+            else {
+                return;
+            };
+            let _ = sender.send(PumpEvent::Failed(error));
             return;
         }
     }
-}
-
-fn mark_relay_disconnected(lifecycle: &AtomicU8) {
-    let _ = lifecycle.compare_exchange(
-        RELAY_RUNNING,
-        RELAY_DISCONNECTED,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
 }
 
 fn send_observed(events: Vec<ObservedEvent>, sender: &SyncSender<PumpEvent>) -> Result<(), ()> {
@@ -1704,7 +2198,11 @@ impl FrameDecoder {
             0x1 => {
                 self.fragmented_text = Some(payload);
             }
-            0x8 => return Err(ReadinessProxyError::Transport),
+            0x8 => {
+                return Err(ReadinessProxyError::Transport(
+                    self.direction.reader_eof_origin(),
+                ));
+            }
             0x9 | 0xA => {}
             _ => return Err(ReadinessProxyError::InvalidFrame),
         }
@@ -2566,12 +3064,14 @@ fn validate_target_response(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::error::Error;
     use std::fs;
     use std::io::{self, Read, Write};
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
@@ -2586,6 +3086,482 @@ mod tests {
     const TARGET_CWD: &str = "/synthetic/workspace";
     const TARGET_MODEL: &str = "calcifer-handoff-smoke";
     const TARGET_MODEL_PROVIDER: &str = "calcifer_smoke";
+
+    #[test]
+    fn transport_origin_catalog_has_unique_fixed_payload_free_labels() {
+        let labels = ReadinessTransportOrigin::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, origin)| {
+                let label = origin.fixed_label();
+                let code = u8::try_from(index + 1).unwrap_or(u8::MAX);
+                assert_eq!(origin as u8, code);
+                assert_eq!(ReadinessTransportOrigin::from_code(code), Some(origin));
+                assert!(!label.is_empty());
+                assert!(
+                    label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+                );
+                assert!(matches!(
+                    ReadinessProxyError::Transport(origin),
+                    ReadinessProxyError::Transport(projected) if projected == origin
+                ));
+                assert_eq!(
+                    ReadinessProxyError::Transport(origin).to_string(),
+                    "the readiness proxy transport failed"
+                );
+                label
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(labels.len(), ReadinessTransportOrigin::ALL.len());
+        assert_eq!(ReadinessTransportOrigin::from_code(0), None);
+        assert_eq!(
+            ReadinessTransportOrigin::from_code(
+                u8::try_from(ReadinessTransportOrigin::ALL.len() + 1).unwrap_or(u8::MAX)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn concurrent_transport_failures_preserve_one_first_origin() -> Result<(), Box<dyn Error>> {
+        let tracker = Arc::new(ReadinessTransportTracker::new());
+        let barrier = Arc::new(Barrier::new(ReadinessTransportOrigin::ALL.len()));
+        let workers = ReadinessTransportOrigin::ALL
+            .into_iter()
+            .map(|origin| {
+                let tracker = Arc::clone(&tracker);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    tracker.record(origin)
+                })
+            })
+            .collect::<Vec<_>>();
+        let recorded = workers
+            .into_iter()
+            .map(|worker| worker.join().map_err(|_| "transport recorder panicked"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let first = tracker
+            .first()
+            .ok_or("concurrent transport failures did not record an origin")?;
+
+        assert!(recorded.into_iter().all(|origin| origin == first));
+        for origin in ReadinessTransportOrigin::ALL {
+            assert_eq!(tracker.record(origin), first);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failure_selection_gate_preserves_the_first_transport_semantic_or_stop_winner() {
+        let lifecycle = AtomicU8::new(RELAY_RUNNING);
+        let transport = ReadinessTransportTracker::new();
+        let first = transport
+            .disconnect(&lifecycle, ReadinessTransportOrigin::ClientEof)
+            .unwrap_or(ReadinessProxyError::UnexpectedSequence);
+        assert_eq!(
+            first,
+            ReadinessProxyError::Transport(ReadinessTransportOrigin::ClientEof)
+        );
+        assert_eq!(
+            transport.select_failure(ReadinessProxyError::InvalidMessage),
+            ProxyRunError::Failed(first)
+        );
+
+        let lifecycle = AtomicU8::new(RELAY_RUNNING);
+        let transport = ReadinessTransportTracker::new();
+        let semantic = transport
+            .fail_while_running(&lifecycle, ReadinessProxyError::InvalidMessage)
+            .unwrap_or(ReadinessProxyError::UnexpectedSequence);
+        assert_eq!(semantic, ReadinessProxyError::InvalidMessage);
+        assert_eq!(transport.first(), None);
+        assert_eq!(lifecycle.load(Ordering::Acquire), RELAY_DISCONNECTED);
+        assert_eq!(
+            transport.disconnect(&lifecycle, ReadinessTransportOrigin::UpstreamEof),
+            None
+        );
+        assert_eq!(
+            transport.select_failure(semantic),
+            ProxyRunError::Failed(semantic)
+        );
+        assert_eq!(transport.first(), None);
+
+        let lifecycle = AtomicU8::new(RELAY_RUNNING);
+        let transport = ReadinessTransportTracker::new();
+        let timeout = transport.select_failure(ReadinessProxyError::Timeout);
+        assert_eq!(timeout, ProxyRunError::Failed(ReadinessProxyError::Timeout));
+        assert_eq!(
+            transport.disconnect(&lifecycle, ReadinessTransportOrigin::ClientWrite),
+            None
+        );
+        assert_eq!(transport.first(), None);
+
+        let lifecycle = AtomicU8::new(RELAY_RUNNING);
+        let transport = ReadinessTransportTracker::new();
+        assert_eq!(transport.stop(&lifecycle), RELAY_RUNNING);
+        assert_eq!(
+            transport.disconnect(&lifecycle, ReadinessTransportOrigin::WorkerFinished),
+            None
+        );
+        assert_eq!(transport.first(), None);
+        assert_eq!(lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+    }
+
+    #[test]
+    fn stopped_selection_rejects_late_worker_failures_without_recording_an_origin() {
+        let failures = [
+            ReadinessProxyError::Timeout,
+            ReadinessProxyError::InvalidMessage,
+            ReadinessProxyError::Transport(ReadinessTransportOrigin::ClientRead),
+        ];
+
+        for failure in failures {
+            let lifecycle = AtomicU8::new(RELAY_RUNNING);
+            let transport = ReadinessTransportTracker::new();
+            assert_eq!(transport.stop(&lifecycle), RELAY_RUNNING);
+
+            assert_eq!(transport.select_failure(failure), ProxyRunError::Stopped);
+            assert_eq!(
+                select_run_error(&transport, ProxyRunError::Failed(failure)),
+                ProxyRunError::Stopped
+            );
+            assert_eq!(transport.first(), None);
+            assert_eq!(lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+        }
+    }
+
+    #[test]
+    fn stop_between_running_read_and_failure_selection_joins_cleanly() -> Result<(), Box<dyn Error>>
+    {
+        let lifecycle = Arc::new(AtomicU8::new(RELAY_RUNNING));
+        let transport = Arc::new(ReadinessTransportTracker::new());
+        let (running_read_sender, running_read_receiver) = mpsc::sync_channel(0);
+        let (release_selection_sender, release_selection_receiver) = mpsc::sync_channel(0);
+        let worker_lifecycle = Arc::clone(&lifecycle);
+        let worker_transport = Arc::clone(&transport);
+        let worker = thread::spawn(move || {
+            let observed = worker_lifecycle.load(Ordering::Acquire);
+            running_read_sender
+                .send(observed)
+                .map_err(|_| "running-read receiver disappeared")?;
+            release_selection_receiver
+                .recv()
+                .map_err(|_| "selection-release sender disappeared")?;
+            let result = worker_transport.select_failure(ReadinessProxyError::Timeout);
+            Ok::<_, &'static str>(finalize_proxy_run(Err(result)))
+        });
+
+        assert_eq!(running_read_receiver.recv()?, RELAY_RUNNING);
+        assert_eq!(transport.stop(&lifecycle), RELAY_RUNNING);
+        release_selection_sender.send(())?;
+
+        assert_eq!(
+            worker
+                .join()
+                .map_err(|_| "failure-selection worker panicked")??,
+            Ok(())
+        );
+        assert_eq!(transport.first(), None);
+        assert_eq!(lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_publication_gate_orders_success_and_transport_failure_without_sleep()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(AtomicU8::new(RELAY_RUNNING));
+        let transport = Arc::new(ReadinessTransportTracker::new());
+        let (publication_entered_sender, publication_entered_receiver) = mpsc::sync_channel(0);
+        let (release_publication_sender, release_publication_receiver) = mpsc::sync_channel(0);
+        let publisher_lifecycle = Arc::clone(&lifecycle);
+        let publisher_transport = Arc::clone(&transport);
+        let publisher = thread::spawn(move || {
+            publisher_transport.publish_readiness(&publisher_lifecycle, || {
+                publication_entered_sender
+                    .send(())
+                    .map_err(|_| ReadinessProxyError::Worker)?;
+                release_publication_receiver
+                    .recv()
+                    .map_err(|_| ReadinessProxyError::Worker)
+            })
+        });
+        publication_entered_receiver.recv()?;
+
+        let failure_lifecycle = Arc::clone(&lifecycle);
+        let failure_transport = Arc::clone(&transport);
+        let (failure_started_sender, failure_started_receiver) = mpsc::sync_channel(0);
+        let failure = thread::spawn(move || {
+            failure_started_sender
+                .send(())
+                .map_err(|_| "failure-start receiver disappeared")?;
+            Ok::<_, &'static str>(
+                failure_transport
+                    .disconnect(&failure_lifecycle, ReadinessTransportOrigin::UpstreamEof),
+            )
+        });
+        failure_started_receiver.recv()?;
+        release_publication_sender.send(())?;
+
+        assert!(
+            publisher
+                .join()
+                .map_err(|_| "readiness publisher panicked")?
+                .is_ok()
+        );
+        assert_eq!(
+            failure
+                .join()
+                .map_err(|_| "transport failure worker panicked")??,
+            Some(ReadinessProxyError::Transport(
+                ReadinessTransportOrigin::UpstreamEof
+            ))
+        );
+
+        let lifecycle = AtomicU8::new(RELAY_RUNNING);
+        let transport = ReadinessTransportTracker::new();
+        let expected = transport
+            .disconnect(&lifecycle, ReadinessTransportOrigin::ClientEof)
+            .unwrap_or(ReadinessProxyError::UnexpectedSequence);
+        let mut published = false;
+        assert!(matches!(
+            transport.publish_readiness(&lifecycle, || {
+                published = true;
+                Ok(())
+            }),
+            Err(ProxyRunError::Failed(error)) if error == expected
+        ));
+        assert!(!published);
+        Ok(())
+    }
+
+    #[test]
+    fn pump_eof_and_write_failures_preserve_exact_endpoint_origins() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            (
+                Direction::ClientToServer,
+                ReadinessTransportOrigin::ClientEof,
+                ReadinessTransportOrigin::UpstreamWrite,
+            ),
+            (
+                Direction::ServerToClient,
+                ReadinessTransportOrigin::UpstreamEof,
+                ReadinessTransportOrigin::ClientWrite,
+            ),
+        ];
+
+        for (direction, eof_origin, write_origin) in cases {
+            let (reader, reader_peer) = UnixStream::pair()?;
+            let (writer, _writer_peer) = UnixStream::pair()?;
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let inspecting = AtomicBool::new(false);
+            let observation_order = Mutex::new(());
+            let control = RelayControl {
+                lifecycle: Arc::new(AtomicU8::new(RELAY_RUNNING)),
+                transport: Arc::new(ReadinessTransportTracker::new()),
+            };
+            drop(reader_peer);
+
+            pump(
+                reader,
+                writer,
+                direction,
+                &inspecting,
+                &sender,
+                &observation_order,
+                &control,
+            );
+            assert!(matches!(
+                receiver.recv()?,
+                PumpEvent::Ended(ReadinessProxyError::Transport(origin)) if origin == eof_origin
+            ));
+            assert_eq!(control.transport.first(), Some(eof_origin));
+            assert_eq!(
+                control.lifecycle.load(Ordering::Acquire),
+                RELAY_DISCONNECTED
+            );
+
+            let (reader, mut reader_peer) = UnixStream::pair()?;
+            let (writer, writer_peer) = UnixStream::pair()?;
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let control = RelayControl {
+                lifecycle: Arc::new(AtomicU8::new(RELAY_RUNNING)),
+                transport: Arc::new(ReadinessTransportTracker::new()),
+            };
+            drop(writer_peer);
+            reader_peer.write_all(b"force exact writer failure")?;
+
+            pump(
+                reader,
+                writer,
+                direction,
+                &inspecting,
+                &sender,
+                &observation_order,
+                &control,
+            );
+            assert!(matches!(
+                receiver.recv()?,
+                PumpEvent::Failed(ReadinessProxyError::Transport(origin)) if origin == write_origin
+            ));
+            assert_eq!(control.transport.first(), Some(write_origin));
+            assert_eq!(
+                control.lifecycle.load(Ordering::Acquire),
+                RELAY_DISCONNECTED
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pump_records_observation_delivery_when_its_receiver_is_gone() -> Result<(), Box<dyn Error>> {
+        let (reader, mut reader_peer) = UnixStream::pair()?;
+        let (writer, mut writer_peer) = UnixStream::pair()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let inspecting = AtomicBool::new(true);
+        let observation_order = Mutex::new(());
+        let control = RelayControl {
+            lifecycle: Arc::new(AtomicU8::new(RELAY_RUNNING)),
+            transport: Arc::new(ReadinessTransportTracker::new()),
+        };
+        drop(receiver);
+        reader_peer.write_all(&websocket_request())?;
+
+        pump(
+            reader,
+            writer,
+            Direction::ClientToServer,
+            &inspecting,
+            &sender,
+            &observation_order,
+            &control,
+        );
+        let mut forwarded = vec![0_u8; websocket_request().len()];
+        writer_peer.read_exact(&mut forwarded)?;
+        assert_eq!(forwarded, websocket_request());
+        assert_eq!(
+            control.transport.first(),
+            Some(ReadinessTransportOrigin::ObservationDelivery)
+        );
+        assert_eq!(
+            control.lifecycle.load(Ordering::Acquire),
+            RELAY_DISCONNECTED
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn racing_copy_pump_eofs_publish_the_same_first_origin() -> Result<(), Box<dyn Error>> {
+        let (client_reader, client_peer) = UnixStream::pair()?;
+        let (client_writer, _client_writer_peer) = UnixStream::pair()?;
+        let (upstream_reader, upstream_peer) = UnixStream::pair()?;
+        let (upstream_writer, _upstream_writer_peer) = UnixStream::pair()?;
+        drop(client_peer);
+        drop(upstream_peer);
+
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let inspecting = Arc::new(AtomicBool::new(false));
+        let observation_order = Arc::new(Mutex::new(()));
+        let control = RelayControl {
+            lifecycle: Arc::new(AtomicU8::new(RELAY_RUNNING)),
+            transport: Arc::new(ReadinessTransportTracker::new()),
+        };
+        let barrier = Arc::new(Barrier::new(3));
+        let pumps = [
+            (client_reader, upstream_writer, Direction::ClientToServer),
+            (upstream_reader, client_writer, Direction::ServerToClient),
+        ]
+        .into_iter()
+        .map(|(reader, writer, direction)| {
+            let sender = sender.clone();
+            let inspecting = Arc::clone(&inspecting);
+            let observation_order = Arc::clone(&observation_order);
+            let control = control.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                pump(
+                    reader,
+                    writer,
+                    direction,
+                    &inspecting,
+                    &sender,
+                    &observation_order,
+                    &control,
+                );
+            })
+        })
+        .collect::<Vec<_>>();
+        drop(sender);
+        barrier.wait();
+
+        for pump in pumps {
+            pump.join().map_err(|_| "copy pump panicked")?;
+        }
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        let [PumpEvent::Ended(ReadinessProxyError::Transport(origin))] = events.as_slice() else {
+            return Err("racing copy pumps did not publish exactly one EOF winner".into());
+        };
+        let first = control
+            .transport
+            .first()
+            .ok_or("racing copy pumps did not record an origin")?;
+        assert!(matches!(
+            first,
+            ReadinessTransportOrigin::ClientEof | ReadinessTransportOrigin::UpstreamEof
+        ));
+        assert_eq!(*origin, first);
+        Ok(())
+    }
+
+    #[test]
+    fn intentional_stop_wakeup_never_records_eof_or_write_origins() -> Result<(), Box<dyn Error>> {
+        let (reader, reader_peer) = UnixStream::pair()?;
+        let (writer, _writer_peer) = UnixStream::pair()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let inspecting = AtomicBool::new(false);
+        let observation_order = Mutex::new(());
+        let control = RelayControl {
+            lifecycle: Arc::new(AtomicU8::new(RELAY_RUNNING)),
+            transport: Arc::new(ReadinessTransportTracker::new()),
+        };
+        control.transport.stop(&control.lifecycle);
+        drop(reader_peer);
+
+        pump(
+            reader,
+            writer,
+            Direction::ClientToServer,
+            &inspecting,
+            &sender,
+            &observation_order,
+            &control,
+        );
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(control.transport.first(), None);
+        assert_eq!(control.lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+
+        let (reader, mut reader_peer) = UnixStream::pair()?;
+        let (writer, writer_peer) = UnixStream::pair()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(writer_peer);
+        reader_peer.write_all(b"shutdown write wakeup")?;
+        pump(
+            reader,
+            writer,
+            Direction::ServerToClient,
+            &inspecting,
+            &sender,
+            &observation_order,
+            &control,
+        );
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(control.transport.first(), None);
+        assert_eq!(control.lifecycle.load(Ordering::Acquire), RELAY_STOPPING);
+        Ok(())
+    }
 
     fn expectation() -> ReadinessExpectation {
         ReadinessExpectation {
@@ -3911,6 +4887,7 @@ mod tests {
 
         assert_eq!(proxy.wait_until_ready(), Ok(()));
         assert_eq!(proxy.ensure_connected(), Ok(()));
+        assert_eq!(proxy.transport.first(), None);
         proxy.shutdown(shutdown_deadline()?)?;
         drop(client);
         server
@@ -4042,6 +5019,7 @@ mod tests {
         assert_eq!(settings, observed_settings());
         assert_eq!(proxy.poll_ready(), Ok(Some(observed_settings())));
         assert_eq!(proxy.ensure_connected(), Ok(()));
+        assert_eq!(proxy.transport.first(), None);
         proxy.shutdown(shutdown_deadline()?)?;
         drop(client);
         server
@@ -4176,6 +5154,7 @@ mod tests {
             Ok(observed_settings())
         );
         assert_eq!(proxy.ensure_connected(), Ok(()));
+        assert_eq!(proxy.transport.first(), None);
         proxy.shutdown(shutdown_deadline()?)?;
         drop(client);
         server
@@ -4295,6 +5274,7 @@ mod tests {
         let server_resume_response = resume_response.clone();
         let server_parent_read = parent_read.clone();
         let server_parent_read_response = parent_read_response.clone();
+        let (readiness_observed_sender, readiness_observed_receiver) = mpsc::sync_channel(0);
         let server = thread::spawn(move || -> io::Result<()> {
             let (mut stream, _) = upstream_listener.accept()?;
             set_short_timeouts(&stream)?;
@@ -4306,6 +5286,9 @@ mod tests {
             stream.write_all(&server_resume_response)?;
             assert_read_exact(&mut stream, &server_parent_read)?;
             stream.write_all(&server_parent_read_response)?;
+            readiness_observed_receiver
+                .recv()
+                .map_err(|_| io::Error::other("readiness observer disappeared"))?;
             stream.shutdown(Shutdown::Both)
         });
 
@@ -4321,6 +5304,7 @@ mod tests {
         client.write_all(&parent_read)?;
         assert_read_exact(&mut client, &parent_read_response)?;
         assert_eq!(proxy.wait_until_ready(), Ok(()));
+        readiness_observed_sender.send(())?;
 
         for _ in 0..100 {
             if proxy.lifecycle.load(Ordering::Acquire) == RELAY_DISCONNECTED {
@@ -4331,16 +5315,23 @@ mod tests {
         assert_eq!(proxy.lifecycle.load(Ordering::Acquire), RELAY_DISCONNECTED);
         assert_eq!(
             proxy.ensure_connected(),
-            Err(ReadinessProxyError::Transport)
+            Err(ReadinessProxyError::Transport(
+                ReadinessTransportOrigin::UpstreamEof
+            ))
         );
         let failure = proxy
             .shutdown(shutdown_deadline()?)
             .err()
             .ok_or("a disconnected proxy unexpectedly shut down cleanly")?;
-        assert_eq!(failure.error(), ReadinessProxyError::Transport);
+        assert_eq!(
+            failure.error(),
+            ReadinessProxyError::Transport(ReadinessTransportOrigin::UpstreamEof)
+        );
         assert_eq!(
             failure.operation_error(),
-            Some(ReadinessProxyError::Transport)
+            Some(ReadinessProxyError::Transport(
+                ReadinessTransportOrigin::UpstreamEof
+            ))
         );
         assert_eq!(failure.cleanup_error(), None);
         server
@@ -4352,18 +5343,40 @@ mod tests {
     #[test]
     fn active_health_probe_detects_eof_without_waiting_for_the_copy_pump() -> io::Result<()> {
         let (stream, peer) = UnixStream::pair()?;
-        assert!(socket_is_connected(&stream).map_err(io::Error::other)?);
+        let transport = ReadinessTransportTracker::new();
+        let lifecycle = AtomicU8::new(RELAY_RUNNING);
+        assert!(
+            socket_is_connected(&stream, HealthEndpoint::Client, &lifecycle, &transport)
+                .map_err(io::Error::other)?
+        );
+        assert_eq!(transport.first(), None);
         drop(peer);
-        assert!(!socket_is_connected(&stream).map_err(io::Error::other)?);
+        assert!(
+            !socket_is_connected(&stream, HealthEndpoint::Client, &lifecycle, &transport)
+                .map_err(io::Error::other)?
+        );
+        assert_eq!(
+            transport.first(),
+            Some(ReadinessTransportOrigin::HealthClientEof)
+        );
         Ok(())
     }
 
     #[test]
     fn active_health_probe_detects_hangup_behind_buffered_data() -> io::Result<()> {
         let (stream, mut peer) = UnixStream::pair()?;
+        let transport = ReadinessTransportTracker::new();
+        let lifecycle = AtomicU8::new(RELAY_RUNNING);
         peer.write_all(b"buffered")?;
         peer.shutdown(Shutdown::Both)?;
-        assert!(!socket_is_connected(&stream).map_err(io::Error::other)?);
+        assert!(
+            !socket_is_connected(&stream, HealthEndpoint::Upstream, &lifecycle, &transport)
+                .map_err(io::Error::other)?
+        );
+        assert_eq!(
+            transport.first(),
+            Some(ReadinessTransportOrigin::HealthUpstreamEof)
+        );
         Ok(())
     }
 
@@ -4607,8 +5620,9 @@ mod tests {
                 Ok(Some(_)) => return Err("disconnect unexpectedly produced readiness".into()),
             }
         };
-        assert_eq!(error, ReadinessProxyError::Transport);
-        assert_eq!(proxy.poll_ready(), Err(ReadinessProxyError::Transport));
+        let expected = ReadinessProxyError::Transport(ReadinessTransportOrigin::ClientEof);
+        assert_eq!(error, expected);
+        assert_eq!(proxy.poll_ready(), Err(expected));
         proxy.shutdown(shutdown_deadline()?)?;
         assert!(!proxy_path.exists());
         Ok(())
@@ -4669,7 +5683,9 @@ mod tests {
         let (returned_sender, returned_receiver) = mpsc::sync_channel(0);
         let (release_sender, release_receiver) = mpsc::sync_channel(0);
         let worker = thread::spawn(move || {
-            let result = Err(ProxyRunError::Failed(ReadinessProxyError::Transport));
+            let result = Err(ProxyRunError::Failed(ReadinessProxyError::Transport(
+                ReadinessTransportOrigin::ClientRead,
+            )));
             returned_sender
                 .send(())
                 .map_err(|_| "failure-return barrier receiver disappeared")?;
@@ -4687,7 +5703,12 @@ mod tests {
             .join()
             .map_err(|_| "failure-finalize worker panicked")??;
         assert_eq!(observed_lifecycle, RELAY_STOPPING);
-        assert_eq!(result, Err(ReadinessProxyError::Transport));
+        assert_eq!(
+            result,
+            Err(ReadinessProxyError::Transport(
+                ReadinessTransportOrigin::ClientRead
+            ))
+        );
         Ok(())
     }
 
@@ -4708,17 +5729,23 @@ mod tests {
         }
         proxy.readiness_result = Some(Ok(observed_settings()));
         proxy.lifecycle.store(RELAY_RUNNING, Ordering::Release);
+        proxy.transport = Arc::new(ReadinessTransportTracker::new());
 
         assert_eq!(
             proxy.ensure_connected(),
-            Err(ReadinessProxyError::Transport)
+            Err(ReadinessProxyError::Transport(
+                ReadinessTransportOrigin::WorkerFinished
+            ))
         );
         assert!(proxy.worker.is_some());
         let failure = proxy
             .shutdown(shutdown_deadline()?)
             .err()
             .ok_or("a timed-out worker unexpectedly produced clean shutdown proof")?;
-        assert_eq!(failure.error(), ReadinessProxyError::Timeout);
+        assert_eq!(
+            failure.error(),
+            ReadinessProxyError::Transport(ReadinessTransportOrigin::WorkerFinished)
+        );
         assert_eq!(failure.cleanup_error(), None);
         assert!(failure.into_proxy().is_none());
         assert!(!proxy_path.exists());
