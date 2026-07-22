@@ -542,7 +542,10 @@ impl PrivateRuntime {
     }
 
     #[cfg(test)]
-    fn create_with_post_mkdir<F>(parent: &Path, post_mkdir: F) -> Result<Self, RuntimeCreateFailure>
+    pub(super) fn create_with_post_mkdir<F>(
+        parent: &Path,
+        post_mkdir: F,
+    ) -> Result<Self, RuntimeCreateFailure>
     where
         F: FnMut(&Path) -> std::io::Result<()>,
     {
@@ -635,6 +638,75 @@ impl PrivateRuntime {
     /// Removes only the still-empty directory with the exact recorded identity.
     pub(super) fn cleanup(self) -> Result<CleanRuntime, RuntimeCleanupFailure> {
         self.cleanup_inner(|_| Ok(()), sync_runtime_parent)
+    }
+
+    /// Clears the bounded, owner-private registry tree used by supervisor
+    /// process fixtures, then applies the normal exact-inode runtime cleanup.
+    /// Every opened node must remain on the root's exact mount; entries are
+    /// quarantined and retain an open-inode unlink proof, while links, foreign
+    /// owners, special nodes, mount crossings, and identity changes fail closed.
+    #[cfg(test)]
+    pub(super) fn cleanup_fixture_tree(self) -> Result<CleanRuntime, RuntimeCleanupFailure> {
+        self.cleanup_fixture_tree_inner(|_| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_fixture_tree_with_before_cleanup<F>(
+        self,
+        mut before_cleanup: F,
+    ) -> Result<CleanRuntime, RuntimeCleanupFailure>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
+        if let Err(error) = remove_fixture_runtime_entries(&self) {
+            return Err(RuntimeCleanupFailure {
+                runtime: Box::new(self),
+                error,
+            });
+        }
+        if before_cleanup(self.path()).is_err() {
+            return Err(RuntimeCleanupFailure {
+                runtime: Box::new(self),
+                error: RuntimeError::Cleanup,
+            });
+        }
+        self.cleanup()
+    }
+
+    #[cfg(test)]
+    fn cleanup_fixture_tree_inner<F>(
+        self,
+        before_unlink: F,
+    ) -> Result<CleanRuntime, RuntimeCleanupFailure>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
+        if let Err(error) = remove_fixture_runtime_entries(&self) {
+            return Err(RuntimeCleanupFailure {
+                runtime: Box::new(self),
+                error,
+            });
+        }
+        self.cleanup_inner(before_unlink, sync_runtime_parent)
+    }
+
+    #[cfg(test)]
+    fn cleanup_fixture_tree_with_before_entry_unlink<F>(
+        self,
+        mut before_unlink: F,
+    ) -> Result<CleanRuntime, RuntimeCleanupFailure>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
+        if let Err(error) =
+            remove_fixture_runtime_entries_with_before_unlink(&self, &mut before_unlink)
+        {
+            return Err(RuntimeCleanupFailure {
+                runtime: Box::new(self),
+                error,
+            });
+        }
+        self.cleanup()
     }
 
     #[cfg(test)]
@@ -917,6 +989,391 @@ impl PrivateRuntime {
         }
         Err(RuntimeError::Cleanup)
     }
+}
+
+#[cfg(test)]
+const FIXTURE_TREE_MAX_ENTRIES: usize = 4096;
+#[cfg(test)]
+const FIXTURE_TREE_MAX_DEPTH: usize = 32;
+#[cfg(test)]
+const FIXTURE_ENTRY_QUARANTINE_ATTEMPTS: usize = 8;
+#[cfg(test)]
+const FIXTURE_ENTRY_QUARANTINE_PREFIX: &str = ".calcifer-fixture-cleanup-";
+
+#[cfg(test)]
+#[derive(Clone, Eq, PartialEq)]
+struct FixtureMountIdentity {
+    token: Vec<u8>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FixtureTreeEntryKind {
+    Directory,
+    RegularFile,
+}
+
+#[cfg(test)]
+fn remove_fixture_runtime_entries(runtime: &PrivateRuntime) -> Result<(), RuntimeError> {
+    remove_fixture_runtime_entries_with_before_unlink(runtime, &mut |_| Ok(()))
+}
+
+#[cfg(test)]
+fn remove_fixture_runtime_entries_with_before_unlink<F>(
+    runtime: &PrivateRuntime,
+    before_unlink: &mut F,
+) -> Result<(), RuntimeError>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    runtime.verify_runtime_entry()?;
+    let root = fstat(&runtime.directory).map_err(|_| RuntimeError::IdentityMismatch)?;
+    let expected_device = NodeIdentity::from_stat(&root).device;
+    let expected_mount = fixture_mount_identity_fd(&runtime.directory)?;
+    let directory = rustix::io::fcntl_dupfd_cloexec(&runtime.directory, 0)
+        .map_err(|_| RuntimeError::Cleanup)?;
+    let mut remaining = FIXTURE_TREE_MAX_ENTRIES;
+    remove_fixture_directory_entries(
+        Dir::new(directory).map_err(|_| RuntimeError::Cleanup)?,
+        runtime.path(),
+        expected_device,
+        &expected_mount,
+        &mut remaining,
+        0,
+        before_unlink,
+    )?;
+    runtime.verify_runtime_entry()?;
+    runtime.verify_empty()
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn remove_fixture_directory_entries<F>(
+    mut directory: Dir,
+    directory_path: &Path,
+    expected_device: u64,
+    expected_mount: &FixtureMountIdentity,
+    remaining: &mut usize,
+    depth: usize,
+    before_unlink: &mut F,
+) -> Result<(), RuntimeError>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    if depth > FIXTURE_TREE_MAX_DEPTH {
+        return Err(RuntimeError::Cleanup);
+    }
+    let directory_fd =
+        rustix::io::fcntl_dupfd_cloexec(directory.fd().map_err(|_| RuntimeError::Cleanup)?, 0)
+            .map_err(|_| RuntimeError::Cleanup)?;
+    ensure_fixture_mount(expected_mount, &fixture_mount_identity_fd(&directory_fd)?)?;
+    let mut entries = Vec::new();
+    for entry in directory.by_ref() {
+        let entry = entry.map_err(|_| RuntimeError::Cleanup)?;
+        if entry.file_name().to_bytes() == b"." || entry.file_name().to_bytes() == b".." {
+            continue;
+        }
+        *remaining = remaining.checked_sub(1).ok_or(RuntimeError::Cleanup)?;
+        let stat = statat(&directory_fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| RuntimeError::Cleanup)?;
+        let kind = validate_fixture_tree_entry(&stat, expected_device)?;
+        entries.try_reserve(1).map_err(|_| RuntimeError::Cleanup)?;
+        entries.push((entry.file_name().to_owned(), stat, kind));
+    }
+
+    for (name, observed, kind) in entries {
+        let current = statat(&directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| RuntimeError::IdentityMismatch)?;
+        validate_same_fixture_tree_entry(&observed, &current, kind, expected_device)?;
+        let entry_fd = open_fixture_entry_at(&directory_fd, &name, kind, expected_mount)?;
+        let opened = fstat(&entry_fd).map_err(|_| RuntimeError::IdentityMismatch)?;
+        validate_same_fixture_tree_entry(&observed, &opened, kind, expected_device)?;
+
+        let quarantine_name = move_fixture_entry_to_quarantine(&directory_fd, &name)?;
+        rustix::fs::fsync(&directory_fd).map_err(|_| RuntimeError::Cleanup)?;
+        let quarantined = statat(
+            &directory_fd,
+            quarantine_name.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| RuntimeError::IdentityMismatch)?;
+        validate_same_fixture_tree_entry(&observed, &quarantined, kind, expected_device)?;
+        let quarantine_path = directory_path.join(&quarantine_name);
+
+        if matches!(kind, FixtureTreeEntryKind::Directory) {
+            let traversal =
+                rustix::io::fcntl_dupfd_cloexec(&entry_fd, 0).map_err(|_| RuntimeError::Cleanup)?;
+            remove_fixture_directory_entries(
+                Dir::new(traversal).map_err(|_| RuntimeError::Cleanup)?,
+                &quarantine_path,
+                expected_device,
+                expected_mount,
+                remaining,
+                depth.checked_add(1).ok_or(RuntimeError::Cleanup)?,
+                before_unlink,
+            )?;
+        }
+
+        let final_opened = fstat(&entry_fd).map_err(|_| RuntimeError::IdentityMismatch)?;
+        validate_same_fixture_tree_entry(&observed, &final_opened, kind, expected_device)?;
+        let final_named = statat(
+            &directory_fd,
+            quarantine_name.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| RuntimeError::IdentityMismatch)?;
+        validate_same_fixture_tree_entry(&observed, &final_named, kind, expected_device)?;
+        let linked_count = final_opened.st_nlink as u64;
+        if linked_count == 0 {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        before_unlink(&quarantine_path).map_err(|_| RuntimeError::Cleanup)?;
+        let unlink_flags = if matches!(kind, FixtureTreeEntryKind::Directory) {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        unlinkat(&directory_fd, quarantine_name.as_str(), unlink_flags)
+            .map_err(|_| RuntimeError::Cleanup)?;
+
+        let unlinked = fstat(&entry_fd).map_err(|_| RuntimeError::IdentityMismatch)?;
+        let quarantine_is_absent = matches!(
+            statat(
+                &directory_fd,
+                quarantine_name.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ),
+            Err(rustix::io::Errno::NOENT)
+        );
+        let regular_file_was_unlinked =
+            !matches!(kind, FixtureTreeEntryKind::RegularFile) || unlinked.st_nlink == 0;
+        if !quarantine_is_absent
+            || !regular_file_was_unlinked
+            || !fixture_tree_entry_identity_matches_after_unlink(&observed, &unlinked, kind)
+            || !open_inode_was_unlinked(&entry_fd, &unlinked, linked_count, &quarantine_path)
+        {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        rustix::fs::fsync(&directory_fd).map_err(|_| RuntimeError::Cleanup)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn move_fixture_entry_to_quarantine(
+    directory: &OwnedFd,
+    visible_name: &std::ffi::CStr,
+) -> Result<String, RuntimeError> {
+    for _ in 0..FIXTURE_ENTRY_QUARANTINE_ATTEMPTS {
+        let quarantine_name = format!("{FIXTURE_ENTRY_QUARANTINE_PREFIX}{}", Uuid::new_v4());
+        match renameat_with(
+            directory,
+            visible_name,
+            directory,
+            quarantine_name.as_str(),
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => return Ok(quarantine_name),
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(rustix::io::Errno::NOENT) => return Err(RuntimeError::IdentityMismatch),
+            Err(_) => return Err(RuntimeError::Cleanup),
+        }
+    }
+    Err(RuntimeError::Cleanup)
+}
+
+#[cfg(test)]
+fn validate_fixture_tree_entry(
+    stat: &Stat,
+    expected_device: u64,
+) -> Result<FixtureTreeEntryKind, RuntimeError> {
+    let identity = NodeIdentity::from_stat(stat);
+    if identity.device != expected_device || stat.st_uid != rustix::process::geteuid().as_raw() {
+        return Err(RuntimeError::UnsafeIdentity);
+    }
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    if file_type.is_dir() {
+        Ok(FixtureTreeEntryKind::Directory)
+    } else if file_type.is_file() && stat.st_nlink == 1 {
+        Ok(FixtureTreeEntryKind::RegularFile)
+    } else {
+        Err(RuntimeError::UnsafeIdentity)
+    }
+}
+
+#[cfg(test)]
+fn validate_same_fixture_tree_entry(
+    expected: &Stat,
+    observed: &Stat,
+    expected_kind: FixtureTreeEntryKind,
+    expected_device: u64,
+) -> Result<(), RuntimeError> {
+    let kind = validate_fixture_tree_entry(observed, expected_device)?;
+    let kind_matches = matches!(
+        (expected_kind, kind),
+        (
+            FixtureTreeEntryKind::Directory,
+            FixtureTreeEntryKind::Directory
+        ) | (
+            FixtureTreeEntryKind::RegularFile,
+            FixtureTreeEntryKind::RegularFile
+        )
+    );
+    let link_count_matches = matches!(expected_kind, FixtureTreeEntryKind::Directory)
+        || expected.st_nlink == observed.st_nlink;
+    if kind_matches
+        && link_count_matches
+        && NodeIdentity::from_stat(expected) == NodeIdentity::from_stat(observed)
+    {
+        Ok(())
+    } else {
+        Err(RuntimeError::IdentityMismatch)
+    }
+}
+
+#[cfg(test)]
+fn fixture_tree_entry_identity_matches_after_unlink(
+    expected: &Stat,
+    observed: &Stat,
+    expected_kind: FixtureTreeEntryKind,
+) -> bool {
+    let observed_kind = FileType::from_raw_mode(observed.st_mode);
+    let kind_matches = match expected_kind {
+        FixtureTreeEntryKind::Directory => observed_kind.is_dir(),
+        FixtureTreeEntryKind::RegularFile => observed_kind.is_file(),
+    };
+    kind_matches && NodeIdentity::from_stat(expected) == NodeIdentity::from_stat(observed)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn open_fixture_entry_at(
+    directory: &OwnedFd,
+    name: &std::ffi::CStr,
+    kind: FixtureTreeEntryKind,
+    expected_mount: &FixtureMountIdentity,
+) -> Result<OwnedFd, RuntimeError> {
+    use rustix::fs::{ResolveFlags, openat2};
+
+    let type_flags = if matches!(kind, FixtureTreeEntryKind::Directory) {
+        OFlags::RDONLY | OFlags::DIRECTORY
+    } else {
+        OFlags::PATH
+    };
+    let descriptor = openat2(
+        directory,
+        name,
+        type_flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH
+            | ResolveFlags::NO_MAGICLINKS
+            | ResolveFlags::NO_SYMLINKS
+            | ResolveFlags::NO_XDEV,
+    )
+    .map_err(fixture_boundary_error)?;
+    ensure_fixture_mount(expected_mount, &fixture_mount_identity_fd(&descriptor)?)?;
+    Ok(descriptor)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn open_fixture_entry_at(
+    directory: &OwnedFd,
+    name: &std::ffi::CStr,
+    kind: FixtureTreeEntryKind,
+    expected_mount: &FixtureMountIdentity,
+) -> Result<OwnedFd, RuntimeError> {
+    let type_flags = if matches!(kind, FixtureTreeEntryKind::Directory) {
+        OFlags::RDONLY | OFlags::DIRECTORY
+    } else {
+        OFlags::RDONLY | OFlags::NONBLOCK
+    };
+    let descriptor = openat(
+        directory,
+        name,
+        type_flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(fixture_boundary_error)?;
+    ensure_fixture_mount(expected_mount, &fixture_mount_identity_fd(&descriptor)?)?;
+    Ok(descriptor)
+}
+
+#[cfg(test)]
+fn ensure_fixture_mount(
+    expected: &FixtureMountIdentity,
+    observed: &FixtureMountIdentity,
+) -> Result<(), RuntimeError> {
+    if expected == observed {
+        Ok(())
+    } else {
+        Err(RuntimeError::UnsafeIdentity)
+    }
+}
+
+#[cfg(test)]
+fn fixture_boundary_error(error: rustix::io::Errno) -> RuntimeError {
+    if matches!(
+        error,
+        rustix::io::Errno::XDEV
+            | rustix::io::Errno::LOOP
+            | rustix::io::Errno::NOSYS
+            | rustix::io::Errno::INVAL
+            | rustix::io::Errno::PERM
+            | rustix::io::Errno::ACCESS
+    ) {
+        RuntimeError::UnsafeIdentity
+    } else {
+        RuntimeError::IdentityMismatch
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn fixture_mount_identity_fd(descriptor: &OwnedFd) -> Result<FixtureMountIdentity, RuntimeError> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+
+    let stat = statx(
+        descriptor,
+        "",
+        AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+    )
+    .map_err(fixture_boundary_error)?;
+    if stat.stx_mask & StatxFlags::MNT_ID.bits() != StatxFlags::MNT_ID.bits()
+        || stat.stx_mnt_id == 0
+    {
+        return Err(RuntimeError::UnsafeIdentity);
+    }
+    Ok(FixtureMountIdentity {
+        token: stat.stx_mnt_id.to_le_bytes().to_vec(),
+    })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn fixture_mount_identity_fd(descriptor: &OwnedFd) -> Result<FixtureMountIdentity, RuntimeError> {
+    let stat = rustix::fs::fstatfs(descriptor).map_err(fixture_boundary_error)?;
+    let mut token = Vec::new();
+    append_fixture_mount_field(&mut token, &stat.f_mntonname, true)?;
+    append_fixture_mount_field(&mut token, &stat.f_mntfromname, false)?;
+    append_fixture_mount_field(&mut token, &stat.f_fstypename, false)?;
+    Ok(FixtureMountIdentity { token })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn append_fixture_mount_field(
+    token: &mut Vec<u8>,
+    field: &[std::ffi::c_char],
+    require_absolute: bool,
+) -> Result<(), RuntimeError> {
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(RuntimeError::UnsafeIdentity)?;
+    let start = token.len();
+    token.extend(field[..end].iter().map(|byte| byte.to_ne_bytes()[0]));
+    if end == 0 || (require_absolute && token.get(start) != Some(&b'/')) {
+        return Err(RuntimeError::UnsafeIdentity);
+    }
+    token.push(0);
+    Ok(())
 }
 
 /// One fixed runtime layout for an App Server plus exact-resume relay.
@@ -2656,6 +3113,146 @@ mod tests {
         let failure = runtime.cleanup().err().ok_or("cleanup must fail")?;
         assert_eq!(failure.error(), RuntimeError::NotEmpty);
         assert_eq!(fs::read(path.join("unexpected"))?, b"synthetic");
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_cleanup_removes_a_bounded_same_mount_registry_tree() -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let path = runtime.path().to_path_buf();
+        let profile_home = path.join("profiles/codex/profile/home");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&profile_home)?;
+        fs::write(profile_home.join("auth.json"), b"auth")?;
+        fs::write(profile_home.join("config.toml"), b"config")?;
+        fs::write(path.join("matrix-app-group.identity"), b"app")?;
+        fs::write(path.join("matrix-tui-group.identity"), b"tui")?;
+        fs::write(
+            path.join(format!(".calcifer-private-publish-{}.tmp", Uuid::new_v4())),
+            b"temporary",
+        )?;
+
+        let _clean = runtime
+            .cleanup_fixture_tree()
+            .map_err(|failure| failure.error())?;
+        assert!(!path.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_cleanup_mount_identity_is_exact_and_mismatch_fails_closed()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let path = runtime.path().to_path_buf();
+        let nested = path.join("same-mount-directory");
+        fs::DirBuilder::new().mode(0o700).create(&nested)?;
+        let nested_fd = open(
+            &nested,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let root_mount = fixture_mount_identity_fd(&runtime.directory)?;
+        assert_eq!(
+            ensure_fixture_mount(&root_mount, &fixture_mount_identity_fd(&nested_fd)?),
+            Ok(())
+        );
+        let different_mount = FixtureMountIdentity {
+            token: b"synthetic-different-mount".to_vec(),
+        };
+        assert_eq!(
+            ensure_fixture_mount(&root_mount, &different_mount),
+            Err(RuntimeError::UnsafeIdentity)
+        );
+
+        let _clean = runtime
+            .cleanup_fixture_tree()
+            .map_err(|failure| failure.error())?;
+        assert!(!path.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_cleanup_rejects_a_link_without_touching_its_target() -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let path = runtime.path().to_path_buf();
+        let target = parent.path.join("outside-target");
+        fs::write(&target, b"must-survive")?;
+        let link = path.join("unexpected-link");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let failure = runtime
+            .cleanup_fixture_tree()
+            .err()
+            .ok_or("a fixture symlink must be rejected")?;
+        assert_eq!(failure.error(), RuntimeError::UnsafeIdentity);
+        assert_eq!(fs::read(&target)?, b"must-survive");
+        let runtime = failure.into_runtime();
+        fs::remove_file(&link)?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        assert!(!path.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_cleanup_quarantine_preserves_a_late_visible_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let path = runtime.path().to_path_buf();
+        let visible = path.join("matrix-app-group.identity");
+        fs::write(&visible, b"original")?;
+        let mut observed_quarantine = None;
+
+        let failure = runtime
+            .cleanup_fixture_tree_with_before_entry_unlink(|quarantine| {
+                observed_quarantine = Some(quarantine.to_path_buf());
+                fs::write(&visible, b"replacement")
+            })
+            .err()
+            .ok_or("a late visible replacement must retain the runtime")?;
+        assert_eq!(fs::read(&visible)?, b"replacement");
+        let quarantine = observed_quarantine.ok_or("fixture quarantine was not observed")?;
+        assert!(
+            quarantine
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(FIXTURE_ENTRY_QUARANTINE_PREFIX))
+        );
+
+        let runtime = failure.into_runtime();
+        fs::remove_file(&visible)?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        assert!(!path.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_cleanup_never_mints_clean_proof_after_final_entry_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestDirectory::new()?;
+        let runtime = PrivateRuntime::create(&parent.path)?;
+        let path = runtime.path().to_path_buf();
+        fs::write(path.join("matrix-app-group.identity"), b"original")?;
+        let parked = path.join("parked-original");
+
+        let failure = runtime
+            .cleanup_fixture_tree_with_before_entry_unlink(|quarantine| {
+                fs::rename(quarantine, &parked)?;
+                fs::write(quarantine, b"replacement")
+            })
+            .err()
+            .ok_or("a replaced fixture quarantine must not mint CleanRuntime")?;
+        assert_eq!(failure.error(), RuntimeError::IdentityMismatch);
+        assert_eq!(fs::read(&parked)?, b"original");
+        let runtime = failure.into_runtime();
+        fs::remove_file(&parked)?;
+        let _clean = runtime.cleanup().map_err(|failure| failure.error())?;
+        assert!(!path.try_exists()?);
         Ok(())
     }
 

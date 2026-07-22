@@ -34,7 +34,8 @@ use super::channel::{
     LifecycleEndpoint, LifecyclePair, spawn_guardian_with_lifecycle_stdin_and_completion,
 };
 use super::coordinator::{
-    CoordinatorBounds, CoordinatorRunOutcome, CoordinatorTerminalReport, ProductionCoordinator,
+    CoordinatorBounds, CoordinatorRunOutcome, CoordinatorTerminalReport,
+    DescriptorIsolationTestSeam, ProductionCoordinator,
 };
 use super::coordinator_terminal::CoordinatorTerminal;
 use super::entry::{
@@ -43,9 +44,10 @@ use super::entry::{
 };
 use super::guardian::{
     GuardianBounds, GuardianRunOutcome, GuardianSetupError, PACKAGED_APP_NOT_STARTED_MARKER,
-    PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER, PACKAGED_STARTUP_FAILURE_MARKERS,
-    PACKAGED_TUI_NOT_STARTED_MARKER, PackagedGuardianSeams, ProductionGuardianConfig,
-    run_production_guardian_with_test_seams, write_packaged_startup_failure_marker,
+    PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS, PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER,
+    PACKAGED_STARTUP_FAILURE_MARKERS, PACKAGED_TUI_NOT_STARTED_MARKER, PackagedGuardianSeams,
+    ProductionGuardianConfig, run_production_guardian_with_test_seams,
+    write_packaged_startup_failure_marker,
 };
 use super::process::{ManagedGroupChild, shutdown_app_server_child};
 use super::protocol::{
@@ -1498,6 +1500,26 @@ const PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS: [&str; 9] = [
     "recovery.drive-failed.exit-input-observation",
 ];
 
+const PACKAGE_INITIAL_GATE_FAILURE_MARKERS: [&str; 11] = [
+    "recovery.drive-failed.initial-gate.subtype.deadline",
+    "recovery.drive-failed.initial-gate.subtype.invalid-payload",
+    "recovery.drive-failed.initial-gate.subtype.read-would-block",
+    "recovery.drive-failed.initial-gate.subtype.read-invalid-data",
+    "recovery.drive-failed.initial-gate.subtype.read-resource-exhausted",
+    "recovery.drive-failed.initial-gate.subtype.read-other",
+    "recovery.drive-failed.initial-gate.subtype.startup-marker-invalid-untrusted",
+    "recovery.drive-failed.initial-gate.subtype.startup-marker-resource-exhausted",
+    "recovery.drive-failed.initial-gate.subtype.startup-marker-observation",
+    "recovery.drive-failed.initial-gate.subtype.coordinator-exited",
+    "recovery.drive-failed.initial-gate.subtype.coordinator-observation",
+];
+
+const PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS: [&str; 3] = [
+    "recovery.drive.initial-gate.retry-observed.marker-read-interrupted",
+    "recovery.drive.initial-gate.retry-observed.startup-scan-interrupted",
+    "recovery.drive.initial-gate.retry-observed.child-try-wait-interrupted",
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackageRecoveryDriveFailure {
     InitialGate,
@@ -1536,6 +1558,158 @@ impl fmt::Display for PackageRecoveryDriveFailure {
 impl Error for PackageRecoveryDriveFailure {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageInitialGateFailure {
+    Deadline,
+    InvalidPayload,
+    ReadWouldBlock,
+    ReadInvalidData,
+    ReadResourceExhausted,
+    ReadOther,
+    StartupMarkerInvalidUntrusted,
+    StartupMarkerResourceExhausted,
+    StartupMarkerObservation,
+    CoordinatorExited,
+    CoordinatorObservation,
+}
+
+impl PackageInitialGateFailure {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Deadline => "recovery.drive-failed.initial-gate.subtype.deadline",
+            Self::InvalidPayload => "recovery.drive-failed.initial-gate.subtype.invalid-payload",
+            Self::ReadWouldBlock => "recovery.drive-failed.initial-gate.subtype.read-would-block",
+            Self::ReadInvalidData => "recovery.drive-failed.initial-gate.subtype.read-invalid-data",
+            Self::ReadResourceExhausted => {
+                "recovery.drive-failed.initial-gate.subtype.read-resource-exhausted"
+            }
+            Self::ReadOther => "recovery.drive-failed.initial-gate.subtype.read-other",
+            Self::StartupMarkerInvalidUntrusted => {
+                "recovery.drive-failed.initial-gate.subtype.startup-marker-invalid-untrusted"
+            }
+            Self::StartupMarkerResourceExhausted => {
+                "recovery.drive-failed.initial-gate.subtype.startup-marker-resource-exhausted"
+            }
+            Self::StartupMarkerObservation => {
+                "recovery.drive-failed.initial-gate.subtype.startup-marker-observation"
+            }
+            Self::CoordinatorExited => {
+                "recovery.drive-failed.initial-gate.subtype.coordinator-exited"
+            }
+            Self::CoordinatorObservation => {
+                "recovery.drive-failed.initial-gate.subtype.coordinator-observation"
+            }
+        }
+    }
+}
+
+impl fmt::Display for PackageInitialGateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the package initial-gate observation failed")
+    }
+}
+
+impl Error for PackageInitialGateFailure {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageInitialGateRetryObservation {
+    MarkerRead,
+    StartupScan,
+    ChildTryWait,
+}
+
+impl PackageInitialGateRetryObservation {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::MarkerRead => {
+                "recovery.drive.initial-gate.retry-observed.marker-read-interrupted"
+            }
+            Self::StartupScan => {
+                "recovery.drive.initial-gate.retry-observed.startup-scan-interrupted"
+            }
+            Self::ChildTryWait => {
+                "recovery.drive.initial-gate.retry-observed.child-try-wait-interrupted"
+            }
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::MarkerRead => 0,
+            Self::StartupScan => 1,
+            Self::ChildTryWait => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct PackageInitialGateRetryObservations {
+    observed: [bool; PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS.len()],
+}
+
+impl PackageInitialGateRetryObservations {
+    const NONE: Self = Self {
+        observed: [false; PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS.len()],
+    };
+
+    fn insert(&mut self, observation: PackageInitialGateRetryObservation) {
+        self.observed[observation.index()] = true;
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (current, observed) in self.observed.iter_mut().zip(other.observed) {
+            *current |= observed;
+        }
+    }
+
+    fn from_report(report: &Path) -> Self {
+        let mut observations = Self::NONE;
+        for observation in [
+            PackageInitialGateRetryObservation::MarkerRead,
+            PackageInitialGateRetryObservation::StartupScan,
+            PackageInitialGateRetryObservation::ChildTryWait,
+        ] {
+            if fixed_package_failure_marker_is_valid(report, observation.marker()) {
+                observations.insert(observation);
+            }
+        }
+        observations
+    }
+
+    fn is_empty(self) -> bool {
+        !self.observed.into_iter().any(|observed| observed)
+    }
+}
+
+impl fmt::Display for PackageInitialGateRetryObservations {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut wrote_marker = false;
+        for (marker, observed) in PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS
+            .iter()
+            .zip(self.observed)
+        {
+            if !observed {
+                continue;
+            }
+            if wrote_marker {
+                formatter.write_str(",")?;
+            }
+            formatter.write_str(marker)?;
+            wrote_marker = true;
+        }
+        if !wrote_marker {
+            formatter.write_str("none")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PackageInitialGateRetryObservations {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "PackageInitialGateRetryObservations({self})")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FixedPackageStartupFailure(&'static str);
 
 impl FixedPackageStartupFailure {
@@ -1546,6 +1720,23 @@ impl FixedPackageStartupFailure {
     const fn marker(self) -> &'static str {
         self.0
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageStartupFailureMarkerProbe {
+    Absent,
+    Valid(FixedPackageStartupFailure),
+    InvalidUntrusted,
+    Interrupted,
+    Deadline,
+    ResourceExhausted,
+    OtherObservationFailure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageInitialGateReadDisposition {
+    Retry(PackageInitialGateRetryObservation),
+    Terminal(PackageInitialGateFailure),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1568,11 +1759,35 @@ impl fmt::Display for PackageRecoveryStartupDriveFailure {
 
 impl Error for PackageRecoveryStartupDriveFailure {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageRecoveryInitialGateDriveFailure {
+    detail: PackageInitialGateFailure,
+    drive: PackageRecoveryDriveFailure,
+}
+
+impl PackageRecoveryInitialGateDriveFailure {
+    const fn new(detail: PackageInitialGateFailure) -> Self {
+        Self {
+            detail,
+            drive: PackageRecoveryDriveFailure::InitialGate,
+        }
+    }
+}
+
+impl fmt::Display for PackageRecoveryInitialGateDriveFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a fixed initial-gate detail ended the retained-recovery drive")
+    }
+}
+
+impl Error for PackageRecoveryInitialGateDriveFailure {}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PackageRecoveryFailureEvidence {
     primary: Option<PackageRecoveryDriveFailure>,
     drive_context: Option<PackageRecoveryDriveFailure>,
     secondary: Option<&'static str>,
+    retry_observations: PackageInitialGateRetryObservations,
 }
 
 impl PackageRecoveryFailureEvidence {
@@ -1581,6 +1796,11 @@ impl PackageRecoveryFailureEvidence {
             self.primary.get_or_insert(failure.drive);
             self.drive_context.get_or_insert(failure.drive);
             self.snapshot_secondary(Some(failure.startup.marker()));
+        } else if let Some(failure) = error.downcast_ref::<PackageRecoveryInitialGateDriveFailure>()
+        {
+            self.primary.get_or_insert(failure.drive);
+            self.drive_context.get_or_insert(failure.drive);
+            self.snapshot_secondary(Some(failure.detail.marker()));
         } else if let Some(failure) = error.downcast_ref::<PackageRecoveryDriveFailure>() {
             self.primary.get_or_insert(*failure);
             self.drive_context.get_or_insert(*failure);
@@ -1600,6 +1820,10 @@ impl PackageRecoveryFailureEvidence {
         self.secondary.get_or_insert(candidate);
     }
 
+    fn snapshot_retry_observations(&mut self, observations: PackageInitialGateRetryObservations) {
+        self.retry_observations.merge(observations);
+    }
+
     const fn primary_marker(self) -> Option<&'static str> {
         match self.primary {
             Some(failure) => Some(failure.marker()),
@@ -1613,6 +1837,10 @@ impl PackageRecoveryFailureEvidence {
 
     const fn secondary_marker(self) -> Option<&'static str> {
         self.secondary
+    }
+
+    const fn retry_observations(self) -> PackageInitialGateRetryObservations {
+        self.retry_observations
     }
 }
 
@@ -1866,7 +2094,11 @@ const fn package_checkpoint_wait_failure_marker(error: CompletionError) -> &'sta
 }
 
 fn record_package_diagnostic_marker(report: &Path, marker: &'static str) {
-    let _ = write_private_new(report.join(marker).as_path(), b"classified\n");
+    // Package observers run concurrently with the helper processes that emit
+    // these diagnostics. Publish by no-replace rename so a visible marker is
+    // always the complete immutable payload, including when two helpers race
+    // to report the same retained generation.
+    let _ = write_private_atomic_new(report.join(marker).as_path(), b"classified\n");
 }
 
 fn classify_package_recovery_drive_stage<T, E>(
@@ -1886,7 +2118,7 @@ fn classify_package_recovery_drive_stage<T, E>(
 
 fn classify_package_recovery_initial_gate(
     report: &Path,
-    result: Result<PackageInitialGateObservation, Box<dyn Error>>,
+    result: Result<PackageInitialGateObservation, PackageInitialGateFailure>,
 ) -> Result<(), Box<dyn Error>> {
     match result {
         Ok(PackageInitialGateObservation::Opened) => Ok(()),
@@ -1897,9 +2129,10 @@ fn classify_package_recovery_initial_gate(
                 failure, drive,
             )))
         }
-        Err(_) => {
-            let failure = PackageRecoveryDriveFailure::InitialGate;
-            record_package_diagnostic_marker(report, failure.marker());
+        Err(detail) => {
+            let failure = PackageRecoveryInitialGateDriveFailure::new(detail);
+            record_package_diagnostic_marker(report, failure.drive.marker());
+            record_package_diagnostic_marker(report, failure.detail.marker());
             Err(Box::new(failure))
         }
     }
@@ -3242,7 +3475,10 @@ fn package_failure_report_scanner_bridges_only_the_closed_recovery_drive_catalog
     let report = scratch.root.join("supervisor-report");
     private_directory(&report)?;
 
-    for marker in PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS {
+    for marker in PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS
+        .into_iter()
+        .chain(PACKAGE_INITIAL_GATE_FAILURE_MARKERS)
+    {
         assert!(marker.is_ascii() && marker.starts_with("recovery.drive-failed."));
         let path = report.join(marker);
         write_private_new(&path, b"classified\n")?;
@@ -3262,6 +3498,85 @@ fn package_failure_report_scanner_bridges_only_the_closed_recovery_drive_catalog
         None,
         "the scanner must reject an unknown recovery-drive filename"
     );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_second_retention_diagnostics_are_closed_best_effort_and_untrusted_nodes_are_rejected()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let reason = "guardian-recovery.retained.reason.deadline";
+    let owner = "guardian-recovery.retained.owner.startup-restore";
+    let generic = "guardian-recovery.retained";
+
+    // Reason and owner are independent best-effort diagnostics; the generic
+    // marker only records that the writer completed its projection loop. None
+    // of these diagnostic states confers recovery authority.
+    for marker in [reason, owner, generic] {
+        write_private_new(&report.join(marker), b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some(marker)
+        );
+        fs::remove_file(report.join(marker))?;
+    }
+    for marker in [reason, owner, generic] {
+        write_private_new(&report.join(marker), b"classified\n")?;
+    }
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some(reason),
+        "the closed exact reason did not outrank its owner and generic fallback"
+    );
+    for marker in [reason, owner, generic] {
+        fs::remove_file(report.join(marker))?;
+    }
+
+    let unknown = report.join("guardian-recovery.retained.reason.user-controlled");
+    write_private_new(&unknown, b"classified\n")?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None
+    );
+    fs::remove_file(unknown)?;
+
+    let reason_path = report.join(reason);
+    write_private_new(&reason_path, b"private payload\n")?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None
+    );
+    fs::remove_file(&reason_path)?;
+
+    let symlink_source = report.join("second-retention-symlink-source");
+    write_private_new(&symlink_source, b"classified\n")?;
+    std::os::unix::fs::symlink(&symlink_source, &reason_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None
+    );
+    fs::remove_file(&reason_path)?;
+    fs::remove_file(symlink_source)?;
+
+    let hardlink_source = report.join("second-retention-hardlink-source");
+    write_private_new(&hardlink_source, b"classified\n")?;
+    fs::hard_link(&hardlink_source, &reason_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None
+    );
+    fs::remove_file(&reason_path)?;
+    fs::remove_file(hardlink_source)?;
+
+    write_private_new(&reason_path, b"classified\n")?;
+    fs::set_permissions(&reason_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None
+    );
+    fs::remove_file(reason_path)?;
     scratch.cleanup()
 }
 
@@ -3537,26 +3852,6 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
         &report.join("startup-failure.session-readiness.subtype.readiness-relay"),
         b"classified\n",
     )?;
-    write_private_new(&report.join(exact), b"private payload\n")?;
-    let symlink_source = report.join("untrusted-startup-symlink-source");
-    write_private_new(&symlink_source, b"classified\n")?;
-    std::os::unix::fs::symlink(
-        &symlink_source,
-        report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[1]),
-    )?;
-    let hardlink_source = report.join("untrusted-startup-hardlink-source");
-    write_private_new(&hardlink_source, b"classified\n")?;
-    fs::hard_link(
-        &hardlink_source,
-        report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[2]),
-    )?;
-    let wrong_mode = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[3]);
-    write_private_new(&wrong_mode, b"classified\n")?;
-    fs::set_permissions(&wrong_mode, fs::Permissions::from_mode(0o640))?;
-    write_private_new(
-        &report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[4]),
-        b"classified\ntrailing\n",
-    )?;
     write_private_new(&gate, b"open\n")?;
     assert_eq!(
         wait_for_private_marker_or_fixed_startup_failure(
@@ -3565,13 +3860,931 @@ fn retained_initial_gate_wait_observes_only_valid_fixed_startup_failures()
             b"open\n",
             Instant::now() + IO_TIMEOUT,
         )?,
-        PackageInitialGateObservation::Opened
+        PackageInitialGateObservation::Opened,
+        "an unknown startup marker became recovery authority"
+    );
+    fs::remove_file(&gate)?;
+
+    write_private_new(&report.join(exact), b"classified\n")?;
+    write_private_new(&gate, b"open\n")?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        )?,
+        PackageInitialGateObservation::Opened,
+        "an exact detail without its generic commit marker became recovery authority"
+    );
+    fs::remove_file(&gate)?;
+    fs::remove_file(report.join(exact))?;
+
+    write_private_new(&report.join(exact), b"private payload\n")?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        ),
+        Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted),
+        "an invalid allowlisted startup detail was treated as absent"
+    );
+    fs::remove_file(report.join(exact))?;
+
+    let symlink_source = report.join("untrusted-startup-symlink-source");
+    write_private_new(&symlink_source, b"classified\n")?;
+    let symlink_marker = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[1]);
+    std::os::unix::fs::symlink(&symlink_source, &symlink_marker)?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        ),
+        Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted),
+        "an allowlisted startup symlink was treated as absent"
+    );
+    fs::remove_file(symlink_marker)?;
+    fs::remove_file(symlink_source)?;
+
+    let hardlink_source = report.join("untrusted-startup-hardlink-source");
+    write_private_new(&hardlink_source, b"classified\n")?;
+    let hardlink_marker = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[2]);
+    fs::hard_link(&hardlink_source, &hardlink_marker)?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        ),
+        Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted),
+        "an allowlisted startup hardlink was treated as absent"
+    );
+    fs::remove_file(hardlink_marker)?;
+    fs::remove_file(hardlink_source)?;
+
+    let wrong_mode = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[3]);
+    write_private_new(&wrong_mode, b"classified\n")?;
+    fs::set_permissions(&wrong_mode, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        ),
+        Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted),
+        "an allowlisted startup marker with unsafe mode was treated as absent"
+    );
+    fs::remove_file(wrong_mode)?;
+
+    let fifo_marker = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[5]);
+    let fifo_status = Command::new("/usr/bin/mkfifo").arg(&fifo_marker).status()?;
+    if !fifo_status.success() {
+        return Err("could not create the package startup FIFO fixture".into());
+    }
+    fs::set_permissions(&fifo_marker, fs::Permissions::from_mode(0o600))?;
+    let fifo_started = Instant::now();
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        ),
+        Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted),
+        "an allowlisted startup FIFO did not fail closed"
+    );
+    assert!(
+        fifo_started.elapsed() < Duration::from_secs(1),
+        "an allowlisted startup FIFO blocked the absolute initial-gate deadline"
+    );
+    fs::remove_file(fifo_marker)?;
+
+    let socket_source = scratch.root.join("z");
+    let socket_marker = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[6]);
+    let socket_listener = UnixListener::bind(&socket_source)?;
+    fs::set_permissions(&socket_source, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&socket_source, &socket_marker)?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        ),
+        Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted),
+        "an allowlisted startup Unix socket did not fail closed"
+    );
+    drop(socket_listener);
+    fs::remove_file(socket_marker)?;
+
+    let trailing_payload = report.join(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[4]);
+    write_private_new(&trailing_payload, b"classified\ntrailing\n")?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+        ),
+        Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted),
+        "an allowlisted startup marker with a trailing payload was treated as absent"
+    );
+    fs::remove_file(trailing_payload)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "unknown marker names became fixed diagnostics"
+    );
+    scratch.cleanup()
+}
+
+#[test]
+fn startup_failure_marker_probes_are_typed_and_only_interrupted_is_retried()
+-> Result<(), Box<dyn Error>> {
+    let marker = PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[0];
+    let fixed = FixedPackageStartupFailure::from_marker(marker)
+        .ok_or("the startup marker probe fixture was outside the closed catalog")?;
+    let cases = [
+        (
+            Err(io::Error::from(io::ErrorKind::NotFound)),
+            PackageStartupFailureMarkerProbe::Absent,
+        ),
+        (
+            Ok(b"classified\n".to_vec()),
+            PackageStartupFailureMarkerProbe::Valid(fixed),
+        ),
+        (
+            Ok(b"private payload\n".to_vec()),
+            PackageStartupFailureMarkerProbe::InvalidUntrusted,
+        ),
+        (
+            Err(io::Error::from(io::ErrorKind::InvalidData)),
+            PackageStartupFailureMarkerProbe::InvalidUntrusted,
+        ),
+        (
+            Err(io::Error::from(io::ErrorKind::Interrupted)),
+            PackageStartupFailureMarkerProbe::Interrupted,
+        ),
+        (
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::MFILE.raw_os_error(),
+            )),
+            PackageStartupFailureMarkerProbe::ResourceExhausted,
+        ),
+        (
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::NFILE.raw_os_error(),
+            )),
+            PackageStartupFailureMarkerProbe::ResourceExhausted,
+        ),
+        (
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            PackageStartupFailureMarkerProbe::OtherObservationFailure,
+        ),
+    ];
+    for (read, expected) in cases {
+        assert_eq!(
+            classify_package_startup_failure_marker_read(marker, read),
+            expected,
+        );
+    }
+    assert_eq!(
+        classify_package_startup_failure_marker_read(
+            "startup-failure.user-controlled",
+            Ok(b"classified\n".to_vec()),
+        ),
+        PackageStartupFailureMarkerProbe::Absent,
+        "an unknown marker name became startup-failure authority"
+    );
+
+    let mut interrupted_then_absent = VecDeque::from([
+        PackageStartupFailureMarkerProbe::Interrupted,
+        PackageStartupFailureMarkerProbe::Absent,
+    ]);
+    let mut gate_reads = 0_u8;
+    let mut coordinator_observations = 0_u8;
+    let mut retry_observations = Vec::new();
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_scanner_and_reader(
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+            || {
+                interrupted_then_absent
+                    .pop_front()
+                    .unwrap_or(PackageStartupFailureMarkerProbe::Absent)
+            },
+            || {
+                gate_reads = gate_reads.saturating_add(1);
+                Ok(b"open\n".to_vec())
+            },
+            || {
+                coordinator_observations = coordinator_observations.saturating_add(1);
+                Ok(true)
+            },
+            |observation| retry_observations.push(observation),
+        )?,
+        PackageInitialGateObservation::Opened,
+        "an interrupted startup scan was not retried"
+    );
+    assert_eq!(gate_reads, 1, "an interrupted scan admitted gate I/O");
+    assert_eq!(coordinator_observations, 0);
+    assert_eq!(
+        retry_observations,
+        [PackageInitialGateRetryObservation::StartupScan],
+        "the startup-scan EINTR did not emit its fixed first-occurrence observation"
+    );
+
+    for (scan, expected) in [
+        (
+            PackageStartupFailureMarkerProbe::InvalidUntrusted,
+            PackageInitialGateFailure::StartupMarkerInvalidUntrusted,
+        ),
+        (
+            PackageStartupFailureMarkerProbe::ResourceExhausted,
+            PackageInitialGateFailure::StartupMarkerResourceExhausted,
+        ),
+        (
+            PackageStartupFailureMarkerProbe::OtherObservationFailure,
+            PackageInitialGateFailure::StartupMarkerObservation,
+        ),
+    ] {
+        let mut gate_reads = 0_u8;
+        let mut coordinator_observations = 0_u8;
+        assert_eq!(
+            wait_for_private_marker_or_fixed_startup_failure_with_scanner_and_reader(
+                b"open\n",
+                Instant::now() + IO_TIMEOUT,
+                || scan,
+                || {
+                    gate_reads = gate_reads.saturating_add(1);
+                    Ok(b"open\n".to_vec())
+                },
+                || {
+                    coordinator_observations = coordinator_observations.saturating_add(1);
+                    Ok(true)
+                },
+                |_| panic!("a terminal startup scan emitted a retry observation"),
+            ),
+            Err(expected),
+        );
+        assert_eq!(gate_reads, 0, "a terminal startup scan admitted gate I/O");
+        assert_eq!(
+            coordinator_observations, 0,
+            "a terminal startup scan admitted child observation"
+        );
+    }
+
+    let logical_now = std::cell::Cell::new(Instant::now());
+    let logical_deadline = logical_now.get() + Duration::from_millis(10);
+    let mut interrupted_scans = 0_u8;
+    let mut gate_reads = 0_u8;
+    let mut coordinator_observations = 0_u8;
+    let mut retry_observations = Vec::new();
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_scanner_reader_clock_and_sleep(
+            b"open\n",
+            logical_deadline,
+            || {
+                interrupted_scans = interrupted_scans.saturating_add(1);
+                assert!(
+                    interrupted_scans <= 2,
+                    "logical time did not advance after startup-scan EINTR"
+                );
+                PackageStartupFailureMarkerProbe::Interrupted
+            },
+            || {
+                gate_reads = gate_reads.saturating_add(1);
+                Ok(b"open\n".to_vec())
+            },
+            || {
+                coordinator_observations = coordinator_observations.saturating_add(1);
+                Ok(true)
+            },
+            |observation| retry_observations.push(observation),
+            PackageInitialGateTiming {
+                now: || logical_now.get(),
+                sleep: |delay| logical_now.set(logical_now.get() + delay),
+            },
+        ),
+        Err(PackageInitialGateFailure::Deadline),
+        "startup scan interruptions replaced the terminal deadline"
+    );
+    assert_eq!(interrupted_scans, 2);
+    assert_eq!(gate_reads, 0);
+    assert_eq!(coordinator_observations, 0);
+    assert_eq!(
+        retry_observations,
+        [PackageInitialGateRetryObservation::StartupScan],
+        "repeated startup-scan EINTR emitted more than its first observation"
+    );
+
+    let catalog_before = Instant::now();
+    let catalog_deadline = catalog_before + IO_TIMEOUT;
+    let catalog_crossed_deadline = std::cell::Cell::new(false);
+    let mut catalog_probes = 0_u8;
+    assert_eq!(
+        scan_fixed_package_startup_failure_marker_catalog_with_probe_and_clock(
+            &PACKAGED_SESSION_STARTUP_FAILURE_MARKERS[..2],
+            catalog_deadline,
+            |_| {
+                catalog_probes = catalog_probes.saturating_add(1);
+                catalog_crossed_deadline.set(true);
+                PackageStartupFailureMarkerProbe::Absent
+            },
+            || {
+                if catalog_crossed_deadline.get() {
+                    catalog_deadline
+                } else {
+                    catalog_before
+                }
+            },
+        ),
+        PackageStartupFailureMarkerProbe::Deadline,
+        "a catalog probe that crossed the fence started a later pathname probe"
+    );
+    assert_eq!(catalog_probes, 1);
+
+    for crossing_source in [
+        PackageInitialGateRetryObservation::StartupScan,
+        PackageInitialGateRetryObservation::MarkerRead,
+        PackageInitialGateRetryObservation::ChildTryWait,
+    ] {
+        let mut scans = 0_u8;
+        let mut reads = 0_u8;
+        let mut coordinator_observations = 0_u8;
+        let mut diagnostic_writes = 0_u8;
+        let before = Instant::now();
+        let deadline = before + IO_TIMEOUT;
+        let crossed_deadline = std::cell::Cell::new(false);
+        let result =
+            wait_for_private_marker_or_fixed_startup_failure_with_scanner_reader_clock_and_sleep(
+                b"open\n",
+                deadline,
+                || {
+                    scans = scans.saturating_add(1);
+                    if crossing_source == PackageInitialGateRetryObservation::StartupScan {
+                        crossed_deadline.set(true);
+                        PackageStartupFailureMarkerProbe::Interrupted
+                    } else {
+                        PackageStartupFailureMarkerProbe::Absent
+                    }
+                },
+                || {
+                    reads = reads.saturating_add(1);
+                    if crossing_source == PackageInitialGateRetryObservation::MarkerRead {
+                        crossed_deadline.set(true);
+                        Err(io::Error::from(io::ErrorKind::Interrupted))
+                    } else {
+                        Err(io::Error::from(io::ErrorKind::NotFound))
+                    }
+                },
+                || {
+                    coordinator_observations = coordinator_observations.saturating_add(1);
+                    if crossing_source == PackageInitialGateRetryObservation::ChildTryWait {
+                        crossed_deadline.set(true);
+                        Err(io::Error::from(io::ErrorKind::Interrupted))
+                    } else {
+                        Ok(true)
+                    }
+                },
+                |_| diagnostic_writes = diagnostic_writes.saturating_add(1),
+                PackageInitialGateTiming {
+                    now: || {
+                        if crossed_deadline.get() {
+                            deadline
+                        } else {
+                            before
+                        }
+                    },
+                    sleep: |_| panic!("a callback that crossed the fence entered retry sleep"),
+                },
+            );
+        assert_eq!(result, Err(PackageInitialGateFailure::Deadline));
+        assert_eq!(
+            diagnostic_writes, 0,
+            "an EINTR callback that crossed the fence started diagnostic I/O"
+        );
+        match crossing_source {
+            PackageInitialGateRetryObservation::StartupScan => {
+                assert_eq!(scans, 1);
+                assert_eq!(reads, 0);
+                assert_eq!(coordinator_observations, 0);
+            }
+            PackageInitialGateRetryObservation::MarkerRead => {
+                assert_eq!(scans, 1);
+                assert_eq!(reads, 1);
+                assert_eq!(coordinator_observations, 0);
+            }
+            PackageInitialGateRetryObservation::ChildTryWait => {
+                assert_eq!(scans, 1);
+                assert_eq!(reads, 1);
+                assert_eq!(coordinator_observations, 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn retained_initial_gate_read_failures_are_closed_retry_only_interrupted_and_keep_first_detail()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let gate = report.join("initial-gate.live");
+
+    let mut interrupted_then_open = VecDeque::from([
+        Err(io::Error::from(io::ErrorKind::Interrupted)),
+        Err(io::Error::from(io::ErrorKind::Interrupted)),
+        Ok(b"open\n".to_vec()),
+    ]);
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_reader(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+            || interrupted_then_open
+                .pop_front()
+                .unwrap_or_else(|| Ok(b"open\n".to_vec())),
+            || Ok(true),
+        )?,
+        PackageInitialGateObservation::Opened,
+        "an interrupted read was not retried inside the same absolute deadline"
+    );
+    let marker_read_interrupted = PackageInitialGateRetryObservation::MarkerRead.marker();
+    assert_eq!(
+        read_private_bounded(&report.join(marker_read_interrupted), b"classified\n".len())?,
+        b"classified\n",
+        "the actual marker-read EINTR path omitted its fixed observation"
     );
     assert_eq!(
         OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
         None,
-        "unknown, prefix-only, or payload-bearing files became fixed diagnostics"
+        "a retry observation was promoted to a terminal failure"
     );
+    fs::remove_file(report.join(marker_read_interrupted))?;
+    assert_eq!(
+        classify_package_initial_gate_read_failure(&io::Error::from(io::ErrorKind::Interrupted)),
+        PackageInitialGateReadDisposition::Retry(PackageInitialGateRetryObservation::MarkerRead),
+        "marker-read EINTR was classified as terminal"
+    );
+
+    let cases = [
+        (
+            Ok(b"closed\n".to_vec()),
+            PackageInitialGateFailure::InvalidPayload,
+        ),
+        (
+            Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            PackageInitialGateFailure::ReadWouldBlock,
+        ),
+        (
+            Err(io::Error::from(io::ErrorKind::InvalidData)),
+            PackageInitialGateFailure::ReadInvalidData,
+        ),
+        (
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::MFILE.raw_os_error(),
+            )),
+            PackageInitialGateFailure::ReadResourceExhausted,
+        ),
+        (
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::NFILE.raw_os_error(),
+            )),
+            PackageInitialGateFailure::ReadResourceExhausted,
+        ),
+        (
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            PackageInitialGateFailure::ReadOther,
+        ),
+    ];
+    for (read, expected) in cases {
+        let mut read = Some(read);
+        assert_eq!(
+            wait_for_private_marker_or_fixed_startup_failure_with_reader(
+                &report,
+                &gate,
+                b"open\n",
+                Instant::now() + IO_TIMEOUT,
+                || {
+                    read.take()
+                        .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::NotFound)))
+                },
+                || Ok(true),
+            ),
+            Err(expected),
+        );
+    }
+
+    let mut expired_reads = 0_u8;
+    let mut expired_observations = 0_u8;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_reader(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now(),
+            || {
+                expired_reads = expired_reads.saturating_add(1);
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            },
+            || {
+                expired_observations = expired_observations.saturating_add(1);
+                Ok(true)
+            },
+        ),
+        Err(PackageInitialGateFailure::Deadline),
+    );
+    assert_eq!(expired_reads, 0, "an expired wait started marker I/O");
+    assert_eq!(
+        expired_observations, 0,
+        "an expired wait started coordinator observation"
+    );
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_reader(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now(),
+            || Err(io::Error::from(io::ErrorKind::NotFound)),
+            || Ok(true),
+        ),
+        Err(PackageInitialGateFailure::Deadline),
+    );
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_reader(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+            || Err(io::Error::from(io::ErrorKind::NotFound)),
+            || Ok(false),
+        ),
+        Err(PackageInitialGateFailure::CoordinatorExited),
+    );
+    let mut interrupted_observer = VecDeque::from([
+        Err(io::Error::from(io::ErrorKind::Interrupted)),
+        Err(io::Error::from(io::ErrorKind::Interrupted)),
+        Ok(false),
+    ]);
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_reader(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+            || Err(io::Error::from(io::ErrorKind::NotFound)),
+            || interrupted_observer.pop_front().unwrap_or(Ok(false)),
+        ),
+        Err(PackageInitialGateFailure::CoordinatorExited),
+        "an interrupted exact-child observation was not retried"
+    );
+    let child_try_wait_interrupted = PackageInitialGateRetryObservation::ChildTryWait.marker();
+    assert_eq!(
+        read_private_bounded(
+            &report.join(child_try_wait_interrupted),
+            b"classified\n".len()
+        )?,
+        b"classified\n",
+        "the actual Child::try_wait EINTR path omitted its fixed observation"
+    );
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a Child::try_wait retry observation became terminal authority"
+    );
+    fs::remove_file(report.join(child_try_wait_interrupted))?;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_reader(
+            &report,
+            &gate,
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+            || Err(io::Error::from(io::ErrorKind::NotFound)),
+            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        ),
+        Err(PackageInitialGateFailure::CoordinatorObservation),
+    );
+
+    let mut final_exit_scans = VecDeque::from([
+        PackageStartupFailureMarkerProbe::Absent,
+        PackageStartupFailureMarkerProbe::Interrupted,
+        PackageStartupFailureMarkerProbe::Absent,
+    ]);
+    let mut final_exit_gate_reads = VecDeque::from([
+        Err(io::Error::from(io::ErrorKind::NotFound)),
+        Ok(b"open\n".to_vec()),
+    ]);
+    let mut final_exit_read_count = 0_u8;
+    let mut final_exit_child_count = 0_u8;
+    let mut final_exit_retries = Vec::new();
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_scanner_and_reader(
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+            || {
+                final_exit_scans
+                    .pop_front()
+                    .unwrap_or(PackageStartupFailureMarkerProbe::Absent)
+            },
+            || {
+                final_exit_read_count = final_exit_read_count.saturating_add(1);
+                final_exit_gate_reads
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(b"open\n".to_vec()))
+            },
+            || {
+                final_exit_child_count = final_exit_child_count.saturating_add(1);
+                Ok(false)
+            },
+            |observation| final_exit_retries.push(observation),
+        ),
+        Err(PackageInitialGateFailure::CoordinatorExited),
+        "a final-scan EINTR forgot the exact coordinator exit"
+    );
+    assert_eq!(final_exit_read_count, 1, "a late gate marker was read");
+    assert_eq!(final_exit_child_count, 1, "the exited child was re-polled");
+    assert_eq!(
+        final_exit_retries,
+        [PackageInitialGateRetryObservation::StartupScan]
+    );
+
+    let mut final_observation_scans = VecDeque::from([
+        PackageStartupFailureMarkerProbe::Absent,
+        PackageStartupFailureMarkerProbe::Interrupted,
+        PackageStartupFailureMarkerProbe::Absent,
+    ]);
+    let mut final_observation_read_count = 0_u8;
+    let mut final_observation_child_count = 0_u8;
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_scanner_and_reader(
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+            || {
+                final_observation_scans
+                    .pop_front()
+                    .unwrap_or(PackageStartupFailureMarkerProbe::Absent)
+            },
+            || {
+                final_observation_read_count = final_observation_read_count.saturating_add(1);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+            || {
+                final_observation_child_count = final_observation_child_count.saturating_add(1);
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+            |_| {},
+        ),
+        Err(PackageInitialGateFailure::CoordinatorObservation),
+        "a final-scan EINTR forgot the exact child-observation failure"
+    );
+    assert_eq!(final_observation_read_count, 1);
+    assert_eq!(final_observation_child_count, 1);
+
+    let final_startup_marker =
+        "startup-failure.session-readiness.subtype.terminal-pump.terminal-channel-write";
+    let final_startup = FixedPackageStartupFailure::from_marker(final_startup_marker)
+        .ok_or("the final-scan startup fixture was outside the closed catalog")?;
+    let mut final_startup_scans = VecDeque::from([
+        PackageStartupFailureMarkerProbe::Absent,
+        PackageStartupFailureMarkerProbe::Interrupted,
+        PackageStartupFailureMarkerProbe::Valid(final_startup),
+    ]);
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_scanner_and_reader(
+            b"open\n",
+            Instant::now() + IO_TIMEOUT,
+            || {
+                final_startup_scans
+                    .pop_front()
+                    .unwrap_or(PackageStartupFailureMarkerProbe::Absent)
+            },
+            || Err(io::Error::from(io::ErrorKind::NotFound)),
+            || Ok(false),
+            |_| {},
+        )?,
+        PackageInitialGateObservation::StartupFailure(final_startup),
+        "a committed startup failure lost priority during final-scan EINTR retry"
+    );
+
+    let logical_now = std::cell::Cell::new(Instant::now());
+    let logical_deadline = logical_now.get() + Duration::from_millis(10);
+    let mut interrupted_observations = 0_u8;
+    let mut retry_observations = Vec::new();
+    assert_eq!(
+        wait_for_private_marker_or_fixed_startup_failure_with_scanner_reader_clock_and_sleep(
+            b"open\n",
+            logical_deadline,
+            || PackageStartupFailureMarkerProbe::Absent,
+            || Err(io::Error::from(io::ErrorKind::NotFound)),
+            || {
+                interrupted_observations = interrupted_observations.saturating_add(1);
+                assert!(
+                    interrupted_observations <= 2,
+                    "logical time did not advance after Child::try_wait EINTR"
+                );
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            },
+            |observation| retry_observations.push(observation),
+            PackageInitialGateTiming {
+                now: || logical_now.get(),
+                sleep: |delay| logical_now.set(logical_now.get() + delay),
+            },
+        ),
+        Err(PackageInitialGateFailure::Deadline),
+        "retryable child-observation interruptions replaced the terminal deadline"
+    );
+    assert_eq!(interrupted_observations, 2);
+    assert_eq!(
+        retry_observations,
+        [PackageInitialGateRetryObservation::ChildTryWait],
+        "repeated Child::try_wait EINTR emitted more than its first observation"
+    );
+
+    let poll_started = Instant::now();
+    assert_eq!(
+        package_initial_gate_poll_delay(poll_started, poll_started + Duration::from_millis(2)),
+        Duration::from_millis(2),
+    );
+    assert_eq!(
+        package_initial_gate_poll_delay(poll_started, poll_started + Duration::from_millis(20)),
+        Duration::from_millis(5),
+    );
+    assert_eq!(
+        package_initial_gate_poll_delay(poll_started, poll_started),
+        Duration::ZERO,
+    );
+
+    let startup_detail =
+        "startup-failure.session-readiness.subtype.terminal-pump.terminal-channel-write";
+    let mut publish_before_exit = true;
+    let raced_startup = wait_for_private_marker_or_fixed_startup_failure_with_reader(
+        &report,
+        &gate,
+        b"open\n",
+        Instant::now() + IO_TIMEOUT,
+        || Err(io::Error::from(io::ErrorKind::NotFound)),
+        || {
+            if publish_before_exit {
+                publish_before_exit = false;
+                write_private_new(&report.join(startup_detail), b"classified\n")
+                    .map_err(|_| io::Error::other("startup detail publication failed"))?;
+                write_private_new(
+                    &report.join("startup-failure.session-readiness"),
+                    b"classified\n",
+                )
+                .map_err(|_| io::Error::other("startup commit publication failed"))?;
+            }
+            Ok(false)
+        },
+    )?;
+    assert_eq!(
+        raced_startup,
+        PackageInitialGateObservation::StartupFailure(
+            FixedPackageStartupFailure::from_marker(startup_detail)
+                .ok_or("the raced startup marker was not closed")?
+        ),
+        "an exact startup failure committed before Child exit lost causal priority",
+    );
+    fs::remove_file(report.join(startup_detail))?;
+    fs::remove_file(report.join("startup-failure.session-readiness"))?;
+
+    let variants = [
+        PackageInitialGateFailure::Deadline,
+        PackageInitialGateFailure::InvalidPayload,
+        PackageInitialGateFailure::ReadWouldBlock,
+        PackageInitialGateFailure::ReadInvalidData,
+        PackageInitialGateFailure::ReadResourceExhausted,
+        PackageInitialGateFailure::ReadOther,
+        PackageInitialGateFailure::StartupMarkerInvalidUntrusted,
+        PackageInitialGateFailure::StartupMarkerResourceExhausted,
+        PackageInitialGateFailure::StartupMarkerObservation,
+        PackageInitialGateFailure::CoordinatorExited,
+        PackageInitialGateFailure::CoordinatorObservation,
+    ];
+    assert_eq!(
+        variants.map(PackageInitialGateFailure::marker),
+        PACKAGE_INITIAL_GATE_FAILURE_MARKERS,
+    );
+    assert!(variants.iter().all(|failure| {
+        failure
+            .marker()
+            .starts_with("recovery.drive-failed.initial-gate.subtype.")
+            && failure.to_string() == "the package initial-gate observation failed"
+    }));
+    let retry_observations = [
+        PackageInitialGateRetryObservation::MarkerRead,
+        PackageInitialGateRetryObservation::StartupScan,
+        PackageInitialGateRetryObservation::ChildTryWait,
+    ];
+    assert_eq!(
+        retry_observations.map(PackageInitialGateRetryObservation::marker),
+        PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS,
+    );
+    assert!(retry_observations.iter().all(|observation| {
+        let marker = observation.marker();
+        marker.is_ascii()
+            && marker.starts_with("recovery.drive.initial-gate.retry-observed.")
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
+    let mut observed = [false; PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS.len()];
+    let mut emitted = Vec::new();
+    {
+        let mut record = |observation| emitted.push(observation);
+        for observation in retry_observations {
+            record_package_initial_gate_retry_observation_once(
+                &mut observed,
+                observation,
+                &mut record,
+            );
+            record_package_initial_gate_retry_observation_once(
+                &mut observed,
+                observation,
+                &mut record,
+            );
+        }
+    }
+    assert_eq!(
+        emitted, retry_observations,
+        "retry observations were not first-occurrence-only"
+    );
+    for observation in retry_observations {
+        let marker = report.join(observation.marker());
+        if marker.exists() {
+            fs::remove_file(marker)?;
+        }
+    }
+    write_private_new(
+        &report.join(PackageInitialGateRetryObservation::StartupScan.marker()),
+        b"classified\n",
+    )?;
+    write_private_new(
+        &report.join(PackageInitialGateRetryObservation::MarkerRead.marker()),
+        b"classified\n",
+    )?;
+    let projected_retry_observations = PackageInitialGateRetryObservations::from_report(&report);
+    assert_eq!(
+        projected_retry_observations.to_string(),
+        format!(
+            "{},{}",
+            PackageInitialGateRetryObservation::MarkerRead.marker(),
+            PackageInitialGateRetryObservation::StartupScan.marker()
+        ),
+        "multi-source retry evidence was collapsed into a false temporal first"
+    );
+    assert!(
+        format!("{projected_retry_observations:?}")
+            .contains(PackageInitialGateRetryObservation::StartupScan.marker()),
+        "ordinary libtest Debug output hid the fixed EINTR source"
+    );
+    fs::remove_file(report.join(PackageInitialGateRetryObservation::StartupScan.marker()))?;
+    fs::remove_file(report.join(PackageInitialGateRetryObservation::MarkerRead.marker()))?;
+
+    let mut evidence = PackageRecoveryFailureEvidence::default();
+    for failure in [
+        PackageInitialGateFailure::ReadInvalidData,
+        PackageInitialGateFailure::ReadOther,
+    ] {
+        let classified = require_rejected_test_result(
+            classify_package_recovery_initial_gate(&report, Err(failure)),
+            "an injected initial-gate failure unexpectedly succeeded",
+        )?;
+        evidence.snapshot_error(classified.as_ref());
+    }
+    assert_eq!(
+        evidence.primary_marker(),
+        Some(PackageRecoveryDriveFailure::InitialGate.marker()),
+    );
+    assert_eq!(
+        evidence.secondary_marker(),
+        Some(PackageInitialGateFailure::ReadInvalidData.marker()),
+        "a later raw read failure overwrote the first closed detail",
+    );
+    assert!(
+        report
+            .join(PackageRecoveryDriveFailure::InitialGate.marker())
+            .is_file()
+    );
+    assert!(
+        report
+            .join(PackageInitialGateFailure::ReadInvalidData.marker())
+            .is_file()
+    );
+    assert!(
+        report
+            .join(PackageInitialGateFailure::ReadOther.marker())
+            .is_file()
+    );
+
     scratch.cleanup()
 }
 
@@ -3779,6 +4992,11 @@ fn packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proof
         .as_ref()
         .err()
         .and_then(|_| harness.latest_fixed_secondary_failure_detail());
+    let recovery_retry_observations = if recovery.is_err() {
+        harness.latest_fixed_retry_observations()
+    } else {
+        PackageInitialGateRetryObservations::NONE
+    };
     let recovery_phase = if recovery.is_err() {
         select_package_failure_phase(
             recovery_failure_before_cleanup,
@@ -3791,7 +5009,8 @@ fn packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proof
     let result = combine_package_exercise_and_cleanup_with_evidence(
         recovery,
         cleanup,
-        PackageOperationFailureEvidence::new(recovery_phase, recovery_secondary_failure),
+        PackageOperationFailureEvidence::new(recovery_phase, recovery_secondary_failure)
+            .with_retry_observations(recovery_retry_observations),
         cleanup_phase,
         None,
         handoff_probe_phase,
@@ -3879,6 +5098,7 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
     let scratch = PackageScratch::create()?;
     let root = scratch.root.clone();
     let backend = PackageSessionBackend::spawn()?;
+    let backend_address = backend.address();
     let mut harness = OfficialTuiPackageHarness::spawn_deterministic_startup_failure_recovery(
         scratch,
         backend,
@@ -3889,10 +5109,11 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
         "startup-failure.session-readiness.subtype.terminal-pump.terminal-channel-write";
 
     let started = Instant::now();
-    let error = require_rejected_test_result(
-        harness.request_selected_recovery(),
-        "the injected early startup failure unexpectedly completed the recovery drive",
-    )?;
+    let exercise = harness.request_selected_recovery();
+    let error = exercise
+        .as_ref()
+        .err()
+        .ok_or("the injected early startup failure unexpectedly completed the recovery drive")?;
     assert!(
         started.elapsed()
             < PACKAGE_SELECTED_RECOVERY_RECONCILIATION_TIMEOUT + Duration::from_secs(5),
@@ -3934,7 +5155,7 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
             && !report.join("recovery.checkpoint-verified").exists(),
         "the startup-owner test hid behind a pre-consumed session checkpoint"
     );
-    harness.snapshot_recovery_secondary_failure();
+    harness.snapshot_recovery_failure_diagnostics();
     assert_eq!(
         harness.recovery_failure_evidence.secondary_marker(),
         Some(startup_marker),
@@ -3946,11 +5167,23 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
         Instant::now() + IO_TIMEOUT,
     )?;
     assert_eq!(second, PackageRecoveryRequestObservation::AlreadyConsumed);
-    harness.verify_selected_recovery_outcome()?;
-    harness.finish_started_generation_cleanup_or_exit();
-    let cleanup_evidence = harness
-        .generation_cleanup
-        .ok_or("the early failure cleanup lost its four-proof evidence")?;
+    harness.verify_selected_recovery_trigger(PackageRecoveryTrigger::GenerationBoundRequest)?;
+
+    let primary = PackageRecoveryDriveFailure::InitialGate.marker();
+    let recovery_case = package_recovery_case_failure_marker(
+        PackageRecoveryTrigger::GenerationBoundRequest,
+        RecoveryCheckpoint::RetainedRestorePending,
+    );
+    let cleanup_outcome = cleanup_deterministic_recovery_case(&mut harness, exercise.is_err());
+    let cleanup_phase = harness.latest_fixed_cleanup_failure_detail();
+    let handoff_probe_phase = harness.latest_handoff_probe_phase();
+    let PackageHarnessCleanupOutcome {
+        result: cleanup,
+        scratch,
+        generation_cleanup,
+    } = cleanup_outcome;
+    let cleanup_evidence =
+        generation_cleanup.ok_or("the exercise-aware cleanup lost its four-proof evidence")?;
     assert!(cleanup_evidence.exact_coordinator_wait);
     assert!(cleanup_evidence.completion_verified);
     assert!(cleanup_evidence.reported_groups_absent);
@@ -3959,11 +5192,110 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
         cleanup_evidence.scratch_decision(),
         PackageScratchCleanupDecision::Delete
     );
-    harness.verify_selected_recovery_trigger(PackageRecoveryTrigger::GenerationBoundRequest)?;
-    harness.cleanup()?;
+    let evidence = match scratch {
+        PackageScratchDisposition::Preserved(evidence) => evidence,
+        PackageScratchDisposition::Deleted => {
+            return Err("real early-startup failure deleted its owned diagnostic evidence".into());
+        }
+        PackageScratchDisposition::Unavailable => {
+            return Err("real early-startup failure lost its evidence owner".into());
+        }
+    };
+    assert_eq!(evidence.root(), root);
+    assert!(
+        harness.scratch.is_none()
+            && harness.coordinator.is_none()
+            && harness.completion.is_none()
+            && harness.generation_cleanup.is_none()
+            && harness.generation_deadline_fence.is_none()
+            && harness.backend.is_none()
+            && harness.master.is_none()
+            && harness.output_cancel.is_none()
+            && harness.output_worker.is_none()
+            && harness.output_finished,
+        "started-generation cleanup preserved a live process, channel, PTY, or worker owner"
+    );
+    let retained_failure_evidence = harness.recovery_failure_evidence;
+    assert_eq!(retained_failure_evidence.primary_marker(), Some(primary));
+    assert_eq!(
+        retained_failure_evidence.secondary_marker(),
+        Some(startup_marker),
+        "started-generation cleanup changed the immutable causal evidence"
+    );
+    let retry_observations = retained_failure_evidence.retry_observations();
+    drop(harness);
+
+    let backend_error = match TcpStream::connect(backend_address) {
+        Err(error) => error,
+        Ok(stream) => {
+            drop(stream);
+            return Err("evidence preservation left the deterministic backend listening".into());
+        }
+    };
+    assert_eq!(backend_error.kind(), io::ErrorKind::ConnectionRefused);
+    let root_metadata = fs::symlink_metadata(&root)?;
+    assert!(root_metadata.file_type().is_dir());
+    assert_eq!(root_metadata.uid(), rustix::process::geteuid().as_raw());
+    assert_eq!(root_metadata.permissions().mode() & 0o7777, 0o700);
+    assert_eq!(fs::canonicalize(&root)?, root);
+    for path in [
+        root.join("owner.marker"),
+        report.join(primary),
+        report.join(startup_marker),
+        report.join("recovery.reported-groups-absent"),
+        report.join("recovery.runtime-empty"),
+    ] {
+        let metadata = fs::symlink_metadata(path)?;
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    }
+
+    let combined = require_rejected_test_result(
+        combine_package_exercise_and_cleanup_with_evidence(
+            exercise,
+            cleanup,
+            PackageOperationFailureEvidence::new(
+                retained_failure_evidence.primary_marker(),
+                retained_failure_evidence.secondary_marker(),
+            )
+            .with_retry_observations(retry_observations),
+            cleanup_phase,
+            Some(recovery_case),
+            handoff_probe_phase,
+            Some(root.clone()),
+        ),
+        "the real failed exercise and preserved evidence produced success",
+    )?;
+    let combined_failure = combined
+        .downcast_ref::<PackageExerciseCleanupFailure>()
+        .ok_or("the combined failure lost its structured evidence")?;
+    assert!(combined_failure.exercise_failed);
+    assert!(!combined_failure.cleanup_failed);
+    assert_eq!(combined_failure.exercise_phase, Some(primary));
+    assert_eq!(
+        combined_failure.secondary_failure_detail,
+        Some(startup_marker)
+    );
+    assert_eq!(combined_failure.cleanup_phase, None);
+    assert_eq!(combined_failure.recovery_case, Some(recovery_case));
+    assert_eq!(
+        combined_failure.preserved_evidence_root.as_deref(),
+        Some(root.as_path())
+    );
+    assert!(combined.source().is_none());
+    let display = combined.to_string();
+    let debug = format!("{combined:?}");
+    for forbidden in ["credential", "private-provider-detail"] {
+        assert!(!display.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+    }
+
+    evidence.cleanup()?;
     assert!(
         !root.exists(),
-        "early startup recovery retained scratch after all four proofs"
+        "explicit evidence cleanup left real early-startup scratch behind"
     );
     Ok(())
 }
@@ -4057,6 +5389,17 @@ fn run_deterministic_owner_loss_recovery_case(
     run_deterministic_recovery_case_with_trigger(checkpoint, PackageRecoveryTrigger::OwnerEof)
 }
 
+fn cleanup_deterministic_recovery_case(
+    harness: &mut OfficialTuiPackageHarness,
+    exercise_failed: bool,
+) -> PackageHarnessCleanupOutcome {
+    // A deterministic case uses synthetic credentials, but its multiprocess
+    // ownership proof is the same as the official case. Keep owned evidence
+    // whenever exercise failed so a hosted-only marker/read race remains
+    // diagnosable after every live authority has been closed.
+    harness.cleanup_after_exercise(exercise_failed)
+}
+
 fn run_deterministic_recovery_case_with_trigger(
     checkpoint: RecoveryCheckpoint,
     trigger: PackageRecoveryTrigger,
@@ -4100,12 +5443,26 @@ fn run_deterministic_recovery_case_with_trigger(
         .as_ref()
         .err()
         .and_then(|_| harness.latest_fixed_failure_detail());
+    let exercise_secondary_failure_before_cleanup = exercise
+        .as_ref()
+        .err()
+        .and_then(|_| harness.latest_fixed_secondary_failure_detail());
     let exercise_phase_before_cleanup = exercise
         .as_ref()
         .err()
         .map(|_| harness.latest_fixed_phase());
-    let cleanup = harness.cleanup();
+    let cleanup_outcome = cleanup_deterministic_recovery_case(&mut harness, exercise.is_err());
+    let preserved_evidence_root = cleanup_outcome
+        .preserved_evidence_root()
+        .map(Path::to_path_buf);
+    let cleanup = cleanup_outcome.result;
     let cleanup_phase = harness.latest_fixed_cleanup_failure_detail();
+    let exercise_secondary_failure = exercise_secondary_failure_before_cleanup.or_else(|| {
+        exercise
+            .as_ref()
+            .err()
+            .and_then(|_| harness.latest_fixed_secondary_failure_detail())
+    });
     let exercise_phase = if exercise.is_err() {
         select_package_failure_phase(
             exercise_failure_before_cleanup,
@@ -4115,12 +5472,20 @@ fn run_deterministic_recovery_case_with_trigger(
     } else {
         None
     };
-    combine_package_exercise_and_cleanup_at_recovery_case(
+    let exercise_retry_observations = if exercise.is_err() {
+        harness.latest_fixed_retry_observations()
+    } else {
+        PackageInitialGateRetryObservations::NONE
+    };
+    combine_package_exercise_and_cleanup_with_evidence(
         exercise,
         cleanup,
-        exercise_phase,
+        PackageOperationFailureEvidence::new(exercise_phase, exercise_secondary_failure)
+            .with_retry_observations(exercise_retry_observations),
         cleanup_phase,
-        package_recovery_case_failure_marker(trigger, checkpoint),
+        Some(package_recovery_case_failure_marker(trigger, checkpoint)),
+        harness.latest_handoff_probe_phase(),
+        preserved_evidence_root,
     )?;
     if root.exists() {
         return Err(format!(
@@ -5559,6 +6924,12 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             harness
                 .recovery_failure_evidence
                 .snapshot_secondary(Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]));
+            let mut retry_observations = PackageInitialGateRetryObservations::NONE;
+            retry_observations.insert(PackageInitialGateRetryObservation::StartupScan);
+            retry_observations.insert(PackageInitialGateRetryObservation::MarkerRead);
+            harness
+                .recovery_failure_evidence
+                .snapshot_retry_observations(retry_observations);
         }
         harness.fail_closed_unproven_generation_cleanup();
     }
@@ -5592,7 +6963,7 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
     assert_eq!(output.status.signal(), None);
     assert!(output.diagnostic.contains(concat!(
         "package-generation-cleanup-unproven:",
-        "phase=scratch-missing,failure=unclassified,secondary=none"
+        "phase=scratch-missing,failure=unclassified,secondary=none,retry_observations=none"
     )));
     assert!(
         !output
@@ -5613,10 +6984,12 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
     assert!(causal.diagnostic.contains(&format!(
         concat!(
             "package-generation-cleanup-unproven:",
-            "phase=scratch-missing,failure={},secondary={}"
+            "phase=scratch-missing,failure={},secondary={},retry_observations={},{}"
         ),
         PackageRecoveryDriveFailure::InitialGate.marker(),
-        PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]
+        PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0],
+        PackageInitialGateRetryObservation::MarkerRead.marker(),
+        PackageInitialGateRetryObservation::StartupScan.marker()
     )));
     assert!(!causal.diagnostic.contains("private provider payload"));
     assert!(!causal.diagnostic.contains("credential"));
@@ -6138,6 +7511,7 @@ enum PackageScratchDisposition {
 struct PackageHarnessCleanupOutcome {
     result: Result<(), Box<dyn Error>>,
     scratch: PackageScratchDisposition,
+    generation_cleanup: Option<PackageGenerationCleanupEvidence>,
 }
 
 impl PackageHarnessCleanupOutcome {
@@ -6235,6 +7609,7 @@ struct PackageExerciseCleanupFailure {
     cleanup_failed: bool,
     exercise_phase: Option<&'static str>,
     secondary_failure_detail: Option<&'static str>,
+    retry_observations: PackageInitialGateRetryObservations,
     cleanup_phase: Option<&'static str>,
     recovery_case: Option<&'static str>,
     handoff_probe_phase: Option<PackageHandoffProbePhase>,
@@ -6245,15 +7620,28 @@ struct PackageExerciseCleanupFailure {
 struct PackageOperationFailureEvidence {
     primary: Option<&'static str>,
     secondary: Option<&'static str>,
+    retry_observations: PackageInitialGateRetryObservations,
 }
 
 impl PackageOperationFailureEvidence {
     const fn new(primary: Option<&'static str>, secondary: Option<&'static str>) -> Self {
-        Self { primary, secondary }
+        Self {
+            primary,
+            secondary,
+            retry_observations: PackageInitialGateRetryObservations::NONE,
+        }
     }
 
     const fn primary(primary: Option<&'static str>) -> Self {
         Self::new(primary, None)
+    }
+
+    const fn with_retry_observations(
+        mut self,
+        retry_observations: PackageInitialGateRetryObservations,
+    ) -> Self {
+        self.retry_observations = retry_observations;
+        self
     }
 }
 
@@ -6265,6 +7653,7 @@ impl fmt::Debug for PackageExerciseCleanupFailure {
             .field("cleanup_failed", &self.cleanup_failed)
             .field("exercise_phase", &self.exercise_phase)
             .field("secondary_failure_detail", &self.secondary_failure_detail)
+            .field("retry_observations", &self.retry_observations)
             .field("cleanup_phase", &self.cleanup_phase)
             .field("recovery_case", &self.recovery_case)
             .field("handoff_probe_phase", &self.handoff_probe_phase)
@@ -6286,6 +7675,13 @@ impl fmt::Display for PackageExerciseCleanupFailure {
         }
         if let Some(detail) = self.secondary_failure_detail {
             write!(formatter, "; fixed secondary failure {detail}")?;
+        }
+        if !self.retry_observations.is_empty() {
+            write!(
+                formatter,
+                "; fixed retry observations {}",
+                self.retry_observations
+            )?;
         }
         if let Some(phase) = self.cleanup_phase {
             if self.exercise_phase.is_some() {
@@ -6397,6 +7793,7 @@ fn combine_package_exercise_and_cleanup_with_evidence(
             cleanup_failed: cleanup.is_err(),
             exercise_phase: failure_evidence.primary,
             secondary_failure_detail: failure_evidence.secondary,
+            retry_observations: failure_evidence.retry_observations,
             cleanup_phase,
             recovery_case,
             handoff_probe_phase,
@@ -6542,6 +7939,9 @@ fn package_exercise_and_cleanup_failures_are_aggregated_with_fixed_redacted_labe
     assert!(!recovery_debug.contains("private"));
     assert!(recovery_case.source().is_none());
 
+    let mut causal_retry_observations = PackageInitialGateRetryObservations::NONE;
+    causal_retry_observations.insert(PackageInitialGateRetryObservation::StartupScan);
+    causal_retry_observations.insert(PackageInitialGateRetryObservation::MarkerRead);
     let causal_recovery = require_rejected_test_result(
         combine_package_exercise_and_cleanup_with_evidence(
             Err("private retained-recovery detail".into()),
@@ -6549,7 +7949,8 @@ fn package_exercise_and_cleanup_failures_are_aggregated_with_fixed_redacted_labe
             PackageOperationFailureEvidence::new(
                 Some(PackageRecoveryDriveFailure::InitialGate.marker()),
                 Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]),
-            ),
+            )
+            .with_retry_observations(causal_retry_observations),
             None,
             None,
             None,
@@ -6560,12 +7961,20 @@ fn package_exercise_and_cleanup_failures_are_aggregated_with_fixed_redacted_labe
     assert_eq!(
         causal_recovery.to_string(),
         format!(
-            "package exercise failed at fixed phase {}; fixed secondary failure {}",
+            concat!(
+                "package exercise failed at fixed phase {}; fixed secondary failure {}; ",
+                "fixed retry observations {},{}"
+            ),
             PackageRecoveryDriveFailure::InitialGate.marker(),
-            PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]
+            PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0],
+            PackageInitialGateRetryObservation::MarkerRead.marker(),
+            PackageInitialGateRetryObservation::StartupScan.marker()
         )
     );
-    assert!(!format!("{causal_recovery:?}").contains("private retained"));
+    let causal_debug = format!("{causal_recovery:?}");
+    assert!(causal_debug.contains(PackageInitialGateRetryObservation::MarkerRead.marker()));
+    assert!(causal_debug.contains(PackageInitialGateRetryObservation::StartupScan.marker()));
+    assert!(!causal_debug.contains("private retained"));
     assert!(causal_recovery.source().is_none());
 
     let preserved = require_rejected_test_result(
@@ -6713,6 +8122,56 @@ fn official_tui_pre_generation_cleanup_joins_backend_and_deletes_owned_scratch_w
         "cleanup must cache the fixed terminal diagnostic before deleting scratch"
     );
     Ok(())
+}
+
+#[test]
+fn deterministic_case_cleanup_preserves_owned_scratch_when_exercise_failed()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let root = scratch.root.clone();
+    let (_placeholder_sender, output_result) = mpsc::sync_channel(1);
+    let mut harness = OfficialTuiPackageHarness {
+        _provider_suite_budget: PackageProviderSuiteBudget::Official,
+        scratch: Some(scratch),
+        backend: None,
+        coordinator: None,
+        completion: None,
+        provider_target: PackageProviderTarget::Official,
+        startup_fault: None,
+        inference_expectation: PackageInferenceExpectation::Zero,
+        recovery_checkpoint: None,
+        recovery_request_state: PackageRecoveryRequestState::Available,
+        generation_cleanup: None,
+        generation_deadline_fence: None,
+        guardian_startup_arm_observed: false,
+        master: None,
+        initial_termios: None,
+        output_cancel: None,
+        output_result,
+        startup_sentinel_observed: None,
+        response_sentinel_observed: None,
+        output_worker: None,
+        output_finished: true,
+        last_handoff_probe_phase: None,
+        recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
+        last_fixed_failure_detail: None,
+        last_fixed_cleanup_failure_detail: None,
+    };
+
+    let outcome = cleanup_deterministic_recovery_case(&mut harness, true);
+    outcome.result?;
+    let evidence = match outcome.scratch {
+        PackageScratchDisposition::Preserved(evidence) => evidence,
+        PackageScratchDisposition::Deleted => {
+            return Err("deterministic failed exercise deleted its diagnostic evidence".into());
+        }
+        PackageScratchDisposition::Unavailable => {
+            return Err("deterministic failed exercise lost its evidence authority".into());
+        }
+    };
+    assert_eq!(evidence.root(), root);
+    assert!(root.exists());
+    evidence.cleanup()
 }
 
 #[test]
@@ -8052,7 +9511,7 @@ impl OfficialTuiPackageHarness {
                 }
             },
         );
-        self.snapshot_recovery_secondary_failure();
+        self.snapshot_recovery_failure_diagnostics();
         result
     }
 
@@ -8245,7 +9704,7 @@ impl OfficialTuiPackageHarness {
         for marker in forbidden
             .iter()
             .copied()
-            .chain(["guardian-recovery.retained"])
+            .chain(PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS.iter().copied())
         {
             if report.join(marker).exists() {
                 return Err("package recovery activation admitted a conflicting cause".into());
@@ -8288,12 +9747,21 @@ impl OfficialTuiPackageHarness {
                     PACKAGE_SUPERVISOR_EXIT_INPUT,
                 ]
                 .concat();
-                let initial_gate = wait_for_private_marker_or_fixed_startup_failure(
-                    &report,
-                    &report.join("initial-gate.live"),
-                    b"open\n",
-                    deadline,
-                );
+                let initial_gate = self
+                    .coordinator
+                    .as_mut()
+                    .ok_or_else(|| -> Box<dyn Error> {
+                        "package coordinator child was missing".into()
+                    })
+                    .map(|coordinator| {
+                        wait_for_private_marker_or_fixed_startup_failure_while_coordinator_live(
+                            &report,
+                            &report.join("initial-gate.live"),
+                            b"open\n",
+                            deadline,
+                            coordinator,
+                        )
+                    })?;
                 classify_package_recovery_initial_gate(&report, initial_gate)?;
                 let raw_mode = self
                     .master()
@@ -8801,7 +10269,7 @@ impl OfficialTuiPackageHarness {
         })
     }
 
-    fn snapshot_recovery_secondary_failure(&mut self) {
+    fn snapshot_recovery_failure_diagnostics(&mut self) {
         let primary = self.recovery_failure_evidence.primary_marker();
         let drive_context = self
             .recovery_failure_evidence
@@ -8822,10 +10290,30 @@ impl OfficialTuiPackageHarness {
                     .filter(|marker| Some(*marker) != primary && Some(*marker) != drive_context)
             });
         self.recovery_failure_evidence.snapshot_secondary(candidate);
+        let retry_observations =
+            self.scratch
+                .as_ref()
+                .map_or(PackageInitialGateRetryObservations::NONE, |scratch| {
+                    PackageInitialGateRetryObservations::from_report(
+                        &scratch.root.join("supervisor-report"),
+                    )
+                });
+        self.recovery_failure_evidence
+            .snapshot_retry_observations(retry_observations);
     }
 
     fn latest_fixed_secondary_failure_detail(&self) -> Option<&'static str> {
         self.recovery_failure_evidence.secondary_marker()
+    }
+
+    fn latest_fixed_retry_observations(&self) -> PackageInitialGateRetryObservations {
+        let mut observations = self.recovery_failure_evidence.retry_observations();
+        if let Some(scratch) = self.scratch.as_ref() {
+            observations.merge(PackageInitialGateRetryObservations::from_report(
+                &scratch.root.join("supervisor-report"),
+            ));
+        }
+        observations
     }
 
     fn latest_fixed_cleanup_failure_detail(&self) -> Option<&'static str> {
@@ -8872,7 +10360,9 @@ impl OfficialTuiPackageHarness {
             .chain(PACKAGED_SESSION_RETAINED_OPERATION_MARKERS.iter().copied())
             .chain(PACKAGE_RECOVERY_OBSERVATION_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_RECOVERY_DRIVE_FAILURE_MARKERS.iter().copied())
+            .chain(PACKAGE_INITIAL_GATE_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_SESSION_BACKEND_FAILURE_MARKERS.iter().copied())
+            .chain(PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS.iter().copied())
             .chain([
                 "app-fixture.handshake-worker-failed",
                 "app-fixture.worker-failed",
@@ -8894,7 +10384,6 @@ impl OfficialTuiPackageHarness {
                 "recovery.checkpoint-failed.replay",
                 "recovery.checkpoint-failed.too-late",
                 "startup-failure.session-readiness",
-                "guardian-recovery.retained",
             ])
     }
 
@@ -9123,8 +10612,9 @@ impl OfficialTuiPackageHarness {
     {
         // Freeze any already-published session evidence before cleanup can
         // add backend/network markers or consume the scratch owner.
-        self.snapshot_recovery_secondary_failure();
+        self.snapshot_recovery_failure_diagnostics();
         let backend_address = self.backend.as_ref().map(PackageSessionBackend::address);
+        let mut completed_generation_cleanup = None;
         let generation_started = match (
             self.coordinator.is_some(),
             self.generation_cleanup.is_some(),
@@ -9138,7 +10628,8 @@ impl OfficialTuiPackageHarness {
             }
             (true, true, true) => {
                 self.finish_started_generation_cleanup_or_exit();
-                self.snapshot_recovery_secondary_failure();
+                self.snapshot_recovery_failure_diagnostics();
+                completed_generation_cleanup = self.generation_cleanup;
                 // A successful four-proof gate consumes this generation. This
                 // also makes explicit cleanup followed by Drop idempotent.
                 self.generation_cleanup.take();
@@ -9236,7 +10727,7 @@ impl OfficialTuiPackageHarness {
                 )
             });
         }
-        self.snapshot_recovery_secondary_failure();
+        self.snapshot_recovery_failure_diagnostics();
         // Preserve filesystem evidence after any failed started generation,
         // including a failure discovered only while draining PTY/backend/network
         // authorities. Pre-generation setup cleanup keeps its historical exact
@@ -9263,6 +10754,7 @@ impl OfficialTuiPackageHarness {
         PackageHarnessCleanupOutcome {
             result: failures.finish(),
             scratch,
+            generation_cleanup: completed_generation_cleanup,
         }
     }
 
@@ -9360,16 +10852,20 @@ impl OfficialTuiPackageHarness {
         // no crash dump, authorizes no marker-derived signal or deletion, and
         // closes this process's complete descriptor table at one kernel
         // boundary.
-        self.snapshot_recovery_secondary_failure();
+        self.snapshot_recovery_failure_diagnostics();
         {
             let mut stderr = io::stderr().lock();
             let _ = writeln!(
                 stderr,
-                "package-generation-cleanup-unproven:phase={},failure={},secondary={}",
+                concat!(
+                    "package-generation-cleanup-unproven:",
+                    "phase={},failure={},secondary={},retry_observations={}"
+                ),
                 self.latest_fixed_phase(),
                 self.latest_fixed_failure_detail().unwrap_or("unclassified"),
                 self.latest_fixed_secondary_failure_detail()
-                    .unwrap_or("none")
+                    .unwrap_or("none"),
+                self.latest_fixed_retry_observations()
             );
             let _ = stderr.flush();
         }
@@ -9539,6 +11035,10 @@ impl PackageGenerationCleanupOperations for OfficialTuiPackageHarness {
         self.generation_cleanup_mut()
             .map_err(|_| PackageCleanupFailure::ReportedGroupsProof)?
             .reported_groups_absent = true;
+        record_package_recovery_verification_phase(
+            &root.join("supervisor-report"),
+            PackageRecoveryVerificationPhase::ReportedGroupsAbsent,
+        );
         Ok(())
     }
 
@@ -9553,6 +11053,10 @@ impl PackageGenerationCleanupOperations for OfficialTuiPackageHarness {
         self.generation_cleanup_mut()
             .map_err(|_| PackageCleanupFailure::RuntimeProof)?
             .runtime_empty = true;
+        record_package_recovery_verification_phase(
+            &root.join("supervisor-report"),
+            PackageRecoveryVerificationPhase::RuntimeEmpty,
+        );
         Ok(())
     }
 }
@@ -9762,17 +11266,35 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
         format!("{guardian_pid} {guardian_pid}\n").as_bytes(),
     )?;
 
-    let coordinator = ProductionCoordinator::assemble(
-        authority,
-        guardian,
-        lifecycle,
-        coordinator_terminal,
-        CoordinatorBounds::new(
-            PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
-            Duration::from_millis(20),
-        )?,
-    )
-    .map_err(|_| "package production coordinator assembly failed")?;
+    let bounds = CoordinatorBounds::new(
+        PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
+        Duration::from_millis(20),
+    )?;
+    // The exact early-startup regression forces the native descriptor scan to
+    // remain in its documented ProcessChanged retry state. The coordinator
+    // must yield to the already-readable lifecycle channel and consume the
+    // authoritative Failed event; a PID, marker, or scanner result is never
+    // allowed to substitute for that protocol transition.
+    let coordinator =
+        if startup_fault == Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore) {
+            ProductionCoordinator::assemble_with_descriptor_isolation_test_seam(
+                authority,
+                guardian,
+                lifecycle,
+                coordinator_terminal,
+                bounds,
+                DescriptorIsolationTestSeam::PermanentTargetChurn,
+            )
+        } else {
+            ProductionCoordinator::assemble(
+                authority,
+                guardian,
+                lifecycle,
+                coordinator_terminal,
+                bounds,
+            )
+        }
+        .map_err(|_| "package production coordinator assembly failed")?;
     match coordinator.run() {
         CoordinatorRunOutcome::Terminal(result) => {
             let projection =
@@ -9876,8 +11398,7 @@ fn run_package_guardian_helper() -> Result<(), Box<dyn Error>> {
             match retained.await_recovery() {
                 GuardianRunOutcome::Terminal(disposition) => disposition,
                 GuardianRunOutcome::Retained(retained) => {
-                    record_package_diagnostic_marker(&report_root, "guardian-recovery.retained");
-                    for marker in retained.packaged_marker_names().into_iter().flatten() {
+                    for marker in retained.packaged_recovery_marker_names() {
                         record_package_diagnostic_marker(&report_root, marker);
                     }
                     retained.park()
@@ -11422,31 +12943,162 @@ fn fixed_package_startup_failure_marker(name: &str) -> Option<&'static str> {
         .find(|marker| *marker == name)
 }
 
-fn fixed_package_startup_failure_from_report(report: &Path) -> Option<FixedPackageStartupFailure> {
-    PACKAGED_STARTUP_FAILURE_MARKERS
-        .iter()
-        .copied()
-        .find_map(|generic| {
-            if !fixed_package_failure_marker_is_valid(report, generic) {
-                return None;
+fn classify_package_startup_failure_marker_read(
+    marker: &str,
+    read: io::Result<Vec<u8>>,
+) -> PackageStartupFailureMarkerProbe {
+    let Some(marker) = fixed_package_startup_failure_marker(marker) else {
+        return PackageStartupFailureMarkerProbe::Absent;
+    };
+    match read {
+        Ok(payload) if payload == b"classified\n" => {
+            PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(marker))
+        }
+        Ok(_) => PackageStartupFailureMarkerProbe::InvalidUntrusted,
+        Err(error) => {
+            if matches!(
+                error.raw_os_error(),
+                Some(raw)
+                    if raw == rustix::io::Errno::MFILE.raw_os_error()
+                        || raw == rustix::io::Errno::NFILE.raw_os_error()
+            ) {
+                return PackageStartupFailureMarkerProbe::ResourceExhausted;
             }
-            let detail = match generic {
-                "startup-failure.compatibility" => PACKAGED_COMPATIBILITY_FAILURE_MARKERS
-                    .iter()
-                    .copied()
-                    .find(|marker| fixed_package_failure_marker_is_valid(report, marker)),
-                "startup-failure.app-socket" => PACKAGED_APP_SOCKET_FAILURE_MARKERS
-                    .iter()
-                    .copied()
-                    .find(|marker| fixed_package_failure_marker_is_valid(report, marker)),
-                "startup-failure.session-readiness" => PACKAGED_SESSION_STARTUP_FAILURE_MARKERS
-                    .iter()
-                    .copied()
-                    .find(|marker| fixed_package_failure_marker_is_valid(report, marker)),
-                _ => None,
-            };
-            Some(FixedPackageStartupFailure(detail.unwrap_or(generic)))
-        })
+            if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+                return PackageStartupFailureMarkerProbe::InvalidUntrusted;
+            }
+            match error.kind() {
+                io::ErrorKind::NotFound => PackageStartupFailureMarkerProbe::Absent,
+                io::ErrorKind::InvalidData => PackageStartupFailureMarkerProbe::InvalidUntrusted,
+                io::ErrorKind::Interrupted => PackageStartupFailureMarkerProbe::Interrupted,
+                _ => PackageStartupFailureMarkerProbe::OtherObservationFailure,
+            }
+        }
+    }
+}
+
+fn probe_fixed_package_startup_failure_marker(
+    report: &Path,
+    marker: &'static str,
+) -> PackageStartupFailureMarkerProbe {
+    if fixed_package_startup_failure_marker(marker).is_none() {
+        return PackageStartupFailureMarkerProbe::Absent;
+    }
+    classify_package_startup_failure_marker_read(
+        marker,
+        read_private_bounded(&report.join(marker), b"classified\n".len()),
+    )
+}
+
+fn scan_fixed_package_startup_failure_marker_catalog(
+    report: &Path,
+    markers: &[&'static str],
+    deadline: Instant,
+) -> PackageStartupFailureMarkerProbe {
+    scan_fixed_package_startup_failure_marker_catalog_with_probe(markers, deadline, |marker| {
+        probe_fixed_package_startup_failure_marker(report, marker)
+    })
+}
+
+fn scan_fixed_package_startup_failure_marker_catalog_with_probe<Probe>(
+    markers: &[&'static str],
+    deadline: Instant,
+    probe: Probe,
+) -> PackageStartupFailureMarkerProbe
+where
+    Probe: FnMut(&'static str) -> PackageStartupFailureMarkerProbe,
+{
+    scan_fixed_package_startup_failure_marker_catalog_with_probe_and_clock(
+        markers,
+        deadline,
+        probe,
+        Instant::now,
+    )
+}
+
+fn scan_fixed_package_startup_failure_marker_catalog_with_probe_and_clock<Probe, Now>(
+    markers: &[&'static str],
+    deadline: Instant,
+    mut probe: Probe,
+    mut now: Now,
+) -> PackageStartupFailureMarkerProbe
+where
+    Probe: FnMut(&'static str) -> PackageStartupFailureMarkerProbe,
+    Now: FnMut() -> Instant,
+{
+    let mut first_valid = None;
+    for &marker in markers {
+        if now() >= deadline {
+            return PackageStartupFailureMarkerProbe::Deadline;
+        }
+        let observation = probe(marker);
+        if now() >= deadline {
+            return PackageStartupFailureMarkerProbe::Deadline;
+        }
+        match observation {
+            PackageStartupFailureMarkerProbe::Absent => {}
+            PackageStartupFailureMarkerProbe::Valid(failure) => {
+                first_valid.get_or_insert(failure);
+            }
+            failure => return failure,
+        }
+    }
+    first_valid.map_or(
+        PackageStartupFailureMarkerProbe::Absent,
+        PackageStartupFailureMarkerProbe::Valid,
+    )
+}
+
+fn fixed_package_startup_failure_from_report(
+    report: &Path,
+    deadline: Instant,
+) -> PackageStartupFailureMarkerProbe {
+    let generic = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_STARTUP_FAILURE_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
+    let compatibility = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_COMPATIBILITY_FAILURE_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
+    let app_socket = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_APP_SOCKET_FAILURE_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
+    let session_readiness = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_SESSION_STARTUP_FAILURE_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
+    let Some(generic) = generic else {
+        return PackageStartupFailureMarkerProbe::Absent;
+    };
+    let detail = match generic.marker() {
+        "startup-failure.compatibility" => compatibility,
+        "startup-failure.app-socket" => app_socket,
+        "startup-failure.session-readiness" => session_readiness,
+        _ => None,
+    };
+    PackageStartupFailureMarkerProbe::Valid(detail.unwrap_or(generic))
 }
 
 fn wait_for_private_marker_or_fixed_startup_failure(
@@ -11454,33 +13106,386 @@ fn wait_for_private_marker_or_fixed_startup_failure(
     path: &Path,
     expected: &[u8],
     deadline: Instant,
-) -> Result<PackageInitialGateObservation, Box<dyn Error>> {
-    let mut next_failure_scan = Instant::now();
+) -> Result<PackageInitialGateObservation, PackageInitialGateFailure> {
+    wait_for_private_marker_or_fixed_startup_failure_with_reader(
+        report,
+        path,
+        expected,
+        deadline,
+        || read_private_bounded(path, expected.len().saturating_add(1)),
+        || Ok(true),
+    )
+}
+
+fn wait_for_private_marker_or_fixed_startup_failure_while_coordinator_live(
+    report: &Path,
+    path: &Path,
+    expected: &[u8],
+    deadline: Instant,
+    coordinator: &mut Child,
+) -> Result<PackageInitialGateObservation, PackageInitialGateFailure> {
+    wait_for_private_marker_or_fixed_startup_failure_with_reader(
+        report,
+        path,
+        expected,
+        deadline,
+        || read_private_bounded(path, expected.len().saturating_add(1)),
+        || coordinator.try_wait().map(|status| status.is_none()),
+    )
+}
+
+fn package_initial_gate_poll_delay(now: Instant, deadline: Instant) -> Duration {
+    Duration::from_millis(5).min(deadline.saturating_duration_since(now))
+}
+
+fn wait_for_private_marker_or_fixed_startup_failure_with_reader<ReadMarker, ObserveCoordinator>(
+    report: &Path,
+    _path: &Path,
+    expected: &[u8],
+    deadline: Instant,
+    read_marker: ReadMarker,
+    observe_coordinator: ObserveCoordinator,
+) -> Result<PackageInitialGateObservation, PackageInitialGateFailure>
+where
+    ReadMarker: FnMut() -> io::Result<Vec<u8>>,
+    ObserveCoordinator: FnMut() -> io::Result<bool>,
+{
+    wait_for_private_marker_or_fixed_startup_failure_with_scanner_and_reader(
+        expected,
+        deadline,
+        || fixed_package_startup_failure_from_report(report, deadline),
+        read_marker,
+        observe_coordinator,
+        |observation| record_package_diagnostic_marker(report, observation.marker()),
+    )
+}
+
+fn classify_package_initial_gate_read_failure(
+    error: &io::Error,
+) -> PackageInitialGateReadDisposition {
+    if matches!(
+        error.raw_os_error(),
+        Some(raw)
+            if raw == rustix::io::Errno::MFILE.raw_os_error()
+                || raw == rustix::io::Errno::NFILE.raw_os_error()
+    ) {
+        return PackageInitialGateReadDisposition::Terminal(
+            PackageInitialGateFailure::ReadResourceExhausted,
+        );
+    }
+    match error.kind() {
+        io::ErrorKind::Interrupted => {
+            PackageInitialGateReadDisposition::Retry(PackageInitialGateRetryObservation::MarkerRead)
+        }
+        io::ErrorKind::WouldBlock => {
+            PackageInitialGateReadDisposition::Terminal(PackageInitialGateFailure::ReadWouldBlock)
+        }
+        io::ErrorKind::InvalidData => {
+            PackageInitialGateReadDisposition::Terminal(PackageInitialGateFailure::ReadInvalidData)
+        }
+        _ => PackageInitialGateReadDisposition::Terminal(PackageInitialGateFailure::ReadOther),
+    }
+}
+
+fn record_package_initial_gate_retry_observation_once<RecordObservation>(
+    observed: &mut [bool; PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS.len()],
+    observation: PackageInitialGateRetryObservation,
+    record_observation: &mut RecordObservation,
+) where
+    RecordObservation: FnMut(PackageInitialGateRetryObservation),
+{
+    let observed = &mut observed[observation.index()];
+    if !*observed {
+        *observed = true;
+        record_observation(observation);
+    }
+}
+
+fn retry_package_initial_gate_after_interruption<RecordObservation, Now, Sleep>(
+    deadline: Instant,
+    observed: &mut [bool; PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS.len()],
+    observation: PackageInitialGateRetryObservation,
+    record_observation: &mut RecordObservation,
+    now: &mut Now,
+    sleep: &mut Sleep,
+) -> Result<(), PackageInitialGateFailure>
+where
+    RecordObservation: FnMut(PackageInitialGateRetryObservation),
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    // An operation that began inside the fence can return EINTR after the
+    // fence. Recheck before starting the independent diagnostic write: the
+    // observation is useful, but it never extends the authority deadline.
+    if now() >= deadline {
+        return Err(PackageInitialGateFailure::Deadline);
+    }
+    record_package_initial_gate_retry_observation_once(observed, observation, record_observation);
+    sleep_for_package_initial_gate_poll_with_clock(deadline, now, sleep)
+}
+
+fn sleep_for_package_initial_gate_poll_with_clock<Now, Sleep>(
+    deadline: Instant,
+    now: &mut Now,
+    sleep: &mut Sleep,
+) -> Result<(), PackageInitialGateFailure>
+where
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    let current = now();
+    if current >= deadline {
+        return Err(PackageInitialGateFailure::Deadline);
+    }
+    let delay = package_initial_gate_poll_delay(current, deadline);
+    if !delay.is_zero() {
+        sleep(delay);
+    }
+    Ok(())
+}
+
+fn finish_package_initial_gate_after_coordinator_stop<
+    ScanStartupFailure,
+    RecordRetryObservation,
+    Now,
+    Sleep,
+>(
+    terminal: PackageInitialGateFailure,
+    deadline: Instant,
+    scan_startup_failure: &mut ScanStartupFailure,
+    retry_observations: &mut [bool; PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS.len()],
+    record_retry_observation: &mut RecordRetryObservation,
+    now: &mut Now,
+    sleep: &mut Sleep,
+) -> Result<PackageInitialGateObservation, PackageInitialGateFailure>
+where
+    ScanStartupFailure: FnMut() -> PackageStartupFailureMarkerProbe,
+    RecordRetryObservation: FnMut(PackageInitialGateRetryObservation),
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
     loop {
-        let now = Instant::now();
-        if now >= next_failure_scan {
-            if let Some(failure) = fixed_package_startup_failure_from_report(report) {
+        if now() >= deadline {
+            return Err(PackageInitialGateFailure::Deadline);
+        }
+        let observation = scan_startup_failure();
+        if now() >= deadline {
+            return Err(PackageInitialGateFailure::Deadline);
+        }
+        match observation {
+            PackageStartupFailureMarkerProbe::Absent => return Err(terminal),
+            PackageStartupFailureMarkerProbe::Valid(failure) => {
                 return Ok(PackageInitialGateObservation::StartupFailure(failure));
             }
-            next_failure_scan = now
+            PackageStartupFailureMarkerProbe::InvalidUntrusted => {
+                return Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted);
+            }
+            PackageStartupFailureMarkerProbe::Interrupted => {
+                retry_package_initial_gate_after_interruption(
+                    deadline,
+                    retry_observations,
+                    PackageInitialGateRetryObservation::StartupScan,
+                    record_retry_observation,
+                    now,
+                    sleep,
+                )?;
+            }
+            PackageStartupFailureMarkerProbe::Deadline => {
+                return Err(PackageInitialGateFailure::Deadline);
+            }
+            PackageStartupFailureMarkerProbe::ResourceExhausted => {
+                return Err(PackageInitialGateFailure::StartupMarkerResourceExhausted);
+            }
+            PackageStartupFailureMarkerProbe::OtherObservationFailure => {
+                return Err(PackageInitialGateFailure::StartupMarkerObservation);
+            }
+        }
+    }
+}
+
+fn wait_for_private_marker_or_fixed_startup_failure_with_scanner_and_reader<
+    ScanStartupFailure,
+    ReadMarker,
+    ObserveCoordinator,
+    RecordRetryObservation,
+>(
+    expected: &[u8],
+    deadline: Instant,
+    scan_startup_failure: ScanStartupFailure,
+    read_marker: ReadMarker,
+    observe_coordinator: ObserveCoordinator,
+    record_retry_observation: RecordRetryObservation,
+) -> Result<PackageInitialGateObservation, PackageInitialGateFailure>
+where
+    ScanStartupFailure: FnMut() -> PackageStartupFailureMarkerProbe,
+    ReadMarker: FnMut() -> io::Result<Vec<u8>>,
+    ObserveCoordinator: FnMut() -> io::Result<bool>,
+    RecordRetryObservation: FnMut(PackageInitialGateRetryObservation),
+{
+    wait_for_private_marker_or_fixed_startup_failure_with_scanner_reader_clock_and_sleep(
+        expected,
+        deadline,
+        scan_startup_failure,
+        read_marker,
+        observe_coordinator,
+        record_retry_observation,
+        PackageInitialGateTiming {
+            now: Instant::now,
+            sleep: thread::sleep,
+        },
+    )
+}
+
+struct PackageInitialGateTiming<Now, Sleep> {
+    now: Now,
+    sleep: Sleep,
+}
+
+fn wait_for_private_marker_or_fixed_startup_failure_with_scanner_reader_clock_and_sleep<
+    ScanStartupFailure,
+    ReadMarker,
+    ObserveCoordinator,
+    RecordRetryObservation,
+    Now,
+    Sleep,
+>(
+    expected: &[u8],
+    deadline: Instant,
+    mut scan_startup_failure: ScanStartupFailure,
+    mut read_marker: ReadMarker,
+    mut observe_coordinator: ObserveCoordinator,
+    mut record_retry_observation: RecordRetryObservation,
+    timing: PackageInitialGateTiming<Now, Sleep>,
+) -> Result<PackageInitialGateObservation, PackageInitialGateFailure>
+where
+    ScanStartupFailure: FnMut() -> PackageStartupFailureMarkerProbe,
+    ReadMarker: FnMut() -> io::Result<Vec<u8>>,
+    ObserveCoordinator: FnMut() -> io::Result<bool>,
+    RecordRetryObservation: FnMut(PackageInitialGateRetryObservation),
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    let PackageInitialGateTiming { mut now, mut sleep } = timing;
+    let mut next_failure_scan = now();
+    let mut retry_observations = [false; PACKAGE_INITIAL_GATE_RETRY_OBSERVATION_MARKERS.len()];
+    loop {
+        let current = now();
+        if current >= deadline {
+            return Err(PackageInitialGateFailure::Deadline);
+        }
+        if current >= next_failure_scan {
+            let observation = scan_startup_failure();
+            if now() >= deadline {
+                return Err(PackageInitialGateFailure::Deadline);
+            }
+            match observation {
+                PackageStartupFailureMarkerProbe::Absent => {}
+                PackageStartupFailureMarkerProbe::Valid(failure) => {
+                    return Ok(PackageInitialGateObservation::StartupFailure(failure));
+                }
+                PackageStartupFailureMarkerProbe::InvalidUntrusted => {
+                    return Err(PackageInitialGateFailure::StartupMarkerInvalidUntrusted);
+                }
+                PackageStartupFailureMarkerProbe::Interrupted => {
+                    retry_package_initial_gate_after_interruption(
+                        deadline,
+                        &mut retry_observations,
+                        PackageInitialGateRetryObservation::StartupScan,
+                        &mut record_retry_observation,
+                        &mut now,
+                        &mut sleep,
+                    )?;
+                    continue;
+                }
+                PackageStartupFailureMarkerProbe::Deadline => {
+                    return Err(PackageInitialGateFailure::Deadline);
+                }
+                PackageStartupFailureMarkerProbe::ResourceExhausted => {
+                    return Err(PackageInitialGateFailure::StartupMarkerResourceExhausted);
+                }
+                PackageStartupFailureMarkerProbe::OtherObservationFailure => {
+                    return Err(PackageInitialGateFailure::StartupMarkerObservation);
+                }
+            }
+            next_failure_scan = now()
                 .checked_add(PACKAGE_FIXED_FAILURE_POLL_INTERVAL)
                 .map(|next| next.min(deadline))
                 .unwrap_or(deadline);
         }
-        match read_private_bounded(path, expected.len().saturating_add(1)) {
+        if now() >= deadline {
+            return Err(PackageInitialGateFailure::Deadline);
+        }
+        let marker_read = read_marker();
+        if now() >= deadline {
+            return Err(PackageInitialGateFailure::Deadline);
+        }
+        match marker_read {
             Ok(bytes) if bytes == expected => return Ok(PackageInitialGateObservation::Opened),
-            Ok(_) => return Err("package supervisor marker payload was invalid".into()),
+            Ok(_) => return Err(PackageInitialGateFailure::InvalidPayload),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => match classify_package_initial_gate_read_failure(&error) {
+                PackageInitialGateReadDisposition::Retry(observation) => {
+                    retry_package_initial_gate_after_interruption(
+                        deadline,
+                        &mut retry_observations,
+                        observation,
+                        &mut record_retry_observation,
+                        &mut now,
+                        &mut sleep,
+                    )?;
+                    continue;
+                }
+                PackageInitialGateReadDisposition::Terminal(failure) => return Err(failure),
+            },
         }
-        if now >= deadline {
-            let name = path
-                .file_name()
-                .and_then(OsStr::to_str)
-                .unwrap_or("unknown");
-            return Err(format!("package supervisor marker `{name}` exceeded its deadline").into());
+        if now() >= deadline {
+            return Err(PackageInitialGateFailure::Deadline);
         }
-        thread::sleep(Duration::from_millis(5));
+        let coordinator_observation = observe_coordinator();
+        if now() >= deadline {
+            return Err(PackageInitialGateFailure::Deadline);
+        }
+        match coordinator_observation {
+            Ok(true) => {}
+            Ok(false) => {
+                // The exact retained Child proves exit, but a startup failure
+                // marker may have been committed between the periodic scan
+                // above and this wait-authority observation. Give that closed
+                // causal catalog one final read before classifying peer exit.
+                return finish_package_initial_gate_after_coordinator_stop(
+                    PackageInitialGateFailure::CoordinatorExited,
+                    deadline,
+                    &mut scan_startup_failure,
+                    &mut retry_observations,
+                    &mut record_retry_observation,
+                    &mut now,
+                    &mut sleep,
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                retry_package_initial_gate_after_interruption(
+                    deadline,
+                    &mut retry_observations,
+                    PackageInitialGateRetryObservation::ChildTryWait,
+                    &mut record_retry_observation,
+                    &mut now,
+                    &mut sleep,
+                )?;
+                continue;
+            }
+            Err(_) => {
+                return finish_package_initial_gate_after_coordinator_stop(
+                    PackageInitialGateFailure::CoordinatorObservation,
+                    deadline,
+                    &mut scan_startup_failure,
+                    &mut retry_observations,
+                    &mut record_retry_observation,
+                    &mut now,
+                    &mut sleep,
+                );
+            }
+        }
+        sleep_for_package_initial_gate_poll_with_clock(deadline, &mut now, &mut sleep)?;
     }
 }
 
@@ -11492,7 +13497,15 @@ fn wait_for_private_marker(
     loop {
         match read_private_bounded(path, expected.len().saturating_add(1)) {
             Ok(bytes) if bytes == expected => return Ok(()),
-            Ok(_) => return Err("package supervisor marker payload was invalid".into()),
+            Ok(_) => {
+                let name = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("unknown");
+                return Err(
+                    format!("package supervisor marker `{name}` payload was invalid").into(),
+                );
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -11516,7 +13529,15 @@ fn wait_for_private_marker_while_child_live(
     loop {
         match read_private_bounded(path, expected.len().saturating_add(1)) {
             Ok(bytes) if bytes == expected => return Ok(()),
-            Ok(_) => return Err("package supervisor marker payload was invalid".into()),
+            Ok(_) => {
+                let name = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("unknown");
+                return Err(
+                    format!("package supervisor marker `{name}` payload was invalid").into(),
+                );
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -17810,13 +19831,30 @@ fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-fn read_private_bounded(path: &Path, maximum: usize) -> std::io::Result<Vec<u8>> {
+pub(super) fn read_private_bounded(path: &Path, maximum: usize) -> std::io::Result<Vec<u8>> {
     let descriptor = rustix::fs::open(
         path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )
-    .map_err(std::io::Error::from)?;
+    .map_err(|error| {
+        if error == rustix::io::Errno::NXIO || error == rustix::io::Errno::OPNOTSUPP {
+            // Linux and Darwin can reject a nonblocking read-only open of a
+            // Unix-domain socket before fstat. Such nodes can never be a
+            // private marker, so retain the same invalid-identity contract as
+            // FIFOs and other non-regular nodes instead of leaking OS errno
+            // differences into the diagnostic state machine.
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "package smoke private path was not a regular file",
+            )
+        } else {
+            std::io::Error::from(error)
+        }
+    })?;
     let mut file = File::from(descriptor);
     let before = file.metadata()?;
     if !before.file_type().is_file()

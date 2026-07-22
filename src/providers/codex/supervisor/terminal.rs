@@ -1889,10 +1889,9 @@ mod tests {
     use std::error::Error;
     use std::mem::size_of;
     use std::os::unix::process::CommandExt;
-    use std::path::PathBuf;
     use std::process::Child;
     use std::sync::{Arc, Barrier};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
 
     const CHILD_HELPER_ENV: &str = "CALCIFER_TERMINAL_CHILD_HELPER";
     const CHILD_MARKER: &[u8] = b"calcifer-terminal-child-ok";
@@ -1901,11 +1900,12 @@ mod tests {
     const RESTORE_FLUSH_RESTORED: &[u8] = b"calcifer-terminal-restore-flush-restored";
     const RESTORE_FLUSH_SENTINEL: &[u8] = b"calcifer-queued-input-sentinel";
     const RESTORE_FLUSH_PROBE: &[u8] = b"\n";
+    const PTY_SCAN_HELPER_ENV: &str = "CALCIFER_TERMINAL_PTY_SCAN_HELPER";
+    const PTY_SCAN_READY: [u8; 1] = [b'R'];
 
     struct PtyScanGroup {
         child: Child,
         process_group: i32,
-        marker: PathBuf,
     }
 
     impl Drop for PtyScanGroup {
@@ -1917,7 +1917,6 @@ mod tests {
                 );
             }
             let _ = self.child.wait();
-            let _ = std::fs::remove_file(&self.marker);
         }
     }
 
@@ -1948,39 +1947,96 @@ mod tests {
     #[test]
     fn forbidden_pty_master_does_not_alias_the_child_and_descendant_slave()
     -> Result<(), Box<dyn Error>> {
+        if std::env::var_os(PTY_SCAN_HELPER_ENV).is_some() {
+            let inherited = calcifer_unix_child_fd::take_inherited_readiness_fd()?;
+            let mut descendant_command = Command::new("/bin/sleep");
+            descendant_command.arg("30").env_remove(PTY_SCAN_HELPER_ENV);
+            calcifer_unix_child_fd::scrub_readiness_fd_env(&mut descendant_command);
+            let mut descendant = descendant_command.spawn()?;
+
+            // Command::spawn has observed the descendant's successful exec,
+            // and shutdown publishes EOF without closing either of this
+            // leader's stable socket descriptors. The parent can therefore
+            // begin its double snapshot without a readiness-related FD-table
+            // mutation still pending in either process-group member.
+            let mut readiness = UnixStream::from(inherited);
+            readiness.write_all(&PTY_SCAN_READY)?;
+            readiness.shutdown(Shutdown::Write)?;
+            if !descendant.wait()?.success() {
+                return Err("PTY scan descendant did not exit successfully".into());
+            }
+            return Ok(());
+        }
+
         let owner = PtyOwner::open(TerminalSize::new(24, 80))?;
         let slave_copy = fcntl_dupfd_cloexec(&owner.slave, 3)?;
         let mut slave_forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
         slave_forbidden.capture(slave_copy.as_fd())?;
 
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let marker = std::env::temp_dir().join(format!(
-            "calcifer-pty-cross-process-scan-{}-{nonce}",
-            std::process::id()
-        ));
-        let mut command = Command::new("/bin/sh");
+        let (mut readiness_observer, inherited_readiness) = UnixStream::pair()?;
+        readiness_observer.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut command = Command::new(std::env::current_exe()?);
         command
-            .arg("-c")
-            .arg("/bin/sleep 30 & child=$!; : > \"$CALCIFER_PTY_SCAN_READY\"; wait \"$child\"")
-            .env("CALCIFER_PTY_SCAN_READY", &marker)
+            .args([
+                "--exact",
+                "providers::codex::supervisor::terminal::tests::forbidden_pty_master_does_not_alias_the_child_and_descendant_slave",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PTY_SCAN_HELPER_ENV, "1")
             .process_group(0);
         let master = owner.configure_child(&mut command)?;
         let master_forbidden = master.capture_forbidden_descriptor_set_before_tui()?;
-        let child = command.spawn()?;
+        let child = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
+            command,
+            inherited_readiness.as_fd(),
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                // A parent-side inheritance readback failure can race the
+                // helper spawning its descendant. Transfer any started direct
+                // child into the group-wide owner before returning so the
+                // generic direct-child fallback cannot leave that descendant
+                // alive until its sleep expires.
+                if let Some(started) = error.into_started_child() {
+                    let mut child = started.into_child();
+                    let process_group = match i32::try_from(child.id()) {
+                        Ok(process_group) => process_group,
+                        Err(_) => {
+                            let _ = child.kill();
+                            child.wait()?;
+                            return Err("PTY scan child process group was invalid".into());
+                        }
+                    };
+                    drop(PtyScanGroup {
+                        child,
+                        process_group,
+                    });
+                }
+                return Err("PTY scan child failed during inherited descriptor setup".into());
+            }
+        };
+        drop(inherited_readiness);
         let process_group = i32::try_from(child.id())?;
         let group = PtyScanGroup {
             child,
             process_group,
-            marker,
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !group.marker.is_file() {
-            if Instant::now() >= deadline {
-                return Err("PTY scan child did not publish readiness".into());
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        let mut ready = [0_u8; PTY_SCAN_READY.len()];
+        readiness_observer.read_exact(&mut ready)?;
+        if ready != PTY_SCAN_READY {
+            return Err("PTY scan child published invalid readiness".into());
+        }
+        let mut trailing = [0_u8; 1];
+        if readiness_observer.read(&mut trailing)? != 0 {
+            return Err("PTY scan child published trailing readiness data".into());
         }
 
+        // Readiness has its own socket timeout. Start the scanner's absolute
+        // deadline only after the complete byte-plus-EOF boundary so a loaded
+        // runner cannot consume the descriptor-proof budget while waiting for
+        // the child to finish its post-exec handshake.
+        let deadline = Instant::now() + Duration::from_secs(5);
         let proof =
             calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
                 group.process_group,

@@ -22,8 +22,8 @@ use super::coordinator_terminal::{
     OutputOnly, Paused, Quiesced, RawAwaitAck, Restored, ResumeRaw, SuspendedRestored,
 };
 use super::protocol::{
-    ChildDisposition, CleanupStatus, CoordinatorCommand, CoordinatorReceiver, FailureCode,
-    GuardianEvent, GuardianExitDisposition, Phase, ProtocolError, SessionStatus,
+    ChildDisposition, ChildRole, CleanupStatus, CoordinatorCommand, CoordinatorReceiver,
+    FailureCode, GuardianEvent, GuardianExitDisposition, Phase, ProtocolError, SessionStatus,
     TerminalSnapshotFingerprint, UnixSignal, VerifiedOpenGateAck, VerifiedReady, WorkerJoinStatus,
 };
 use super::signals::{
@@ -188,37 +188,109 @@ fn final_descriptor_isolation_error(
     CoordinatorDriveError::DescriptorIsolation(failure.error)
 }
 
-fn retry_descriptor_isolation_observation<T>(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DescriptorIsolationRetryOutcome<T> {
+    Verified(T),
+    LifecycleReadable,
+}
+
+fn lifecycle_descriptor_readable(
+    descriptor: &impl AsFd,
+    deadline: Instant,
+) -> Result<bool, CoordinatorDriveError> {
+    loop {
+        let now = Instant::now();
+        // A deadline at or before `now` deliberately becomes a single
+        // zero-time poll. Callers use that final observation to give an
+        // already-buffered authoritative lifecycle frame precedence over a
+        // scan which consumed the remaining budget.
+        let timeout = rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
+            .map_err(|_| CoordinatorDriveError::Deadline)?;
+        let mut descriptors = [rustix::event::PollFd::new(
+            descriptor,
+            rustix::event::PollFlags::IN,
+        )];
+        match rustix::event::poll(&mut descriptors, Some(&timeout)) {
+            Ok(0) => return Ok(false),
+            Ok(_) => {
+                let events = descriptors[0].revents();
+                if events.intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::NVAL)
+                {
+                    return Err(CoordinatorDriveError::Lifecycle);
+                }
+                return Ok(
+                    events.intersects(rustix::event::PollFlags::IN | rustix::event::PollFlags::HUP)
+                );
+            }
+            Err(rustix::io::Errno::INTR) if Instant::now() < deadline => {}
+            Err(rustix::io::Errno::INTR) => return Ok(false),
+            Err(_) => return Err(CoordinatorDriveError::Lifecycle),
+        }
+    }
+}
+
+fn retry_descriptor_isolation_observation<State, T>(
     deadline: Instant,
     poll_interval: Duration,
-    mut attempt: impl FnMut() -> (
+    state: &mut State,
+    mut attempt: impl FnMut(
+        &mut State,
+    ) -> (
         Result<T, DescriptorIsolationObservationFailure>,
         Result<(), CoordinatorDriveError>,
     ),
-) -> Result<T, CoordinatorDriveError> {
+    mut lifecycle_ready: impl FnMut(&mut State, Instant) -> Result<bool, CoordinatorDriveError>,
+) -> Result<DescriptorIsolationRetryOutcome<T>, CoordinatorDriveError> {
     loop {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
+            // A descriptor scan is allowed to consume the complete isolation
+            // budget, but it must not mask a lifecycle frame which the
+            // guardian already committed before that fence. This is one
+            // zero-wait observation only: it can decode buffered progress in
+            // the outer bootstrap loop, but it can never authorize another
+            // descriptor scan after expiry.
+            if lifecycle_ready(state, now)? {
+                return Ok(DescriptorIsolationRetryOutcome::LifecycleReadable);
+            }
             return Err(CoordinatorDriveError::DescriptorIsolation(
                 calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline,
             ));
         }
 
-        let (observation, guardian_liveness) = attempt();
+        let (observation, guardian_liveness) = attempt(state);
         guardian_liveness?;
         match observation {
-            Ok(proof) => return Ok(proof),
+            Ok(proof) => return Ok(DescriptorIsolationRetryOutcome::Verified(proof)),
             Err(failure) if failure.retryable_target_change => {
                 let now = Instant::now();
                 if now >= deadline {
+                    if lifecycle_ready(state, now)? {
+                        return Ok(DescriptorIsolationRetryOutcome::LifecycleReadable);
+                    }
                     #[cfg(test)]
                     record_descriptor_isolation_observation_failure(failure);
                     return Err(CoordinatorDriveError::DescriptorIsolation(
                         calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline,
                     ));
                 }
-                thread::sleep(
-                    poll_interval.min(deadline.saturating_duration_since(Instant::now())),
-                );
+                let poll_deadline = now
+                    .checked_add(poll_interval)
+                    .map(|candidate| candidate.min(deadline))
+                    .ok_or(CoordinatorDriveError::Deadline)?;
+                if lifecycle_ready(state, poll_deadline)? {
+                    return Ok(DescriptorIsolationRetryOutcome::LifecycleReadable);
+                }
+            }
+            Err(failure)
+                if failure.error
+                    == calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline =>
+            {
+                let now = Instant::now();
+                if lifecycle_ready(state, now)? {
+                    return Ok(DescriptorIsolationRetryOutcome::LifecycleReadable);
+                }
+                return Err(final_descriptor_isolation_error(failure));
             }
             Err(failure) => return Err(final_descriptor_isolation_error(failure)),
         }
@@ -973,6 +1045,60 @@ pub(super) enum CoordinatorRunOutcome {
     Retained(Box<RetainedCoordinatorGeneration>),
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DescriptorIsolationTestSeam {
+    PermanentTargetChurn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingDescriptorIsolation {
+    process_group: i32,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+struct BootstrapDescriptorGate {
+    app: Option<PendingDescriptorIsolation>,
+    tui: Option<PendingDescriptorIsolation>,
+    ready: Option<VerifiedReady>,
+}
+
+impl BootstrapDescriptorGate {
+    fn insert(
+        &mut self,
+        role: ChildRole,
+        process_group: i32,
+        deadline: Instant,
+    ) -> Result<(), CoordinatorDriveError> {
+        let slot = match role {
+            ChildRole::AppServer => &mut self.app,
+            ChildRole::Tui => &mut self.tui,
+        };
+        if slot.is_some() {
+            return Err(CoordinatorDriveError::Protocol);
+        }
+        *slot = Some(PendingDescriptorIsolation {
+            process_group,
+            deadline,
+        });
+        Ok(())
+    }
+
+    fn first_pending(&self) -> Option<(ChildRole, PendingDescriptorIsolation)> {
+        self.app
+            .map(|pending| (ChildRole::AppServer, pending))
+            .or_else(|| self.tui.map(|pending| (ChildRole::Tui, pending)))
+    }
+
+    fn clear(&mut self, role: ChildRole) {
+        match role {
+            ChildRole::AppServer => self.app = None,
+            ChildRole::Tui => self.tui = None,
+        }
+    }
+}
+
 /// Exact production owner for one coordinator generation.
 pub(super) struct ProductionCoordinator {
     authority: CoordinatorProfileLease,
@@ -983,6 +1109,8 @@ pub(super) struct ProductionCoordinator {
     signals: CoordinatorSignalLatches,
     bounds: CoordinatorBounds,
     session_failed: bool,
+    #[cfg(test)]
+    descriptor_isolation_test_seam: Option<DescriptorIsolationTestSeam>,
 }
 
 enum ActiveOutcome {
@@ -1012,6 +1140,18 @@ impl ProductionCoordinator {
         lifecycle: LifecycleEndpoint,
         terminal: CoordinatorTerminal<OutputOnly>,
         bounds: CoordinatorBounds,
+    ) -> Result<Self, Box<CoordinatorSetupFailure>> {
+        Self::assemble_with_test_seam(authority, guardian, lifecycle, terminal, bounds, None)
+    }
+
+    fn assemble_with_test_seam(
+        authority: CoordinatorProfileLease,
+        guardian: Child,
+        lifecycle: LifecycleEndpoint,
+        terminal: CoordinatorTerminal<OutputOnly>,
+        bounds: CoordinatorBounds,
+        #[cfg(test)] descriptor_isolation_test_seam: Option<DescriptorIsolationTestSeam>,
+        #[cfg(not(test))] _descriptor_isolation_test_seam: Option<()>,
     ) -> Result<Self, Box<CoordinatorSetupFailure>> {
         let lifecycle_ready = lifecycle
             .set_read_timeout(Some(bounds.phase_timeout))
@@ -1046,7 +1186,21 @@ impl ProductionCoordinator {
             signals,
             bounds,
             session_failed: false,
+            #[cfg(test)]
+            descriptor_isolation_test_seam,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn assemble_with_descriptor_isolation_test_seam(
+        authority: CoordinatorProfileLease,
+        guardian: Child,
+        lifecycle: LifecycleEndpoint,
+        terminal: CoordinatorTerminal<OutputOnly>,
+        bounds: CoordinatorBounds,
+        seam: DescriptorIsolationTestSeam,
+    ) -> Result<Self, Box<CoordinatorSetupFailure>> {
+        Self::assemble_with_test_seam(authority, guardian, lifecycle, terminal, bounds, Some(seam))
     }
 
     pub(super) fn run(mut self) -> CoordinatorRunOutcome {
@@ -1107,8 +1261,24 @@ impl ProductionCoordinator {
             .as_ref()
             .ok_or(CoordinatorDriveError::Protocol)?
             .snapshot_fingerprint()?;
+        let mut descriptor_gate = BootstrapDescriptorGate::default();
 
         loop {
+            if let Some((role, pending)) = descriptor_gate.first_pending() {
+                match self.verify_reported_child_descriptor_isolation(
+                    pending.process_group,
+                    pending.deadline,
+                )? {
+                    DescriptorIsolationRetryOutcome::Verified(()) => {
+                        descriptor_gate.clear(role);
+                        continue;
+                    }
+                    DescriptorIsolationRetryOutcome::LifecycleReadable => {}
+                }
+            } else if let Some(readiness) = descriptor_gate.ready.take() {
+                return Ok(BootstrapOutcome::Ready(readiness));
+            }
+
             match self.receive_with_output(self.bounds.phase_deadline()?)? {
                 GuardianEvent::TerminalArmed {
                     snapshot: guardian_snapshot,
@@ -1122,22 +1292,19 @@ impl ProductionCoordinator {
                     return Err(CoordinatorDriveError::Snapshot);
                 }
                 // The receiver validates exact role order and positive
-                // PID/PGID syntax. The numeric identity is used synchronously
-                // for one read-only scan and is never retained as signal or
-                // wait authority.
-                GuardianEvent::ChildStarted { pgid, .. } => {
-                    self.verify_reported_child_descriptor_isolation(
-                        pgid,
-                        self.bounds.phase_deadline()?,
-                    )?;
+                // PID/PGID syntax. The numeric identity is retained only in
+                // this fixed two-slot bootstrap gate for bounded, repeated
+                // read-only scans. It never becomes signal or wait authority.
+                GuardianEvent::ChildStarted { role, pgid, .. } => {
+                    descriptor_gate.insert(role, pgid, self.bounds.phase_deadline()?)?;
                 }
                 GuardianEvent::Ready => {
-                    return self
-                        .lifecycle
-                        .receiver
-                        .take_verified_ready()
-                        .map(BootstrapOutcome::Ready)
-                        .map_err(classify_protocol_error);
+                    descriptor_gate.ready = Some(
+                        self.lifecycle
+                            .receiver
+                            .take_verified_ready()
+                            .map_err(classify_protocol_error)?,
+                    );
                 }
                 GuardianEvent::Failed { .. } => return Ok(BootstrapOutcome::Failed),
                 _ => return Err(CoordinatorDriveError::Protocol),
@@ -1149,16 +1316,29 @@ impl ProductionCoordinator {
         &mut self,
         process_group: i32,
         deadline: Instant,
-    ) -> Result<(), CoordinatorDriveError> {
+    ) -> Result<DescriptorIsolationRetryOutcome<()>, CoordinatorDriveError> {
         let poll_interval = self.bounds.poll_interval;
-        let proof = retry_descriptor_isolation_observation(deadline, poll_interval, || {
-            let observation =
-                self.observe_reported_child_descriptor_isolation(process_group, deadline);
-            let guardian_liveness = self.ensure_guardian_live();
-            (observation, guardian_liveness)
-        })?;
-        let _ = proof;
-        Ok(())
+        let outcome = retry_descriptor_isolation_observation(
+            deadline,
+            poll_interval,
+            self,
+            |coordinator| {
+                let observation = coordinator
+                    .observe_reported_child_descriptor_isolation(process_group, deadline);
+                let guardian_liveness = coordinator.ensure_guardian_live();
+                (observation, guardian_liveness)
+            },
+            |coordinator, poll_deadline| coordinator.lifecycle_readable(poll_deadline),
+        )?;
+        match outcome {
+            DescriptorIsolationRetryOutcome::Verified(proof) => {
+                let _ = proof;
+                Ok(DescriptorIsolationRetryOutcome::Verified(()))
+            }
+            DescriptorIsolationRetryOutcome::LifecycleReadable => {
+                Ok(DescriptorIsolationRetryOutcome::LifecycleReadable)
+            }
+        }
     }
 
     fn observe_reported_child_descriptor_isolation(
@@ -1169,6 +1349,14 @@ impl ProductionCoordinator {
         calcifer_unix_child_fd::ProcessGroupDescriptorIsolationProof,
         DescriptorIsolationObservationFailure,
     > {
+        #[cfg(test)]
+        if self.descriptor_isolation_test_seam
+            == Some(DescriptorIsolationTestSeam::PermanentTargetChurn)
+        {
+            return Err(DescriptorIsolationObservationFailure::target(
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged,
+            ));
+        }
         let mut forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
         self.authority
             .append_forbidden_descriptor(&mut forbidden)
@@ -1523,34 +1711,7 @@ impl ProductionCoordinator {
     }
 
     fn lifecycle_readable(&self, deadline: Instant) -> Result<bool, CoordinatorDriveError> {
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(false);
-            }
-            let timeout =
-                rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
-                    .map_err(|_| CoordinatorDriveError::Deadline)?;
-            let mut descriptors = [rustix::event::PollFd::new(
-                &self.lifecycle,
-                rustix::event::PollFlags::IN,
-            )];
-            match rustix::event::poll(&mut descriptors, Some(&timeout)) {
-                Ok(0) => return Ok(false),
-                Ok(_) => {
-                    let events = descriptors[0].revents();
-                    if events
-                        .intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::NVAL)
-                    {
-                        return Err(CoordinatorDriveError::Lifecycle);
-                    }
-                    return Ok(events
-                        .intersects(rustix::event::PollFlags::IN | rustix::event::PollFlags::HUP));
-                }
-                Err(rustix::io::Errno::INTR) => {}
-                Err(_) => return Err(CoordinatorDriveError::Lifecycle),
-            }
-        }
+        lifecycle_descriptor_readable(&self.lifecycle, deadline)
     }
 
     fn pump_output(&mut self, deadline: Instant) -> Result<(), CoordinatorDriveError> {
@@ -1697,6 +1858,8 @@ impl ProductionCoordinator {
             signals,
             bounds: _,
             session_failed: _,
+            #[cfg(test)]
+                descriptor_isolation_test_seam: _,
         } = self;
         let restoration = match terminal {
             Some(CoordinatorTerminalOwner::Finished(restoration)) => restoration,
@@ -1787,6 +1950,7 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
     use std::process::{ChildStdin, Command, Stdio};
     use std::rc::Rc;
     use std::sync::Arc;
@@ -1802,6 +1966,7 @@ mod tests {
         ChildRole, GuardianCommandReceiver, SessionTerminationCause, StopAction,
         project_terminal_semantics, send_guardian_event,
     };
+    use super::super::runtime::PrivateRuntime;
     use super::super::terminal::{
         PtyMaster, PtyOwner, TerminalBuffer, TerminalChannelPair, TerminalEndpoint, TerminalRead,
         TerminalShutdown, TerminalWrite, claim_controlling_terminal_from_stdin,
@@ -1810,17 +1975,22 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
     const TEST_PROCESS_GROUP_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+    const TEST_PRODUCTION_MATRIX_PHASE_TIMEOUT: Duration = Duration::from_secs(2);
+    const TEST_PRODUCTION_MATRIX_SETUP_MARGIN: Duration = Duration::from_secs(10);
+    const TEST_MATRIX_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
     // The parent observes a child that may perform two independently bounded
-    // ten-second process-group scans before publishing its first control
-    // line. Its fixture deadline must dominate that complete child path while
-    // the production coordinator keeps its own two-second operation bounds.
-    const TEST_PRODUCTION_MATRIX_PARENT_TIMEOUT: Duration = Duration::from_secs(25);
+    // process-group readiness scans and two independently bounded production
+    // descriptor scans before publishing its first control line. This outer
+    // envelope also reserves explicit setup and scheduler margin; it never
+    // changes a production deadline or the green-path runtime.
+    const TEST_PRODUCTION_MATRIX_PARENT_TIMEOUT: Duration = Duration::from_secs(40);
     const PRODUCTION_MATRIX_HELPER_ENV: &str = "CALCIFER_COORDINATOR_MATRIX_HELPER";
-    const PRODUCTION_MATRIX_SCAN_GROUP_HELPER_ENV: &str =
-        "CALCIFER_COORDINATOR_MATRIX_SCAN_GROUP_HELPER";
-    const PRODUCTION_MATRIX_SCAN_GROUP_HELPER_TEST: &str = "providers::codex::supervisor::coordinator::tests::production_coordinator_matrix_scan_group_helper";
-    const MATRIX_SCAN_GROUP_READINESS_SENTINEL: u8 = b'R';
+    const PRODUCTION_MATRIX_TIMEOUT_HELPER_ENV: &str = "CALCIFER_COORDINATOR_MATRIX_TIMEOUT_HELPER";
+    const PRODUCTION_MATRIX_ROOT_ENV: &str = "CALCIFER_COORDINATOR_MATRIX_ROOT";
+    const PRODUCTION_MATRIX_APP_GROUP_MARKER: &str = "matrix-app-group.identity";
+    const PRODUCTION_MATRIX_TUI_GROUP_MARKER: &str = "matrix-tui-group.identity";
     const PRODUCTION_MATRIX_OUTPUT: &[u8] = b"calcifer-production-coordinator-output";
+    const MATRIX_UNPROVEN_CHILD_CLEANUP_EXIT_CODE: u8 = 93;
 
     #[test]
     fn packaged_retention_diagnostics_are_closed_fixed_and_payload_free() {
@@ -1927,26 +2097,138 @@ mod tests {
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged,
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged,
         ] {
-            let mut attempts = 0_usize;
-            let mut liveness_checks = 0_usize;
-            let proof = retry_descriptor_isolation_observation(
+            let mut state = (0_usize, 0_usize);
+            let outcome = retry_descriptor_isolation_observation(
                 Instant::now() + TEST_TIMEOUT,
                 Duration::from_millis(1),
-                || {
-                    attempts += 1;
-                    liveness_checks += 1;
-                    let observation = if attempts == 1 {
+                &mut state,
+                |(attempts, liveness_checks)| {
+                    *attempts += 1;
+                    *liveness_checks += 1;
+                    let observation = if *attempts == 1 {
                         Err(DescriptorIsolationObservationFailure::target(transient))
                     } else {
                         Ok(0x42_u8)
                     };
                     (observation, Ok(()))
                 },
+                |_, _| Ok(false),
             )?;
+            let DescriptorIsolationRetryOutcome::Verified(proof) = outcome else {
+                return Err("transient churn was misclassified as startup failure".into());
+            };
             assert_eq!(proof, 0x42);
-            assert_eq!(attempts, 2);
-            assert_eq!(liveness_checks, attempts);
+            assert_eq!(state.0, 2);
+            assert_eq!(state.1, state.0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_isolation_churn_yields_to_authoritative_startup_failure_before_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let mut attempts = 0_usize;
+        let mut progress_checks = 0_usize;
+        let outcome = retry_descriptor_isolation_observation::<_, ()>(
+            deadline,
+            Duration::from_millis(1),
+            &mut (),
+            |_| {
+                attempts += 1;
+                (
+                    Err(DescriptorIsolationObservationFailure::target(
+                        calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged,
+                    )),
+                    Ok(()),
+                )
+            },
+            |_, _| {
+                progress_checks += 1;
+                Ok(true)
+            },
+        )?;
+        assert_eq!(outcome, DescriptorIsolationRetryOutcome::LifecycleReadable);
+        assert_eq!(attempts, 1);
+        assert_eq!(progress_checks, 1);
+        assert!(Instant::now() < deadline);
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_isolation_deadline_yields_to_an_already_buffered_lifecycle_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for failure in [
+            DescriptorIsolationObservationFailure::target(
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged,
+            ),
+            DescriptorIsolationObservationFailure::target(
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline,
+            ),
+        ] {
+            let mut attempts = 0_usize;
+            let mut readiness_checks = 0_usize;
+            let deadline = Instant::now() + Duration::from_millis(1);
+            let outcome = retry_descriptor_isolation_observation::<_, ()>(
+                deadline,
+                Duration::from_millis(1),
+                &mut (),
+                |_| {
+                    attempts += 1;
+                    if failure.retryable_target_change {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    (Err(failure), Ok(()))
+                },
+                |_, _| {
+                    readiness_checks += 1;
+                    Ok(true)
+                },
+            )?;
+
+            assert_eq!(outcome, DescriptorIsolationRetryOutcome::LifecycleReadable);
+            assert_eq!(attempts, 1);
+            assert_eq!(readiness_checks, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_isolation_expiry_never_authorizes_another_scan_attempt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut attempts = 0_usize;
+        let mut readiness_checks = 0_usize;
+        let outcome = retry_descriptor_isolation_observation::<_, ()>(
+            Instant::now(),
+            Duration::from_millis(1),
+            &mut (),
+            |_| {
+                attempts += 1;
+                (Ok(()), Ok(()))
+            },
+            |_, _| {
+                readiness_checks += 1;
+                Ok(true)
+            },
+        )?;
+
+        assert_eq!(outcome, DescriptorIsolationRetryOutcome::LifecycleReadable);
+        assert_eq!(attempts, 0);
+        assert_eq!(readiness_checks, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_lifecycle_poll_observes_only_an_already_buffered_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut writer, mut reader) = UnixStream::pair()?;
+        writer.write_all(b"F")?;
+
+        assert!(lifecycle_descriptor_readable(&reader, Instant::now())?);
+        let mut byte = [0_u8; 1];
+        reader.read_exact(&mut byte)?;
+        assert_eq!(byte, *b"F");
+        assert!(!lifecycle_descriptor_readable(&reader, Instant::now())?);
         Ok(())
     }
 
@@ -1956,19 +2238,20 @@ mod tests {
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged,
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged,
         ] {
-            let mut attempts = 0_usize;
-            let mut liveness_checks = 0_usize;
-            let result = retry_descriptor_isolation_observation::<u8>(
+            let mut state = (0_usize, 0_usize);
+            let result = retry_descriptor_isolation_observation::<_, u8>(
                 Instant::now() + Duration::from_millis(20),
                 Duration::from_millis(1),
-                || {
-                    attempts += 1;
-                    liveness_checks += 1;
+                &mut state,
+                |(attempts, liveness_checks)| {
+                    *attempts += 1;
+                    *liveness_checks += 1;
                     (
                         Err(DescriptorIsolationObservationFailure::target(transient)),
                         Ok(()),
                     )
                 },
+                |_, _| Ok(false),
             );
             let error = match result {
                 Ok(_) => panic!("permanent descriptor churn minted a stable proof"),
@@ -1984,8 +2267,8 @@ mod tests {
                 error.retention_reason(),
                 RetentionReason::InvariantUnconfirmed
             );
-            assert!(attempts > 1);
-            assert_eq!(liveness_checks, attempts);
+            assert!(state.0 > 1);
+            assert_eq!(state.1, state.0);
         }
     }
 
@@ -2016,13 +2299,15 @@ mod tests {
 
         for failure in failures {
             let mut attempts = 0_usize;
-            let result = retry_descriptor_isolation_observation::<u8>(
+            let result = retry_descriptor_isolation_observation::<_, u8>(
                 Instant::now() + TEST_TIMEOUT,
                 Duration::from_millis(1),
-                || {
-                    attempts += 1;
+                &mut attempts,
+                |attempts| {
+                    *attempts += 1;
                     (Err(failure), Ok(()))
                 },
+                |_, _| Ok(false),
             );
             let error = match result {
                 Ok(_) => panic!("fatal descriptor observation minted a stable proof"),
@@ -2039,11 +2324,12 @@ mod tests {
     #[test]
     fn descriptor_isolation_requires_exact_guardian_liveness_after_every_attempt() {
         let mut attempts = 0_usize;
-        let result = retry_descriptor_isolation_observation::<u8>(
+        let result = retry_descriptor_isolation_observation::<_, u8>(
             Instant::now() + TEST_TIMEOUT,
             Duration::from_millis(1),
-            || {
-                attempts += 1;
+            &mut attempts,
+            |attempts| {
+                *attempts += 1;
                 (
                     Err(DescriptorIsolationObservationFailure::target(
                         calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged,
@@ -2051,6 +2337,7 @@ mod tests {
                     Err(CoordinatorDriveError::Guardian),
                 )
             },
+            |_, _| Ok(false),
         );
         assert_eq!(result, Err(CoordinatorDriveError::Guardian));
         assert_eq!(attempts, 1);
@@ -2492,79 +2779,360 @@ mod tests {
     }
 
     #[test]
-    fn matrix_scan_group_readiness_requires_the_writer_to_close()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut group = spawn_matrix_readiness_test_group()?;
-        let (readiness, mut writer) = UnixStream::pair()?;
-        let (sent_sender, sent_receiver) = mpsc::channel();
-        let (release_sender, release_receiver) = mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            let result = writer.write_all(&[MATRIX_SCAN_GROUP_READINESS_SENTINEL]);
-            let _ = sent_sender.send(result);
-            let _ = release_receiver.recv();
-        });
-        sent_receiver.recv_timeout(TEST_TIMEOUT)??;
+    fn matrix_scan_group_owns_two_exec_confirmed_members() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut group = spawn_matrix_scan_group("ownership", None)?;
+        let leader_raw_pid = i32::try_from(group.leader.id())?;
+        assert_eq!(leader_raw_pid, group.raw_pid);
+        let leader_pid = rustix::process::Pid::from_raw(leader_raw_pid)
+            .ok_or("matrix leader PID was invalid")?;
+        assert_eq!(rustix::process::getpgid(Some(leader_pid))?, leader_pid);
+        assert!(group.leader.try_wait()?.is_none());
 
-        let result = await_matrix_scan_group_readiness(
-            &mut group,
-            readiness,
-            Instant::now() + Duration::from_millis(30),
-        );
-        let _ = release_sender.send(());
-        writer.join().map_err(|_| "readiness writer panicked")?;
-        let error = result
-            .err()
-            .ok_or("an open readiness writer must not publish the process group")?;
+        let member = group.member.as_mut().ok_or("matrix member was missing")?;
+        let member_raw_pid = i32::try_from(member.id())?;
+        let member_pid = rustix::process::Pid::from_raw(member_raw_pid)
+            .ok_or("matrix member PID was invalid")?;
+        assert_ne!(member_pid, leader_pid);
+        assert_eq!(rustix::process::getpgid(Some(member_pid))?, leader_pid);
+        assert!(member.try_wait()?.is_none());
+
         assert_eq!(
-            error.to_string(),
-            "matrix process group readiness timed out"
+            group
+                .proof
+                .map(|proof| proof.member_count())
+                .ok_or("matrix descriptor proof was missing")?,
+            2
         );
+        let raw_process_group = group.raw_pid;
+        drop(group);
+        assert!(matches!(
+            rustix::process::waitpid(Some(leader_pid), rustix::process::WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
+        ));
+        assert!(matches!(
+            rustix::process::waitpid(Some(member_pid), rustix::process::WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
+        ));
+        wait_for_matrix_group_gone(raw_process_group, Instant::now() + TEST_TIMEOUT)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn matrix_zombie_only_group_uses_bounded_fixture_absence_proof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let group = spawn_matrix_scan_group("zombie-proof", None)?;
+        let process_group = rustix::process::Pid::from_raw(group.raw_pid)
+            .ok_or("matrix zombie process group was invalid")?;
+        let member_raw_pid = i32::try_from(
+            group
+                .member
+                .as_ref()
+                .ok_or("matrix zombie member was missing")?
+                .id(),
+        )?;
+        let member = rustix::process::Pid::from_raw(member_raw_pid)
+            .ok_or("matrix zombie member PID was invalid")?;
+        let session = rustix::process::getsid(Some(process_group))?
+            .as_raw_nonzero()
+            .get();
+        let identity = MatrixGroupIdentity {
+            process_group: group.raw_pid,
+            leader: group.raw_pid,
+            member: member_raw_pid,
+            session,
+        };
+
+        group._lease.shutdown(std::net::Shutdown::Both)?;
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        wait_for_matrix_child_terminal_without_reaping(process_group, deadline)?;
+        wait_for_matrix_child_terminal_without_reaping(member, deadline)?;
+        assert!(!macos_matrix_fixture_group_has_live_members(process_group)?);
+
+        signal_published_matrix_group(identity, session)?;
+        cleanup_published_matrix_group(identity, session, deadline)?;
+        drop(group);
+        wait_for_matrix_group_gone(process_group.as_raw_nonzero().get(), deadline)?;
         Ok(())
     }
 
     #[test]
-    fn matrix_scan_group_readiness_uses_one_absolute_deadline()
+    fn production_matrix_parent_deadline_dominates_nested_budgets()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut group = spawn_matrix_readiness_test_group()?;
-        let (readiness, mut writer) = UnixStream::pair()?;
-        let (started_sender, started_receiver) = mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            let _ = started_sender.send(());
-            std::thread::sleep(Duration::from_millis(100));
-            let _ = writer.write_all(&[MATRIX_SCAN_GROUP_READINESS_SENTINEL]);
-            std::thread::sleep(Duration::from_millis(150));
-        });
-        started_receiver.recv_timeout(TEST_TIMEOUT)?;
+        let required = TEST_PROCESS_GROUP_SCAN_TIMEOUT
+            .checked_mul(2)
+            .and_then(|duration| {
+                TEST_PRODUCTION_MATRIX_PHASE_TIMEOUT
+                    .checked_mul(2)
+                    .and_then(|phase| duration.checked_add(phase))
+            })
+            .and_then(|duration| duration.checked_add(TEST_PRODUCTION_MATRIX_SETUP_MARGIN))
+            .and_then(|duration| duration.checked_add(TEST_MATRIX_CHILD_CLEANUP_TIMEOUT))
+            .ok_or("the matrix deadline budget did not fit in Duration")?;
 
-        let started = Instant::now();
-        let result = await_matrix_scan_group_readiness(
-            &mut group,
-            readiness,
-            started + Duration::from_millis(200),
-        );
-        writer.join().map_err(|_| "readiness writer panicked")?;
-        let error = result
-            .err()
-            .ok_or("an open readiness writer must not publish the process group")?;
-        assert_eq!(
-            error.to_string(),
-            "matrix process group readiness timed out"
-        );
+        assert!(TEST_PRODUCTION_MATRIX_PARENT_TIMEOUT >= required);
         Ok(())
     }
 
-    fn spawn_matrix_readiness_test_group() -> Result<MatrixScanGroup, Box<dyn std::error::Error>> {
-        let mut command = Command::new("/bin/sleep");
-        command
+    #[test]
+    fn matrix_test_root_is_removed_after_post_creation_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let observed_root = Rc::new(RefCell::new(None));
+        let capture = Rc::clone(&observed_root);
+        let result = with_matrix_test_root(|root| -> Result<(), Box<dyn std::error::Error>> {
+            *capture.borrow_mut() = Some(root.to_path_buf());
+            std::fs::write(root.join("post-root-evidence"), b"private")?;
+            Err("forced post-root failure".into())
+        });
+        let error = match result {
+            Ok(()) => return Err("the injected post-root failure was lost".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "forced post-root failure");
+        let root = observed_root
+            .borrow()
+            .clone()
+            .ok_or("the test root was not observed")?;
+        assert!(!root.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn matrix_test_root_post_mkdir_validation_failure_retains_cleanup_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parent = std::fs::canonicalize(std::env::temp_dir())?;
+        let observed_root = Rc::new(RefCell::new(None));
+        let capture = Rc::clone(&observed_root);
+        let failure = match PrivateRuntime::create_with_post_mkdir(&parent, |root| {
+            *capture.borrow_mut() = Some(root.to_path_buf());
+            Err(std::io::Error::other("injected post-mkdir failure"))
+        }) {
+            Ok(runtime) => {
+                return match runtime.cleanup() {
+                    Ok(_) => Err("the injected post-mkdir failure was lost".into()),
+                    Err(failure) => Err(format!(
+                        "the injected post-mkdir failure was lost; cleanup failed: {}",
+                        failure.error()
+                    )
+                    .into()),
+                };
+            }
+            Err(failure) => failure,
+        };
+        assert!(failure.has_created_path());
+        let primary = failure.error();
+        let root = observed_root
+            .borrow()
+            .clone()
+            .ok_or("the provisional matrix root was not observed")?;
+        assert!(root.try_exists()?);
+        if let Err(failure) = failure.cleanup_created() {
+            return Err(format!(
+                "matrix root primary failure {primary} lost cleanup: {:?}",
+                failure.cleanup_error()
+            )
+            .into());
+        }
+        assert!(!root.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn matrix_test_root_preserves_a_replacement_before_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut root = MatrixTestRoot::create()?;
+        let visible = root.path().to_path_buf();
+        std::fs::write(visible.join("owned-evidence"), b"owned")?;
+        let parent = visible.parent().ok_or("matrix root parent was missing")?;
+        let parked = parent.join(format!(".calcifer-matrix-parked-{}", Uuid::new_v4()));
+        let replacement_file = visible.join("replacement-must-survive");
+        let error = match root.cleanup_with_before_cleanup(|cleanup_path| {
+            std::fs::rename(cleanup_path, &parked)?;
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(cleanup_path)?;
+            std::fs::write(
+                cleanup_path.join("replacement-must-survive"),
+                b"replacement",
+            )
+        }) {
+            Ok(()) => return Err("a replacement matrix root was deleted".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(std::fs::read(&replacement_file)?, b"replacement");
+
+        std::fs::remove_file(&replacement_file)?;
+        std::fs::remove_dir(&visible)?;
+        std::fs::rename(&parked, &visible)?;
+        root.cleanup()?;
+        assert!(!visible.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn matrix_test_child_timeout_kills_and_reaps_exact_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let child = Command::new("/bin/sleep")
             .arg("30")
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = command.spawn()?;
-        drop(command);
-        let raw_pid = i32::try_from(child.id())?;
-        Ok(MatrixScanGroup { child, raw_pid })
+            .stderr(Stdio::null())
+            .spawn()?;
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id())?)
+            .ok_or("matrix timeout child PID was invalid")?;
+        let mut owner = MatrixTestChild::new(child);
+
+        let error = match owner.wait_before(Instant::now()) {
+            Ok(_) => return Err("an expired matrix child deadline unexpectedly passed".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "matrix helper exceeded its deadline");
+        assert!(matches!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn matrix_child_reap_poll_is_bounded_and_retries_interruption() {
+        let started_at = Instant::now();
+        let mut expired_attempts = 0_usize;
+        let expired = poll_matrix_child_reap_before(Instant::now(), || {
+            expired_attempts += 1;
+            Ok(None)
+        });
+        assert_eq!(expired, Ok(None));
+        assert_eq!(expired_attempts, 1);
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+
+        let mut interrupted_attempts = 0_usize;
+        let reaped = poll_matrix_child_reap_before(Instant::now() + TEST_TIMEOUT, || {
+            interrupted_attempts += 1;
+            if interrupted_attempts == 1 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "synthetic interruption",
+                ))
+            } else {
+                Ok(Some(ExitStatus::from_raw(0)))
+            }
+        });
+        assert_eq!(reaped, Ok(Some(ExitStatus::from_raw(0))));
+        assert_eq!(interrupted_attempts, 2);
+    }
+
+    #[test]
+    fn matrix_interruption_retry_stops_at_the_absolute_deadline() {
+        let started_at = Instant::now();
+        let error =
+            match retry_matrix_interrupted_before(Instant::now(), "synthetic matrix deadline") {
+                Ok(()) => panic!("an expired EINTR retry passed"),
+                Err(error) => error,
+            };
+        assert_eq!(error.to_string(), "synthetic matrix deadline");
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn matrix_test_child_drop_kills_and_reaps_exact_child() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id())?)
+            .ok_or("matrix drop child PID was invalid")?;
+
+        drop(MatrixTestChild::new(child));
+
+        assert!(matches!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn matrix_test_child_timeout_cleans_nested_groups_and_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let observed_root = Rc::new(RefCell::new(None));
+        let capture = Rc::clone(&observed_root);
+        with_matrix_test_root(|root| {
+            *capture.borrow_mut() = Some(root.to_path_buf());
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "providers::codex::supervisor::coordinator::tests::production_matrix_timeout_cleanup_child_helper",
+                    "--nocapture",
+                ])
+                .env(PRODUCTION_MATRIX_TIMEOUT_HELPER_ENV, "1")
+                .env(PRODUCTION_MATRIX_ROOT_ENV, root);
+            let owner = PtyOwner::open(TerminalSize::new(24, 80))?;
+            let master = owner.configure_child(&mut command)?;
+            command.stderr(Stdio::piped());
+            let child = command.spawn()?;
+            drop(command);
+            let mut child = MatrixTestChild::with_matrix_root(child, root)?;
+            let mut master = Some(master);
+            let helper_pid = rustix::process::Pid::from_raw(child.raw_pid()?)
+                .ok_or("matrix timeout helper PID was invalid")?;
+            let stderr = child.take_stderr()?;
+            let (line_sender, line_receiver) = mpsc::channel();
+            let (done_sender, done_receiver) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    if line_sender.send(line).is_err() {
+                        break;
+                    }
+                }
+                let _ = done_sender.send(());
+            });
+            expect_matrix_line(
+                &line_receiver,
+                "matrix-timeout-groups-ready",
+                Instant::now() + TEST_TIMEOUT,
+            )?;
+            let app = read_matrix_group_identity(root, PRODUCTION_MATRIX_APP_GROUP_MARKER)?
+                .ok_or("matrix timeout app group was not published")?;
+            let tui = read_matrix_group_identity(root, PRODUCTION_MATRIX_TUI_GROUP_MARKER)?
+                .ok_or("matrix timeout TUI group was not published")?;
+
+            let error = match child.wait_before_with_timeout_cleanup(Instant::now(), || {
+                drop(master.take());
+                Ok(())
+            }) {
+                Ok(_) => return Err("matrix timeout helper unexpectedly exited cleanly".into()),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), "matrix helper exceeded its deadline");
+            assert!(matches!(
+                rustix::process::waitpid(Some(helper_pid), rustix::process::WaitOptions::NOHANG),
+                Err(rustix::io::Errno::CHILD)
+            ));
+            wait_for_matrix_group_gone(app.process_group, Instant::now() + TEST_TIMEOUT)?;
+            wait_for_matrix_group_gone(tui.process_group, Instant::now() + TEST_TIMEOUT)?;
+            done_receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .map_err(|_| "matrix timeout stderr reader did not observe EOF")?;
+            reader
+                .join()
+                .map_err(|_| "matrix timeout stderr reader panicked")?;
+            drop(master);
+            Ok(())
+        })?;
+        let root = observed_root
+            .borrow()
+            .clone()
+            .ok_or("the matrix timeout root was not observed")?;
+        assert!(!root.try_exists()?);
+        Ok(())
     }
 
     #[test]
@@ -2582,48 +3150,52 @@ mod tests {
             eprintln!("matrix-helper-error:invalid-case");
             std::process::exit(91);
         };
-        if let Err(error) = run_matrix_child(case) {
+        let Some(root) = std::env::var_os(PRODUCTION_MATRIX_ROOT_ENV).map(PathBuf::from) else {
+            eprintln!("matrix-helper-error:missing-root");
+            std::process::exit(91);
+        };
+        if let Err(error) = run_matrix_child(case, &root) {
             eprintln!("matrix-helper-error:{error}");
             std::process::exit(91);
         }
     }
 
     #[test]
-    fn production_coordinator_matrix_scan_group_helper() {
-        if std::env::var_os(PRODUCTION_MATRIX_SCAN_GROUP_HELPER_ENV).is_none() {
+    fn production_matrix_timeout_cleanup_child_helper() {
+        if std::env::var_os(PRODUCTION_MATRIX_TIMEOUT_HELPER_ENV).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
             return;
         }
-        let exit_code = if run_matrix_scan_group_helper().is_ok() {
-            0
-        } else {
-            91
+        let Some(root) = std::env::var_os(PRODUCTION_MATRIX_ROOT_ENV).map(PathBuf::from) else {
+            eprintln!("matrix-timeout-helper-error:missing-root");
+            std::process::exit(91);
         };
-        std::process::exit(exit_code);
+        if let Err(error) = run_matrix_timeout_cleanup_child(&root) {
+            eprintln!("matrix-timeout-helper-error:{error}");
+            std::process::exit(91);
+        }
     }
 
-    fn run_matrix_scan_group_helper() -> Result<(), Box<dyn std::error::Error>> {
-        let inherited = calcifer_unix_child_fd::take_inherited_readiness_fd()?;
-        let mut readiness = UnixStream::from(inherited);
-        let mut sleeper_command = Command::new("/bin/sleep");
-        calcifer_unix_child_fd::scrub_readiness_fd_env(&mut sleeper_command);
-        let mut sleeper = sleeper_command
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        readiness.write_all(&[MATRIX_SCAN_GROUP_READINESS_SENTINEL])?;
-        readiness.shutdown(std::net::Shutdown::Write)?;
-
-        let status = sleeper.wait()?;
-        if !status.success() {
-            return Err("matrix process group sleeper failed".into());
+    fn run_matrix_timeout_cleanup_child(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        claim_controlling_terminal_from_stdin()?;
+        validate_matrix_child_root(root)?;
+        let _app_group = spawn_matrix_scan_group("app", Some(root))?;
+        let _tui_group = spawn_matrix_scan_group("tui", Some(root))?;
+        eprintln!("matrix-timeout-groups-ready");
+        loop {
+            std::thread::park();
         }
-        Ok(())
     }
 
     fn run_matrix_parent(case: ProductionMatrixCase) -> Result<(), Box<dyn std::error::Error>> {
+        with_matrix_test_root(|root| run_matrix_parent_with_root(case, root))
+    }
+
+    fn run_matrix_parent_with_root(
+        case: ProductionMatrixCase,
+        root: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let parent_deadline = Instant::now() + TEST_PRODUCTION_MATRIX_PARENT_TIMEOUT;
         let mut command = Command::new(std::env::current_exe()?);
         command
@@ -2632,20 +3204,25 @@ mod tests {
                 "providers::codex::supervisor::coordinator::tests::production_coordinator_matrix_child_helper",
                 "--nocapture",
             ])
-            .env(PRODUCTION_MATRIX_HELPER_ENV, case.as_str());
+            .env(PRODUCTION_MATRIX_HELPER_ENV, case.as_str())
+            .env(PRODUCTION_MATRIX_ROOT_ENV, root);
         let owner = PtyOwner::open(TerminalSize::new(33, 107))?;
         let master = owner.configure_child(&mut command)?;
         let initial_termios = rustix::termios::tcgetattr(&master)?;
         command.stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+        let child = command.spawn()?;
         // `Command` is reusable and retains its configured PTY slave handles
         // after `spawn`. Linux therefore cannot report master EOF until this
         // parent-side configuration owner is dropped.
         drop(command);
-        let raw_pid = i32::try_from(child.id())?;
+        let mut child = MatrixTestChild::with_matrix_root(child, root)?;
+        // This binding is intentionally created after `child`: unwind drops
+        // the PTY master before MatrixTestChild sends a fatal signal to the
+        // session leader, avoiding Darwin's exiting-session wait cycle.
+        let mut master = Some(master);
+        let raw_pid = child.raw_pid()?;
         let pid = rustix::process::Pid::from_raw(raw_pid).ok_or("invalid helper PID")?;
-        let stderr = child.stderr.take().ok_or("missing matrix helper stderr")?;
-        let mut child = MatrixTestChild::new(child);
+        let stderr = child.take_stderr()?;
         let (line_sender, line_receiver) = mpsc::channel();
         let (reader_done_sender, reader_done_receiver) = mpsc::channel();
         let reader = std::thread::spawn(move || {
@@ -2656,7 +3233,10 @@ mod tests {
             }
             let _ = reader_done_sender.send(());
         });
-        master.enable_nonblocking()?;
+        master
+            .as_ref()
+            .ok_or("matrix PTY master was missing")?
+            .enable_nonblocking()?;
 
         if case == ProductionMatrixCase::CoordinatorAuthorityLeak {
             expect_matrix_line(
@@ -2669,19 +3249,14 @@ mod tests {
                 "coordinator-a-leak-rejected",
                 parent_deadline,
             )?;
-            let (drain_sender, drain_receiver) = mpsc::channel();
-            let drainer = std::thread::spawn(move || {
-                let result = drain_matrix_master(master, parent_deadline);
-                let _ = drain_sender.send(result);
-            });
-            let status = child.wait_before(parent_deadline)?;
+            let master = master.take().ok_or("matrix PTY master was missing")?;
+            let mut drainer = MatrixMasterDrainer::spawn(master, parent_deadline);
+            let status =
+                child.wait_before_with_timeout_cleanup(parent_deadline, || drainer.cancel())?;
             if !status.success() {
                 return Err(format!("A-leak helper exited as {status}").into());
             }
-            drain_receiver
-                .recv_timeout(matrix_parent_remaining(parent_deadline)?)
-                .map_err(|_| "A-leak PTY drainer timed out")??;
-            drainer.join().map_err(|_| "A-leak PTY drainer panicked")?;
+            drainer.finish(parent_deadline)?;
             reader_done_receiver
                 .recv_timeout(matrix_parent_remaining(parent_deadline)?)
                 .map_err(|_| "A-leak stderr reader did not observe EOF")?;
@@ -2700,7 +3275,9 @@ mod tests {
             ProductionMatrixCase::SuspendResume => {
                 rustix::process::kill_process(pid, rustix::process::Signal::TSTP)?;
                 wait_for_matrix_stop(pid, parent_deadline)?;
-                let stopped_termios = rustix::termios::tcgetattr(&master)?;
+                let stopped_termios = rustix::termios::tcgetattr(
+                    master.as_ref().ok_or("matrix PTY master was missing")?,
+                )?;
                 if !termios_semantically_equal(&initial_termios, &stopped_termios) {
                     return Err("suspend did not restore the exact outer terminal".into());
                 }
@@ -2718,7 +3295,7 @@ mod tests {
                         .insert(rustix::termios::LocalModes::ECHO);
                 }
                 rustix::termios::tcsetattr(
-                    &master,
+                    master.as_ref().ok_or("matrix PTY master was missing")?,
                     rustix::termios::OptionalActions::Now,
                     &mutated,
                 )?;
@@ -2732,29 +3309,30 @@ mod tests {
         }
 
         if case == ProductionMatrixCase::DataThenEof {
-            wait_for_matrix_output(&master, PRODUCTION_MATRIX_OUTPUT, parent_deadline)?;
+            wait_for_matrix_output(
+                master.as_ref().ok_or("matrix PTY master was missing")?,
+                PRODUCTION_MATRIX_OUTPUT,
+                parent_deadline,
+            )?;
         }
         expect_matrix_line(&line_receiver, "coordinator-finished", parent_deadline)?;
         if case == ProductionMatrixCase::SuspendResume {
-            let final_termios = rustix::termios::tcgetattr(&master)?;
+            let final_termios = rustix::termios::tcgetattr(
+                master.as_ref().ok_or("matrix PTY master was missing")?,
+            )?;
             if !termios_semantically_equal(&initial_termios, &final_termios) {
                 return Err("post-resume shutdown did not restore the original termios".into());
             }
         }
 
-        let (drain_sender, drain_receiver) = mpsc::channel();
-        let drainer = std::thread::spawn(move || {
-            let result = drain_matrix_master(master, parent_deadline);
-            let _ = drain_sender.send(result);
-        });
-        let status = child.wait_before(parent_deadline)?;
+        let master = master.take().ok_or("matrix PTY master was missing")?;
+        let mut drainer = MatrixMasterDrainer::spawn(master, parent_deadline);
+        let status =
+            child.wait_before_with_timeout_cleanup(parent_deadline, || drainer.cancel())?;
         if !status.success() {
             return Err(format!("matrix helper {case:?} exited as {status}").into());
         }
-        drain_receiver
-            .recv_timeout(matrix_parent_remaining(parent_deadline)?)
-            .map_err(|_| "matrix PTY drainer timed out")??;
-        drainer.join().map_err(|_| "matrix PTY drainer panicked")?;
+        drainer.finish(parent_deadline)?;
         reader_done_receiver
             .recv_timeout(matrix_parent_remaining(parent_deadline)?)
             .map_err(|_| "matrix stderr reader did not observe EOF")?;
@@ -2762,14 +3340,13 @@ mod tests {
         Ok(())
     }
 
-    fn run_matrix_child(case: ProductionMatrixCase) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_matrix_child(
+        case: ProductionMatrixCase,
+        root: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         claim_controlling_terminal_from_stdin()?;
-        let root = std::fs::canonicalize(std::env::temp_dir())?.join(format!(
-            "calcifer-coordinator-matrix-{}-{}",
-            std::process::id(),
-            Uuid::new_v4()
-        ));
-        let registry = Registry::at(root.clone());
+        validate_matrix_child_root(root)?;
+        let registry = Registry::at(root.to_path_buf());
         let pending = registry.begin_codex_registration("matrix")?;
         let mut auth = OpenOptions::new()
             .write(true)
@@ -2799,10 +3376,10 @@ mod tests {
         } else {
             None
         };
-        let app_group = spawn_matrix_scan_group("app")?;
+        let app_group = spawn_matrix_scan_group("app", Some(root))?;
         let app_group_pid = app_group.raw_pid;
         drop(inherited_a);
-        let tui_group = spawn_matrix_scan_group("tui")?;
+        let tui_group = spawn_matrix_scan_group("tui", Some(root))?;
         let tui_group_pid = tui_group.raw_pid;
         let mut child = Command::new("/bin/sh")
             .args(["-c", case.child_script()])
@@ -2811,28 +3388,53 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()?;
         let trigger = child.stdin.take().ok_or("missing guardian child trigger")?;
-        let peer = std::thread::spawn(move || {
-            run_matrix_guardian_peer(
-                case,
-                snapshot,
-                guardian_lifecycle,
-                guardian_terminal,
-                trigger,
-                app_group,
-                tui_group,
-            )
-        });
-        let bounds = CoordinatorBounds::new(Duration::from_secs(2), Duration::from_millis(5))?;
-        let coordinator = ProductionCoordinator::assemble(
+        let bounds = CoordinatorBounds::new(
+            TEST_PRODUCTION_MATRIX_PHASE_TIMEOUT,
+            Duration::from_millis(5),
+        )?;
+        let coordinator = match ProductionCoordinator::assemble(
             authority,
             child,
             coordinator_lifecycle,
             terminal,
             bounds,
-        )
-        .map_err(|_| "production coordinator assembly failed")?;
-        let outcome = coordinator.run();
-        let peer_result = peer.join().map_err(|_| "matrix guardian peer panicked")?;
+        ) {
+            Ok(coordinator) => coordinator,
+            Err(failure) => {
+                let CoordinatorSetupFailure {
+                    authority,
+                    mut guardian,
+                    lifecycle,
+                    terminal,
+                    error,
+                } = *failure;
+                let _ = guardian.kill();
+                guardian
+                    .wait()
+                    .map_err(|_| "matrix guardian reap after assembly failure failed")?;
+                drop((authority, lifecycle, terminal));
+                return Err(format!("production coordinator assembly failed: {error}").into());
+            }
+        };
+        // The peer only acquires the process-group owners after coordinator
+        // assembly succeeds. A scoped thread then makes its join mandatory on
+        // normal return and unwind before the helper can call `process::exit`.
+        let (outcome, peer_result) = std::thread::scope(|scope| {
+            let peer = scope.spawn(move || {
+                run_matrix_guardian_peer(
+                    case,
+                    snapshot,
+                    guardian_lifecycle,
+                    guardian_terminal,
+                    trigger,
+                    app_group,
+                    tui_group,
+                )
+            });
+            let outcome = coordinator.run();
+            let peer_result = peer.join().map_err(|_| "matrix guardian peer panicked")?;
+            Ok::<_, Box<dyn std::error::Error>>((outcome, peer_result))
+        })?;
 
         match (case, outcome) {
             (
@@ -2859,7 +3461,6 @@ mod tests {
                 peer_result.map_err(|error| format!("A-leak guardian peer failed: {error}"))?;
                 wait_for_matrix_group_gone(app_group_pid, Instant::now() + TEST_TIMEOUT)?;
                 wait_for_matrix_group_gone(tui_group_pid, Instant::now() + TEST_TIMEOUT)?;
-                std::fs::remove_dir_all(root)?;
                 eprintln!("coordinator-a-leak-rejected");
                 return Ok(());
             }
@@ -2918,8 +3519,26 @@ mod tests {
             }
         }
         peer_result.map_err(|error| format!("matrix guardian peer failed: {error}"))?;
-        std::fs::remove_dir_all(root)?;
         eprintln!("coordinator-finished");
+        Ok(())
+    }
+
+    fn validate_matrix_child_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let parent = std::fs::canonicalize(std::env::temp_dir())?;
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("matrix test root name was invalid")?;
+        let metadata = std::fs::symlink_metadata(root)?;
+        if root.parent() != Some(parent.as_path())
+            || !name.starts_with(".calcifer-supervisor-")
+            || std::fs::canonicalize(root)? != root
+            || !metadata.file_type().is_dir()
+            || std::os::unix::fs::MetadataExt::uid(&metadata) != rustix::process::geteuid().as_raw()
+            || std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o7777 != 0o700
+        {
+            return Err("matrix test root identity was invalid".into());
+        }
         Ok(())
     }
 
@@ -3224,16 +3843,96 @@ mod tests {
                 Ok(Some(_)) | Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::INTR) => {
+                    retry_matrix_interrupted_before(deadline, "matrix helper did not stop")?
+                }
                 Ok(Some(_)) | Ok(None) => return Err("matrix helper did not stop".into()),
                 Err(_) => return Err("matrix helper waitpid failed".into()),
             }
         }
     }
 
-    fn drain_matrix_master(master: PtyMaster, deadline: Instant) -> Result<(), &'static str> {
+    fn retry_matrix_interrupted_before(
+        deadline: Instant,
+        deadline_message: &'static str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(deadline_message.into());
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(1)),
+        );
+        Ok(())
+    }
+
+    struct MatrixMasterDrainer {
+        cancel: mpsc::Sender<()>,
+        result: Receiver<Result<(), &'static str>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MatrixMasterDrainer {
+        fn spawn(master: PtyMaster, deadline: Instant) -> Self {
+            let (cancel_sender, cancel_receiver) = mpsc::channel();
+            let (result_sender, result_receiver) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let result = drain_matrix_master(master, deadline, &cancel_receiver);
+                let _ = result_sender.send(result);
+            });
+            Self {
+                cancel: cancel_sender,
+                result: result_receiver,
+                thread: Some(thread),
+            }
+        }
+
+        fn cancel(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            if self.thread.is_none() {
+                return Ok(());
+            }
+            let _ = self.cancel.send(());
+            let _drain_result = self
+                .result
+                .recv_timeout(TEST_TIMEOUT)
+                .map_err(|_| "matrix PTY drainer did not release the master")?;
+            let thread = self.thread.take().ok_or("matrix PTY drainer was missing")?;
+            thread.join().map_err(|_| "matrix PTY drainer panicked")?;
+            Ok(())
+        }
+
+        fn finish(mut self, deadline: Instant) -> Result<(), Box<dyn std::error::Error>> {
+            let result = self
+                .result
+                .recv_timeout(matrix_parent_remaining(deadline)?)
+                .map_err(|_| "matrix PTY drainer timed out")?;
+            let thread = self.thread.take().ok_or("matrix PTY drainer was missing")?;
+            thread.join().map_err(|_| "matrix PTY drainer panicked")?;
+            result.map_err(Into::into)
+        }
+    }
+
+    impl Drop for MatrixMasterDrainer {
+        fn drop(&mut self) {
+            let _ = self.cancel();
+        }
+    }
+
+    fn drain_matrix_master(
+        master: PtyMaster,
+        deadline: Instant,
+        cancel: &Receiver<()>,
+    ) -> Result<(), &'static str> {
         let mut buffer = TerminalBuffer::new();
         loop {
+            match cancel.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("matrix PTY drain cancelled");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
             if Instant::now() >= deadline {
                 return Err("matrix outer PTY remained open");
             }
@@ -3247,36 +3946,176 @@ mod tests {
         }
     }
 
-    fn spawn_matrix_scan_group(role: &str) -> Result<MatrixScanGroup, Box<dyn std::error::Error>> {
-        // Path visibility is not a close barrier: a scanner can observe the
-        // descriptor that created a marker before the shell drops it. The
-        // helper publishes only after its descendant exec, and EOF proves that
-        // its one-shot readiness writer is quiescent before scanning begins.
-        let (readiness, inherited_readiness) = UnixStream::pair()?;
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .args([
-                "--exact",
-                PRODUCTION_MATRIX_SCAN_GROUP_HELPER_TEST,
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(PRODUCTION_MATRIX_SCAN_GROUP_HELPER_ENV, "1")
+    fn with_matrix_test_root<T>(
+        run: impl FnOnce(&Path) -> Result<T, Box<dyn std::error::Error>>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let mut root = MatrixTestRoot::create()?;
+        let result = run(root.path());
+        let cleanup = root.cleanup();
+        match (result, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => {
+                Err(format!("{error}; matrix root cleanup also failed: {cleanup}").into())
+            }
+        }
+    }
+
+    struct MatrixTestRoot {
+        path: PathBuf,
+        runtime: Option<PrivateRuntime>,
+    }
+
+    impl MatrixTestRoot {
+        fn create() -> Result<Self, Box<dyn std::error::Error>> {
+            let parent = std::fs::canonicalize(std::env::temp_dir())?;
+            let runtime = match PrivateRuntime::create(&parent) {
+                Ok(runtime) => runtime,
+                Err(failure) => {
+                    let primary = failure.error();
+                    if !failure.has_created_path() {
+                        return Err(format!("matrix test root creation failed: {primary}").into());
+                    }
+                    return match failure.cleanup_created() {
+                        Ok(_) => Err(format!("matrix test root creation failed: {primary}").into()),
+                        Err(failure) => Err(format!(
+                            "matrix test root creation failed: {primary}; provisional cleanup failed: {:?}",
+                            failure.cleanup_error()
+                        )
+                        .into()),
+                    };
+                }
+            };
+            Ok(Self {
+                path: runtime.path().to_path_buf(),
+                runtime: Some(runtime),
+            })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn cleanup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            let Some(runtime) = self.runtime.take() else {
+                return Ok(());
+            };
+            match runtime.cleanup_fixture_tree() {
+                Ok(_) => Ok(()),
+                Err(failure) => {
+                    let error = failure.error();
+                    let runtime = failure.into_runtime();
+                    self.path = runtime.path().to_path_buf();
+                    self.runtime = Some(runtime);
+                    Err(format!("matrix test root cleanup failed: {error}").into())
+                }
+            }
+        }
+
+        fn cleanup_with_before_cleanup<F>(
+            &mut self,
+            before_cleanup: F,
+        ) -> Result<(), Box<dyn std::error::Error>>
+        where
+            F: FnMut(&Path) -> std::io::Result<()>,
+        {
+            let Some(runtime) = self.runtime.take() else {
+                return Ok(());
+            };
+            match runtime.cleanup_fixture_tree_with_before_cleanup(before_cleanup) {
+                Ok(_) => Ok(()),
+                Err(failure) => {
+                    let error = failure.error();
+                    let runtime = failure.into_runtime();
+                    self.path = runtime.path().to_path_buf();
+                    self.runtime = Some(runtime);
+                    Err(format!("matrix test root cleanup failed: {error}").into())
+                }
+            }
+        }
+    }
+
+    impl Drop for MatrixTestRoot {
+        fn drop(&mut self) {
+            let _ = self.cleanup();
+        }
+    }
+
+    fn spawn_matrix_scan_group(
+        role: &str,
+        record_root: Option<&Path>,
+    ) -> Result<MatrixScanGroup, Box<dyn std::error::Error>> {
+        // Both children are spawned and exec-confirmed by this exact parent.
+        // The scanner proves a process-group property, not a PPID hierarchy;
+        // owning both waits avoids a nested libtest startup. A private lease
+        // pipe also makes both children exit on EOF if this helper is killed
+        // before Rust can run the exact group owner's destructor.
+        let (leader_input, lease) = UnixStream::pair()?;
+        let member_input = leader_input.try_clone()?;
+        let mut leader_command = Command::new("/bin/sh");
+        leader_command
+            .args(["-c", "IFS= read -r _; exit 0"])
             .process_group(0)
-            .stdin(Stdio::null())
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(leader_input)))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
-            command,
-            inherited_readiness.as_fd(),
-        )?;
-        drop(inherited_readiness);
-        let raw_pid = i32::try_from(child.id())?;
-        let mut group = MatrixScanGroup { child, raw_pid };
-        let deadline = Instant::now() + TEST_PROCESS_GROUP_SCAN_TIMEOUT;
-        await_matrix_scan_group_readiness(&mut group, readiness, deadline)
-            .map_err(|error| format!("matrix {role} process group readiness failed: {error}"))?;
+        let mut leader = leader_command
+            .spawn()
+            .map_err(|_| format!("matrix {role} group leader spawn failed"))?;
+        let raw_pid = match i32::try_from(leader.id()) {
+            Ok(raw_pid) => raw_pid,
+            Err(_) => {
+                let _ = leader.kill();
+                leader.wait()?;
+                return Err(format!("matrix {role} group leader PID was invalid").into());
+            }
+        };
+        let mut group = MatrixScanGroup {
+            leader,
+            member: None,
+            raw_pid,
+            proof: None,
+            _lease: lease,
+        };
+        let leader_pid = rustix::process::Pid::from_raw(raw_pid)
+            .ok_or_else(|| format!("matrix {role} group leader PID was invalid"))?;
+        if rustix::process::getpgid(Some(leader_pid))
+            .map_err(|_| format!("matrix {role} group leader identity was unavailable"))?
+            != leader_pid
+        {
+            return Err(format!("matrix {role} group leader identity was invalid").into());
+        }
 
+        let mut member_command = Command::new("/bin/sh");
+        member_command
+            .args(["-c", "IFS= read -r _; exit 0"])
+            .process_group(raw_pid)
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(member_input)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let member = member_command
+            .spawn()
+            .map_err(|_| format!("matrix {role} group member spawn failed"))?;
+        group.member = Some(member);
+        let member_raw_pid = group
+            .member
+            .as_ref()
+            .and_then(|member| i32::try_from(member.id()).ok())
+            .ok_or_else(|| format!("matrix {role} group member PID was invalid"))?;
+        let member_pid = rustix::process::Pid::from_raw(member_raw_pid)
+            .ok_or_else(|| format!("matrix {role} group member PID was invalid"))?;
+        if rustix::process::getpgid(Some(member_pid))
+            .map_err(|_| format!("matrix {role} group member identity was unavailable"))?
+            != leader_pid
+        {
+            return Err(format!("matrix {role} group member identity was invalid").into());
+        }
+        if let Some(root) = record_root {
+            publish_matrix_group_identity(root, role, raw_pid, member_raw_pid)?;
+        }
+
+        let deadline = Instant::now() + TEST_PROCESS_GROUP_SCAN_TIMEOUT;
         let empty_forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
         let mut last_transient_error = None;
         loop {
@@ -3286,7 +4125,11 @@ mod tests {
                     &empty_forbidden,
                     deadline,
                 ) {
-                    Ok(proof) => proof.member_count() == 2,
+                    Ok(proof) if proof.member_count() == 2 => {
+                        group.proof = Some(proof);
+                        true
+                    }
+                    Ok(_) => false,
                     Err(
                         error @ (calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
                         | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged),
@@ -3313,61 +4156,55 @@ mod tests {
         }
     }
 
-    fn await_matrix_scan_group_readiness(
-        group: &mut MatrixScanGroup,
-        mut readiness: UnixStream,
-        deadline: Instant,
+    fn publish_matrix_group_identity(
+        root: &Path,
+        role: &str,
+        process_group: i32,
+        member: i32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if group.child.try_wait()?.is_some() {
-            return Err("matrix process group exited before readiness".into());
-        }
-        let mut bytes = [0_u8; 2];
-        let byte_count =
-            read_matrix_scan_group_readiness_before(&mut readiness, &mut bytes, deadline)?;
-        if byte_count != 1 || bytes[0] != MATRIX_SCAN_GROUP_READINESS_SENTINEL {
-            return Err("matrix process group readiness was invalid".into());
-        }
-        if read_matrix_scan_group_readiness_before(&mut readiness, &mut bytes, deadline)? != 0 {
-            return Err("matrix process group readiness was invalid".into());
-        }
-        if group.child.try_wait()?.is_some() {
-            return Err("matrix process group exited before readiness".into());
-        }
-        Ok(())
-    }
-
-    fn read_matrix_scan_group_readiness_before(
-        readiness: &mut UnixStream,
-        bytes: &mut [u8],
-        deadline: Instant,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err("matrix process group readiness timed out".into());
-            }
-            readiness
-                .set_read_timeout(Some(deadline.saturating_duration_since(now)))
-                .map_err(|_| "matrix process group readiness timeout setup failed")?;
-            match readiness.read(bytes) {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    return Err("matrix process group readiness timed out".into());
-                }
-                Err(_) => return Err("matrix process group readiness read failed".into()),
-                Ok(byte_count) => return Ok(byte_count),
-            }
-        }
+        let marker = match role {
+            "app" => PRODUCTION_MATRIX_APP_GROUP_MARKER,
+            "tui" => PRODUCTION_MATRIX_TUI_GROUP_MARKER,
+            _ => return Err("matrix group role could not be published".into()),
+        };
+        let session = rustix::process::getsid(None)?.as_raw_nonzero().get();
+        let payload = format!("{process_group} {process_group} {member} {session}\n");
+        super::super::packaged_smoke::write_private_atomic_new(
+            &root.join(marker),
+            payload.as_bytes(),
+        )
     }
 
     struct MatrixScanGroup {
-        child: Child,
+        leader: Child,
+        member: Option<Child>,
         raw_pid: i32,
+        proof: Option<calcifer_unix_child_fd::ProcessGroupDescriptorIsolationProof>,
+        _lease: UnixStream,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_matrix_child_terminal_without_reaping(
+        child: rustix::process::Pid,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            match rustix::process::waitid(
+                rustix::process::WaitId::Pid(child),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ) {
+                Ok(Some(status)) if status.exited() || status.killed() || status.dumped() => {
+                    return Ok(());
+                }
+                Ok(_) | Err(rustix::io::Errno::INTR) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(_) => return Err("matrix child did not become terminal".into()),
+                Err(_) => return Err("matrix child terminal state was unavailable".into()),
+            }
+        }
     }
 
     fn wait_for_matrix_group_gone(
@@ -3379,7 +4216,16 @@ mod tests {
         loop {
             match rustix::process::test_kill_process_group(process_group) {
                 Err(rustix::io::Errno::SRCH) => return Ok(()),
-                Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::INTR) => retry_matrix_interrupted_before(
+                    deadline,
+                    "matrix process group absence was inconclusive",
+                )?,
+                #[cfg(target_os = "macos")]
+                Err(rustix::io::Errno::PERM)
+                    if !macos_matrix_fixture_group_has_live_members(process_group)? =>
+                {
+                    return Ok(());
+                }
                 Ok(()) | Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -3389,38 +4235,442 @@ mod tests {
         }
     }
 
+    /// Darwin reports `EPERM` for a synthetic process group whose only
+    /// remaining members are zombies. This bounded whole-group scan is a test
+    /// fixture accommodation only; production containment never treats EPERM
+    /// alone as absence proof.
+    #[cfg(target_os = "macos")]
+    fn macos_matrix_fixture_group_has_live_members(
+        process_group: rustix::process::Pid,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        calcifer_unix_child_fd::macos_process_group_has_live_members(
+            process_group.as_raw_nonzero().get(),
+        )
+        .map_err(Into::into)
+    }
+
+    fn poll_matrix_child_reap_before(
+        deadline: Instant,
+        mut try_wait: impl FnMut() -> std::io::Result<Option<ExitStatus>>,
+    ) -> Result<Option<ExitStatus>, &'static str> {
+        loop {
+            match try_wait() {
+                Ok(Some(status)) => return Ok(Some(status)),
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err("observation-failed"),
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(1)),
+            );
+        }
+    }
+
+    fn fail_unproven_matrix_child_cleanup(
+        context: &'static str,
+        kill_failed: bool,
+        reap: &'static str,
+    ) -> ! {
+        // This is a libtest-only fail-closed boundary. Returning would detach
+        // exact direct-child wait authority, while blocking would defeat the
+        // outer CI deadline. `_exit` closes every inherited lease atomically
+        // and runs no unrelated destructors.
+        {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "matrix-child-cleanup-unproven:context={context},kill={},reap={reap}",
+                if kill_failed { "failed" } else { "delivered" }
+            );
+            let _ = stderr.flush();
+        }
+        calcifer_unix_child_fd::exit_process_without_destructors(
+            MATRIX_UNPROVEN_CHILD_CLEANUP_EXIT_CODE,
+        );
+    }
+
+    fn terminate_matrix_child_or_exit(child: &mut Child, context: &'static str) {
+        let kill_failed = child.kill().is_err();
+        let Some(deadline) = Instant::now().checked_add(TEST_MATRIX_CHILD_CLEANUP_TIMEOUT) else {
+            fail_unproven_matrix_child_cleanup(context, kill_failed, "deadline-overflow");
+        };
+        match poll_matrix_child_reap_before(deadline, || child.try_wait()) {
+            Ok(Some(_)) => {}
+            Ok(None) => fail_unproven_matrix_child_cleanup(context, kill_failed, "deadline"),
+            Err(reap) => fail_unproven_matrix_child_cleanup(context, kill_failed, reap),
+        }
+    }
+
     impl Drop for MatrixScanGroup {
         fn drop(&mut self) {
             if let Some(group) = rustix::process::Pid::from_raw(self.raw_pid) {
                 let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
             }
-            let _ = self.child.wait();
+            terminate_matrix_child_or_exit(&mut self.leader, "scan-leader-drop");
+            if let Some(member) = self.member.as_mut() {
+                terminate_matrix_child_or_exit(member, "scan-member-drop");
+            }
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct MatrixGroupIdentity {
+        process_group: i32,
+        leader: i32,
+        member: i32,
+        session: i32,
+    }
+
+    fn read_matrix_group_identity(
+        root: &Path,
+        marker: &str,
+    ) -> Result<Option<MatrixGroupIdentity>, Box<dyn std::error::Error>> {
+        let bytes =
+            match super::super::packaged_smoke::read_private_bounded(&root.join(marker), 128) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+        let text = std::str::from_utf8(&bytes)?;
+        let line = text
+            .strip_suffix('\n')
+            .ok_or("matrix group identity was not newline terminated")?;
+        let mut fields = line.split(' ');
+        let process_group = fields
+            .next()
+            .ok_or("matrix group identity missed its process group")?
+            .parse::<i32>()?;
+        let leader = fields
+            .next()
+            .ok_or("matrix group identity missed its leader")?
+            .parse::<i32>()?;
+        let member = fields
+            .next()
+            .ok_or("matrix group identity missed its member")?
+            .parse::<i32>()?;
+        let session = fields
+            .next()
+            .ok_or("matrix group identity missed its session")?
+            .parse::<i32>()?;
+        if fields.next().is_some()
+            || process_group <= 0
+            || leader != process_group
+            || member <= 0
+            || member == leader
+            || session <= 0
+        {
+            return Err("matrix group identity was invalid".into());
+        }
+        Ok(Some(MatrixGroupIdentity {
+            process_group,
+            leader,
+            member,
+            session,
+        }))
+    }
+
+    fn cleanup_published_matrix_groups(
+        root: &Path,
+        expected_session: i32,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for marker in [
+            PRODUCTION_MATRIX_APP_GROUP_MARKER,
+            PRODUCTION_MATRIX_TUI_GROUP_MARKER,
+        ] {
+            if let Some(identity) = read_matrix_group_identity(root, marker)? {
+                cleanup_published_matrix_group(identity, expected_session, deadline)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn signal_published_matrix_groups(
+        root: &Path,
+        expected_session: i32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for marker in [
+            PRODUCTION_MATRIX_APP_GROUP_MARKER,
+            PRODUCTION_MATRIX_TUI_GROUP_MARKER,
+        ] {
+            if let Some(identity) = read_matrix_group_identity(root, marker)? {
+                signal_published_matrix_group(identity, expected_session)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn signal_published_matrix_group(
+        identity: MatrixGroupIdentity,
+        expected_session: i32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if identity.session != expected_session {
+            return Err("matrix group identity belonged to another session".into());
+        }
+        let process_group = rustix::process::Pid::from_raw(identity.process_group)
+            .ok_or("matrix cleanup process group was invalid")?;
+        let mut exact_member_live = false;
+        for raw_pid in [identity.leader, identity.member] {
+            let pid = rustix::process::Pid::from_raw(raw_pid)
+                .ok_or("matrix cleanup member PID was invalid")?;
+            match rustix::process::getsid(Some(pid)) {
+                Ok(session) => {
+                    if session.as_raw_nonzero().get() != expected_session
+                        || rustix::process::getpgid(Some(pid))? != process_group
+                    {
+                        return Err("matrix cleanup member identity changed".into());
+                    }
+                    exact_member_live = true;
+                }
+                Err(rustix::io::Errno::SRCH) => {}
+                Err(_) => return Err("matrix cleanup member identity was unavailable".into()),
+            }
+        }
+        if exact_member_live {
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            loop {
+                match rustix::process::kill_process_group(
+                    process_group,
+                    rustix::process::Signal::KILL,
+                ) {
+                    Ok(()) | Err(rustix::io::Errno::SRCH) => return Ok(()),
+                    Err(rustix::io::Errno::INTR) if Instant::now() < deadline => continue,
+                    #[cfg(target_os = "macos")]
+                    Err(rustix::io::Errno::PERM)
+                        if !macos_matrix_fixture_group_has_live_members(process_group)? =>
+                    {
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        return Err("matrix published process group cleanup failed".into());
+                    }
+                }
+            }
+        } else {
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            loop {
+                match rustix::process::test_kill_process_group(process_group) {
+                    Err(rustix::io::Errno::SRCH) => return Ok(()),
+                    Err(rustix::io::Errno::INTR) if Instant::now() < deadline => continue,
+                    #[cfg(target_os = "macos")]
+                    Err(rustix::io::Errno::PERM)
+                        if !macos_matrix_fixture_group_has_live_members(process_group)? =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(()) | Err(rustix::io::Errno::PERM) => {
+                        return Err("matrix cleanup found an unrecognized group member".into());
+                    }
+                    Err(_) => {
+                        return Err("matrix cleanup group absence was inconclusive".into());
+                    }
+                }
+            }
+        }
+    }
+
+    fn cleanup_published_matrix_group(
+        identity: MatrixGroupIdentity,
+        expected_session: i32,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if identity.session != expected_session {
+            return Err("matrix group identity belonged to another session".into());
+        }
+        let process_group = rustix::process::Pid::from_raw(identity.process_group)
+            .ok_or("matrix cleanup process group was invalid")?;
+        loop {
+            let mut exact_member_live = false;
+            let mut interrupted = false;
+            for raw_pid in [identity.leader, identity.member] {
+                let pid = rustix::process::Pid::from_raw(raw_pid)
+                    .ok_or("matrix cleanup member PID was invalid")?;
+                match rustix::process::getsid(Some(pid)) {
+                    Ok(session) => {
+                        if session.as_raw_nonzero().get() != expected_session
+                            || rustix::process::getpgid(Some(pid))? != process_group
+                        {
+                            return Err("matrix cleanup member identity changed".into());
+                        }
+                        exact_member_live = true;
+                    }
+                    Err(rustix::io::Errno::SRCH) => {}
+                    Err(rustix::io::Errno::INTR) => {
+                        interrupted = true;
+                        break;
+                    }
+                    Err(_) => return Err("matrix cleanup member identity was unavailable".into()),
+                }
+            }
+            if interrupted {
+                retry_matrix_interrupted_before(
+                    deadline,
+                    "matrix published process group remained live",
+                )?;
+                continue;
+            }
+            if !exact_member_live {
+                return match rustix::process::test_kill_process_group(process_group) {
+                    Err(rustix::io::Errno::SRCH) => Ok(()),
+                    #[cfg(target_os = "macos")]
+                    Err(rustix::io::Errno::PERM)
+                        if !macos_matrix_fixture_group_has_live_members(process_group)? =>
+                    {
+                        Ok(())
+                    }
+                    Ok(()) | Err(rustix::io::Errno::INTR) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Ok(()) => Err("matrix cleanup found an unrecognized group member".into()),
+                    Err(error) => Err(format!(
+                        "matrix cleanup group absence was inconclusive: {error}"
+                    )
+                    .into()),
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err("matrix published process group remained live".into());
+            }
+            match rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL)
+            {
+                Ok(()) | Err(rustix::io::Errno::SRCH) | Err(rustix::io::Errno::INTR) => {}
+                #[cfg(target_os = "macos")]
+                Err(rustix::io::Errno::PERM)
+                    if !macos_matrix_fixture_group_has_live_members(process_group)? =>
+                {
+                    return Ok(());
+                }
+                Err(_) => return Err("matrix published process group cleanup failed".into()),
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    struct MatrixResidualAuthority {
+        root: PathBuf,
+        session: i32,
     }
 
     struct MatrixTestChild {
         child: Option<Child>,
+        residual: Option<MatrixResidualAuthority>,
     }
 
     impl MatrixTestChild {
         fn new(child: Child) -> Self {
-            Self { child: Some(child) }
+            Self {
+                child: Some(child),
+                residual: None,
+            }
+        }
+
+        fn with_matrix_root(
+            mut child: Child,
+            root: &Path,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let session = match i32::try_from(child.id()) {
+                Ok(session) if session > 0 => session,
+                _ => {
+                    terminate_matrix_child_or_exit(&mut child, "invalid-helper-pid");
+                    return Err("matrix helper PID was invalid".into());
+                }
+            };
+            Ok(Self {
+                child: Some(child),
+                residual: Some(MatrixResidualAuthority {
+                    root: root.to_path_buf(),
+                    session,
+                }),
+            })
+        }
+
+        fn raw_pid(&self) -> Result<i32, Box<dyn std::error::Error>> {
+            let child = self.child.as_ref().ok_or("matrix helper was not live")?;
+            Ok(i32::try_from(child.id())?)
+        }
+
+        fn take_stderr(&mut self) -> Result<std::process::ChildStderr, Box<dyn std::error::Error>> {
+            self.child
+                .as_mut()
+                .and_then(|child| child.stderr.take())
+                .ok_or_else(|| "missing matrix helper stderr".into())
+        }
+
+        fn cleanup_residuals(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            let Some(residual) = self.residual.as_ref() else {
+                return Ok(());
+            };
+            cleanup_published_matrix_groups(
+                &residual.root,
+                residual.session,
+                Instant::now() + TEST_TIMEOUT,
+            )?;
+            self.residual = None;
+            Ok(())
+        }
+
+        fn signal_residuals(&self) -> Result<(), Box<dyn std::error::Error>> {
+            let Some(residual) = self.residual.as_ref() else {
+                return Ok(());
+            };
+            signal_published_matrix_groups(&residual.root, residual.session)
         }
 
         fn wait_before(
             &mut self,
             deadline: Instant,
         ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
-            let child = self.child.as_mut().ok_or("matrix helper already reaped")?;
+            self.wait_before_with_timeout_cleanup(deadline, || Ok(()))
+        }
+
+        fn wait_before_with_timeout_cleanup<F>(
+            &mut self,
+            deadline: Instant,
+            on_timeout: F,
+        ) -> Result<ExitStatus, Box<dyn std::error::Error>>
+        where
+            F: FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+        {
+            let mut on_timeout = Some(on_timeout);
             loop {
-                if let Some(status) = child.try_wait()? {
+                let observed = self
+                    .child
+                    .as_mut()
+                    .ok_or("matrix helper already reaped")?
+                    .try_wait()?;
+                if let Some(status) = observed {
                     self.child = None;
+                    self.cleanup_residuals()?;
                     return Ok(status);
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    self.child = None;
-                    return Err("matrix helper exceeded its deadline".into());
+                    let timeout_cleanup = match on_timeout.take() {
+                        Some(on_timeout) => on_timeout(),
+                        None => Ok(()),
+                    };
+                    let signal = self.signal_residuals();
+                    let mut child = self.child.take().ok_or("matrix helper already reaped")?;
+                    terminate_matrix_child_or_exit(&mut child, "helper-timeout");
+                    let cleanup = self.cleanup_residuals();
+                    return match (&timeout_cleanup, &signal, &cleanup) {
+                        (Ok(()), Ok(()), Ok(())) => {
+                            Err("matrix helper exceeded its deadline".into())
+                        }
+                        _ => Err(format!(
+                            "matrix helper exceeded its deadline; cleanup failed: terminal={:?}, signal={:?}, verify={:?}",
+                            timeout_cleanup.as_ref().err().map(|error| error.to_string()),
+                            signal.as_ref().err().map(|error| error.to_string()),
+                            cleanup.as_ref().err().map(|error| error.to_string())
+                        )
+                        .into()),
+                    };
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -3429,9 +4679,11 @@ mod tests {
 
     impl Drop for MatrixTestChild {
         fn drop(&mut self) {
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.kill();
+            let _ = self.signal_residuals();
+            if let Some(mut child) = self.child.take() {
+                terminate_matrix_child_or_exit(&mut child, "helper-drop");
             }
+            let _ = self.cleanup_residuals();
         }
     }
 }

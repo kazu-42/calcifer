@@ -930,6 +930,73 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   retained `StartupRestore` owner, one-shot request, failed-clean coordinator
   projection, and all four deletion proofs without pre-consuming a healthy
   session checkpoint.
+- Retains App and TUI descriptor-isolation observations in two fixed bootstrap
+  slots, each with the absolute deadline minted when its validated
+  `ChildStarted` frame arrived. Only target-side `DescriptorChanged` and
+  `ProcessChanged` are retryable. Between those attempts the coordinator polls
+  the lifecycle descriptor and returns to the ordinary decoder when it becomes
+  readable; only a decoded, sequence-checked `Failed` frame may waive an
+  unfinished descriptor proof. A PGID, scan result, report marker, or
+  readability hint never becomes signal, wait, gate, or cleanup authority.
+  This prevents descriptor churn from starving an already-buffered startup
+  failure while keeping permanent churn bounded by the original deadline. If
+  an in-flight scan consumes that deadline or returns its own `Deadline`, the
+  coordinator performs exactly one zero-time lifecycle poll. That poll can
+  expose only a frame already buffered at the fence and can never authorize a
+  later descriptor scan.
+- Keeps the real-exec matrix root under an exact parent-held directory
+  descriptor. Test-only recursive cleanup is capped at 4,096 nodes and depth
+  32, accepts only current-user directories and singly linked regular files,
+  and proves every opened node remains on the root's exact mount (`statx`
+  mount ID plus `openat2(NO_XDEV)` on Linux, `fstatfs` identity on macOS).
+  Each entry is atomically moved to an unguessable same-directory quarantine,
+  durably synced, revalidated against its retained descriptor, then removed
+  only with an open-inode unlink postcondition. Mounts, links, special nodes,
+  foreign owners, replacement races, and inconclusive postconditions retain
+  cleanup authority instead of minting a clean root.
+- Gives every matrix wait an absolute `EINTR` fence. After an execution timeout,
+  the exact helper receives `SIGKILL` and is polled with `Child::try_wait` only
+  through a separate fixed cleanup interval. Failure to prove the direct reap
+  exits the libtest process through the audited no-destructor boundary with a
+  fixed diagnostic; the harness neither blocks indefinitely nor detaches wait
+  authority. Published process groups are identity-checked, killed, and proven
+  absent before their markers and root may be removed.
+- Checks the retained-recovery initial-gate deadline before every marker scan,
+  every allowlisted pathname probe inside that scan, marker read, and exact
+  coordinator-child observation, and rechecks it after each operation before
+  starting diagnostic I/O. Private marker opens are nonblocking; FIFOs, Unix
+  sockets, symlinks, hardlinks, unsafe modes, and invalid payloads fail closed
+  without escaping the fence. Filesystem reads and `waitpid`-backed
+  `Child::try_wait` retry only `EINTR`, under that same absolute deadline; all
+  other observation errors fail closed, and an exhausted budget is reported as
+  `Deadline` rather than promoting a historical transient interrupt into the
+  terminal cause. Once exact coordinator exit or observation failure is known,
+  a final-scan `EINTR` retries only the startup catalog and cannot re-read a
+  late gate or forget that terminal fact. Sleeps are capped by the remaining
+  interval, so no poll starts after expiry. The three fixed EINTR source
+  observations remain non-authoritative and are projected separately from the
+  terminal secondary cause into ordinary libtest diagnostics and fail-closed
+  stderr; if several sources occur, all observed fixed sources are retained.
+  Every package diagnostic marker uses complete-file, no-replace atomic
+  publication. Concurrent Guardian and coordinator projections can therefore
+  expose only absence or the immutable fixed payload, never a visible
+  create-before-write file; duplicate writers remain best-effort and grant no
+  authority.
+- Exercises early startup failure from the still-live failed generation through
+  the exercise-aware cleanup itself. The cleanup outcome copies its four-proof
+  evidence before consuming internal authorities, so the regression can verify
+  exact coordinator reap, completion, reported-group absence, and runtime
+  emptiness without pre-driving those proofs. Failed exercise scratch remains
+  owner-validated evidence until the test explicitly removes it after checking
+  the fixed primary, secondary, retry, and cleanup projections.
+- Returns a second retained Guardian generation to the caller with its sole
+  recovery budget already consumed. The production owner then parks exactly as
+  before; the package owner first emits separate fixed, payload-free
+  `guardian-recovery.retained.*` reason and owner markers, followed by a generic
+  completion marker. These are best-effort independent diagnostics: a closed
+  reason or owner marker remains useful if the later write cannot complete,
+  but neither partial nor complete projection grants recovery or process
+  authority. No third retry can be constructed.
 - Adds a credential-free, loopback-only deterministic fixture for startup
   queued, ready, active, suspended, retained quiescing, retained restore pending,
   and retained cleanup pending. It is designed to run the exact production

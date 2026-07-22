@@ -15,11 +15,6 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use std::fs::OpenOptions;
-#[cfg(test)]
-use std::os::unix::fs::OpenOptionsExt;
-
 use crate::profiles::{Profile, Registry};
 
 use super::channel::{ChannelError, LifecycleEndpoint, bootstrap_guardian_from_stdin};
@@ -1027,6 +1022,66 @@ const fn packaged_retention_owner_marker(kind: PackagedGuardianOwnerKind) -> &'s
 }
 
 #[cfg(test)]
+// Reason and owner are independent best-effort diagnostics. The generic name
+// is written last to show that the package projection loop completed, but is
+// not an authority-bearing transaction commit and is not required in order to
+// retain an already-written closed reason or owner observation.
+pub(super) const PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS: [&str; 12] = [
+    "guardian-recovery.retained.reason.deadline",
+    "guardian-recovery.retained.reason.protocol-invalid",
+    "guardian-recovery.retained.reason.restore-unconfirmed",
+    "guardian-recovery.retained.reason.cleanup-unconfirmed",
+    "guardian-recovery.retained.reason.unreportable-child",
+    "guardian-recovery.retained.owner.missing",
+    "guardian-recovery.retained.owner.post-arm",
+    "guardian-recovery.retained.owner.startup-quiesce",
+    "guardian-recovery.retained.owner.startup-restore",
+    "guardian-recovery.retained.owner.startup-cleanup",
+    "guardian-recovery.retained.owner.session-shutdown",
+    "guardian-recovery.retained",
+];
+
+#[cfg(test)]
+const fn packaged_recovery_retention_reason_marker(
+    reason: GuardianRetentionReason,
+) -> &'static str {
+    match reason {
+        GuardianRetentionReason::Deadline => "guardian-recovery.retained.reason.deadline",
+        GuardianRetentionReason::ProtocolInvalid => {
+            "guardian-recovery.retained.reason.protocol-invalid"
+        }
+        GuardianRetentionReason::RestoreUnconfirmed => {
+            "guardian-recovery.retained.reason.restore-unconfirmed"
+        }
+        GuardianRetentionReason::CleanupUnconfirmed => {
+            "guardian-recovery.retained.reason.cleanup-unconfirmed"
+        }
+        GuardianRetentionReason::UnreportableChild => {
+            "guardian-recovery.retained.reason.unreportable-child"
+        }
+    }
+}
+
+#[cfg(test)]
+const fn packaged_recovery_retention_owner_marker(kind: PackagedGuardianOwnerKind) -> &'static str {
+    match kind {
+        PackagedGuardianOwnerKind::PostArm => "guardian-recovery.retained.owner.post-arm",
+        PackagedGuardianOwnerKind::StartupQuiesce => {
+            "guardian-recovery.retained.owner.startup-quiesce"
+        }
+        PackagedGuardianOwnerKind::StartupRestore => {
+            "guardian-recovery.retained.owner.startup-restore"
+        }
+        PackagedGuardianOwnerKind::StartupCleanup => {
+            "guardian-recovery.retained.owner.startup-cleanup"
+        }
+        PackagedGuardianOwnerKind::SessionShutdown => {
+            "guardian-recovery.retained.owner.session-shutdown"
+        }
+    }
+}
+
+#[cfg(test)]
 const fn packaged_startup_quiesce_detail_markers(
     phase: PackagedStartupQuiescePhase,
     state: Option<&'static str>,
@@ -1131,6 +1186,26 @@ impl RetainedGuardianGeneration {
             detail_markers[1],
             detail_markers[2],
             detail_markers[3],
+        ]
+    }
+
+    /// Projects a second, consumed-budget retention into a namespace that is
+    /// distinct from the initial retention. Exact reason and owner diagnostics
+    /// are written first and remain independently useful if a later diagnostic
+    /// write fails; the generic completion marker is last. None of the three
+    /// ever grants authority; the exact retained owner is then parked.
+    #[cfg(test)]
+    pub(super) fn packaged_recovery_marker_names(&self) -> [&'static str; 3] {
+        let owner_marker = self
+            .owner
+            .as_ref()
+            .map_or("guardian-recovery.retained.owner.missing", |owner| {
+                packaged_recovery_retention_owner_marker(owner.packaged_kind())
+            });
+        [
+            packaged_recovery_retention_reason_marker(self.reason),
+            owner_marker,
+            "guardian-recovery.retained",
         ]
     }
 
@@ -1287,6 +1362,7 @@ impl fmt::Debug for RetainedGuardianGeneration {
     }
 }
 
+#[must_use = "the guardian outcome must be applied or its retained authority parked"]
 pub(super) enum GuardianRunOutcome {
     Terminal(GuardianExitDisposition),
     Retained(Box<RetainedGuardianGeneration>),
@@ -1372,18 +1448,16 @@ fn retry_retained_owner(
     owner: RetainedGuardianOwner,
     recovery_attempt: ConsumedRecoveryRetry,
 ) -> GuardianRunOutcome {
-    let outcome = retry_retained_owner_with_budget(
-        bounds,
-        lifecycle,
-        owner,
-        RetainedRecoveryBudget::after_retry(recovery_attempt),
-    );
-    match outcome {
-        GuardianRunOutcome::Retained(retained) => {
-            retained.publish_retained_unrecoverable_and_park()
-        }
-        GuardianRunOutcome::Terminal(disposition) => GuardianRunOutcome::Terminal(disposition),
-    }
+    run_consumed_recovery_retry(recovery_attempt, |recovery_budget| {
+        retry_retained_owner_with_budget(bounds, lifecycle, owner, recovery_budget)
+    })
+}
+
+fn run_consumed_recovery_retry(
+    recovery_attempt: ConsumedRecoveryRetry,
+    retry: impl FnOnce(RetainedRecoveryBudget) -> GuardianRunOutcome,
+) -> GuardianRunOutcome {
+    retry(RetainedRecoveryBudget::after_retry(recovery_attempt))
 }
 
 fn retry_retained_owner_with_budget(
@@ -1735,15 +1809,11 @@ fn record_packaged_session_readiness_failure(report_root: &Path, error: SessionS
 
 #[cfg(test)]
 pub(super) fn write_packaged_startup_failure_marker(report_root: &Path, marker: &'static str) {
-    let _ = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(report_root.join(marker))
-        .and_then(|mut file| {
-            file.write_all(b"classified\n")?;
-            file.sync_all()
-        });
+    // The initial-gate scanner treats an invalid allowlisted node as an
+    // integrity failure. Publish the complete private payload by atomic rename
+    // so it can observe only absence or the final immutable marker, never the
+    // create-before-write window of a zero-length regular file.
+    let _ = write_private_atomic_new(&report_root.join(marker), b"classified\n");
 }
 
 const LIFECYCLE_SESSION_ERROR: SessionOperationError =
@@ -3332,17 +3402,20 @@ fn apply_terminal_disposition(disposition: GuardianExitDisposition) -> ExitCode 
 mod tests {
     use super::{
         GuardianBounds, GuardianControlTurn, GuardianLifecycle, GuardianLifecycleError,
-        GuardianRetentionReason, GuardianRunOutcome, GuardianSetupError, PackagedGuardianOwnerKind,
-        RetainedRecoveryBudget, SessionShutdownTrigger, TestRecoveryCheckpointOutcome,
-        checkpoint_arms_recovery_command_race, coordinator_stop_trigger, finalize_projection,
+        GuardianRetentionReason, GuardianRunOutcome, GuardianSetupError,
+        PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS, PackagedGuardianOwnerKind,
+        RetainedGuardianGeneration, RetainedRecoveryBudget, SessionShutdownTrigger,
+        TestRecoveryCheckpointOutcome, checkpoint_arms_recovery_command_race,
+        coordinator_stop_trigger, finalize_projection,
         packaged_guardian_checkpoint_boundary_failure_marker,
-        packaged_guardian_checkpoint_request_failure_marker, packaged_retention_owner_marker,
-        packaged_retention_reason_marker, packaged_session_readiness_failure_markers,
-        packaged_startup_quiesce_detail_markers, receive_bounded_command,
-        record_packaged_session_readiness_failure, recovery_shutdown_trigger,
-        restore_wait_retention_reason, retained_generation_can_attempt_recovery,
-        retained_session_recovery_checkpoint, retention_reason_allows_recovery,
-        tui_exit_drain_deadline,
+        packaged_guardian_checkpoint_request_failure_marker,
+        packaged_recovery_retention_owner_marker, packaged_recovery_retention_reason_marker,
+        packaged_retention_owner_marker, packaged_retention_reason_marker,
+        packaged_session_readiness_failure_markers, packaged_startup_quiesce_detail_markers,
+        receive_bounded_command, record_packaged_session_readiness_failure,
+        recovery_shutdown_trigger, restore_wait_retention_reason,
+        retained_generation_can_attempt_recovery, retained_session_recovery_checkpoint,
+        retention_reason_allows_recovery, run_consumed_recovery_retry, tui_exit_drain_deadline,
     };
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -3499,6 +3572,23 @@ mod tests {
         );
         assert_eq!(
             [
+                GuardianRetentionReason::Deadline,
+                GuardianRetentionReason::ProtocolInvalid,
+                GuardianRetentionReason::RestoreUnconfirmed,
+                GuardianRetentionReason::CleanupUnconfirmed,
+                GuardianRetentionReason::UnreportableChild,
+            ]
+            .map(packaged_recovery_retention_reason_marker),
+            [
+                "guardian-recovery.retained.reason.deadline",
+                "guardian-recovery.retained.reason.protocol-invalid",
+                "guardian-recovery.retained.reason.restore-unconfirmed",
+                "guardian-recovery.retained.reason.cleanup-unconfirmed",
+                "guardian-recovery.retained.reason.unreportable-child",
+            ]
+        );
+        assert_eq!(
+            [
                 PackagedGuardianOwnerKind::PostArm,
                 PackagedGuardianOwnerKind::StartupQuiesce,
                 PackagedGuardianOwnerKind::StartupRestore,
@@ -3514,6 +3604,56 @@ mod tests {
                 "guardian-retained.owner.session-shutdown",
             ]
         );
+        assert_eq!(
+            [
+                PackagedGuardianOwnerKind::PostArm,
+                PackagedGuardianOwnerKind::StartupQuiesce,
+                PackagedGuardianOwnerKind::StartupRestore,
+                PackagedGuardianOwnerKind::StartupCleanup,
+                PackagedGuardianOwnerKind::SessionShutdown,
+            ]
+            .map(packaged_recovery_retention_owner_marker),
+            [
+                "guardian-recovery.retained.owner.post-arm",
+                "guardian-recovery.retained.owner.startup-quiesce",
+                "guardian-recovery.retained.owner.startup-restore",
+                "guardian-recovery.retained.owner.startup-cleanup",
+                "guardian-recovery.retained.owner.session-shutdown",
+            ]
+        );
+
+        let expected_recovery_catalog = [
+            "guardian-recovery.retained.reason.deadline",
+            "guardian-recovery.retained.reason.protocol-invalid",
+            "guardian-recovery.retained.reason.restore-unconfirmed",
+            "guardian-recovery.retained.reason.cleanup-unconfirmed",
+            "guardian-recovery.retained.reason.unreportable-child",
+            // These two sentinels make impossible test/debug projections
+            // explicit; production recovery cannot originate from PostArm or
+            // a missing concrete retained owner.
+            "guardian-recovery.retained.owner.missing",
+            "guardian-recovery.retained.owner.post-arm",
+            "guardian-recovery.retained.owner.startup-quiesce",
+            "guardian-recovery.retained.owner.startup-restore",
+            "guardian-recovery.retained.owner.startup-cleanup",
+            "guardian-recovery.retained.owner.session-shutdown",
+            "guardian-recovery.retained",
+        ];
+        assert_eq!(
+            PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS,
+            expected_recovery_catalog
+        );
+        let unique: std::collections::BTreeSet<_> = expected_recovery_catalog.into_iter().collect();
+        assert_eq!(unique.len(), expected_recovery_catalog.len());
+        assert!(expected_recovery_catalog.iter().all(|marker| {
+            marker.is_ascii()
+                && marker.starts_with("guardian-recovery.retained")
+                && !marker.contains('/')
+                && !marker.contains(char::is_whitespace)
+                && marker
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'-' | b'.'))
+        }));
     }
 
     #[test]
@@ -3881,6 +4021,43 @@ mod tests {
         assert!(retained_again.begin_retry().is_none());
         assert!(!retained_generation_can_attempt_recovery(
             &retained_again,
+            true
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn consumed_recovery_retry_returns_second_retention_to_its_caller()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut initial = RetainedRecoveryBudget::available();
+        let attempt = initial
+            .begin_retry()
+            .ok_or("the initial retained generation had no recovery retry budget")?;
+
+        let outcome = run_consumed_recovery_retry(attempt, |recovery_budget| {
+            GuardianRunOutcome::Retained(Box::new(RetainedGuardianGeneration {
+                lifecycle: None,
+                owner: None,
+                reason: GuardianRetentionReason::Deadline,
+                recovery_budget,
+            }))
+        });
+
+        let GuardianRunOutcome::Retained(mut retained) = outcome else {
+            return Err("the second retained generation did not reach its caller".into());
+        };
+        assert_eq!(
+            retained.packaged_recovery_marker_names(),
+            [
+                "guardian-recovery.retained.reason.deadline",
+                "guardian-recovery.retained.owner.missing",
+                "guardian-recovery.retained",
+            ]
+        );
+        assert_eq!(retained.recovery_budget, RetainedRecoveryBudget::Consumed);
+        assert!(retained.recovery_budget.begin_retry().is_none());
+        assert!(!retained_generation_can_attempt_recovery(
+            &retained.recovery_budget,
             true
         ));
         Ok(())
