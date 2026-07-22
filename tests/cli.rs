@@ -17,6 +17,18 @@ fn signal_child_process_group(
 }
 
 #[cfg(unix)]
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+#[cfg(unix)]
 const AMBIENT_CODEX_AUTH_OVERRIDES: &[(&str, &str)] = &[
     ("OPENAI_API_KEY", "synthetic-ambient-value"),
     ("CODEX_API_KEY", ""),
@@ -400,10 +412,7 @@ with open(status_path, "w", encoding="ascii") as destination:
     let status_path = attempt_root.join("status");
     let ready_path = attempt_root.join("ready");
     let continue_path = attempt_root.join("continue");
-    let input_hex = input.map_or_else(
-        || "EOF".to_owned(),
-        |bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
-    );
+    let input_hex = input.map_or_else(|| "EOF".to_owned(), lowercase_hex);
     let mut helper_process = Command::new("python3")
         .arg(&helper)
         .args([
@@ -2531,12 +2540,19 @@ config_file = "{sensitive_role_path}"
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if !barrier_ready.is_file() {
-            let _ =
-                signal_child_process_group(&untracked_spawn_parent, rustix::process::Signal::KILL);
-            let _ = untracked_spawn_parent.wait();
-            return Err(
-                std::io::Error::other("untracked guardian missed preflight barrier").into(),
-            );
+            if untracked_spawn_parent.try_wait()?.is_none() {
+                let _ = signal_child_process_group(
+                    &untracked_spawn_parent,
+                    rustix::process::Signal::KILL,
+                );
+            }
+            let output = untracked_spawn_parent.wait_with_output()?;
+            return Err(std::io::Error::other(format!(
+                "untracked guardian missed preflight barrier (status={:?}, stderr={})",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
         }
         std::fs::rename(&fake_codex, &fake_codex_backup)?;
         let release = std::fs::OpenOptions::new()

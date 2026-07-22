@@ -18,7 +18,7 @@ List the exact commands and manual checks you ran.
 
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --all-targets --all-features --locked -- -D warnings`
-- [ ] `cargo test --all-targets --all-features --locked`
+- [ ] `cargo test --all-targets --all-features --locked -- --test-threads=1`
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked`
 - [ ] `cargo +1.85.0 check --all-targets --all-features --locked`
 - [ ] Documentation and JSON/CLI contracts are updated when applicable

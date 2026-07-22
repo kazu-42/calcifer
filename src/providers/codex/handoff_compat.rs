@@ -1,13 +1,48 @@
 //! Fail-closed compatibility gate for cross-profile Codex thread handoff.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+#[cfg(any(
+    all(test, unix),
+    all(
+        feature = "internal-supervisor-fixture",
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(any(
+    all(test, unix),
+    all(
+        feature = "internal-supervisor-fixture",
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
 use std::time::Duration;
 
 use serde_json::Value;
 
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+use super::supervisor::ProviderLaunchAuthorization;
+
 #[cfg(unix)]
 mod runtime;
+#[cfg(unix)]
+pub(in crate::providers::codex) use runtime::PinnedExecutableStage;
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+pub(in crate::providers::codex) use runtime::PinnedStageError;
+#[cfg(all(test, unix))]
+pub(in crate::providers::codex) use runtime::{PinnedStageCleanupFault, PinnedStageCreateFailure};
+
+#[cfg(not(unix))]
+pub(in crate::providers::codex) struct PinnedExecutableStage {
+    _private: (),
+}
 
 /// Capability proving that an exact Codex build passed schema, fork, and
 /// remote-TUI runtime probes in an isolated credential-free workspace.
@@ -16,7 +51,7 @@ mod runtime;
 /// cannot mint it from a version string or schema inspection alone.
 #[allow(dead_code)] // Consumed by the handoff transaction introduced in issue #33.
 pub(crate) struct CodexHandoffCapability {
-    executable: CodexExecutableIdentity,
+    executable: PinnedExecutableStage,
 }
 
 #[derive(Eq, PartialEq)]
@@ -45,6 +80,63 @@ impl CodexHandoffCapability {
     pub(crate) const fn version(&self) -> &'static str {
         "0.144.4"
     }
+
+    pub(in crate::providers::codex) fn into_pinned_executable(self) -> PinnedExecutableStage {
+        self.executable
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(super) struct TestCompatibilityCapability {
+    executable: CodexExecutableIdentity,
+}
+
+#[cfg(all(test, unix))]
+impl TestCompatibilityCapability {
+    pub(super) fn capture(executable: &Path) -> Result<Self, runtime::PinnedStageError> {
+        runtime::capture_test_compatibility(executable).map(|executable| Self { executable })
+    }
+
+    pub(super) fn pin_in(
+        self,
+        parent: &Path,
+    ) -> Result<CodexHandoffCapability, runtime::PinnedStageCreateFailure> {
+        runtime::pin_test_compatibility(self.executable, parent)
+            .map(|executable| CodexHandoffCapability { executable })
+    }
+
+    /// Captures and pins the fixture under one caller-supplied budget. The
+    /// seam preserves the production capture error and projects any partial
+    /// stage through the normal retained compatibility owner.
+    pub(super) fn capture_and_pin_authorized(
+        executable: &Path,
+        parent: &Path,
+        timeout: Duration,
+    ) -> Result<CodexHandoffCapability, CodexHandoffFailure> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(CodexHandoffError::Timeout)?;
+        let executable = runtime::capture_test_compatibility_until(executable, deadline)?;
+        runtime::pin_test_compatibility_until(executable, parent, deadline)
+            .map(|executable| CodexHandoffCapability { executable })
+            .map_err(Into::into)
+    }
+
+    pub(super) fn pin_in_with_root_sync_failure(
+        self,
+        parent: &Path,
+    ) -> Result<CodexHandoffCapability, runtime::PinnedStageCreateFailure> {
+        runtime::pin_test_compatibility_with_root_sync_failure(self.executable, parent)
+            .map(|executable| CodexHandoffCapability { executable })
+    }
+
+    pub(super) fn pin_in_with_parent_sync_failure(
+        self,
+        parent: &Path,
+    ) -> Result<CodexHandoffCapability, runtime::PinnedStageCreateFailure> {
+        runtime::pin_test_compatibility_with_parent_sync_failure(self.executable, parent)
+            .map(|executable| CodexHandoffCapability { executable })
+    }
 }
 
 /// Redacted compatibility failure returned before handoff is authorized.
@@ -56,6 +148,149 @@ pub(crate) enum CodexHandoffError {
     Timeout,
     Transport,
     Spawn,
+}
+
+/// A compatibility failure that retains any filesystem authority created
+/// before the failure became observable.
+#[must_use = "handoff failure can retain staged filesystem ownership"]
+pub(crate) struct CodexHandoffFailure {
+    error: CodexHandoffError,
+    cleanup_error: Option<CodexHandoffError>,
+    #[cfg(unix)]
+    retained: Option<runtime::CodexHandoffRetention>,
+}
+
+impl CodexHandoffFailure {
+    #[cfg(unix)]
+    fn with_retained(error: CodexHandoffError, retained: runtime::CodexHandoffRetention) -> Self {
+        Self {
+            error,
+            cleanup_error: None,
+            retained: Some(retained),
+        }
+    }
+
+    pub(crate) const fn error(&self) -> CodexHandoffError {
+        self.error
+    }
+
+    pub(crate) const fn has_retained_ownership(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.retained.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(crate) const fn cleanup_error(&self) -> Option<CodexHandoffError> {
+        self.cleanup_error
+    }
+
+    /// Resolves every exact filesystem/process owner retained by a failed
+    /// compatibility probe. A failed cleanup returns the same original probe
+    /// error together with the still-owned retry state; cleanup errors never
+    /// overwrite the operation failure.
+    #[cfg(unix)]
+    #[expect(
+        clippy::boxed_local,
+        reason = "the compatibility failure can retain large recursive cleanup ownership"
+    )]
+    pub(crate) fn resolve(
+        self: Box<Self>,
+        deadline: std::time::Instant,
+    ) -> Result<CodexHandoffResolution, Box<Self>> {
+        let Self {
+            error,
+            cleanup_error,
+            retained,
+        } = *self;
+        let Some(retained) = retained else {
+            return Ok(CodexHandoffResolution {
+                error,
+                cleanup_error,
+            });
+        };
+        match runtime::resolve_handoff_retention(retained, deadline) {
+            Ok(()) => Ok(CodexHandoffResolution {
+                error,
+                cleanup_error,
+            }),
+            Err(failure) => Err(Box::new(Self {
+                error,
+                cleanup_error: cleanup_error.or(Some(failure.error)),
+                retained: Some(failure.retained),
+            })),
+        }
+    }
+}
+
+impl From<CodexHandoffError> for CodexHandoffFailure {
+    fn from(error: CodexHandoffError) -> Self {
+        Self {
+            error,
+            cleanup_error: None,
+            #[cfg(unix)]
+            retained: None,
+        }
+    }
+}
+
+impl fmt::Debug for CodexHandoffFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexHandoffFailure")
+            .field("error", &self.error)
+            .field("cleanup_error", &self.cleanup_error)
+            .field("retained", &self.has_retained_ownership())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for CodexHandoffFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error().fmt(formatter)
+    }
+}
+
+impl std::error::Error for CodexHandoffFailure {}
+
+/// Proof that a failed compatibility attempt retains no process or filesystem
+/// cleanup authority. The original operation failure remains observable after
+/// cleanup succeeds.
+#[cfg(unix)]
+#[must_use = "resolved compatibility cleanup must be projected to startup"]
+pub(crate) struct CodexHandoffResolution {
+    error: CodexHandoffError,
+    cleanup_error: Option<CodexHandoffError>,
+}
+
+#[cfg(unix)]
+impl CodexHandoffResolution {
+    pub(crate) const fn error(&self) -> CodexHandoffError {
+        self.error
+    }
+
+    pub(crate) const fn cleanup_error(&self) -> Option<CodexHandoffError> {
+        self.cleanup_error
+    }
+
+    pub(crate) const fn release(self) -> CodexHandoffError {
+        self.error
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for CodexHandoffResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexHandoffResolution")
+            .field("error", &self.error)
+            .field("cleanup_error", &self.cleanup_error)
+            .finish()
+    }
 }
 
 impl fmt::Display for CodexHandoffError {
@@ -74,22 +309,30 @@ impl std::error::Error for CodexHandoffError {}
 
 /// Runs the complete private compatibility gate without reading or mutating a
 /// Calcifer profile, conversation binding, credential, or user rollout.
-#[cfg(unix)]
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[allow(dead_code)] // Consumed by the handoff transaction introduced in issue #33.
 pub(crate) fn verify_codex_handoff_compatibility(
+    _authorization: &ProviderLaunchAuthorization,
     codex_executable: &Path,
     timeout: Duration,
-) -> Result<CodexHandoffCapability, CodexHandoffError> {
+) -> Result<CodexHandoffCapability, CodexHandoffFailure> {
     runtime::verify(codex_executable, timeout)
 }
 
-#[cfg(not(unix))]
-#[allow(dead_code)] // Windows support remains explicitly gated off in issue #28.
-pub(crate) fn verify_codex_handoff_compatibility(
-    _codex_executable: &Path,
-    _timeout: Duration,
-) -> Result<CodexHandoffCapability, CodexHandoffError> {
-    Err(CodexHandoffError::Unsupported)
+#[cfg(all(test, unix))]
+fn verify_codex_handoff_compatibility_for_test(
+    codex_executable: &Path,
+    timeout: Duration,
+) -> Result<CodexHandoffCapability, CodexHandoffFailure> {
+    runtime::verify(codex_executable, timeout)
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn compatibility_verification_attempts_for_test() -> usize {
+    runtime::verification_attempts_for_test()
 }
 
 const JSON_SCHEMA_DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
@@ -649,10 +892,17 @@ mod tests {
             .map(PathBuf::from)
             .ok_or("CALCIFER_CODEX_COMPAT_BINARY must name the pinned Codex binary")?;
 
-        let capability =
-            verify_codex_handoff_compatibility(&executable, std::time::Duration::from_secs(180))?;
+        let timeout = std::time::Duration::from_secs(180);
+        let capability = verify_codex_handoff_compatibility_for_test(&executable, timeout)?;
         assert_eq!(capability.id(), "codex-handoff/0.144.4/v1");
         assert_eq!(capability.version(), "0.144.4");
+        let cleanup_deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or("the direct compatibility cleanup deadline overflowed")?;
+        capability
+            .into_pinned_executable()
+            .cleanup(cleanup_deadline)
+            .map_err(|failure| failure.error())?;
         Ok(())
     }
 }

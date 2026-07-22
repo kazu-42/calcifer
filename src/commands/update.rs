@@ -1322,11 +1322,14 @@ mod tests {
         for (index, target) in SUPPORTED_TARGETS.iter().enumerate() {
             checksum_entries.insert(archive_name(&parsed, target), format!("{:064x}", index + 1));
         }
-        let checksums = checksum_entries
-            .iter()
-            .map(|(name, digest)| format!("{digest}  {name}\n"))
-            .collect::<String>()
-            .into_bytes();
+        let mut checksums = String::new();
+        for (name, digest) in &checksum_entries {
+            checksums.push_str(digest);
+            checksums.push_str("  ");
+            checksums.push_str(name);
+            checksums.push('\n');
+        }
+        let checksums = checksums.into_bytes();
 
         let manifest_url = format!("https://api.github.com/repos/{REPOSITORY}/releases/assets/1");
         let checksum_url = format!("https://api.github.com/repos/{REPOSITORY}/releases/assets/2");

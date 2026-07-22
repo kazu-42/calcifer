@@ -6,8 +6,6 @@
 //! time. This keeps transcript retention and unbounded buffering out of the
 //! supervised-session boundary.
 
-#![allow(dead_code)] // Wired to the internal supervisor fixture in issue #52.
-
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -16,6 +14,7 @@ use std::net::Shutdown;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::time::Duration;
 
 use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
@@ -95,6 +94,7 @@ impl TerminalBuffer {
     }
 
     /// Copies one bounded input fragment into the fixed buffer.
+    #[cfg(test)]
     pub(super) fn load<'buffer>(
         &'buffer mut self,
         bytes: &[u8],
@@ -110,6 +110,7 @@ impl TerminalBuffer {
     }
 
     /// Reads at most one fixed buffer from a non-PTY byte source.
+    #[cfg(test)]
     pub(super) fn read_from<R: Read>(
         &mut self,
         reader: &mut R,
@@ -146,6 +147,7 @@ impl<'buffer> TerminalChunk<'buffer> {
         Self { bytes, written: 0 }
     }
 
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -169,6 +171,11 @@ impl<'buffer> TerminalChunk<'buffer> {
         &self.bytes[self.written..]
     }
 
+    #[cfg(test)]
+    pub(super) fn remaining_bytes_for_test(&self) -> &[u8] {
+        self.remaining_bytes()
+    }
+
     fn record_write(&mut self, length: usize) -> Result<TerminalWrite, TerminalError> {
         if length == 0 || length > self.remaining() {
             return Err(TerminalError::Write);
@@ -184,6 +191,11 @@ impl<'buffer> TerminalChunk<'buffer> {
                 remaining: self.remaining(),
             })
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn consume_for_test(&mut self) -> Result<TerminalWrite, TerminalError> {
+        self.record_write(self.remaining())
     }
 }
 
@@ -308,6 +320,20 @@ impl PtyMaster {
             .map_err(|_| TerminalError::DescriptorIdentity)
     }
 
+    /// Pins the guardian-owned PTY master as a forbidden child descriptor.
+    /// The returned set borrows this owner until the process-group scan ends.
+    pub(super) fn capture_forbidden_descriptor_set_before_tui(
+        &self,
+    ) -> Result<
+        calcifer_unix_child_fd::CrossProcessDescriptorSet<'_>,
+        calcifer_unix_child_fd::CrossProcessDescriptorIdentityError,
+    > {
+        let mut forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+        forbidden.capture(self.descriptor.as_fd())?;
+        Ok(forbidden)
+    }
+
+    #[cfg(test)]
     pub(super) fn size(&self) -> Result<TerminalSize, TerminalError> {
         terminal_size(&self.descriptor)
     }
@@ -337,6 +363,7 @@ impl PtyMaster {
         enable_nonblocking_checked(&self.descriptor)
     }
 
+    #[cfg(test)]
     fn verify_close_on_exec(&self) -> Result<(), TerminalError> {
         verify_close_on_exec(&self.descriptor)
     }
@@ -678,6 +705,20 @@ impl TerminalSnapshot {
         })
     }
 
+    /// Restores while blocking job-control `SIGTTOU` on only the current
+    /// thread. The audited guard aborts if restoring the prior signal mask
+    /// fails, so no false terminal proof can cross that boundary.
+    pub(super) fn restore_with_sigttou_block<Fd: AsFd>(
+        &self,
+        descriptor: Fd,
+    ) -> Result<RestoredTerminalProof, TerminalError> {
+        let guard = calcifer_unix_child_fd::block_sigttou_for_current_thread()
+            .map_err(|_| TerminalError::SignalSafety)?;
+        let restored = self.restore(descriptor);
+        drop(guard);
+        restored
+    }
+
     #[cfg(feature = "internal-supervisor-fixture")]
     pub(super) fn restore_with_identity_mismatch_for_fixture<Fd: AsFd>(
         &self,
@@ -741,6 +782,98 @@ impl fmt::Debug for RawTerminalProof {
 #[must_use = "restoration proof must precede terminal recovery disarm"]
 pub(super) struct RestoredTerminalProof {
     descriptor_identity: calcifer_unix_child_fd::DescriptorIdentity,
+}
+
+/// Proof that the guardian's process-local fallback tty was the sole remaining
+/// descriptor for its identity and was then closed (count 1 -> 0).
+#[must_use = "recovery disarm proof must precede the lifecycle acknowledgement"]
+pub(super) struct RecoveryDisarmProof {
+    descriptor_identity: calcifer_unix_child_fd::DescriptorIdentity,
+}
+
+/// Post-close authority retained when the guardian cannot yet prove that no
+/// descriptor with the recovery tty identity remains open.
+///
+/// The descriptor itself has already been closed, so returning a
+/// [`RecoveryTty`] would be false. Keeping the identity in this move-only
+/// owner lets shutdown retry one bounded scan without manufacturing a disarm
+/// proof or advancing provider/build cleanup.
+#[must_use = "unconfirmed recovery disarm must be retried or retained"]
+pub(super) struct RecoveryDisarmUnconfirmed {
+    descriptor_identity: calcifer_unix_child_fd::DescriptorIdentity,
+}
+
+#[must_use = "a failed pre-disarm proof retains the recovery tty"]
+pub(super) struct RecoveryDisarmFailure {
+    recovery: RecoveryTty,
+    error: TerminalError,
+}
+
+impl RecoveryDisarmFailure {
+    pub(super) fn into_recovery(self) -> RecoveryTty {
+        self.recovery
+    }
+}
+
+impl fmt::Debug for RecoveryDisarmFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = &self.recovery;
+        formatter
+            .debug_struct("RecoveryDisarmFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for RecoveryDisarmFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for RecoveryDisarmFailure {}
+
+/// One exact result after the recovery descriptor has been closed.
+/// `Disarmed` is the sole branch that authorizes the lifecycle acknowledgement;
+/// `Unconfirmed` retains the only capability that can retry the post-close
+/// identity scan.
+#[must_use = "recovery disarm outcome must authorize acknowledgement or be retained"]
+pub(super) enum RecoveryDisarmOutcome {
+    Disarmed(RecoveryDisarmProof),
+    Unconfirmed(RecoveryDisarmUnconfirmed),
+}
+
+impl fmt::Debug for RecoveryDisarmProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self.descriptor_identity;
+        formatter.write_str("RecoveryDisarmProof(<redacted>)")
+    }
+}
+
+impl fmt::Debug for RecoveryDisarmUnconfirmed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self.descriptor_identity;
+        formatter.write_str("RecoveryDisarmUnconfirmed(<redacted>)")
+    }
+}
+
+impl RecoveryDisarmUnconfirmed {
+    /// Performs exactly one post-close identity scan. No internal retry loop
+    /// can extend a caller's shutdown deadline. A nonzero count or scan error
+    /// returns the same move-only authority for a later bounded shutdown turn.
+    pub(super) fn retry_once(self) -> RecoveryDisarmOutcome {
+        self.retry_once_with(|identity| {
+            calcifer_unix_child_fd::count_open_descriptors_with_identity(identity)
+                .map_err(|_| TerminalError::RecoveryAuthorityMismatch)
+        })
+    }
+
+    fn retry_once_with(
+        self,
+        scan: impl FnOnce(calcifer_unix_child_fd::DescriptorIdentity) -> Result<usize, TerminalError>,
+    ) -> RecoveryDisarmOutcome {
+        classify_closed_recovery(self.descriptor_identity, scan(self.descriptor_identity))
+    }
 }
 
 impl RestoredTerminalProof {
@@ -822,6 +955,15 @@ impl RecoveryTty {
         self.descriptor_identity
     }
 
+    /// Appends the recovery terminal to one source-pinned child denyset
+    /// without exposing its raw descriptor or kernel identity.
+    pub(super) fn append_forbidden_descriptor<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        forbidden.capture(self.descriptor.as_fd())
+    }
+
     pub(super) fn verify_invariants(&self) -> Result<(), TerminalError> {
         verify_close_on_exec(&self.descriptor)?;
         if !rustix::termios::isatty(&self.descriptor)
@@ -832,18 +974,125 @@ impl RecoveryTty {
         Ok(())
     }
 
-    pub(super) fn restore(
+    pub(super) fn restore_with_sigttou_block(
         &self,
         snapshot: &TerminalSnapshot,
     ) -> Result<RestoredTerminalProof, TerminalError> {
         self.verify_invariants()?;
-        snapshot.restore(&self.descriptor)
+        snapshot.restore_with_sigttou_block(&self.descriptor)
+    }
+
+    pub(super) fn disarm(self) -> Result<RecoveryDisarmOutcome, RecoveryDisarmFailure> {
+        self.disarm_with_scan(|identity| {
+            calcifer_unix_child_fd::count_open_descriptors_with_identity(identity)
+                .map_err(|_| TerminalError::RecoveryAuthorityMismatch)
+        })
+    }
+
+    fn disarm_with_scan(
+        self,
+        mut scan: impl FnMut(calcifer_unix_child_fd::DescriptorIdentity) -> Result<usize, TerminalError>,
+    ) -> Result<RecoveryDisarmOutcome, RecoveryDisarmFailure> {
+        if let Err(error) = self.verify_invariants() {
+            return Err(RecoveryDisarmFailure {
+                recovery: self,
+                error,
+            });
+        }
+        let descriptor_identity = self.descriptor_identity;
+        let count = match scan(descriptor_identity) {
+            Ok(count) => count,
+            Err(error) => {
+                return Err(RecoveryDisarmFailure {
+                    recovery: self,
+                    error,
+                });
+            }
+        };
+        if count != 1 {
+            return Err(RecoveryDisarmFailure {
+                recovery: self,
+                error: TerminalError::RecoveryAuthorityMismatch,
+            });
+        }
+        let Self {
+            descriptor,
+            descriptor_identity,
+        } = self;
+        drop(descriptor);
+        Ok(classify_closed_recovery(
+            descriptor_identity,
+            scan(descriptor_identity),
+        ))
     }
 
     /// Moves the recovery tty into guardian stderr for one exec boundary.
     pub(super) fn into_stdio(self) -> Result<Stdio, TerminalError> {
         self.verify_invariants()?;
         Ok(Stdio::from(self.descriptor))
+    }
+}
+
+/// Builds the smallest physical terminal authority used by startup rollback
+/// tests. The production constructors remain unchanged: this fixture opens a
+/// real PTY, snapshots the exact slave identity, drops every slave reference
+/// except the one recovery descriptor, and pairs it with a real terminal byte
+/// channel. The returned master keepalive is a different descriptor identity;
+/// it must remain open because Linux changes the disconnected slave's
+/// observable identity after the final master closes. Normal
+/// coordinator-proof tests never use the synthetic foreground field to
+/// restore; they use it only to exercise the post-proof disarm gate.
+#[cfg(test)]
+pub(super) fn startup_failure_terminal_for_test() -> Result<
+    (
+        TerminalEndpoint,
+        TerminalEndpoint,
+        RecoveryTty,
+        TerminalSnapshot,
+        calcifer_unix_child_fd::DescriptorIdentity,
+        File,
+    ),
+    TerminalError,
+> {
+    let PtyOwner { master, slave } = PtyOwner::open(TerminalSize::new(24, 80))?;
+    let descriptor = slave.as_fd();
+    let descriptor_identity = read_descriptor_identity(descriptor)?;
+    let snapshot = TerminalSnapshot {
+        descriptor_identity,
+        attributes: rustix::termios::tcgetattr(descriptor)
+            .map_err(|_| TerminalError::TerminalAttributesRead)?,
+        size: terminal_size(descriptor)?,
+        foreground_process_group: rustix::process::getpgrp().as_raw_nonzero().get(),
+    };
+    let recovery = RecoveryTty::duplicate(descriptor)?;
+    let (peer, endpoint) = TerminalChannelPair::new()?.split();
+    drop(slave);
+    let open = calcifer_unix_child_fd::count_open_descriptors_with_identity(descriptor_identity)
+        .map_err(|_| TerminalError::RecoveryAuthorityMismatch)?;
+    if open != 1 {
+        return Err(TerminalError::RecoveryAuthorityMismatch);
+    }
+    Ok((
+        endpoint,
+        peer,
+        recovery,
+        snapshot,
+        descriptor_identity,
+        master,
+    ))
+}
+
+fn classify_closed_recovery(
+    descriptor_identity: calcifer_unix_child_fd::DescriptorIdentity,
+    count: Result<usize, TerminalError>,
+) -> RecoveryDisarmOutcome {
+    match count {
+        Ok(0) => RecoveryDisarmOutcome::Disarmed(RecoveryDisarmProof {
+            descriptor_identity,
+        }),
+        Ok(_) | Err(_) => RecoveryDisarmOutcome::Unconfirmed(RecoveryDisarmUnconfirmed {
+            descriptor_identity,
+        }),
     }
 }
 
@@ -968,7 +1217,7 @@ fn read_foreground_process_group(descriptor: BorrowedFd<'_>) -> Result<i32, Term
 
 /// Compares every semantic termios field exposed by rustix on Linux/macOS.
 /// This helper never formats attributes or special codes into diagnostics.
-fn termios_semantically_equal(
+pub(super) fn termios_semantically_equal(
     expected: &rustix::termios::Termios,
     actual: &rustix::termios::Termios,
 ) -> bool {
@@ -1161,20 +1410,24 @@ impl TerminalEndpoint {
             .map_err(|_| TerminalError::DescriptorIdentity)
     }
 
+    /// Appends the guardian terminal channel to one source-pinned child
+    /// denyset without exposing its raw descriptor or kernel identity.
+    pub(super) fn append_forbidden_descriptor<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        forbidden.capture(self.stream.as_fd())
+    }
+
     pub(super) fn verify_invariants(&self) -> Result<(), TerminalError> {
         verify_close_on_exec(&self.stream)?;
         verify_terminal_endpoint(&self.stream)
     }
 
+    #[cfg(test)]
     pub(super) fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), TerminalError> {
         self.stream
             .set_read_timeout(timeout)
-            .map_err(|_| TerminalError::TimeoutConfiguration)
-    }
-
-    pub(super) fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), TerminalError> {
-        self.stream
-            .set_write_timeout(timeout)
             .map_err(|_| TerminalError::TimeoutConfiguration)
     }
 
@@ -1205,9 +1458,21 @@ impl TerminalEndpoint {
     }
 
     pub(super) fn shutdown(&self, direction: TerminalShutdown) -> Result<(), TerminalError> {
-        self.stream
-            .shutdown(direction.into())
-            .map_err(|_| TerminalError::Shutdown)
+        match self.stream.shutdown(direction.into()) {
+            Ok(()) => Ok(()),
+            // The endpoint is non-cloneable and was adopted only after an exact
+            // connected-peer check. Once that exact peer closes, Darwin reports
+            // ENOTCONN for SHUT_WR even though no local write can reach a peer.
+            // Treat only that typed write-half condition as an idempotent close;
+            // SHUT_RDWR and every other error remain fail-closed.
+            Err(error)
+                if direction == TerminalShutdown::Write
+                    && error.kind() == io::ErrorKind::NotConnected =>
+            {
+                Ok(())
+            }
+            Err(_) => Err(TerminalError::Shutdown),
+        }
     }
 
     /// Moves the endpoint into one guardian standard stream. The guardian must
@@ -1233,7 +1498,6 @@ impl AsFd for TerminalEndpoint {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TerminalShutdown {
-    Read,
     Write,
     Both,
 }
@@ -1241,7 +1505,6 @@ pub(super) enum TerminalShutdown {
 impl From<TerminalShutdown> for Shutdown {
     fn from(direction: TerminalShutdown) -> Self {
         match direction {
-            TerminalShutdown::Read => Self::Read,
             TerminalShutdown::Write => Self::Write,
             TerminalShutdown::Both => Self::Both,
         }
@@ -1522,7 +1785,9 @@ pub(super) enum TerminalError {
     RawModeRollback,
     RestoreApply,
     RestoreMismatch,
+    #[cfg(test)]
     EmptyChunk,
+    #[cfg(test)]
     ChunkTooLarge,
     Read,
     Write,
@@ -1533,9 +1798,12 @@ pub(super) enum TerminalError {
     InvalidPeerDomain,
     MissingPeer,
     SignalSafety,
+    #[cfg(test)]
     TimeoutConfiguration,
     Shutdown,
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     UnsupportedPlatform,
+    RecoveryAuthorityMismatch,
 }
 
 impl TerminalError {
@@ -1574,7 +1842,9 @@ impl TerminalError {
             Self::RawModeRollback => "raw_mode_rollback",
             Self::RestoreApply => "restore_apply",
             Self::RestoreMismatch => "restore_mismatch",
+            #[cfg(test)]
             Self::EmptyChunk => "empty_chunk",
+            #[cfg(test)]
             Self::ChunkTooLarge => "chunk_too_large",
             Self::Read => "read",
             Self::Write => "write",
@@ -1585,9 +1855,12 @@ impl TerminalError {
             Self::InvalidPeerDomain => "invalid_peer_domain",
             Self::MissingPeer => "missing_peer",
             Self::SignalSafety => "signal_safety",
+            #[cfg(test)]
             Self::TimeoutConfiguration => "timeout_configuration",
             Self::Shutdown => "shutdown",
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Self::UnsupportedPlatform => "unsupported_platform",
+            Self::RecoveryAuthorityMismatch => "recovery_authority_mismatch",
         }
     }
 }
@@ -1615,7 +1888,10 @@ mod tests {
 
     use std::error::Error;
     use std::mem::size_of;
+    use std::os::unix::process::CommandExt;
+    use std::process::Child;
     use std::sync::{Arc, Barrier};
+    use std::time::Instant;
 
     const CHILD_HELPER_ENV: &str = "CALCIFER_TERMINAL_CHILD_HELPER";
     const CHILD_MARKER: &[u8] = b"calcifer-terminal-child-ok";
@@ -1624,6 +1900,122 @@ mod tests {
     const RESTORE_FLUSH_RESTORED: &[u8] = b"calcifer-terminal-restore-flush-restored";
     const RESTORE_FLUSH_SENTINEL: &[u8] = b"calcifer-queued-input-sentinel";
     const RESTORE_FLUSH_PROBE: &[u8] = b"\n";
+    const PTY_SCAN_HELPER_ENV: &str = "CALCIFER_TERMINAL_PTY_SCAN_HELPER";
+    const PTY_SCAN_READY: [u8; 1] = [b'R'];
+    const PTY_SCAN_CHILD_REAP: Duration = Duration::from_secs(15);
+
+    struct PtyScanGroup {
+        leader: Option<Child>,
+        member: Option<Child>,
+        process_group: i32,
+        leader_lease: UnixStream,
+        member_lease: Option<UnixStream>,
+    }
+
+    impl PtyScanGroup {
+        fn release_and_reap(&mut self) -> Result<(), Box<dyn Error>> {
+            self.leader_lease.shutdown(Shutdown::Write)?;
+            if let Some(member_lease) = &self.member_lease {
+                member_lease.shutdown(Shutdown::Write)?;
+            }
+            self.kill_and_reap_or_exit();
+            Ok(())
+        }
+
+        fn kill_and_reap_or_exit(&mut self) {
+            if let Some(process_group) = rustix::process::Pid::from_raw(self.process_group) {
+                let _ = rustix::process::kill_process_group(
+                    process_group,
+                    rustix::process::Signal::KILL,
+                );
+            }
+            let deadline = Instant::now() + PTY_SCAN_CHILD_REAP;
+            while self.leader.is_some() || self.member.is_some() {
+                let leader = reap_pty_scan_child(&mut self.leader);
+                let member = reap_pty_scan_child(&mut self.member);
+                if leader.is_err() || member.is_err() {
+                    eprintln!("calcifer: PTY scan helper exact reap was not proven");
+                    calcifer_unix_child_fd::exit_process_without_destructors(93);
+                }
+                if self.leader.is_none() && self.member.is_none() {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    eprintln!("calcifer: PTY scan helper exact reap was not proven");
+                    calcifer_unix_child_fd::exit_process_without_destructors(93);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Drop for PtyScanGroup {
+        fn drop(&mut self) {
+            if self.leader.is_some() || self.member.is_some() {
+                self.kill_and_reap_or_exit();
+            }
+        }
+    }
+
+    fn reap_pty_scan_child(child: &mut Option<Child>) -> io::Result<()> {
+        let Some(owner) = child.as_mut() else {
+            return Ok(());
+        };
+        if owner.try_wait()?.is_some() {
+            *child = None;
+        }
+        Ok(())
+    }
+
+    fn terminate_single_pty_scan_child_or_exit(mut child: Child) {
+        let _ = child.kill();
+        let deadline = Instant::now() + PTY_SCAN_CHILD_REAP;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(None) | Err(_) => {
+                    eprintln!("calcifer: PTY scan child exact reap was not proven");
+                    calcifer_unix_child_fd::exit_process_without_destructors(93);
+                }
+            }
+        }
+    }
+
+    fn pty_scan_helper_command(process_group: i32) -> io::Result<Command> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "providers::codex::supervisor::terminal::tests::forbidden_pty_master_does_not_alias_two_exec_confirmed_group_members",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PTY_SCAN_HELPER_ENV, "1")
+            .process_group(process_group);
+        Ok(command)
+    }
+
+    fn read_pty_scan_readiness(observer: &mut UnixStream) -> io::Result<()> {
+        let mut ready = [0_u8; PTY_SCAN_READY.len()];
+        observer.read_exact(&mut ready)?;
+        if ready != PTY_SCAN_READY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTY scan child published invalid readiness",
+            ));
+        }
+        let mut trailing = [0_u8; 1];
+        if observer.read(&mut trailing)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTY scan child published trailing readiness data",
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn pty_pair_is_cloexec_and_preserves_initial_size() -> Result<(), Box<dyn Error>> {
@@ -1646,6 +2038,125 @@ mod tests {
         assert_eq!(master.size()?, resized);
         master.verify_close_on_exec()?;
         assert_ne!(master.descriptor_identity()?.inode, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn forbidden_pty_master_does_not_alias_two_exec_confirmed_group_members()
+    -> Result<(), Box<dyn Error>> {
+        if std::env::var_os(PTY_SCAN_HELPER_ENV).is_some() {
+            let inherited = calcifer_unix_child_fd::take_inherited_readiness_fd()?;
+            let mut readiness = UnixStream::from(inherited);
+            readiness.write_all(&PTY_SCAN_READY)?;
+            readiness.shutdown(Shutdown::Write)?;
+            let mut lease = [0_u8; 1];
+            if readiness.read(&mut lease)? != 0 {
+                return Err("PTY scan helper received unexpected lease data".into());
+            }
+            return Ok(());
+        }
+
+        let owner = PtyOwner::open(TerminalSize::new(24, 80))?;
+        let slave_copy = fcntl_dupfd_cloexec(&owner.slave, 3)?;
+        let member_stdin = fcntl_dupfd_cloexec(&owner.slave, 3)?;
+        let member_stdout = fcntl_dupfd_cloexec(&owner.slave, 3)?;
+        let member_stderr = fcntl_dupfd_cloexec(&owner.slave, 3)?;
+        let mut slave_forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+        slave_forbidden.capture(slave_copy.as_fd())?;
+
+        let (leader_lease, inherited_leader_lease) = UnixStream::pair()?;
+        leader_lease.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut leader_command = pty_scan_helper_command(0)?;
+        let master = owner.configure_child(&mut leader_command)?;
+        let master_forbidden = master.capture_forbidden_descriptor_set_before_tui()?;
+        let leader = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
+            leader_command,
+            inherited_leader_lease.as_fd(),
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(started) = error.into_started_child() {
+                    let child = started.into_child();
+                    let process_group = match i32::try_from(child.id()) {
+                        Ok(process_group) => process_group,
+                        Err(_) => {
+                            terminate_single_pty_scan_child_or_exit(child);
+                            return Err("PTY scan child process group was invalid".into());
+                        }
+                    };
+                    let mut failed_group = PtyScanGroup {
+                        leader: Some(child),
+                        member: None,
+                        process_group,
+                        leader_lease,
+                        member_lease: None,
+                    };
+                    failed_group.kill_and_reap_or_exit();
+                }
+                return Err("PTY scan child failed during inherited descriptor setup".into());
+            }
+        };
+        drop(inherited_leader_lease);
+        let process_group = i32::try_from(leader.id())?;
+        let mut group = PtyScanGroup {
+            leader: Some(leader),
+            member: None,
+            process_group,
+            leader_lease,
+            member_lease: None,
+        };
+        read_pty_scan_readiness(&mut group.leader_lease)?;
+
+        let (member_lease, inherited_member_lease) = UnixStream::pair()?;
+        member_lease.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut member_command = pty_scan_helper_command(process_group)?;
+        member_command
+            .stdin(Stdio::from(member_stdin))
+            .stdout(Stdio::from(member_stdout))
+            .stderr(Stdio::from(member_stderr));
+        let member = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
+            member_command,
+            inherited_member_lease.as_fd(),
+        ) {
+            Ok(member) => member,
+            Err(error) => {
+                if let Some(started) = error.into_started_child() {
+                    group.member = Some(started.into_child());
+                }
+                return Err("PTY scan member failed during inherited descriptor setup".into());
+            }
+        };
+        drop(inherited_member_lease);
+        group.member = Some(member);
+        group.member_lease = Some(member_lease);
+        read_pty_scan_readiness(
+            group
+                .member_lease
+                .as_mut()
+                .ok_or("PTY scan member lease was missing")?,
+        )?;
+
+        // Readiness has its own socket timeout. Start the scanner's absolute
+        // deadline only after the complete byte-plus-EOF boundary so a loaded
+        // runner cannot consume the descriptor-proof budget while waiting for
+        // the child to finish its post-exec handshake.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let proof =
+            calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
+                group.process_group,
+                &master_forbidden,
+                deadline,
+            )?;
+        assert_eq!(proof.member_count(), 2);
+        assert_eq!(
+            calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
+                group.process_group,
+                &slave_forbidden,
+                deadline,
+            ),
+            Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor)
+        );
+        group.release_and_reap()?;
         Ok(())
     }
 
@@ -1778,7 +2289,7 @@ mod tests {
         {
             std::process::exit(78);
         }
-        let restored = match snapshot.restore(io::stdin()) {
+        let restored = match snapshot.restore_with_sigttou_block(io::stdin()) {
             Ok(restored) => restored,
             Err(error) => {
                 std::process::exit(match error {
@@ -1801,7 +2312,7 @@ mod tests {
         {
             std::process::exit(79);
         }
-        if recovery.restore(&snapshot).is_err() {
+        if recovery.restore_with_sigttou_block(&snapshot).is_err() {
             std::process::exit(80);
         }
         let mut marker_buffer = TerminalBuffer::new();
@@ -2227,7 +2738,11 @@ mod tests {
             assert!(fcntl_getfd(io::stderr())?.contains(FdFlags::CLOEXEC));
             assert!(!rustix::termios::isatty(io::stderr()));
 
-            drop(recovery);
+            let disarmed = match recovery.disarm() {
+                Ok(disarmed) => disarmed,
+                Err(_) => return Err("sole recovery descriptor could not be disarmed".into()),
+            };
+            assert!(matches!(disarmed, RecoveryDisarmOutcome::Disarmed(_)));
             assert_eq!(
                 calcifer_unix_child_fd::count_open_descriptors_with_identity(inherited_identity)?,
                 0
@@ -2254,6 +2769,49 @@ mod tests {
             .stderr(child_recovery.into_stdio()?)
             .spawn()?;
         assert!(child.wait()?.success());
+        Ok(())
+    }
+
+    #[test]
+    fn post_close_disarm_scan_failure_retains_identity_until_zero_is_proved()
+    -> Result<(), Box<dyn Error>> {
+        let owner = PtyOwner::open(TerminalSize::new(24, 80))?;
+        let recovery = RecoveryTty::duplicate(&owner.slave)?;
+        let identity = recovery.descriptor_identity();
+        let mut observations = [Ok(1), Err(TerminalError::RecoveryAuthorityMismatch)].into_iter();
+
+        let first = recovery.disarm_with_scan(|observed| {
+            assert_eq!(observed, identity);
+            observations
+                .next()
+                .ok_or(TerminalError::RecoveryAuthorityMismatch)?
+        })?;
+        let unconfirmed = match first {
+            RecoveryDisarmOutcome::Unconfirmed(owner) => owner,
+            RecoveryDisarmOutcome::Disarmed(_) => {
+                return Err("post-close scan failure fabricated a proof".into());
+            }
+        };
+        assert_eq!(
+            format!("{unconfirmed:?}"),
+            "RecoveryDisarmUnconfirmed(<redacted>)"
+        );
+
+        let still_open = unconfirmed.retry_once_with(|observed| {
+            assert_eq!(observed, identity);
+            Ok(1)
+        });
+        let unconfirmed = match still_open {
+            RecoveryDisarmOutcome::Unconfirmed(owner) => owner,
+            RecoveryDisarmOutcome::Disarmed(_) => {
+                return Err("nonzero descriptor count fabricated a proof".into());
+            }
+        };
+        let disarmed = unconfirmed.retry_once_with(|observed| {
+            assert_eq!(observed, identity);
+            Ok(0)
+        });
+        assert!(matches!(disarmed, RecoveryDisarmOutcome::Disarmed(_)));
         Ok(())
     }
 
@@ -2416,10 +2974,27 @@ mod tests {
             coordinator.read_into(&mut buffer)?,
             TerminalRead::EndOfStream
         ));
+
+        // Darwin may accept one buffered send after peer EOF, while SHUT_RDWR
+        // can report ENOTCONN once either write half is already closed. Close
+        // exactly our remaining write half while the peer endpoint is still
+        // live, making the SIGPIPE-safe post-EOF send result deterministic.
+        coordinator.shutdown(TerminalShutdown::Write)?;
         drop(guardian);
 
         let mut chunk = buffer.load(b"peer-closed")?;
         assert_eq!(coordinator.try_write(&mut chunk), Err(TerminalError::Write));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_write_shutdown_is_idempotent_after_the_exact_peer_closes()
+    -> Result<(), Box<dyn Error>> {
+        let (coordinator, guardian) = TerminalChannelPair::new()?.split();
+        drop(guardian);
+
+        coordinator.shutdown(TerminalShutdown::Write)?;
+        coordinator.shutdown(TerminalShutdown::Write)?;
         Ok(())
     }
 

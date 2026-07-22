@@ -14,11 +14,27 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
 mod handoff_compat;
-#[cfg(unix)]
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod json;
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod monitor;
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
 mod remote;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(dead_code)] // Staged behind issue #50 until the public supervisor is complete.
 mod supervisor;
 
 #[cfg(all(
@@ -26,6 +42,17 @@ mod supervisor;
     any(target_os = "linux", target_os = "macos")
 ))]
 pub(crate) use supervisor::run_internal_fixture;
+
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) use supervisor::{internal_production_role_requested, run_internal_production_role};
+#[cfg(all(
+    feature = "internal-supervisor-fixture",
+    any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) use supervisor::{internal_tui_launcher_requested, run_internal_tui_launcher};
 
 /// Capability proving that the installed Codex process passed the exact
 /// identity-adapter initialize/home/version gate.
@@ -69,6 +96,15 @@ pub(crate) const MCP_OAUTH_FILE_CREDENTIALS_OVERRIDE: &str =
     r#"mcp_oauth_credentials_store="file""#;
 
 const MANAGED_ENVIRONMENT_DENYLIST: &[&str] = &[
+    // Calcifer's private supervisor bootstrap is authority-bearing. Provider
+    // descendants must never inherit enough of it to dispatch another role or
+    // retain the anchor completion endpoint.
+    "CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE",
+    "CALCIFER_INTERNAL_CODEX_PROFILE_ID",
+    "CALCIFER_INTERNAL_CODEX_THREAD_ID",
+    "CALCIFER_INTERNAL_CODEX_EXECUTABLE",
+    "CALCIFER_INTERNAL_CODEX_FOREGROUND_PROCESS_GROUP",
+    "CALCIFER_SUPERVISOR_READINESS_FD",
     "OPENAI_API_KEY",
     "OPENAI_ORGANIZATION",
     "OPENAI_PROJECT",
@@ -105,6 +141,8 @@ const ROLLOUT_SNAPSHOT_NODE_CAP: usize = 20_000;
 const THREAD_PAGE_SIZE: u32 = 100;
 const MAX_THREAD_PAGES_PER_STATE: usize = 8;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(target_os = "macos")]
+const MACOS_GROUP_KILL_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SERVER_CLIENT_NAME: &str = "calcifer";
 
 pub(crate) const CODEX_STATUS_PROTOCOL: &str = "account/rateLimits/read";
@@ -243,6 +281,12 @@ impl std::error::Error for CodexThreadError {}
 /// replace the profile selected by Calcifer.
 pub(crate) fn managed_command(executable: &Path, codex_home: &Path) -> Command {
     let mut command = Command::new(executable);
+    command.env_clear();
+    for (name, value) in std::env::vars_os() {
+        if !is_managed_environment_override(&name) {
+            command.env(name, value);
+        }
+    }
     sanitize_managed_environment(&mut command);
     command
         .args([
@@ -275,6 +319,8 @@ fn is_managed_environment_override(name: &OsStr) -> bool {
     };
     let normalized = name.to_ascii_uppercase();
     MANAGED_ENVIRONMENT_DENYLIST.contains(&normalized.as_str())
+        || normalized.starts_with("CALCIFER_")
+        || normalized.starts_with("OPENAI_")
         || normalized.starts_with("CODEX_TEST_")
         || normalized.starts_with("CODEX_CLOUD_TASKS_")
         || normalized.starts_with("CODEX_EXEC_SERVER_")
@@ -1677,8 +1723,71 @@ struct AppServerProcess {
     reaped: bool,
     stdin: Option<ChildStdin>,
     stdout_events: Option<Receiver<StdoutEvent>>,
-    stdout_reader: Option<JoinHandle<()>>,
-    stderr_drainer: Option<JoinHandle<()>>,
+    stdout_reader: Option<AppServerIoWorker>,
+    stderr_drainer: Option<AppServerIoWorker>,
+}
+
+struct AppServerIoWorker {
+    handle: JoinHandle<()>,
+    completed: Receiver<Instant>,
+}
+
+impl AppServerIoWorker {
+    fn join_until(self, deadline: Instant) -> io::Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.completed.recv_timeout(remaining) {
+            Ok(completed_at) => {
+                let joined = join_app_server_io_handle_until(self.handle, deadline);
+                if completed_at < deadline {
+                    joined
+                } else {
+                    joined.and(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Codex I/O worker exceeded its shutdown deadline",
+                    )))
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Dropping a JoinHandle detaches the blocked reader. The
+                // caller receives no compatibility capability, and a later
+                // AppServerProcess::drop must not repeat an unbounded join.
+                drop(self.handle);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Codex I/O worker exceeded its shutdown deadline",
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                join_app_server_io_handle_until(self.handle, deadline).and(Err(io::Error::other(
+                    "Codex I/O worker omitted its completion proof",
+                )))
+            }
+        }
+    }
+}
+
+fn join_app_server_io_handle_until(handle: JoinHandle<()>, deadline: Instant) -> io::Result<()> {
+    while !handle.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            drop(handle);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Codex I/O worker exceeded its shutdown deadline",
+            ));
+        }
+        thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    if Instant::now() >= deadline {
+        drop(handle);
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Codex I/O worker exceeded its shutdown deadline",
+        ));
+    }
+    handle
+        .join()
+        .map_err(|_| io::Error::other("Codex I/O worker panicked"))
 }
 
 impl AppServerProcess {
@@ -1730,25 +1839,39 @@ impl AppServerProcess {
         };
 
         let (stdout_sender, stdout_events) = mpsc::sync_channel(16);
-        let stdout_reader = match thread::Builder::new()
+        let (stdout_completed_sender, stdout_completed) = mpsc::sync_channel(1);
+        let stdout_reader_handle = match thread::Builder::new()
             .name("calcifer-codex-stdout".to_owned())
-            .spawn(move || read_stdout(stdout, &stdout_sender))
-        {
+            .spawn(move || {
+                read_stdout(stdout, &stdout_sender);
+                let _ = stdout_completed_sender.send(Instant::now());
+            }) {
             Ok(reader) => reader,
             Err(_) => {
                 force_terminate_process_tree(&mut child).map_err(|_| CodexUsageError::Transport)?;
                 return Err(CodexUsageError::Spawn);
             }
         };
-        let stderr_drainer = match thread::Builder::new()
+        let stdout_reader = AppServerIoWorker {
+            handle: stdout_reader_handle,
+            completed: stdout_completed,
+        };
+        let (stderr_completed_sender, stderr_completed) = mpsc::sync_channel(1);
+        let stderr_drainer_handle = match thread::Builder::new()
             .name("calcifer-codex-stderr".to_owned())
-            .spawn(move || drain_stderr(stderr))
-        {
+            .spawn(move || {
+                drain_stderr(stderr);
+                let _ = stderr_completed_sender.send(Instant::now());
+            }) {
             Ok(drainer) => drainer,
             Err(_) => {
                 force_terminate_process_tree(&mut child).map_err(|_| CodexUsageError::Transport)?;
                 return Err(CodexUsageError::Spawn);
             }
+        };
+        let stderr_drainer = AppServerIoWorker {
+            handle: stderr_drainer_handle,
+            completed: stderr_completed,
         };
 
         Ok(Self {
@@ -1791,30 +1914,52 @@ impl AppServerProcess {
     }
 
     fn shutdown(&mut self) -> io::Result<()> {
+        let deadline = Instant::now()
+            .checked_add(GRACEFUL_SHUTDOWN_TIMEOUT)
+            .ok_or_else(|| io::Error::other("Codex shutdown deadline overflowed"))?;
+        self.shutdown_after_completed_request_until(deadline)
+    }
+
+    /// Closes a completed one-shot request and requires a clean exit before
+    /// the caller's existing absolute deadline.
+    ///
+    /// A direct exit code zero observed before the deadline is the protocol
+    /// success condition; reaping also sweeps that child's exact process group.
+    /// Forced direct-child cleanup after the deadline never becomes success,
+    /// and the group sweep does not claim that a new-session descendant is
+    /// absent. This keeps compatibility probes bounded without manufacturing
+    /// a stronger descendant-containment proof than the process group provides.
+    fn shutdown_after_completed_request_until(&mut self, deadline: Instant) -> io::Result<()> {
         self.stdin.take();
-        if !self.reaped {
-            let termination = graceful_terminate(&mut self.child, GRACEFUL_SHUTDOWN_TIMEOUT);
+        let child_result = if self.reaped {
+            Ok(())
+        } else {
+            let termination = graceful_terminate_until(&mut self.child, deadline);
             self.reaped = child_reap_confirmed(&mut self.child);
-            let status = termination?;
-            if !self.reaped {
-                return Err(io::Error::other("Codex child was not reaped"));
+            match termination {
+                Ok(_) if !self.reaped => Err(io::Error::other("Codex child was not reaped")),
+                Ok(status) if !status.success() => {
+                    Err(io::Error::other("Codex app-server did not exit cleanly"))
+                }
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
             }
-            if !status.success() {
-                return Err(io::Error::other("Codex app-server did not exit cleanly"));
-            }
-        }
+        };
+        let worker_result = self.join_io_workers_until(deadline);
+        child_result.and(worker_result)
+    }
+
+    fn join_io_workers_until(&mut self, deadline: Instant) -> io::Result<()> {
         self.stdout_events.take();
-        if let Some(reader) = self.stdout_reader.take() {
-            reader
-                .join()
-                .map_err(|_| io::Error::other("Codex stdout reader panicked"))?;
-        }
-        if let Some(drainer) = self.stderr_drainer.take() {
-            drainer
-                .join()
-                .map_err(|_| io::Error::other("Codex stderr drainer panicked"))?;
-        }
-        Ok(())
+        let stdout_result = self
+            .stdout_reader
+            .take()
+            .map_or(Ok(()), |reader| reader.join_until(deadline));
+        let stderr_result = self
+            .stderr_drainer
+            .take()
+            .map_or(Ok(()), |drainer| drainer.join_until(deadline));
+        stdout_result.and(stderr_result)
     }
 }
 
@@ -2014,25 +2159,44 @@ pub(super) fn force_terminate_process_tree(
     child: &mut Child,
 ) -> io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
-    let group_result = {
-        let process_group = rustix::process::Pid::from_child(child);
-        match rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-            #[cfg(target_os = "macos")]
-            Err(rustix::io::Errno::PERM)
-                if child_exit_observed_without_reaping(child).unwrap_or(false) =>
-            {
-                // macOS can report EPERM when the child exited between the
-                // liveness decision and killpg and only its zombie remains.
-                Ok(())
-            }
-            Err(error) => Err(io::Error::from(error)),
-        }
-    };
+    let process_group = rustix::process::Pid::from_child(&*child);
+    #[cfg(target_os = "macos")]
+    let mut group_result = kill_process_group_for_cleanup(child, process_group);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let group_result = kill_process_group_for_cleanup(child, process_group);
     #[cfg(not(unix))]
     let group_result: io::Result<()> = Ok(());
 
     let kill_result = child.kill();
+    #[cfg(target_os = "macos")]
+    if group_result
+        .as_ref()
+        .err()
+        .and_then(|error| error.raw_os_error())
+        == Some(rustix::io::Errno::PERM.raw_os_error())
+        && direct_kill_may_have_reached_child(&kill_result)
+    {
+        // The TUI can naturally exit between the initial liveness observation
+        // and killpg. Keep its exact leader unreaped so PID/PGID reuse remains
+        // impossible, wait briefly for a terminal WNOWAIT state after the
+        // direct SIGKILL, then repeat the group sweep against that anchor.
+        let deadline = Instant::now()
+            .checked_add(MACOS_GROUP_KILL_RETRY_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        loop {
+            match child_exit_observed_without_reaping(child) {
+                Ok(true) => {
+                    group_result = kill_process_group_for_cleanup(child, process_group);
+                    break;
+                }
+                Ok(false) if Instant::now() < deadline => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                Ok(false) | Err(_) => break,
+            }
+        }
+    }
     let wait_result = wait_for_child(child);
     group_result?;
     if let Err(error) = kill_result {
@@ -2051,6 +2215,40 @@ pub(super) fn force_terminate_process_tree(
 }
 
 #[cfg(unix)]
+fn kill_process_group_for_cleanup(
+    _child: &mut Child,
+    process_group: rustix::process::Pid,
+) -> io::Result<()> {
+    match rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(rustix::io::Errno::PERM)
+            if macos_anchored_zombie_group_absent(_child, process_group) =>
+        {
+            // Darwin can report EPERM for a group containing only its
+            // waitable zombie leader. The unreaped child pins the numeric
+            // identity while two stable snapshots prove no descendant
+            // remains.
+            Ok(())
+        }
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn direct_kill_may_have_reached_child(result: &io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+            ) || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+        }
+    }
+}
+
+#[cfg(unix)]
 pub(super) fn child_exit_observed_without_reaping(child: &mut Child) -> io::Result<bool> {
     let pid = rustix::process::Pid::from_child(child);
     retry_rustix_intr(|| {
@@ -2061,7 +2259,13 @@ pub(super) fn child_exit_observed_without_reaping(child: &mut Child) -> io::Resu
                 | rustix::process::WaitIdOptions::NOWAIT,
         )
     })
-    .map(|status| status.is_some())
+    .map(|status| {
+        // Darwin can surface a pending stopped/continued notification even
+        // when this non-consuming query asks for EXITED only. Those states
+        // still carry live process authority and must never be reaped as an
+        // exit.
+        status.is_some_and(|status| status.exited() || status.killed() || status.dumped())
+    })
     .map_err(io::Error::from)
 }
 
@@ -2095,10 +2299,13 @@ pub(super) fn reap_exited_process_tree(child: &mut Child) -> io::Result<std::pro
     #[cfg(unix)]
     let group_result = {
         let process_group = rustix::process::Pid::from_child(&*child);
-        exited_group_kill_result(rustix::process::kill_process_group(
-            process_group,
-            rustix::process::Signal::KILL,
-        ))
+        let result =
+            rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+        #[cfg(target_os = "macos")]
+        let anchored_zombie_only = macos_anchored_zombie_group_absent(child, process_group);
+        #[cfg(not(target_os = "macos"))]
+        let anchored_zombie_only = false;
+        exited_group_kill_result(result, anchored_zombie_only)
     };
     #[cfg(not(unix))]
     let group_result: io::Result<()> = Ok(());
@@ -2109,17 +2316,52 @@ pub(super) fn reap_exited_process_tree(child: &mut Child) -> io::Result<std::pro
 }
 
 #[cfg(unix)]
-fn exited_group_kill_result(result: Result<(), rustix::io::Errno>) -> Result<(), io::Error> {
+fn exited_group_kill_result(
+    result: Result<(), rustix::io::Errno>,
+    anchored_zombie_only: bool,
+) -> Result<(), io::Error> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = anchored_zombie_only;
     match result {
         Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-        // macOS reports EPERM when the WNOWAIT-observed group contains only
-        // the zombie leader. The direct wait still proves that leader was
-        // reaped. Other Unix platforms keep EPERM fatal because it can mean
-        // live descendants were not signalled.
         #[cfg(target_os = "macos")]
-        Err(rustix::io::Errno::PERM) => Ok(()),
+        Err(rustix::io::Errno::PERM) if anchored_zombie_only => Ok(()),
         Err(error) => Err(io::Error::from(error)),
     }
+}
+
+/// Proves that a Darwin process group contains only its exact, unreaped,
+/// terminal leader.
+///
+/// EPERM alone is never absence evidence. The wait-visible child pins PID/PGID
+/// reuse, and two complete process snapshots must agree that the leader is the
+/// group's only zombie member.
+#[cfg(target_os = "macos")]
+fn macos_anchored_zombie_group_absent(
+    child: &mut Child,
+    process_group: rustix::process::Pid,
+) -> bool {
+    let direct_child = rustix::process::Pid::from_child(&*child);
+    if direct_child != process_group {
+        return false;
+    }
+    let terminal = retry_rustix_intr(|| {
+        rustix::process::waitid(
+            rustix::process::WaitId::Pid(direct_child),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        )
+    })
+    .ok()
+    .flatten()
+    .is_some_and(|status| status.exited() || status.killed() || status.dumped());
+    terminal
+        && calcifer_unix_child_fd::macos_process_group_is_anchored_zombie_only(
+            process_group.as_raw_nonzero().get(),
+            direct_child.as_raw_nonzero().get(),
+        )
+        .unwrap_or(false)
 }
 
 fn decode_response(line: &str, expected_id: u64) -> Result<Option<Value>, CodexUsageError> {
@@ -2225,21 +2467,38 @@ fn classify_rpc_error(error: &Value) -> CodexUsageError {
     }
 }
 
-fn graceful_terminate(
+fn graceful_terminate_until(
     child: &mut Child,
-    timeout: Duration,
+    deadline: Instant,
 ) -> io::Result<std::process::ExitStatus> {
-    let deadline = Instant::now().checked_add(timeout);
     loop {
         match child_exit_observed_without_reaping(child) {
             Ok(true) => {
-                return reap_exited_process_tree(child);
+                let observed_before_deadline = Instant::now() < deadline;
+                let status = reap_exited_process_tree(child)?;
+                return if observed_before_deadline {
+                    Ok(status)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Codex child exited after its shutdown deadline",
+                    ))
+                };
             }
-            Ok(false) if deadline.is_some_and(|deadline| Instant::now() < deadline) => {
-                thread::sleep(Duration::from_millis(10));
+            Ok(false) if Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(Duration::from_millis(10)));
             }
-            Ok(false) | Err(_) => {
-                return force_terminate_process_tree(child);
+            Ok(false) => {
+                force_terminate_process_tree(child)?;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Codex child exceeded its shutdown deadline",
+                ));
+            }
+            Err(observation_error) => {
+                force_terminate_process_tree(child)?;
+                return Err(observation_error);
             }
         }
     }
@@ -2515,16 +2774,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exited_group_cleanup_accepts_only_platform_proven_kill_results() {
-        assert!(exited_group_kill_result(Ok(())).is_ok());
-        assert!(exited_group_kill_result(Err(rustix::io::Errno::SRCH)).is_ok());
+        assert!(exited_group_kill_result(Ok(()), false).is_ok());
+        assert!(exited_group_kill_result(Err(rustix::io::Errno::SRCH), false).is_ok());
 
-        let permission = exited_group_kill_result(Err(rustix::io::Errno::PERM));
-        #[cfg(target_os = "macos")]
-        assert!(permission.is_ok());
-        #[cfg(not(target_os = "macos"))]
+        let permission = exited_group_kill_result(Err(rustix::io::Errno::PERM), false);
         assert_eq!(
             permission.err().and_then(|error| error.raw_os_error()),
             Some(rustix::io::Errno::PERM.raw_os_error())
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            exited_group_kill_result(Err(rustix::io::Errno::PERM), true).is_ok(),
+            "Darwin EPERM requires an independent anchored-zombie absence proof"
         );
     }
 
@@ -2554,6 +2815,40 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn forced_cleanup_repeatedly_contains_the_natural_exit_race()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..32 {
+            let mut command = Command::new("sh");
+            configure_own_process_group(&mut command);
+            let mut child = command
+                .args(["-c", "exit 0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+
+            let _ = force_terminate_process_tree(&mut child)?;
+            assert!(child_reap_confirmed(&mut child));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_group_retry_requires_a_delivered_or_already_gone_direct_kill() {
+        assert!(direct_kill_may_have_reached_child(&Ok(())));
+        assert!(direct_kill_may_have_reached_child(&Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "synthetic",
+        ))));
+        assert!(!direct_kill_may_have_reached_child(&Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "synthetic",
+        ))));
+    }
+
     #[cfg(unix)]
     #[test]
     fn checked_app_server_shutdown_rejects_a_nonzero_exit() -> Result<(), Box<dyn std::error::Error>>
@@ -2565,6 +2860,247 @@ mod tests {
 
         assert!(process.shutdown().is_err());
         assert!(process.reaped);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_app_server_shutdown_does_not_relax_a_forced_kill()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap '' HUP TERM; while :; do sleep 30; done"]);
+        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"), None)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let started = Instant::now();
+
+        assert!(process.shutdown().is_err());
+
+        assert!(process.reaped);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "strict app-server shutdown exceeded its fixed test bound"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_request_shutdown_allows_a_clean_exit_within_the_shared_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "cat >/dev/null; sleep 1; exit 0"]);
+        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"), None)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let started = Instant::now();
+
+        process.shutdown_after_completed_request_until(
+            Instant::now()
+                .checked_add(Duration::from_secs(2))
+                .ok_or("shutdown deadline overflowed")?,
+        )?;
+
+        assert!(process.reaped);
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "completed-request shutdown did not exercise the extended clean drain"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "completed-request shutdown exceeded its fixed test bound"
+        );
+        assert!(process.stdin.is_none());
+        assert!(process.stdout_events.is_none());
+        assert!(process.stdout_reader.is_none());
+        assert!(process.stderr_drainer.is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_request_shutdown_never_promotes_forced_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap '' HUP TERM; while :; do sleep 30; done"]);
+        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"), None)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(100))
+            .ok_or("shutdown deadline overflowed")?;
+
+        let error = match process.shutdown_after_completed_request_until(deadline) {
+            Ok(()) => return Err("forced cleanup became a successful shutdown".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(process.reaped);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "forced cleanup exceeded its fixed test bound"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_request_shutdown_rejects_an_expired_deadline_after_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"), None)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let observation_deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or("observation deadline overflowed")?;
+        while !child_exit_observed_without_reaping(&mut process.child)? {
+            if Instant::now() >= observation_deadline {
+                return Err("child did not exit before the test deadline".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let error = match process.shutdown_after_completed_request_until(Instant::now()) {
+            Ok(()) => return Err("an expired shutdown deadline succeeded".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(process.reaped);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_request_shutdown_rejects_a_signal_exit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "cat >/dev/null; kill -TERM \"$$\""]);
+        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"), None)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or("shutdown deadline overflowed")?;
+
+        let error = match process.shutdown_after_completed_request_until(deadline) {
+            Ok(()) => return Err("a signal exit became a successful shutdown".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(process.reaped);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_request_shutdown_bounds_a_background_pipe_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let escaped_pid_file = std::env::temp_dir().join(format!(
+            "calcifer-app-server-escaped-pid-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper = fs::canonicalize(std::env::current_exe()?)?;
+        let mut command = Command::new("/bin/sh");
+        command
+            .env("CALCIFER_TEST_ESCAPED_HELPER", helper)
+            .env("CALCIFER_TEST_ESCAPED_PID_FILE", &escaped_pid_file)
+            .args([
+                "-c",
+                "( \"$CALCIFER_TEST_ESCAPED_HELPER\" providers::codex::tests::completed_request_shutdown_escaped_pipe_owner_helper --exact --ignored --nocapture; : ) & cat >/dev/null; exit 0",
+            ]);
+        let mut process = AppServerProcess::spawn_command(command, Path::new("/tmp"), None)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let pid_file_deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or("PID-file deadline overflowed")?;
+        let escaped_pid = loop {
+            match fs::read_to_string(&escaped_pid_file) {
+                Ok(raw_pid) => {
+                    let raw_pid = raw_pid.parse::<i32>()?;
+                    break rustix::process::Pid::from_raw(raw_pid)
+                        .ok_or("escaped process PID was invalid")?;
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && Instant::now() < pid_file_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(200))
+            .ok_or("shutdown deadline overflowed")?;
+
+        let shutdown = process.shutdown_after_completed_request_until(deadline);
+        let escaped_cleanup =
+            rustix::process::kill_process(escaped_pid, rustix::process::Signal::KILL);
+        fs::remove_file(&escaped_pid_file)?;
+        let error = match shutdown {
+            Ok(()) => return Err("a background pipe owner escaped the shutdown deadline".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(process.reaped);
+        assert!(process.stdout_reader.is_none());
+        assert!(process.stderr_drainer.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "background pipe ownership exceeded the fixed shutdown bound"
+        );
+        assert!(matches!(
+            escaped_cleanup,
+            Ok(()) | Err(rustix::io::Errno::SRCH)
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "internal subprocess for escaped pipe-owner containment"]
+    fn completed_request_shutdown_escaped_pipe_owner_helper()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pid_file = std::env::var_os("CALCIFER_TEST_ESCAPED_PID_FILE")
+            .map(PathBuf::from)
+            .ok_or("escaped pipe-owner helper was not explicitly requested")?;
+        rustix::process::setsid()?;
+        fs::write(
+            pid_file,
+            rustix::process::getpid().as_raw_nonzero().to_string(),
+        )?;
+        println!("pipe-held");
+        io::stdout().flush()?;
+        thread::sleep(Duration::from_secs(30));
+        Ok(())
+    }
+
+    #[test]
+    fn io_worker_completion_notification_does_not_bypass_the_join_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (completed_sender, completed) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let _ = completed_sender.send(Instant::now());
+            thread::sleep(Duration::from_millis(500));
+        });
+        let worker = AppServerIoWorker { handle, completed };
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(100))
+            .ok_or("worker deadline overflowed")?;
+
+        let error = match worker.join_until(deadline) {
+            Ok(()) => return Err("an unfinished I/O worker bypassed its join deadline".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "I/O worker join exceeded its fixed test bound"
+        );
         Ok(())
     }
 
@@ -2821,7 +3357,21 @@ mod tests {
     #[test]
     fn managed_environment_filter_rejects_auth_config_and_future_overrides() {
         for name in [
+            "CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE",
+            "CALCIFER_INTERNAL_CODEX_PROFILE_ID",
+            "CALCIFER_INTERNAL_CODEX_THREAD_ID",
+            "CALCIFER_INTERNAL_CODEX_EXECUTABLE",
+            "CALCIFER_INTERNAL_CODEX_FOREGROUND_PROCESS_GROUP",
+            "CALCIFER_SUPERVISOR_READINESS_FD",
+            "CALCIFER_PACKAGE_SUPERVISOR_ROLE",
+            "CALCIFER_PACKAGE_TUI_LAUNCHER",
+            "CaLcIfEr_PaCkAgE_FuTuRe_CoNtRoL",
+            "CALCIFER_CODEX_COMPAT_BINARY",
+            "CALCIFER_HOME",
+            "CaLcIfEr_FuTuRe_CoNtRoL",
             "OPENAI_API_KEY",
+            "OPENAI_FUTURE_ENDPOINT",
+            "OpEnAi_FuTuRe_RoUtInG_SeCrEt",
             "CODEX_ACCESS_TOKEN",
             "CoDeX_AcCeSs_ToKeN",
             "CODEX_AUTHAPI_BASE_URL",
@@ -2859,6 +3409,34 @@ mod tests {
                 "{name} is outside the managed authentication denylist"
             );
         }
+    }
+
+    #[test]
+    fn managed_command_projects_the_complete_safe_ambient_environment() {
+        let command = managed_command(
+            Path::new("/synthetic/codex"),
+            Path::new("/synthetic/profile"),
+        );
+        let projected = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<BTreeMap<std::ffi::OsString, Option<std::ffi::OsString>>>();
+        let mut safe_values = 0_usize;
+        for (name, value) in std::env::vars_os() {
+            if name == OsStr::new("CODEX_HOME") || is_managed_environment_override(&name) {
+                continue;
+            }
+            safe_values += 1;
+            assert_eq!(
+                projected.get(&name),
+                Some(&Some(value)),
+                "safe ambient environment must survive the launcher projection"
+            );
+        }
+        assert!(
+            safe_values > 0,
+            "the test process had no safe ambient values"
+        );
     }
 
     #[test]

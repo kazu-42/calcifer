@@ -1,9 +1,13 @@
-//! Minimal child-only Unix descriptor inheritance for Calcifer.
+//! Audited Unix process and descriptor primitives for Calcifer.
 //!
-//! The main crate forbids unsafe Rust. This crate contains the one audited
-//! `pre_exec` boundary needed to preserve an already-open lease descriptor in
-//! one selected child without ever clearing `FD_CLOEXEC` in the multithreaded
-//! parent process.
+//! The main crate forbids unsafe Rust. This crate confines the required unsafe
+//! OS boundaries: signal-mask guards, child-only `pre_exec` descriptor
+//! inheritance, exact child/process-group lifecycle operations, and bounded
+//! Linux/macOS process-group descriptor inspection. Safe wrappers preserve
+//! descriptor ownership, validate native return sizes and process identity,
+//! cap every externally sized scan, and fail closed on mutation, permission
+//! loss, unsupported descriptor identity, or deadline exhaustion. The parent
+//! process never clears `FD_CLOEXEC` on a shared descriptor.
 
 #![cfg(unix)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -20,7 +24,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process_group_scan;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use process_group_scan::{
+    CrossProcessDescriptorIdentityError, CrossProcessDescriptorSet,
+    ProcessGroupDescriptorIsolationProof, ProcessGroupDescriptorScanError,
+    verify_process_group_forbidden_descriptors_absent_before,
+};
+
 const MAX_DESCRIPTOR_SCAN_ENTRIES: usize = 4_096;
+#[cfg(target_os = "macos")]
+const MAX_PROCESS_GROUP_SCAN_ENTRIES: usize = 4_096;
 const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const CHILD_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -35,6 +50,23 @@ static READINESS_FD_TAKEN: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static SIGTTOU_BLOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SIGCONT_BLOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Terminates the complete Unix process without running Rust/C destructors or
+/// producing a signal-driven core dump.
+///
+/// This is the safe, audited `_exit(2)` boundary for a fail-closed process that
+/// must not unwind or run cleanup code. Callers are responsible for writing and
+/// flushing any required diagnostic first. A zero status is technically
+/// accepted by the kernel, so callers that report failure must pass a fixed
+/// nonzero value.
+pub fn exit_process_without_destructors(status: u8) -> ! {
+    // SAFETY: `_exit` accepts every integer status, does not dereference
+    // pointers, and never returns. Restricting the public input to `u8` avoids
+    // target-specific truncation while keeping the unsafe libc call confined
+    // to this audited crate.
+    unsafe { libc::_exit(i32::from(status)) }
 }
 
 /// A calling-thread-only `SIGTTOU` mask guard.
@@ -127,6 +159,84 @@ pub fn block_sigttou_for_current_thread() -> io::Result<SigttouBlockGuard> {
         next
     });
     Ok(SigttouBlockGuard {
+        previous_mask,
+        depth,
+        _not_send_or_sync: PhantomData,
+    })
+}
+
+/// Calling-thread-only `SIGCONT` mask guard for an atomic self-stop boundary.
+///
+/// This is deliberately separate from [`SigttouBlockGuard`]: job-control
+/// continuation has different ordering semantics, and nesting the two guards
+/// must restore each complete prior mask in strict LIFO order.
+#[must_use = "dropping the guard restores the calling thread's prior signal mask"]
+pub struct SigcontBlockGuard {
+    previous_mask: libc::sigset_t,
+    depth: usize,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl fmt::Debug for SigcontBlockGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SigcontBlockGuard(<active>)")
+    }
+}
+
+impl Drop for SigcontBlockGuard {
+    fn drop(&mut self) {
+        let in_order = SIGCONT_BLOCK_DEPTH.with(|depth| depth.get() == self.depth);
+        if !in_order {
+            std::process::abort();
+        }
+        // SAFETY: the successful pthread_sigmask call below initialized the
+        // complete prior mask, and this !Send guard drops on that same thread.
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous_mask, std::ptr::null_mut())
+        };
+        if result != 0 {
+            std::process::abort();
+        }
+        SIGCONT_BLOCK_DEPTH.with(|depth| depth.set(self.depth - 1));
+    }
+}
+
+/// Blocks `SIGCONT` only on the calling coordinator thread.
+///
+/// The guarded scope must not create a thread, fork, or exec. A process-level
+/// `SIGCONT` still resumes a stopped process while blocked; after resumption,
+/// dropping this guard restores the exact prior mask and lets the installed
+/// handler mint the fresh continuation latch.
+pub fn block_sigcont_for_current_thread() -> io::Result<SigcontBlockGuard> {
+    let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: writable storage is fully initialized by sigemptyset on success.
+    if unsafe { libc::sigemptyset(blocked.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: SIGCONT is valid on every Unix target supported by this crate.
+    if unsafe { libc::sigaddset(blocked.as_mut_ptr(), libc::SIGCONT) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both initialization calls succeeded.
+    let blocked = unsafe { blocked.assume_init() };
+    let mut previous_mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: inputs are initialized and pthread_sigmask writes one full mask.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, previous_mask.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    // SAFETY: successful pthread_sigmask initialized the output mask.
+    let previous_mask = unsafe { previous_mask.assume_init() };
+    let depth = SIGCONT_BLOCK_DEPTH.with(|depth| {
+        let next = depth
+            .get()
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        depth.set(next);
+        next
+    });
+    Ok(SigcontBlockGuard {
         previous_mask,
         depth,
         _not_send_or_sync: PhantomData,
@@ -307,6 +417,200 @@ pub fn count_open_descriptors_with_identity(expected: DescriptorIdentity) -> io:
         }
     }
     Ok(matches)
+}
+
+/// Returns whether a macOS process group contains any non-zombie member.
+///
+/// This bounded observation exists only for explicitly synthetic fixtures
+/// after `killpg(2)` reports `EPERM`; it is never production containment
+/// proof. Darwin can retain a wait-visible zombie group leader that cannot
+/// receive a signal; that leader no longer holds fixture resources, but its
+/// exit alone says nothing about same-group descendants. `proc_listpgrppids`
+/// enumerates the whole group and each member is checked with
+/// `PROC_PIDTBSDINFO`. Capacity saturation or an unreadable member fails
+/// closed instead of being interpreted as absence.
+#[cfg(target_os = "macos")]
+pub fn macos_process_group_has_live_members(process_group: i32) -> io::Result<bool> {
+    if process_group <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process group must be positive",
+        ));
+    }
+    let mut members = [0_i32; MAX_PROCESS_GROUP_SCAN_ENTRIES];
+    let buffer_bytes = std::mem::size_of_val(&members);
+    let buffer_size = libc::c_int::try_from(buffer_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process scan was too large"))?;
+    // SAFETY: `members` is a writable fixed-size PID array for the entire
+    // declared byte range. `proc_listpgrppids` does not retain the pointer.
+    let count =
+        unsafe { libc::proc_listpgrppids(process_group, members.as_mut_ptr().cast(), buffer_size) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let count = usize::try_from(count)
+        .map_err(|_| io::Error::other("process-group scan count was invalid"))?;
+    if count >= members.len() {
+        return Err(io::Error::other(
+            "process-group scan reached its fixed bound",
+        ));
+    }
+
+    for pid in members.into_iter().take(count) {
+        if pid <= 0 {
+            continue;
+        }
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let info_size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .map_err(|_| io::Error::other("process info size was invalid"))?;
+        // SAFETY: `info` is writable storage for exactly one proc_bsdinfo and
+        // `proc_pidinfo` does not retain the pointer. The value is read only
+        // after the function reports a complete structure.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                info_size,
+            )
+        };
+        if read == 0 {
+            let error = io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+                continue;
+            }
+            return Err(error);
+        }
+        if read != info_size {
+            return Err(io::Error::other("process info read was incomplete"));
+        }
+        // SAFETY: the exact-size successful read initialized the structure.
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pgid == process_group as u32 && info.pbi_status != libc::SZOMB {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Proves that an unreaped process-group leader anchors a zombie-only group.
+///
+/// This is stricter than [`macos_process_group_has_live_members`]. It is
+/// suitable for a production containment decision only after the caller has
+/// independently observed the exact direct child in a terminal wait state
+/// without reaping it. The unreaped leader pins the numeric PID/PGID against
+/// reuse while two complete snapshots prove that the exact leader is the
+/// group's only member and is a zombie. Production deliberately rejects
+/// additional zombie members: PID-list equality alone cannot exclude a
+/// descendant reap/reuse ABA without another birth-identity anchor. A missing,
+/// vanished, or unreadable member, capacity saturation, or membership drift
+/// fails closed.
+#[cfg(target_os = "macos")]
+pub fn macos_process_group_is_anchored_zombie_only(
+    process_group: i32,
+    leader_pid: i32,
+) -> io::Result<bool> {
+    if process_group <= 0 || leader_pid != process_group {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the unreaped group leader must anchor its own positive process group",
+        ));
+    }
+
+    let first = macos_zombie_group_snapshot(process_group, leader_pid)?;
+    if !first.all_zombie || !first.leader_seen || first.members.as_slice() != [leader_pid] {
+        return Ok(false);
+    }
+    let second = macos_zombie_group_snapshot(process_group, leader_pid)?;
+    Ok(second.all_zombie
+        && second.leader_seen
+        && second.members.as_slice() == [leader_pid]
+        && first.members == second.members)
+}
+
+#[cfg(target_os = "macos")]
+struct MacosZombieGroupSnapshot {
+    members: Vec<i32>,
+    leader_seen: bool,
+    all_zombie: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_zombie_group_snapshot(
+    process_group: i32,
+    leader_pid: i32,
+) -> io::Result<MacosZombieGroupSnapshot> {
+    let mut listed = [0_i32; MAX_PROCESS_GROUP_SCAN_ENTRIES];
+    let buffer_size = libc::c_int::try_from(std::mem::size_of_val(&listed))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process scan was too large"))?;
+    // SAFETY: `listed` is writable for the complete byte range and the call
+    // does not retain the pointer.
+    let count =
+        unsafe { libc::proc_listpgrppids(process_group, listed.as_mut_ptr().cast(), buffer_size) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let count = usize::try_from(count)
+        .map_err(|_| io::Error::other("process-group scan count was invalid"))?;
+    if count == 0 || count >= listed.len() {
+        return Err(io::Error::other(
+            "anchored process-group scan was empty or reached its fixed bound",
+        ));
+    }
+
+    let mut members = Vec::with_capacity(count);
+    let mut leader_seen = false;
+    let mut all_zombie = true;
+    for pid in listed.into_iter().take(count) {
+        if pid <= 0 {
+            return Err(io::Error::other(
+                "anchored process-group scan returned an invalid member",
+            ));
+        }
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let info_size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .map_err(|_| io::Error::other("process info size was invalid"))?;
+        // SAFETY: `info` is exact writable storage for one proc_bsdinfo and
+        // is read only after a complete successful call.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                info_size,
+            )
+        };
+        if read != info_size {
+            return Err(if read == 0 {
+                io::Error::last_os_error()
+            } else {
+                io::Error::other("process info read was incomplete")
+            });
+        }
+        // SAFETY: the exact-size successful read initialized the structure.
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pgid != process_group as u32 {
+            return Err(io::Error::other(
+                "process-group member identity changed during inspection",
+            ));
+        }
+        leader_seen |= pid == leader_pid && info.pbi_status == libc::SZOMB;
+        all_zombie &= info.pbi_status == libc::SZOMB;
+        members.push(pid);
+    }
+    members.sort_unstable();
+    if members.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(io::Error::other(
+            "process-group scan returned a duplicate member",
+        ));
+    }
+    Ok(MacosZombieGroupSnapshot {
+        members,
+        leader_seen,
+        all_zombie,
+    })
 }
 
 /// Atomically replaces inherited stdin with a close-on-exec `/dev/null` while
@@ -835,6 +1139,17 @@ mod tests {
     const RESEALED_IDENTITY_ENV: &str = "CALCIFER_TEST_RESEALED_READINESS_IDENTITY";
     const INVALID_READINESS_HELPER_ENV: &str = "CALCIFER_TEST_INVALID_READINESS_FD";
     const SIGTTOU_LIFO_ABORT_HELPER_ENV: &str = "CALCIFER_TEST_SIGTTOU_LIFO_ABORT";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_group_scan_observes_the_live_calling_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // SAFETY: getpgrp has no arguments and returns process-local metadata.
+        let process_group = unsafe { libc::getpgrp() };
+        assert!(macos_process_group_has_live_members(process_group)?);
+        assert!(macos_process_group_has_live_members(0).is_err());
+        Ok(())
+    }
 
     #[test]
     fn child_reap_poll_returns_at_its_deadline_without_a_blocking_wait() {
@@ -1420,10 +1735,10 @@ mod tests {
                 "InheritedFdSpawnError { child_started: true }"
             );
 
-            let mut child = failure
+            let started_child = failure
                 .into_started_child()
-                .ok_or("started child authority was missing")?
-                .into_child();
+                .ok_or("started child authority was missing")?;
+            let mut child = started_child.into_child();
             assert!(terminate_spawned_child(&mut child));
             Ok(())
         })

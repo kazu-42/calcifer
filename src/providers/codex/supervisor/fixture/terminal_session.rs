@@ -5,10 +5,9 @@
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, ExitStatus};
@@ -21,6 +20,9 @@ use std::time::{Duration, Instant};
 use calcifer_unix_child_fd::descriptor_identity;
 
 use super::*;
+use crate::providers::codex::supervisor::protocol::{
+    SessionTerminationCause, project_terminal_semantics,
+};
 use crate::providers::codex::supervisor::terminal::{
     GateOpen, InputGate, PtyMaster, PtyOwner, RecoveryTty, TerminalBuffer, TerminalChannelPair,
     TerminalChunk, TerminalEndpoint, TerminalError, TerminalRead, TerminalShutdown, TerminalSize,
@@ -34,7 +36,6 @@ const GUARDIAN_FOREGROUND_ENV: &str = "CALCIFER_SUPERVISOR_FIXTURE_FOREGROUND_PG
 const COORDINATOR_FOREGROUND_ENV: &str = "CALCIFER_SUPERVISOR_FIXTURE_FOREGROUND_TERMINAL";
 const HEARTBEAT_EXPECTED_GROUP_ENV: &str = "CALCIFER_SUPERVISOR_FIXTURE_HEARTBEAT_EXPECTED_GROUP";
 
-const TUI_READINESS_TOKEN: u8 = 1;
 const TUI_EXIT_BYTE: u8 = 0x04;
 const EVENT_POLL: Duration = Duration::from_millis(10);
 const ANCHOR_TIMEOUT: Duration = Duration::from_secs(30);
@@ -542,9 +543,7 @@ pub(super) fn run_guardian(scenario: Scenario) -> Result<ExitCode, FixtureError>
 /// readiness byte, and then echoes one byte at a time. It never allocates or
 /// retains a transcript.
 pub(super) fn run_fake_tui(scenario: Scenario) -> Result<ExitCode, FixtureError> {
-    let inherited_readiness = calcifer_unix_child_fd::take_inherited_readiness_fd()
-        .map_err(|_| FixtureError::Descriptor)?;
-    let mut readiness = UnixStream::from(inherited_readiness);
+    let readiness = InheritedTuiReadiness::take().map_err(|_| FixtureError::Descriptor)?;
     let proof = claim_controlling_terminal_from_stdin().map_err(|_| FixtureError::Process)?;
     if !rustix::termios::isatty(io::stdin())
         || !rustix::termios::isatty(io::stdout())
@@ -591,14 +590,7 @@ pub(super) fn run_fake_tui(scenario: Scenario) -> Result<ExitCode, FixtureError>
     }
     wait_for_exact_marker("test.release-ready", b"release\n")?;
     write_marker("tui.ready", b"ready\n")?;
-    readiness
-        .write_all(&[TUI_READINESS_TOKEN])
-        .and_then(|()| readiness.flush())
-        .map_err(|_| FixtureError::Process)?;
-    readiness
-        .shutdown(std::net::Shutdown::Both)
-        .map_err(|_| FixtureError::Process)?;
-    drop(readiness);
+    readiness.publish().map_err(|_| FixtureError::Process)?;
 
     if scenario == Scenario::PtyTuiExitBeforeGate {
         write_marker("tui.pre-gate-exit-armed", b"armed\n")?;
@@ -961,60 +953,6 @@ fn parse_positive_process_group(name: &str) -> Result<i32, FixtureError> {
     Ok(value)
 }
 
-struct TuiReadinessReceiver {
-    stream: UnixStream,
-    saw_token: bool,
-}
-
-fn tui_readiness_pair() -> Result<(TuiReadinessReceiver, UnixStream), FixtureError> {
-    let (receiver, sender) = UnixStream::pair().map_err(|_| FixtureError::Channel)?;
-    for stream in [&receiver, &sender] {
-        let flags = rustix::io::fcntl_getfd(stream).map_err(|_| FixtureError::Descriptor)?;
-        rustix::io::fcntl_setfd(stream, flags | rustix::io::FdFlags::CLOEXEC)
-            .map_err(|_| FixtureError::Descriptor)?;
-        if !rustix::io::fcntl_getfd(stream)
-            .map_err(|_| FixtureError::Descriptor)?
-            .contains(rustix::io::FdFlags::CLOEXEC)
-        {
-            return Err(FixtureError::Descriptor);
-        }
-    }
-    receiver
-        .set_nonblocking(true)
-        .map_err(|_| FixtureError::Channel)?;
-    Ok((
-        TuiReadinessReceiver {
-            stream: receiver,
-            saw_token: false,
-        },
-        sender,
-    ))
-}
-
-impl TuiReadinessReceiver {
-    fn descriptor_identity(
-        &self,
-    ) -> Result<calcifer_unix_child_fd::DescriptorIdentity, FixtureError> {
-        descriptor_identity(self.stream.as_fd()).map_err(|_| FixtureError::Descriptor)
-    }
-
-    fn poll(&mut self) -> Result<Option<VerifiedTuiReadiness>, FixtureError> {
-        let mut bytes = [0_u8; 2];
-        match self.stream.read(&mut bytes) {
-            Ok(0) if self.saw_token => Ok(Some(VerifiedTuiReadiness { _private: () })),
-            Ok(0) => Err(FixtureError::Protocol),
-            Ok(1) if !self.saw_token && bytes[0] == TUI_READINESS_TOKEN => {
-                self.saw_token = true;
-                Ok(None)
-            }
-            Ok(_) => Err(FixtureError::Protocol),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(_) => Err(FixtureError::Channel),
-        }
-    }
-}
-
 trait PumpIo: AsFd + Send + Sync + 'static {
     fn enable_nonblocking(&self) -> Result<(), FixtureError>;
     fn read_into<'buffer>(
@@ -1262,6 +1200,7 @@ impl<L: PumpIo, R: PumpIo> PumpCore<L, R> {
         Ok(pump)
     }
 
+    #[cfg(test)]
     fn start_duplex(left: L, right: R) -> Result<Self, FixtureError> {
         let mut pump = Self::start_output(left, right)?;
         pump.start_input()?;
@@ -1568,10 +1507,6 @@ enum GuardianPumpState {
     Output(GuardianOutputPump),
     Ready(GuardianReadyPump),
     Duplex(GuardianDuplexPump),
-}
-
-struct VerifiedTuiReadiness {
-    _private: (),
 }
 
 struct GuardianOpenGate {
@@ -3461,10 +3396,15 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
             RetentionReason::ProtocolInvalid,
         )
     }
-    let (terminal_session, tui_disposition) = loop {
+    let (terminal_session, tui_disposition, guardian_exit) = loop {
         match receiver.receive(phase_deadline()) {
             Ok(GuardianEvent::Failed { .. }) if !session_failed => session_failed = true,
-            Ok(GuardianEvent::ChildrenReaped { session, tui, .. }) => break (session, tui),
+            Ok(GuardianEvent::ChildrenReaped {
+                session,
+                tui,
+                guardian_exit,
+                ..
+            }) => break (session, tui, guardian_exit),
             Ok(_) => {
                 drop(signal_flags.take());
                 drop(receiver);
@@ -3552,46 +3492,49 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
     drop(lifecycle);
     drop(guardian);
     drop(coordinator_lease);
-    let operational_session = if forced_guardian_stop
-        || session_failed != (terminal_session == SessionStatus::Failed)
-        || !guardian_status_matches_terminal(status, terminal_session)
-    {
-        SessionStatus::Failed
-    } else {
-        terminal_session
-    };
-    match operational_session {
+    if forced_guardian_stop || !guardian_status_matches_exit(status, guardian_exit) {
+        write_marker("coordinator.failed", b"clean\n")?;
+        write_fixture_stdout(b"FAILED_CLEAN\n")?;
+        return Ok(ExitCode::from(EXIT_FAILURE));
+    }
+    match terminal_session {
         SessionStatus::Completed => {
             write_marker("coordinator.completed", b"complete\n")?;
             write_fixture_stdout(b"COMPLETED\n")?;
-            project_tui_disposition(tui_disposition)
         }
         SessionStatus::Failed => {
             write_marker("coordinator.failed", b"clean\n")?;
             write_fixture_stdout(b"FAILED_CLEAN\n")?;
-            Ok(ExitCode::from(EXIT_FAILURE))
         }
+    }
+    let _ = (session_failed, tui_disposition);
+    project_guardian_exit(guardian_exit)
+}
+
+fn guardian_status_matches_exit(status: ExitStatus, disposition: GuardianExitDisposition) -> bool {
+    match disposition {
+        GuardianExitDisposition::Code(code) => status.code() == Some(i32::from(code)),
+        GuardianExitDisposition::Signal(signal) => status.signal() == Some(i32::from(signal)),
+        GuardianExitDisposition::InternalFailure => status.code() == Some(1),
     }
 }
 
-fn project_tui_disposition(disposition: ChildDisposition) -> Result<ExitCode, FixtureError> {
+fn project_guardian_exit(disposition: GuardianExitDisposition) -> Result<ExitCode, FixtureError> {
     match disposition {
-        ChildDisposition::Exited {
-            code,
-            stop_action: StopAction::None,
-        } => Ok(ExitCode::from(code)),
-        ChildDisposition::Signaled {
-            signal,
-            stop_action: StopAction::None,
-            ..
-        } => {
+        GuardianExitDisposition::Code(code) => Ok(ExitCode::from(code)),
+        GuardianExitDisposition::Signal(signal) => {
             signal_hook::low_level::emulate_default_handler(i32::from(signal))
                 .map_err(|_| FixtureError::Process)?;
             Err(FixtureError::Process)
         }
-        ChildDisposition::NotStarted
-        | ChildDisposition::Exited { .. }
-        | ChildDisposition::Signaled { .. } => Err(FixtureError::Invariant),
+        GuardianExitDisposition::InternalFailure => Ok(ExitCode::from(EXIT_FAILURE)),
+    }
+}
+
+fn apply_guardian_exit(disposition: GuardianExitDisposition) -> Result<ExitCode, FixtureError> {
+    match disposition {
+        GuardianExitDisposition::InternalFailure => Ok(ExitCode::from(1)),
+        disposition => project_guardian_exit(disposition),
     }
 }
 
@@ -4024,7 +3967,7 @@ fn run_terminal_guardian(_scenario: Scenario) -> Result<ExitCode, FixtureError> 
             true,
         );
     }
-    let mut tui = match ManagedGroupChild::spawn_session_leader_with_inherited_fd(
+    let mut tui = match ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fd(
         ChildRole::Tui,
         tui_command,
         readiness_sender.as_fd(),
@@ -4386,7 +4329,7 @@ fn await_tui_readiness(
 ) {
     let deadline = startup_deadline();
     loop {
-        match readiness.poll() {
+        match readiness.try_receive() {
             Ok(Some(readiness)) => return (Some(readiness), true, None),
             Ok(None) => {}
             Err(_) => {
@@ -5591,6 +5534,13 @@ fn finish_terminal_guardian_inner(
     mut channel_live: bool,
     hold_after_announced_failure: bool,
 ) -> Result<ExitCode, FixtureError> {
+    let forwarded_cause = match &tui_shutdown {
+        GuardianTuiShutdown::SignalAlreadyForwarded { proof, .. } => Some(match proof.signal() {
+            TerminalShutdownSignal::Hup => SessionTerminationCause::ForwardedHup,
+            TerminalShutdownSignal::Term => SessionTerminationCause::ForwardedTerm,
+        }),
+        GuardianTuiShutdown::Standard(_) => None,
+    };
     let mut failure_announced = false;
     if channel_live {
         if let Some((phase, code)) = failure {
@@ -5648,10 +5598,10 @@ fn finish_terminal_guardian_inner(
 
     let shutdown_result = match tui_shutdown {
         GuardianTuiShutdown::Standard(tui) => {
-            shutdown_pair(tui, app, SHUTDOWN_GRACE, SHUTDOWN_FORCE)
+            shutdown_fixture_pair(tui, app, SHUTDOWN_GRACE, SHUTDOWN_FORCE)
         }
         GuardianTuiShutdown::SignalAlreadyForwarded { tui, proof } => {
-            shutdown_pair_after_forwarded_tui_signal(
+            shutdown_fixture_pair_after_forwarded_tui_signal(
                 tui,
                 app,
                 proof,
@@ -5878,10 +5828,32 @@ fn finish_terminal_guardian_inner(
         }
         .park()
     }
-    let session = if failure.is_some() {
-        SessionStatus::Failed
+    let tui_disposition = children.tui();
+    let termination_cause = forwarded_cause.unwrap_or(match tui_disposition {
+        ChildDisposition::Exited {
+            stop_action: StopAction::None,
+            ..
+        }
+        | ChildDisposition::Signaled {
+            stop_action: StopAction::None,
+            ..
+        } => SessionTerminationCause::NaturalTuiEof,
+        ChildDisposition::Exited { .. }
+        | ChildDisposition::Signaled { .. }
+        | ChildDisposition::NotStarted => SessionTerminationCause::CoordinatorStop,
+    });
+    let (session, guardian_exit) = if failure.is_some() {
+        (
+            SessionStatus::Failed,
+            GuardianExitDisposition::InternalFailure,
+        )
     } else {
-        SessionStatus::Completed
+        project_terminal_semantics(
+            children.app_server(),
+            tui_disposition,
+            worker_status,
+            termination_cause,
+        )
     };
     if !channel_live {
         drop(provider_lease);
@@ -5896,6 +5868,7 @@ fn finish_terminal_guardian_inner(
             worker: worker_status,
             cleanup: CleanupStatus::Complete,
             session,
+            guardian_exit,
         },
     ) {
         let _ = endpoint.shutdown();
@@ -5906,11 +5879,7 @@ fn finish_terminal_guardian_inner(
         .park()
     }
     drop(provider_lease);
-    Ok(if session == SessionStatus::Completed {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(EXIT_FAILURE)
-    })
+    apply_guardian_exit(guardian_exit)
 }
 
 fn receive_terminal_restored(

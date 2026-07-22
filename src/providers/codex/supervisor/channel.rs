@@ -5,8 +5,6 @@
 //! one connected `AF_UNIX` stream pair, keeps every parent-side descriptor
 //! close-on-exec, and moves exactly one endpoint into the guardian's stdin.
 
-#![allow(dead_code)] // Wired to the default-off supervisor in issue #50.
-
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -14,7 +12,9 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
+#[cfg(not(target_os = "linux"))]
+use rustix::io::fcntl_setfd;
+use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_getfd};
 use rustix::net::{AddressFamily, SendFlags, SocketType};
 
 /// Path-free descriptor identity whose diagnostic representation is always
@@ -92,6 +92,11 @@ impl LifecyclePair {
 
     pub(super) fn guardian_identity(&self) -> Result<DescriptorIdentity, ChannelError> {
         self.guardian.descriptor_identity()
+    }
+
+    #[cfg(test)]
+    pub(super) fn split_for_test(self) -> (LifecycleEndpoint, LifecycleEndpoint) {
+        (self.coordinator, self.guardian)
     }
 }
 
@@ -229,6 +234,13 @@ pub(super) struct GuardianSpawnFailure {
 }
 
 impl GuardianSpawnFailure {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained foundation accessor is exercised by channel unit tests"
+        )
+    )]
     pub(super) const fn error(&self) -> ChannelError {
         self.error
     }
@@ -256,8 +268,28 @@ impl fmt::Debug for GuardianSpawnFailure {
 /// endpoint is checked both before and after spawn and is returned on every
 /// path. Profile authority remains outside this function and is never dropped.
 pub(super) fn spawn_guardian_with_lifecycle_stdin(
+    command: Command,
+    pair: LifecyclePair,
+) -> Result<SpawnedGuardian, GuardianSpawnFailure> {
+    spawn_guardian_with_lifecycle_stdin_inner(command, pair, None)
+}
+
+/// Moves the lifecycle endpoint into stdin and gives only this exact guardian
+/// exec one additional close-on-exec capability. The extra descriptor is
+/// dynamically advertised and must be consumed/resealed at the guardian's
+/// single-threaded role entry before any later process or worker is created.
+pub(super) fn spawn_guardian_with_lifecycle_stdin_and_completion(
+    command: Command,
+    pair: LifecyclePair,
+    completion: BorrowedFd<'_>,
+) -> Result<SpawnedGuardian, GuardianSpawnFailure> {
+    spawn_guardian_with_lifecycle_stdin_inner(command, pair, Some(completion))
+}
+
+fn spawn_guardian_with_lifecycle_stdin_inner(
     mut command: Command,
     pair: LifecyclePair,
+    completion: Option<BorrowedFd<'_>>,
 ) -> Result<SpawnedGuardian, GuardianSpawnFailure> {
     let LifecyclePair {
         coordinator,
@@ -283,15 +315,32 @@ pub(super) fn spawn_guardian_with_lifecycle_stdin(
     let guardian_descriptor = OwnedFd::from(stream);
     command.stdin(Stdio::from(guardian_descriptor));
 
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => {
-            return Err(GuardianSpawnFailure {
-                coordinator,
-                child: None,
-                error: ChannelError::Spawn,
-            });
+    let child = match completion {
+        Some(completion) => {
+            match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(command, completion) {
+                Ok(child) => child,
+                Err(failure) => {
+                    let child = failure
+                        .into_started_child()
+                        .map(calcifer_unix_child_fd::StartedChild::into_child);
+                    return Err(GuardianSpawnFailure {
+                        coordinator,
+                        child,
+                        error: ChannelError::Spawn,
+                    });
+                }
+            }
         }
+        None => match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                return Err(GuardianSpawnFailure {
+                    coordinator,
+                    child: None,
+                    error: ChannelError::Spawn,
+                });
+            }
+        },
     };
 
     if let Err(error) = coordinator.verify_invariants() {
@@ -357,6 +406,7 @@ fn create_socket_pair() -> Result<(UnixStream, UnixStream), ChannelError> {
     UnixStream::pair().map_err(|_| ChannelError::Create)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn set_and_verify_close_on_exec<Fd: AsFd>(descriptor: Fd) -> Result<(), ChannelError> {
     let flags = fcntl_getfd(&descriptor).map_err(|_| ChannelError::DescriptorFlags)?;
     fcntl_setfd(&descriptor, flags | FdFlags::CLOEXEC)
@@ -447,10 +497,24 @@ pub(super) enum ChannelError {
     InvalidSocketDomain,
     InvalidPeerDomain,
     MissingPeer,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "constructed only by the Darwin SO_NOSIGPIPE implementation"
+        )
+    )]
     SignalSafety,
     Shutdown,
     TimeoutConfiguration,
     Spawn,
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "constructed only by the explicitly unsupported platform implementation"
+        )
+    )]
     UnsupportedPlatform,
 }
 

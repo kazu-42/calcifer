@@ -1316,6 +1316,131 @@ impl Registry {
         })
     }
 
+    /// Acquires the same-profile guardian's provider-side lease directly.
+    ///
+    /// The authenticated hidden guardian must call this only after its
+    /// coordinator has acquired A for the exact selected row. Its private
+    /// coordinator/guardian channel establishes that provenance; this
+    /// filesystem boundary proves only that an independent open-file
+    /// description holds the exact private A inode. It then acquires only B
+    /// and refetches the immutable profile ID while B is held. A completed
+    /// rename, removal, lock-file replacement, or inheritable B is rejected
+    /// before a launchable [`TargetGuardianLease`] can exist.
+    ///
+    /// Cross-profile handoff continues to use the A+B reservation and
+    /// `SCM_RIGHTS` acknowledgement protocol; this narrower path never sends or
+    /// receives a descriptor and cannot return a raw [`ProfileLease`].
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(dead_code)] // Consumed by the internal supervised session in issue #54.
+    pub(crate) fn lock_profile_guardian_current(
+        &self,
+        expected: &Profile,
+    ) -> Result<TargetGuardianLease, ProfileError> {
+        self.lock_profile_guardian_current_inner(expected, || Ok(()))
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    fn lock_profile_guardian_current_with_probe_hook<F>(
+        &self,
+        expected: &Profile,
+        after_live_coordinator_probe: F,
+    ) -> Result<TargetGuardianLease, ProfileError>
+    where
+        F: FnOnce() -> Result<(), ProfileError>,
+    {
+        self.lock_profile_guardian_current_inner(expected, after_live_coordinator_probe)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn lock_profile_guardian_current_inner<F>(
+        &self,
+        expected: &Profile,
+        after_live_coordinator_probe: F,
+    ) -> Result<TargetGuardianLease, ProfileError>
+    where
+        F: FnOnce() -> Result<(), ProfileError>,
+    {
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        let profile_directory = self.profile_directory(expected)?;
+        let profile_directory_identity = private_directory_identity(&profile_directory)?;
+        let coordinator_path = profile_directory.join(COORDINATOR_LOCK_FILE);
+        let provider_path = profile_directory.join(PROVIDER_LOCK_FILE);
+
+        // B must already be a durable managed node. Creating a replacement
+        // lock at guardian admission would silently split lifetime authority.
+        let provider = lock_existing_profile_file(&provider_path, &expected.reference())?;
+        let provider_identity = private_lock_file_identity(&provider, &provider_path)?;
+        if !fcntl_getfd(&provider)
+            .map_err(io::Error::from)?
+            .contains(FdFlags::CLOEXEC)
+        {
+            return Err(ProfileError::UnsafeState(
+                "guardian provider lock is inheritable".to_owned(),
+            ));
+        }
+
+        // The authenticated caller binds this admission to its coordinator;
+        // flock alone identifies no process. This probe never adopts or
+        // transfers A: successfully acquiring it proves that no independent
+        // owner held A at the admission linearization point. Once observed,
+        // B remains sufficient if the coordinator exits selectively.
+        let coordinator_probe = open_existing_private_lock_file(&coordinator_path)?;
+        let coordinator_identity =
+            private_lock_file_identity(&coordinator_probe, &coordinator_path)?;
+        if !fcntl_getfd(&coordinator_probe)
+            .map_err(io::Error::from)?
+            .contains(FdFlags::CLOEXEC)
+        {
+            return Err(ProfileError::UnsafeState(
+                "guardian coordinator probe is inheritable".to_owned(),
+            ));
+        }
+        match FileExt::try_lock_exclusive(&coordinator_probe) {
+            Ok(()) => {
+                return Err(ProfileError::UnsafeState(
+                    "same-profile guardian requires a live coordinator lease".to_owned(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(ProfileError::Io(error)),
+        }
+        after_live_coordinator_probe()?;
+
+        // Rename and removal acquire A before B. With an independent A owner
+        // observed and this guardian's B held, the immutable-ID refetch cannot
+        // legitimately change. Exact row equality keeps alias and creation
+        // metadata from becoming caller-reconstructed authority.
+        let current = self.find_by_id_without_recovery(expected.provider, &expected.id)?;
+        if current != *expected {
+            return Err(ProfileError::NotFound(expected.reference()));
+        }
+        if self.profile_directory(&current)? != profile_directory
+            || private_directory_identity(&profile_directory)? != profile_directory_identity
+            || private_lock_file_identity(&coordinator_probe, &coordinator_path)?
+                != coordinator_identity
+            || private_lock_file_identity(&provider, &provider_path)? != provider_identity
+            || !fcntl_getfd(&coordinator_probe)
+                .map_err(io::Error::from)?
+                .contains(FdFlags::CLOEXEC)
+            || !fcntl_getfd(&provider)
+                .map_err(io::Error::from)?
+                .contains(FdFlags::CLOEXEC)
+        {
+            return Err(ProfileError::UnsafeState(
+                "same-profile guardian authority changed during admission".to_owned(),
+            ));
+        }
+
+        Ok(TargetGuardianLease {
+            lease: ProfileLease {
+                coordinator: None,
+                provider: Some(provider),
+            },
+            profile: current,
+        })
+    }
+
     /// Receives the provider half of an already-held target reservation.
     ///
     /// The descriptor is accepted only when it still names the exact private
@@ -2061,10 +2186,17 @@ impl RemovalRegistryBarrier {
 }
 
 fn registry_digest(document: &RegistryDocument) -> Result<String, ProfileError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let bytes = serde_json::to_vec(document)
         .map_err(|_| ProfileError::InvalidRegistry("registry serialization failed".to_owned()))?;
     let digest = Sha256::digest(bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(encoded)
 }
 
 fn effective_removal_journal(
@@ -3190,10 +3322,10 @@ impl VerifiedTargetReservation {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn send_provider_lease<'control>(
+    pub(crate) fn send_provider_lease(
         self,
-        control: &'control std::os::unix::net::UnixStream,
-    ) -> Result<AwaitingProviderLeaseAck<'control>, Box<ProviderLeaseTransferSendError>> {
+        control: &std::os::unix::net::UnixStream,
+    ) -> Result<AwaitingProviderLeaseAck<'_>, Box<ProviderLeaseTransferSendError>> {
         if self.lease.coordinator.is_none() {
             return Err(Box::new(ProviderLeaseTransferSendError {
                 reservation: self,
@@ -3235,6 +3367,21 @@ impl CoordinatorProfileLease {
             .coordinator
             .as_ref()
             .ok_or_else(|| ProfileError::UnsafeState("coordinator lock is not held".to_owned()))
+    }
+
+    /// Pins coordinator-only lease A into a child descriptor denyset without
+    /// exposing the lock file or its raw descriptor outside this authority.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn append_forbidden_descriptor<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        use std::os::fd::AsFd;
+
+        let coordinator = self.lock_file().map_err(|_| {
+            calcifer_unix_child_fd::CrossProcessDescriptorIdentityError::ObservationFailed
+        })?;
+        forbidden.capture(coordinator.as_fd())
     }
 }
 
@@ -3439,6 +3586,36 @@ impl<'control> ProviderLeaseGuardianAckSendError<'control> {
 impl TargetGuardianLease {
     pub(crate) const fn profile(&self) -> &Profile {
         &self.profile
+    }
+
+    /// Returns the path-free identity of the exact provider lock held by B.
+    ///
+    /// Package-level inheritance tests serialize this identity for a child
+    /// process to inspect. Deriving it from the already-open descriptor keeps
+    /// that proof bound to this lease even if the visible lock pathname is
+    /// replaced after admission.
+    #[cfg(test)]
+    pub(crate) fn descriptor_identity_for_test(
+        &self,
+    ) -> Result<calcifer_unix_child_fd::DescriptorIdentity, ProfileError> {
+        use std::os::fd::AsFd;
+
+        let provider = self.lease.provider_lock_file()?;
+        calcifer_unix_child_fd::descriptor_identity(provider.as_fd()).map_err(ProfileError::Io)
+    }
+
+    /// Pins the guardian-only B lease into a child descriptor denyset without
+    /// exposing the lock file or its raw descriptor to provider code.
+    pub(crate) fn append_forbidden_descriptor<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        use std::os::fd::AsFd;
+
+        let provider = self.lease.provider_lock_file().map_err(|_| {
+            calcifer_unix_child_fd::CrossProcessDescriptorIdentityError::ObservationFailed
+        })?;
+        forbidden.capture(provider.as_fd())
     }
 }
 
@@ -6490,6 +6667,220 @@ config_file = "{sensitive_path}"
         assert_eq!(current.alias, "client-a");
 
         drop(_lease);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_profile_guardian_requires_live_a_and_mints_only_cloexec_b()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        let root = temporary_root("same-profile-guardian-direct-b");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+
+        let error = registry
+            .lock_profile_guardian_current(&profile)
+            .err()
+            .ok_or("guardian B must not be minted without a live coordinator A")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+
+        let coordinator = registry.lock_profile_coordinator(&profile)?;
+        let guardian = registry.lock_profile_guardian_current(&profile)?;
+        assert_eq!(guardian.profile(), &profile);
+        let provider = guardian
+            .lease
+            .provider
+            .as_ref()
+            .ok_or("guardian did not retain provider B")?;
+        assert!(fcntl_getfd(provider)?.contains(FdFlags::CLOEXEC));
+        assert!(matches!(
+            registry.lock_profile_provider(&profile),
+            Err(ProfileError::Busy(_))
+        ));
+
+        drop(guardian);
+        drop(registry.lock_profile_provider(&profile)?);
+        drop(coordinator);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn guardian_audit_identity_stays_bound_to_held_b_after_path_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsFd;
+
+        let root = temporary_root("guardian-held-b-audit-identity");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let provider_path = profile_directory.join(PROVIDER_LOCK_FILE);
+        let displaced_path = profile_directory.join("provider.lock.displaced");
+
+        let coordinator = registry.lock_profile_coordinator(&profile)?;
+        let guardian = registry.lock_profile_guardian_current(&profile)?;
+        let held_identity = guardian.descriptor_identity_for_test()?;
+
+        fs::rename(&provider_path, &displaced_path)?;
+        write_private_file(&provider_path, b"")?;
+        let visible = open_existing_private_lock_file(&provider_path)?;
+        let visible_identity = calcifer_unix_child_fd::descriptor_identity(visible.as_fd())?;
+
+        assert_ne!(visible_identity, held_identity);
+        assert_eq!(guardian.descriptor_identity_for_test()?, held_identity);
+
+        drop(visible);
+        drop(guardian);
+        drop(coordinator);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_profile_guardian_survives_coordinator_exit_after_live_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("same-profile-guardian-selective-a-exit");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+
+        let coordinator = registry.lock_profile_coordinator(&profile)?;
+        let guardian =
+            registry.lock_profile_guardian_current_with_probe_hook(&profile, move || {
+                drop(coordinator);
+                Ok(())
+            })?;
+
+        // A selective coordinator exit after the live-owner observation must
+        // not create an unlock gap: the surviving B blocks a normal A-then-B
+        // writer until the guardian itself releases its authority.
+        let error = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("surviving guardian B must block a normal profile contender")?;
+        assert_eq!(error.code(), "profile_busy");
+
+        drop(guardian);
+        drop(registry.lock_profile(&profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_profile_guardian_rejects_a_stale_row_and_releases_provisional_b()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("same-profile-guardian-stale-row");
+        let registry = Registry::at(root.clone());
+        let stale = register_test_profile(&registry, "work")?;
+        let (current, changed) = registry.rename(Provider::Codex, "work", "client-a")?;
+        assert!(changed);
+
+        let coordinator = registry.lock_profile_coordinator(&current)?;
+        let error = registry
+            .lock_profile_guardian_current(&stale)
+            .err()
+            .ok_or("a stale selected row must not mint guardian B")?;
+        assert_eq!(error.code(), "profile_not_found");
+
+        // The rejected provisional B must be closed immediately; only A stays
+        // held for the coordinator lifetime.
+        drop(registry.lock_profile_provider(&current)?);
+        drop(coordinator);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_profile_guardian_rejects_forged_created_at_and_releases_provisional_b()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("same-profile-guardian-forged-created-at");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let mut forged = profile.clone();
+        forged.created_at = forged
+            .created_at
+            .checked_add(1)
+            .ok_or("synthetic creation time overflowed")?;
+
+        let coordinator = registry.lock_profile_coordinator(&profile)?;
+        let error = registry
+            .lock_profile_guardian_current(&forged)
+            .err()
+            .ok_or("caller-reconstructed creation metadata must not mint guardian B")?;
+        assert_eq!(error.code(), "profile_not_found");
+
+        // Exact-row rejection must close the provisional B immediately while
+        // the real coordinator continues to hold A.
+        drop(registry.lock_profile_provider(&profile)?);
+        drop(coordinator);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_profile_guardian_rejects_coordinator_inode_replacement_after_live_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("same-profile-guardian-replaced-a");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let coordinator_path = profile_directory.join(COORDINATOR_LOCK_FILE);
+        let displaced_path = profile_directory.join("coordinator.displaced");
+
+        let coordinator = registry.lock_profile_coordinator(&profile)?;
+        let error = registry
+            .lock_profile_guardian_current_with_probe_hook(&profile, || {
+                fs::rename(&coordinator_path, &displaced_path)?;
+                write_private_file(&coordinator_path, b"")
+            })
+            .err()
+            .ok_or("replacing A after the live-owner probe must reject guardian B")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+
+        // Rejection must close the provisional provider-side authority. The
+        // displaced A remains independently held until the coordinator exits.
+        drop(registry.lock_profile_provider(&profile)?);
+        drop(coordinator);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_profile_guardian_rejects_profile_tree_replacement_after_live_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("same-profile-guardian-replaced-tree");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        let displaced_directory = profile_directory.with_extension("displaced");
+
+        let coordinator = registry.lock_profile_coordinator(&profile)?;
+        let error = registry
+            .lock_profile_guardian_current_with_probe_hook(&profile, || {
+                fs::rename(&profile_directory, &displaced_directory)?;
+                fs::create_dir(&profile_directory)?;
+                fs::set_permissions(&profile_directory, fs::Permissions::from_mode(0o700))?;
+                write_private_file(&profile_directory.join(OWNER_MARKER), profile.id.as_bytes())?;
+                create_durable_profile_lock_files(&profile_directory)
+            })
+            .err()
+            .ok_or("replacing the profile tree after the live-owner probe must reject B")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+
+        // The newly visible tree is not made authoritative by the stale A/B
+        // held on the displaced tree, and its B remains independently free.
+        drop(registry.lock_profile_provider(&profile)?);
+        drop(coordinator);
         fs::remove_dir_all(root)?;
         Ok(())
     }

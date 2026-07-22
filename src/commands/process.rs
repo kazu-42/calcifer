@@ -474,6 +474,12 @@ fn internal_calcifer_command(
 ) -> Command {
     let mut command = Command::new(executable);
     sanitize_managed_environment(&mut command);
+    #[cfg(all(debug_assertions, unix))]
+    project_debug_test_environment(
+        &mut command,
+        std::env::var_os("CALCIFER_TEST_MARKER_ID"),
+        std::env::var_os("CALCIFER_TEST_FINAL_PREFLIGHT_BARRIER"),
+    );
     // Calcifer itself does not use CODEX_HOME. The selected managed home is
     // reintroduced only on the final, validated official Codex command.
     command.env_remove("CODEX_HOME");
@@ -481,6 +487,34 @@ fn internal_calcifer_command(
     // the public process even when the user's symlink alias changes later.
     command.env("CALCIFER_HOME", calcifer_home);
     command
+}
+
+#[cfg(all(debug_assertions, unix))]
+fn project_debug_test_environment(
+    command: &mut Command,
+    marker_id: Option<OsString>,
+    final_preflight_barrier: Option<OsString>,
+) {
+    let Some(marker_id) = marker_id else {
+        return;
+    };
+    let Some(marker_text) = marker_id.to_str() else {
+        return;
+    };
+    let Ok(marker) = Uuid::parse_str(marker_text) else {
+        return;
+    };
+    if marker.to_string() != marker_text {
+        return;
+    }
+
+    // These debug-only hooks observe Calcifer's internal coordinator/guardian
+    // boundary. Re-project only the exact, validated pair after the broad
+    // CALCIFER_* scrub; the final provider command clears them again.
+    command.env("CALCIFER_TEST_MARKER_ID", marker_text);
+    if final_preflight_barrier.as_deref() == Some(std::ffi::OsStr::new("1")) {
+        command.env("CALCIFER_TEST_FINAL_PREFLIGHT_BARRIER", "1");
+    }
 }
 
 #[cfg(unix)]
@@ -844,6 +878,35 @@ mod tests {
                 "{denied} must be removed before the helper process starts"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debug_test_hooks_cross_only_internal_calcifer_boundaries_when_validated() {
+        let marker = "01900000-0000-7000-8000-000000000001";
+        let mut valid = Command::new("/synthetic/calcifer");
+        project_debug_test_environment(
+            &mut valid,
+            Some(OsString::from(marker)),
+            Some(OsString::from("1")),
+        );
+        assert!(valid.get_envs().any(|(name, value)| {
+            name == "CALCIFER_TEST_MARKER_ID" && value == Some(std::ffi::OsStr::new(marker))
+        }));
+        assert!(valid.get_envs().any(|(name, value)| {
+            name == "CALCIFER_TEST_FINAL_PREFLIGHT_BARRIER"
+                && value == Some(std::ffi::OsStr::new("1"))
+        }));
+
+        let mut invalid = Command::new("/synthetic/calcifer");
+        project_debug_test_environment(
+            &mut invalid,
+            Some(OsString::from("not-a-canonical-uuid")),
+            Some(OsString::from("1")),
+        );
+        assert!(!invalid.get_envs().any(|(name, _)| {
+            name == "CALCIFER_TEST_MARKER_ID" || name == "CALCIFER_TEST_FINAL_PREFLIGHT_BARRIER"
+        }));
     }
 
     #[test]

@@ -4,8 +4,9 @@
 //! identifiers are containment metadata only; they are never wait authority.
 
 use std::fmt;
-use std::io::Read;
-use std::os::fd::BorrowedFd;
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,16 +16,214 @@ use std::time::{Duration, Instant};
 use super::protocol::{ChildDisposition, ChildRole, StopAction, UnixSignal};
 
 const READINESS_SENTINEL: u8 = b'R';
+const TUI_READINESS_TOKEN: u8 = 1;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+// A Linux attempt walks the process table and target fd tables twice. Give
+// transient churn time to settle without consuming an entire startup budget.
+const DESCRIPTOR_OBSERVATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const SPAWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 static NEXT_CHILD_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+
+/// A fixed, redacted failure at the one-shot TUI launcher readiness boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TuiReadinessError {
+    Channel,
+    Descriptor,
+    Inherited,
+    Invalid,
+    Timeout,
+    Deadline,
+}
+
+impl fmt::Display for TuiReadinessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Channel => "TUI readiness channel failed",
+            Self::Descriptor => "TUI readiness descriptor was invalid",
+            Self::Inherited => "TUI readiness capability was unavailable",
+            Self::Invalid => "TUI readiness proof was invalid",
+            Self::Timeout => "TUI readiness exceeded its deadline",
+            Self::Deadline => "TUI readiness deadline was invalid",
+        })
+    }
+}
+
+impl std::error::Error for TuiReadinessError {}
+
+/// Capability proving that the launcher emitted exactly one token and then
+/// closed its write half. Its fields are private so later terminal typestates
+/// cannot manufacture readiness from a byte or a child PID.
+pub(super) struct VerifiedTuiReadiness {
+    _private: (),
+}
+
+impl fmt::Debug for VerifiedTuiReadiness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedTuiReadiness(<verified>)")
+    }
+}
+
+/// Guardian-side half of the bounded launcher readiness protocol.
+pub(super) struct TuiReadinessReceiver {
+    stream: UnixStream,
+    saw_token: bool,
+}
+
+/// Child-only descriptor authority. It exposes only `AsFd`, which lets the
+/// audited inheritance crate duplicate it for one selected exec.
+pub(super) struct TuiReadinessSender {
+    stream: UnixStream,
+}
+
+impl AsFd for TuiReadinessSender {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+/// Creates a close-on-exec full-duplex readiness pair.
+pub(super) fn tui_readiness_pair()
+-> Result<(TuiReadinessReceiver, TuiReadinessSender), TuiReadinessError> {
+    let (receiver, sender) = UnixStream::pair().map_err(|_| TuiReadinessError::Channel)?;
+    for stream in [&receiver, &sender] {
+        let flags = rustix::io::fcntl_getfd(stream).map_err(|_| TuiReadinessError::Descriptor)?;
+        rustix::io::fcntl_setfd(stream, flags | rustix::io::FdFlags::CLOEXEC)
+            .map_err(|_| TuiReadinessError::Descriptor)?;
+        if !rustix::io::fcntl_getfd(stream)
+            .map_err(|_| TuiReadinessError::Descriptor)?
+            .contains(rustix::io::FdFlags::CLOEXEC)
+        {
+            return Err(TuiReadinessError::Descriptor);
+        }
+    }
+    receiver
+        .set_nonblocking(true)
+        .map_err(|_| TuiReadinessError::Channel)?;
+    Ok((
+        TuiReadinessReceiver {
+            stream: receiver,
+            saw_token: false,
+        },
+        TuiReadinessSender { stream: sender },
+    ))
+}
+
+impl TuiReadinessReceiver {
+    pub(super) fn descriptor_identity(
+        &self,
+    ) -> Result<calcifer_unix_child_fd::DescriptorIdentity, TuiReadinessError> {
+        calcifer_unix_child_fd::descriptor_identity(self.stream.as_fd())
+            .map_err(|_| TuiReadinessError::Descriptor)
+    }
+
+    /// Waits for exactly `token + EOF`, never extending the caller's absolute
+    /// deadline after EINTR, partial input, or a token without peer closure.
+    pub(super) fn receive(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<VerifiedTuiReadiness, TuiReadinessError> {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TuiReadinessError::Timeout);
+            }
+            let timeout =
+                rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
+                    .map_err(|_| TuiReadinessError::Deadline)?;
+            let mut descriptors = [rustix::event::PollFd::new(
+                &self.stream,
+                rustix::event::PollFlags::IN,
+            )];
+            match rustix::event::poll(&mut descriptors, Some(&timeout)) {
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => return Err(TuiReadinessError::Channel),
+                Ok(0) => return Err(TuiReadinessError::Timeout),
+                Ok(_) => {}
+            }
+            let events = descriptors[0].revents();
+            if events.intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::NVAL) {
+                return Err(TuiReadinessError::Channel);
+            }
+            if events.intersects(rustix::event::PollFlags::IN | rustix::event::PollFlags::HUP) {
+                if let Some(proof) = self.try_receive()? {
+                    return Ok(proof);
+                }
+            }
+        }
+    }
+
+    /// Performs one bounded two-byte read for guardian loops that must also
+    /// interleave child liveness and lifecycle-channel checks.
+    pub(super) fn try_receive(
+        &mut self,
+    ) -> Result<Option<VerifiedTuiReadiness>, TuiReadinessError> {
+        let mut bytes = [0_u8; 2];
+        match self.stream.read(&mut bytes) {
+            Ok(0) if self.saw_token => Ok(Some(VerifiedTuiReadiness { _private: () })),
+            Ok(0) => Err(TuiReadinessError::Invalid),
+            Ok(1) if !self.saw_token && bytes[0] == TUI_READINESS_TOKEN => {
+                self.saw_token = true;
+                Ok(None)
+            }
+            Ok(_) => Err(TuiReadinessError::Invalid),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(_) => Err(TuiReadinessError::Channel),
+        }
+    }
+}
+
+/// Launcher-side one-shot publisher acquired before any terminal mutation.
+pub(super) struct InheritedTuiReadiness {
+    stream: UnixStream,
+}
+
+impl InheritedTuiReadiness {
+    pub(super) fn take() -> Result<Self, TuiReadinessError> {
+        let inherited = calcifer_unix_child_fd::take_inherited_readiness_fd()
+            .map_err(|_| TuiReadinessError::Inherited)?;
+        Ok(Self {
+            stream: UnixStream::from(inherited),
+        })
+    }
+
+    /// Emits the sole fixed token and shuts down the write half. Shutdown is
+    /// required because the sealed bootstrap descriptor remains open until
+    /// the immediately following exec closes it via `FD_CLOEXEC`.
+    pub(super) fn publish(mut self) -> Result<(), TuiReadinessError> {
+        self.stream
+            .write_all(&[TUI_READINESS_TOKEN])
+            .and_then(|()| self.stream.flush())
+            .map_err(|_| TuiReadinessError::Channel)?;
+        self.stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|_| TuiReadinessError::Channel)
+    }
+
+    /// Writes the token without closing the socket. The caller must exec
+    /// immediately: EOF is then generated only when `FD_CLOEXEC` seals the
+    /// bootstrap descriptor at that exec boundary (or when a failed launcher
+    /// exits). This lets the guardian distinguish a silent pre-exec stall from
+    /// an exec attempt without passing the readiness fd to Codex.
+    pub(super) fn publish_before_exec(mut self) -> Result<(), TuiReadinessError> {
+        self.stream
+            .write_all(&[TUI_READINESS_TOKEN])
+            .and_then(|()| self.stream.flush())
+            .map_err(|_| TuiReadinessError::Channel)
+    }
+
+    #[cfg(test)]
+    fn from_stream_for_test(stream: UnixStream) -> Self {
+        Self { stream }
+    }
+}
 
 /// Process-local identity that cannot be reconstructed from a reported PID or
 /// process-group number. It binds one-shot signal proofs to one direct child
 /// handle even after the operating system reuses numeric process identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ChildAuthority(u64);
+pub(super) struct ChildAuthority(u64);
 
 impl ChildAuthority {
     fn next() -> Self {
@@ -34,6 +233,11 @@ impl ChildAuthority {
             Ok(authority) => Self(authority),
             Err(_) => std::process::abort(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn for_test(value: u64) -> Self {
+        Self(value)
     }
 }
 
@@ -57,6 +261,11 @@ impl ContainmentMetadata {
     pub(super) const fn pgid(self) -> i32 {
         self.pgid
     }
+
+    #[cfg(test)]
+    pub(super) const fn for_test(role: ChildRole, pid: i32, pgid: i32) -> Self {
+        Self { role, pid, pgid }
+    }
 }
 
 /// Proof that every guardian-owned direct child was exactly reaped.
@@ -76,6 +285,59 @@ pub(super) enum ShutdownOutcome {
         children: ReapedChildren,
         error: ProcessError,
     },
+}
+
+/// Move-only evidence that the pinned official App Server received the
+/// guardian's one allowed shutdown signal and then exited successfully.
+///
+/// Codex shell tools may call `setsid(2)` and leave the App Server's process
+/// group. This capability is therefore not a kernel-level descendant-absence
+/// proof. It authorizes release only under the pinned upstream App Server's
+/// graceful running-turn shutdown contract: the exact direct child must exit
+/// with code zero after this owner delivers its first and only `SIGTERM`.
+#[must_use = "the pinned App graceful-drain evidence must stay attached to provider teardown"]
+pub(super) struct PinnedAppGracefulDrain {
+    outcome: ShutdownOutcome,
+    _proof: PinnedAppGracefullyDrained,
+}
+
+struct PinnedAppGracefullyDrained {
+    authority: ChildAuthority,
+}
+
+struct ShutdownCompletion {
+    outcome: ShutdownOutcome,
+    app_gracefully_drained: Option<PinnedAppGracefullyDrained>,
+}
+
+impl PinnedAppGracefulDrain {
+    pub(super) const fn outcome(&self) -> &ShutdownOutcome {
+        &self.outcome
+    }
+
+    pub(super) const fn child_authority(&self) -> ChildAuthority {
+        self._proof.authority
+    }
+
+    #[cfg(test)]
+    pub(super) const fn for_child_authority_test(authority: ChildAuthority) -> Self {
+        Self {
+            outcome: ShutdownOutcome::Clean(ReapedChildren {
+                tui: ChildDisposition::NotStarted,
+                app_server: ChildDisposition::NotStarted,
+            }),
+            _proof: PinnedAppGracefullyDrained { authority },
+        }
+    }
+}
+
+impl fmt::Debug for PinnedAppGracefulDrain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedAppGracefulDrain")
+            .field("outcome", &self.outcome)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ShutdownOutcome {
@@ -164,12 +426,98 @@ impl ForwardedTuiSignal {
 enum TuiShutdownMode {
     StartWithTerm,
     SignalAlreadyForwarded(TerminalShutdownSignal),
+    OutputEofObserved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppGracefulDrainState {
+    NotApplicable,
+    AwaitingInitialTerm,
+    InitialTermSent,
+    Drained,
+    Invalid,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InjectedAppShutdownFault {
+    Stop,
+    Term,
+    Cont,
+}
+
+impl AppGracefulDrainState {
+    const fn for_role(role: ChildRole) -> Self {
+        match role {
+            ChildRole::AppServer => Self::AwaitingInitialTerm,
+            ChildRole::Tui => Self::NotApplicable,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionIdentityObservation {
     Pending,
     Exact,
+}
+
+/// Whether a synthetic fixture may use Darwin's bounded zombie-only group
+/// observation after `killpg` returns `EPERM`.
+///
+/// Every real provider child is permanently `ProductionStrict`: EPERM alone
+/// never becomes containment proof there. The fixture-only variant is explicit so
+/// a test accommodation cannot silently reach App Server or official TUI
+/// cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupContainmentPolicy {
+    ProductionStrict,
+    #[cfg(any(test, feature = "internal-supervisor-fixture"))]
+    SyntheticFixture,
+}
+
+impl GroupContainmentPolicy {
+    #[cfg(target_os = "macos")]
+    fn permits_macos_eperm(self, _process_group: rustix::process::Pid) -> bool {
+        match self {
+            Self::ProductionStrict => false,
+            #[cfg(any(test, feature = "internal-supervisor-fixture"))]
+            Self::SyntheticFixture => calcifer_unix_child_fd::macos_process_group_has_live_members(
+                _process_group.as_raw_nonzero().get(),
+            )
+            .is_ok_and(|has_live_members| !has_live_members),
+        }
+    }
+}
+
+/// Returns an independent Darwin absence proof for a wait-visible direct
+/// leader that still pins its PID/PGID against reuse.
+///
+/// This does not reinterpret `EPERM` as success. The exact non-consuming wait
+/// and the bounded, stable zombie-only group snapshots must both succeed;
+/// every ambiguous observation remains an unresolved containment failure.
+#[cfg(target_os = "macos")]
+fn macos_anchored_zombie_group_absent(
+    direct_child: rustix::process::Pid,
+    process_group: rustix::process::Pid,
+) -> bool {
+    if direct_child != process_group {
+        return false;
+    }
+    let terminal = rustix::process::waitid(
+        rustix::process::WaitId::Pid(direct_child),
+        rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOHANG
+            | rustix::process::WaitIdOptions::NOWAIT,
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|status| status.exited() || status.killed() || status.dumped());
+    terminal
+        && calcifer_unix_child_fd::macos_process_group_is_anchored_zombie_only(
+            process_group.as_raw_nonzero().get(),
+            direct_child.as_raw_nonzero().get(),
+        )
+        .unwrap_or(false)
 }
 
 impl ReapedChildren {
@@ -186,6 +534,18 @@ impl ReapedChildren {
 ///
 /// It contains no command, path, provider output, readiness byte, or raw I/O
 /// error string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AppGracefulDrainFailureStage {
+    PriorInvalid,
+    ExitedBeforeTerm,
+    StopTimeout,
+    ExitedWhileStopping,
+    InvalidDisposition,
+    KillForbidden,
+    WrongRetryPath,
+    MissingProof,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ProcessError {
     Spawn {
@@ -247,6 +607,13 @@ pub(super) enum ProcessError {
     WaitTimeout {
         role: ChildRole,
     },
+    TuiOutputDrain {
+        role: ChildRole,
+    },
+    AppGracefulDrainUnconfirmed {
+        role: ChildRole,
+        stage: AppGracefulDrainFailureStage,
+    },
     RoleMismatch {
         expected: ChildRole,
         actual: ChildRole,
@@ -289,6 +656,10 @@ impl fmt::Display for ProcessError {
             Self::SuspendTimeout { .. } => "supervised child suspend exceeded its deadline",
             Self::Wait { .. } => "supervised child wait failed",
             Self::WaitTimeout { .. } => "supervised child wait exceeded its deadline",
+            Self::TuiOutputDrain { .. } => "supervised TUI shutdown output drain failed",
+            Self::AppGracefulDrainUnconfirmed { .. } => {
+                "the pinned App Server graceful drain remained unconfirmed"
+            }
             Self::RoleMismatch { .. } => "supervised child role mismatched its shutdown slot",
             Self::RetryAfterResolution => "supervised child shutdown was already resolved",
             Self::Deadline => "supervised child deadline was invalid",
@@ -322,15 +693,10 @@ enum SpawnCleanupKind {
 #[must_use = "failed-spawn reaping proof must be consumed"]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SpawnCleanupProof {
-    error: ProcessError,
     kind: SpawnCleanupKind,
 }
 
 impl SpawnCleanupProof {
-    pub(super) const fn error(self) -> ProcessError {
-        self.error
-    }
-
     pub(super) const fn started_unannounced(self) -> bool {
         matches!(self.kind, SpawnCleanupKind::ReapedUnannounced(_))
     }
@@ -341,8 +707,18 @@ struct FailedSpawnChild {
     expected_group: Option<rustix::process::Pid>,
     containment_swept: bool,
     drop_deadline: Option<Instant>,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "read only by Darwin EPERM containment classification"
+        )
+    )]
+    containment_policy: GroupContainmentPolicy,
     #[cfg(test)]
     force_group_sweep_failure: bool,
+    #[cfg(all(test, target_os = "macos"))]
+    force_group_sweep_permission_denied: bool,
 }
 
 /// A spawn failure that preserves the direct child handle until exact reap.
@@ -367,10 +743,81 @@ impl SpawnFailure {
         }
     }
 
+    #[cfg(all(test, target_os = "macos"))]
     fn started(
         error: ProcessError,
         child: Child,
         expected_group: Option<rustix::process::Pid>,
+    ) -> Self {
+        Self::started_with_policy(
+            error,
+            child,
+            expected_group,
+            GroupContainmentPolicy::ProductionStrict,
+        )
+    }
+
+    #[cfg(test)]
+    fn started_fixture(
+        error: ProcessError,
+        child: Child,
+        expected_group: Option<rustix::process::Pid>,
+    ) -> Self {
+        Self::started_with_policy(
+            error,
+            child,
+            expected_group,
+            GroupContainmentPolicy::SyntheticFixture,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn live_unannounced_app_for_test(
+        mut command: Command,
+    ) -> Result<(Self, ContainmentMetadata), std::io::Error> {
+        command
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn()?;
+        let pid = rustix::process::Pid::from_child(&child);
+        let pgid = match rustix::process::getpgid(Some(pid)) {
+            Ok(pgid) if pgid == pid => pgid,
+            Ok(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::other(
+                    "test App did not enter its exact process group",
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::from(error));
+            }
+        };
+        Ok((
+            Self::started_fixture(
+                ProcessError::Spawn {
+                    role: ChildRole::AppServer,
+                },
+                child,
+                Some(pgid),
+            ),
+            ContainmentMetadata {
+                role: ChildRole::AppServer,
+                pid: pid.as_raw_pid(),
+                pgid: pgid.as_raw_pid(),
+            },
+        ))
+    }
+
+    fn started_with_policy(
+        error: ProcessError,
+        child: Child,
+        expected_group: Option<rustix::process::Pid>,
+        containment_policy: GroupContainmentPolicy,
     ) -> Self {
         Self {
             error,
@@ -379,8 +826,11 @@ impl SpawnFailure {
                 expected_group,
                 containment_swept: false,
                 drop_deadline: None,
+                containment_policy,
                 #[cfg(test)]
                 force_group_sweep_failure: false,
+                #[cfg(all(test, target_os = "macos"))]
+                force_group_sweep_permission_denied: false,
             }),
             disposition: None,
             started: true,
@@ -407,14 +857,12 @@ impl SpawnFailure {
     pub(super) fn cleanup(mut self, deadline: Instant) -> Result<SpawnCleanupProof, Self> {
         if !self.started {
             return Ok(SpawnCleanupProof {
-                error: self.error,
                 kind: SpawnCleanupKind::NotStarted,
             });
         }
         if self.child.is_none() {
             if let Some(disposition) = self.disposition {
                 return Ok(SpawnCleanupProof {
-                    error: self.error,
                     kind: SpawnCleanupKind::ReapedUnannounced(disposition),
                 });
             }
@@ -454,7 +902,6 @@ impl SpawnFailure {
                 Ok(Some(status)) => {
                     let disposition = project_disposition(status, StopAction::Kill);
                     return Ok(SpawnCleanupProof {
-                        error: self.error,
                         kind: SpawnCleanupKind::ReapedUnannounced(disposition),
                     });
                 }
@@ -543,6 +990,12 @@ fn sweep_failed_spawn_group(failed_child: &FailedSpawnChild) -> bool {
     if failed_child.force_group_sweep_failure {
         return false;
     }
+    #[cfg(all(test, target_os = "macos"))]
+    if failed_child.force_group_sweep_permission_denied {
+        return failed_child
+            .expected_group
+            .is_some_and(|group| failed_child.containment_policy.permits_macos_eperm(group));
+    }
     let Some(expected_group) = failed_child.expected_group else {
         return false;
     };
@@ -552,23 +1005,20 @@ fn sweep_failed_spawn_group(failed_child: &FailedSpawnChild) -> bool {
     match rustix::process::kill_process_group(expected_group, rustix::process::Signal::KILL) {
         Ok(()) | Err(rustix::io::Errno::SRCH) => true,
         #[cfg(target_os = "macos")]
-        Err(rustix::io::Errno::PERM) => failed_spawn_leader_exit_is_observed(failed_child),
+        Err(rustix::io::Errno::PERM)
+            if macos_anchored_zombie_group_absent(
+                rustix::process::Pid::from_child(&failed_child.child),
+                expected_group,
+            ) =>
+        {
+            true
+        }
+        #[cfg(target_os = "macos")]
+        Err(rustix::io::Errno::PERM) => failed_child
+            .containment_policy
+            .permits_macos_eperm(expected_group),
         Err(_) => false,
     }
-}
-
-#[cfg(target_os = "macos")]
-fn failed_spawn_leader_exit_is_observed(failed_child: &FailedSpawnChild) -> bool {
-    let pid = rustix::process::Pid::from_child(&failed_child.child);
-    rustix::process::waitid(
-        rustix::process::WaitId::Pid(pid),
-        rustix::process::WaitIdOptions::EXITED
-            | rustix::process::WaitIdOptions::NOHANG
-            | rustix::process::WaitIdOptions::NOWAIT,
-    )
-    .is_ok_and(|status| {
-        status.is_some_and(|status| status.exited() || status.killed() || status.dumped())
-    })
 }
 
 /// A guardian-owned direct child whose leader starts a distinct process group.
@@ -583,7 +1033,18 @@ pub(super) struct ManagedGroupChild {
     containment_swept: bool,
     stop_action: StopAction,
     disposition: Option<ChildDisposition>,
+    app_graceful_drain: AppGracefulDrainState,
     drop_deadline: Option<Instant>,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "read only by Darwin EPERM containment classification"
+        )
+    )]
+    containment_policy: GroupContainmentPolicy,
+    #[cfg(test)]
+    injected_app_shutdown_fault: Option<InjectedAppShutdownFault>,
 }
 
 impl ManagedGroupChild {
@@ -592,7 +1053,34 @@ impl ManagedGroupChild {
         command: Command,
         readiness_stdout: bool,
     ) -> Result<Self, SpawnFailure> {
-        Self::spawn_inner(role, command, readiness_stdout, false)
+        Self::spawn_inner(
+            role,
+            command,
+            readiness_stdout,
+            false,
+            GroupContainmentPolicy::ProductionStrict,
+        )
+    }
+
+    /// Spawns a synthetic test child under the fixture-only Darwin policy.
+    ///
+    /// macOS may report `EPERM` while a process group contains only exited
+    /// fixture members. Tests may use the bounded process-table scan to prove
+    /// that synthetic absence, but real provider children must always use
+    /// [`Self::spawn`] and retain `EPERM` as an unresolved containment error.
+    #[cfg(test)]
+    fn spawn_fixture(
+        role: ChildRole,
+        command: Command,
+        readiness_stdout: bool,
+    ) -> Result<Self, SpawnFailure> {
+        Self::spawn_inner(
+            role,
+            command,
+            readiness_stdout,
+            false,
+            GroupContainmentPolicy::SyntheticFixture,
+        )
     }
 
     /// Spawns a synthetic child whose stdin closes if its guardian dies.
@@ -602,24 +1090,23 @@ impl ManagedGroupChild {
     /// abrupt guardian exit makes it terminate without turning a reported PID
     /// into delayed signal authority. Production provider children must use a
     /// provider-specific liveness contract instead of assuming stdin is free.
+    #[cfg(feature = "internal-supervisor-fixture")]
     pub(super) fn spawn_with_parent_liveness_pipe(
         role: ChildRole,
         command: Command,
         readiness_stdout: bool,
     ) -> Result<Self, SpawnFailure> {
-        Self::spawn_inner(role, command, readiness_stdout, true)
+        Self::spawn_inner(
+            role,
+            command,
+            readiness_stdout,
+            true,
+            GroupContainmentPolicy::SyntheticFixture,
+        )
     }
 
-    /// Spawns a reviewed launcher that claims a new session after `exec`.
-    ///
-    /// The caller must have already attached PTY slave descriptors to the
-    /// command. Unlike [`Self::spawn`], this function deliberately does not
-    /// call `process_group(0)`: a process-group leader cannot subsequently
-    /// call `setsid(2)`. The child is not published until the guardian reads
-    /// back both `PGID == PID` and `SID == PID` through its direct-child
-    /// identity. A failure before that proof is cleaned through the exact
-    /// [`Child`] handle and never signals an unconfirmed numeric group.
-    pub(super) fn spawn_session_leader(
+    #[cfg(test)]
+    fn spawn_fixture_session_leader(
         role: ChildRole,
         mut command: Command,
         deadline: Instant,
@@ -627,7 +1114,12 @@ impl ManagedGroupChild {
         let child = command
             .spawn()
             .map_err(|_| SpawnFailure::not_started(ProcessError::Spawn { role }))?;
-        Self::publish_session_leader(role, child, deadline)
+        Self::publish_session_leader(
+            role,
+            child,
+            deadline,
+            GroupContainmentPolicy::SyntheticFixture,
+        )
     }
 
     /// Spawns the reviewed session launcher with one child-only readiness fd.
@@ -643,6 +1135,38 @@ impl ManagedGroupChild {
         inherited_fd: BorrowedFd<'_>,
         deadline: Instant,
     ) -> Result<Self, SpawnFailure> {
+        Self::spawn_session_leader_with_inherited_fd_policy(
+            role,
+            command,
+            inherited_fd,
+            deadline,
+            GroupContainmentPolicy::ProductionStrict,
+        )
+    }
+
+    #[cfg(any(test, feature = "internal-supervisor-fixture"))]
+    pub(super) fn spawn_fixture_session_leader_with_inherited_fd(
+        role: ChildRole,
+        command: Command,
+        inherited_fd: BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> Result<Self, SpawnFailure> {
+        Self::spawn_session_leader_with_inherited_fd_policy(
+            role,
+            command,
+            inherited_fd,
+            deadline,
+            GroupContainmentPolicy::SyntheticFixture,
+        )
+    }
+
+    fn spawn_session_leader_with_inherited_fd_policy(
+        role: ChildRole,
+        command: Command,
+        inherited_fd: BorrowedFd<'_>,
+        deadline: Instant,
+        containment_policy: GroupContainmentPolicy,
+    ) -> Result<Self, SpawnFailure> {
         let child = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
             command,
             inherited_fd,
@@ -653,20 +1177,22 @@ impl ManagedGroupChild {
                     return Err(cleanup_unconfirmed_session(
                         child.into_child(),
                         ProcessError::Spawn { role },
+                        containment_policy,
                     ));
                 }
                 None => return Err(SpawnFailure::not_started(ProcessError::Spawn { role })),
             },
         };
-        Self::publish_session_leader(role, child, deadline)
+        Self::publish_session_leader(role, child, deadline, containment_policy)
     }
 
     fn publish_session_leader(
         role: ChildRole,
         child: Child,
         deadline: Instant,
+        containment_policy: GroupContainmentPolicy,
     ) -> Result<Self, SpawnFailure> {
-        Self::publish_session_leader_with_probe(role, child, deadline, |pid| {
+        Self::publish_session_leader_with_probe(role, child, deadline, containment_policy, |pid| {
             observe_session_identity(pid, role)
         })
     }
@@ -675,6 +1201,7 @@ impl ManagedGroupChild {
         role: ChildRole,
         mut child: Child,
         deadline: Instant,
+        containment_policy: GroupContainmentPolicy,
         mut probe: F,
     ) -> Result<Self, SpawnFailure>
     where
@@ -696,11 +1223,21 @@ impl ManagedGroupChild {
                         containment_swept: false,
                         stop_action: StopAction::None,
                         disposition: None,
+                        app_graceful_drain: AppGracefulDrainState::for_role(role),
                         drop_deadline: None,
+                        containment_policy,
+                        #[cfg(test)]
+                        injected_app_shutdown_fault: None,
                     });
                 }
                 Ok(SessionIdentityObservation::Pending) => {}
-                Err(error) => return Err(cleanup_unconfirmed_session(child, error)),
+                Err(error) => {
+                    return Err(cleanup_unconfirmed_session(
+                        child,
+                        error,
+                        containment_policy,
+                    ));
+                }
             }
 
             match child.try_wait() {
@@ -716,6 +1253,7 @@ impl ManagedGroupChild {
                     return Err(cleanup_unconfirmed_session(
                         child,
                         ProcessError::Wait { role },
+                        containment_policy,
                     ));
                 }
                 Ok(None) if Instant::now() < deadline => sleep_until_next_poll(deadline),
@@ -723,6 +1261,7 @@ impl ManagedGroupChild {
                     return Err(cleanup_unconfirmed_session(
                         child,
                         ProcessError::SessionStartupTimeout { role },
+                        containment_policy,
                     ));
                 }
             }
@@ -734,6 +1273,7 @@ impl ManagedGroupChild {
         mut command: Command,
         readiness_stdout: bool,
         parent_liveness_pipe: bool,
+        containment_policy: GroupContainmentPolicy,
     ) -> Result<Self, SpawnFailure> {
         command
             .process_group(0)
@@ -760,6 +1300,7 @@ impl ManagedGroupChild {
                     child,
                     pid,
                     ProcessError::ProcessGroupReadback { role },
+                    containment_policy,
                 ));
             }
         };
@@ -768,6 +1309,7 @@ impl ManagedGroupChild {
                 child,
                 pid,
                 ProcessError::ProcessGroupMismatch { role },
+                containment_policy,
             ));
         }
 
@@ -776,6 +1318,7 @@ impl ManagedGroupChild {
                 child,
                 pid,
                 ProcessError::ParentLivenessUnavailable { role },
+                containment_policy,
             ));
         }
 
@@ -787,6 +1330,7 @@ impl ManagedGroupChild {
                         child,
                         pid,
                         ProcessError::ReadinessUnavailable { role },
+                        containment_policy,
                     ));
                 }
             }
@@ -805,7 +1349,11 @@ impl ManagedGroupChild {
             containment_swept: false,
             stop_action: StopAction::None,
             disposition: None,
+            app_graceful_drain: AppGracefulDrainState::for_role(role),
             drop_deadline: None,
+            containment_policy,
+            #[cfg(test)]
+            injected_app_shutdown_fault: None,
         })
     }
 
@@ -815,6 +1363,81 @@ impl ManagedGroupChild {
             pid: self.pid.as_raw_pid(),
             pgid: self.pgid.as_raw_pid(),
         }
+    }
+
+    pub(super) const fn child_authority(&self) -> ChildAuthority {
+        self.authority
+    }
+
+    /// Takes a bounded, read-only snapshot of this exact process group.
+    ///
+    /// This observer carries no signal or wait authority. The returned proof
+    /// is momentary and must be projected into a higher-level readiness or
+    /// cleanup barrier by the owner that still retains this child.
+    #[cfg(test)]
+    pub(super) fn observe_forbidden_descriptors_absent(
+        &self,
+        forbidden: &calcifer_unix_child_fd::CrossProcessDescriptorSet<'_>,
+        deadline: Instant,
+    ) -> Result<
+        calcifer_unix_child_fd::ProcessGroupDescriptorIsolationProof,
+        calcifer_unix_child_fd::ProcessGroupDescriptorScanError,
+    > {
+        retry_descriptor_observation(deadline, |deadline| {
+            calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
+                self.pgid.as_raw_pid(),
+                forbidden,
+                deadline,
+            )
+            .map_err(DescriptorObservationAttemptError::from_scan)
+        })
+    }
+
+    /// Retries only transient process/fd snapshot races while the exact direct
+    /// child handle remains live before and after every attempted scan.
+    ///
+    /// A successful return therefore represents the final stable double
+    /// snapshot, not an earlier partial observation. Forbidden identities and
+    /// every non-race failure remain immediately fatal.
+    pub(super) fn observe_forbidden_descriptors_absent_while_live(
+        &mut self,
+        forbidden: &calcifer_unix_child_fd::CrossProcessDescriptorSet<'_>,
+        deadline: Instant,
+    ) -> Result<
+        calcifer_unix_child_fd::ProcessGroupDescriptorIsolationProof,
+        calcifer_unix_child_fd::ProcessGroupDescriptorScanError,
+    > {
+        let process_group = self.pgid.as_raw_pid();
+        retry_descriptor_observation(deadline, |deadline| {
+            self.confirm_running_after_readiness(deadline)
+                .map_err(|_| DescriptorObservationAttemptError::terminal_process_changed())?;
+            let observed =
+                calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
+                    process_group,
+                    forbidden,
+                    deadline,
+                );
+            match observed {
+                Ok(proof) => {
+                    self.confirm_running_after_readiness(deadline)
+                        .map_err(|_| {
+                            DescriptorObservationAttemptError::terminal_process_changed()
+                        })?;
+                    Ok(proof)
+                }
+                Err(error @ (
+                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+                    | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged
+                )) => {
+                    self.confirm_running_after_readiness(deadline)
+                        .map_err(|_| {
+                            DescriptorObservationAttemptError::terminal_process_changed()
+                        })?;
+                    Err(DescriptorObservationAttemptError::from_scan(error))
+                }
+                Err(error) => Err(DescriptorObservationAttemptError::Terminal(error)),
+            }
+        })
     }
 
     pub(super) fn await_ready(&mut self, deadline: Instant) -> Result<(), ProcessError> {
@@ -929,6 +1552,24 @@ impl ManagedGroupChild {
         }
     }
 
+    /// Rejects a direct child that has already become wait-visible at the
+    /// token+EOF boundary. Launcher exec failures close their readiness fd as
+    /// the launcher exits and therefore become typed early exits here.
+    pub(super) fn confirm_running_after_readiness(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), ProcessError> {
+        if self.observe_exit_for_readiness(deadline)? {
+            let disposition = self.contain_and_reap_observed_exit(deadline)?;
+            Err(ProcessError::EarlyExit {
+                role: self.role,
+                disposition,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Forwards one typed interactive signal through the guardian's still-live
     /// direct-child authority.
     pub(super) fn forward_interactive_terminal_signal(
@@ -969,6 +1610,24 @@ impl ManagedGroupChild {
             containment: self.containment(),
             authority: self.authority,
         })
+    }
+
+    /// Continues a stopped TUI only to deliver an already-forwarded terminal
+    /// shutdown signal. Unlike interactive resume, an exit caused by that
+    /// signal is the expected result and is therefore not classified as an
+    /// early-exit error. No input-gate authority is created here.
+    pub(super) fn continue_after_forwarded_shutdown(
+        &mut self,
+        forwarded: &ForwardedTuiSignal,
+        deadline: Instant,
+    ) -> Result<(), ProcessError> {
+        self.role_matches(ChildRole::Tui)?;
+        if !forwarded.matches(self) {
+            return Err(ProcessError::ForwardedSignalMismatch {
+                role: ChildRole::Tui,
+            });
+        }
+        self.signal_group(rustix::process::Signal::CONT, StopAction::None, deadline)
     }
 
     /// Publishes a terminal resize only after the PTY size itself was updated.
@@ -1139,7 +1798,17 @@ impl ManagedGroupChild {
             Ok(()) => Ok(()),
             Err(rustix::io::Errno::SRCH) if self.observe_exit_without_reaping(deadline)? => Ok(()),
             #[cfg(target_os = "macos")]
-            Err(rustix::io::Errno::PERM) if self.observe_exit_without_reaping(deadline)? => Ok(()),
+            Err(rustix::io::Errno::PERM)
+                if macos_anchored_zombie_group_absent(self.pid, self.pgid) =>
+            {
+                Ok(())
+            }
+            #[cfg(target_os = "macos")]
+            Err(rustix::io::Errno::PERM)
+                if self.containment_policy.permits_macos_eperm(self.pgid) =>
+            {
+                Ok(())
+            }
             Err(_) => Err(ProcessError::Signal {
                 role: self.role,
                 action,
@@ -1184,7 +1853,161 @@ impl ManagedGroupChild {
         }
     }
 
+    fn try_reap_app_server(&mut self) -> Result<bool, ProcessError> {
+        if self.disposition.is_some() {
+            return Ok(true);
+        }
+        if self.role != ChildRole::AppServer {
+            return Err(ProcessError::RoleMismatch {
+                expected: ChildRole::AppServer,
+                actual: self.role,
+            });
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                let disposition = project_disposition(status, self.stop_action);
+                self.disposition = Some(disposition);
+                self.observed_exit = true;
+                self.app_graceful_drain = if self.app_graceful_drain
+                    == AppGracefulDrainState::InitialTermSent
+                    && disposition
+                        == (ChildDisposition::Exited {
+                            code: 0,
+                            stop_action: StopAction::Term,
+                        }) {
+                    AppGracefulDrainState::Drained
+                } else {
+                    AppGracefulDrainState::Invalid
+                };
+                if self.app_graceful_drain == AppGracefulDrainState::Drained {
+                    Ok(true)
+                } else {
+                    Err(ProcessError::AppGracefulDrainUnconfirmed {
+                        role: self.role,
+                        stage: AppGracefulDrainFailureStage::InvalidDisposition,
+                    })
+                }
+            }
+            Ok(None) => Ok(false),
+            Err(_) => {
+                self.app_graceful_drain = AppGracefulDrainState::Invalid;
+                Err(ProcessError::Wait { role: self.role })
+            }
+        }
+    }
+
+    fn begin_app_server_shutdown(&mut self, deadline: Instant) -> Result<(), ProcessError> {
+        match self.app_graceful_drain {
+            AppGracefulDrainState::Drained | AppGracefulDrainState::InitialTermSent => {
+                return Ok(());
+            }
+            AppGracefulDrainState::Invalid => {
+                return Err(ProcessError::AppGracefulDrainUnconfirmed {
+                    role: self.role,
+                    stage: AppGracefulDrainFailureStage::PriorInvalid,
+                });
+            }
+            AppGracefulDrainState::NotApplicable => {
+                return Err(ProcessError::RoleMismatch {
+                    expected: ChildRole::AppServer,
+                    actual: self.role,
+                });
+            }
+            AppGracefulDrainState::AwaitingInitialTerm => {}
+        }
+
+        // Invalid is written before either observation or signal. Any syscall
+        // failure therefore permanently removes permission to retry TERM.
+        self.app_graceful_drain = AppGracefulDrainState::Invalid;
+        match self.observe_exit_without_reaping(deadline) {
+            Ok(true) => {
+                let _ = self.try_reap_app_server();
+                return Err(ProcessError::AppGracefulDrainUnconfirmed {
+                    role: self.role,
+                    stage: AppGracefulDrainFailureStage::ExitedBeforeTerm,
+                });
+            }
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+
+        // Pin the exact unreaped leader in a stopped state before queuing the
+        // shutdown signal. This closes the observation-to-signal race where a
+        // group-wide `killpg` can succeed only because another same-group
+        // member survived after the App leader exited. The direct Child wait
+        // authority prevents numeric PID reuse until this protocol resolves.
+        #[cfg(test)]
+        if self.injected_app_shutdown_fault == Some(InjectedAppShutdownFault::Stop) {
+            return Err(ProcessError::Signal {
+                role: self.role,
+                action: StopAction::None,
+            });
+        }
+        rustix::process::kill_process(self.pid, rustix::process::Signal::STOP).map_err(|_| {
+            ProcessError::Signal {
+                role: self.role,
+                action: StopAction::None,
+            }
+        })?;
+        match self.wait_for_stopped(deadline) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(ProcessError::AppGracefulDrainUnconfirmed {
+                    role: self.role,
+                    stage: AppGracefulDrainFailureStage::StopTimeout,
+                });
+            }
+            Err(ProcessError::EarlyExit { .. }) => {
+                let _ = self.try_reap_app_server();
+                return Err(ProcessError::AppGracefulDrainUnconfirmed {
+                    role: self.role,
+                    stage: AppGracefulDrainFailureStage::ExitedWhileStopping,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+
+        #[cfg(test)]
+        if self.injected_app_shutdown_fault == Some(InjectedAppShutdownFault::Term) {
+            return Err(ProcessError::Signal {
+                role: self.role,
+                action: StopAction::Term,
+            });
+        }
+        self.stop_action = StopAction::Term;
+        // Queue TERM on the exact stopped leader. No group member can make
+        // this syscall look successful on behalf of a leader that raced to
+        // exit, and no detached tool receives an independent shutdown signal.
+        rustix::process::kill_process(self.pid, rustix::process::Signal::TERM).map_err(|_| {
+            ProcessError::Signal {
+                role: self.role,
+                action: StopAction::Term,
+            }
+        })?;
+        // Delivery occurs only after this exact continuation edge. A failure
+        // leaves the state permanently invalid: retries may observe/reap but
+        // may never issue another STOP, TERM, CONT, or KILL.
+        #[cfg(test)]
+        if self.injected_app_shutdown_fault == Some(InjectedAppShutdownFault::Cont) {
+            return Err(ProcessError::Signal {
+                role: self.role,
+                action: StopAction::None,
+            });
+        }
+        rustix::process::kill_process(self.pid, rustix::process::Signal::CONT).map_err(|_| {
+            ProcessError::Signal {
+                role: self.role,
+                action: StopAction::None,
+            }
+        })?;
+        self.app_graceful_drain = AppGracefulDrainState::InitialTermSent;
+        Ok(())
+    }
+
     fn begin_termination(&mut self, deadline: Instant) -> Result<(), ProcessError> {
+        if self.role == ChildRole::AppServer {
+            return self.begin_app_server_shutdown(deadline);
+        }
         if self.disposition.is_some() {
             return Ok(());
         }
@@ -1198,6 +2021,13 @@ impl ManagedGroupChild {
     }
 
     fn sweep_with_kill(&mut self, deadline: Instant) -> Result<(), ProcessError> {
+        if self.role == ChildRole::AppServer {
+            self.app_graceful_drain = AppGracefulDrainState::Invalid;
+            return Err(ProcessError::AppGracefulDrainUnconfirmed {
+                role: self.role,
+                stage: AppGracefulDrainFailureStage::KillForbidden,
+            });
+        }
         if self.disposition.is_some() {
             return Ok(());
         }
@@ -1225,8 +2055,80 @@ impl ManagedGroupChild {
     }
 }
 
+enum DescriptorObservationAttemptError {
+    TransientProcessChanged,
+    TransientDescriptorChanged,
+    Terminal(calcifer_unix_child_fd::ProcessGroupDescriptorScanError),
+}
+
+impl DescriptorObservationAttemptError {
+    fn from_scan(error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError) -> Self {
+        match error {
+            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged => {
+                Self::TransientProcessChanged
+            }
+            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged => {
+                Self::TransientDescriptorChanged
+            }
+            error => Self::Terminal(error),
+        }
+    }
+
+    fn terminal_process_changed() -> Self {
+        Self::Terminal(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged)
+    }
+}
+
+fn retry_descriptor_observation<T>(
+    caller_deadline: Instant,
+    mut observe: impl FnMut(Instant) -> Result<T, DescriptorObservationAttemptError>,
+) -> Result<T, calcifer_unix_child_fd::ProcessGroupDescriptorScanError> {
+    let deadline = descriptor_observation_deadline(Instant::now(), caller_deadline);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline);
+        }
+        match observe(deadline) {
+            Ok(proof) => return Ok(proof),
+            Err(
+                DescriptorObservationAttemptError::TransientProcessChanged
+                | DescriptorObservationAttemptError::TransientDescriptorChanged,
+            ) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline);
+                }
+                thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
+            }
+            Err(DescriptorObservationAttemptError::Terminal(error)) => return Err(error),
+        }
+    }
+}
+
+fn descriptor_observation_deadline(now: Instant, caller_deadline: Instant) -> Instant {
+    match now.checked_add(DESCRIPTOR_OBSERVATION_SETTLE_TIMEOUT) {
+        Some(settle_deadline) if settle_deadline < caller_deadline => settle_deadline,
+        Some(_) | None => caller_deadline,
+    }
+}
+
 impl Drop for ManagedGroupChild {
     fn drop(&mut self) {
+        if self.role == ChildRole::AppServer {
+            if self.app_graceful_drain == AppGracefulDrainState::Drained
+                && self.disposition.is_some()
+            {
+                return;
+            }
+            // An ambiguous App owner may contain detached-session tools. Drop
+            // has no authority to send a second shutdown edge or a forced
+            // signal, and direct reap alone cannot satisfy the pinned App
+            // graceful-drain contract.
+            // Structured production recovery parks while retaining this owner;
+            // accidental unwinding fails closed without signalling anything.
+            unreaped_drop_is_fatal();
+        }
         if self.disposition.is_some() {
             return;
         }
@@ -1334,7 +2236,67 @@ impl UnreapedChildren {
     }
 
     /// Starts a new explicit bounded attempt while preserving the first error.
+    #[cfg(test)]
     pub(super) fn retry(
+        &mut self,
+        grace: Duration,
+        forced: Duration,
+    ) -> Result<ShutdownOutcome, ProcessError> {
+        self.retry_inner(grace, forced, None)
+    }
+
+    pub(super) fn retry_with_tui_output_progress(
+        &mut self,
+        grace: Duration,
+        forced: Duration,
+        progress: &mut dyn FnMut() -> Result<(), ProcessError>,
+    ) -> Result<ShutdownOutcome, ProcessError> {
+        self.retry_inner(grace, forced, Some(progress))
+    }
+
+    fn retry_inner(
+        &mut self,
+        grace: Duration,
+        forced: Duration,
+        tui_output_progress: Option<&mut dyn FnMut() -> Result<(), ProcessError>>,
+    ) -> Result<ShutdownOutcome, ProcessError> {
+        if self.resolved {
+            return Err(ProcessError::RetryAfterResolution);
+        }
+        if [self.tui.as_ref(), self.app_server.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|child| child.role == ChildRole::AppServer)
+        {
+            return Err(ProcessError::AppGracefulDrainUnconfirmed {
+                role: ChildRole::AppServer,
+                stage: AppGracefulDrainFailureStage::WrongRetryPath,
+            });
+        }
+        match shutdown_pair_inner_with_tui_output_progress(
+            self.tui.take(),
+            self.app_server.take(),
+            grace,
+            forced,
+            self.tui_shutdown_mode,
+            Some(self.error),
+            tui_output_progress,
+        ) {
+            Ok(completion) => {
+                self.resolved = true;
+                Ok(completion.outcome)
+            }
+            Err(mut unreaped) => {
+                self.error = unreaped.error;
+                self.tui = unreaped.tui.take();
+                self.app_server = unreaped.app_server.take();
+                Err(self.error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn retry_fixture(
         &mut self,
         grace: Duration,
         forced: Duration,
@@ -1350,13 +2312,64 @@ impl UnreapedChildren {
             self.tui_shutdown_mode,
             Some(self.error),
         ) {
-            Ok(outcome) => {
+            Ok(completion) => {
                 self.resolved = true;
-                Ok(outcome)
+                Ok(completion.outcome)
             }
             Err(mut unreaped) => {
                 self.error = unreaped.error;
                 self.tui = unreaped.tui.take();
+                self.app_server = unreaped.app_server.take();
+                Err(self.error)
+            }
+        }
+    }
+
+    /// Retries only observation/reaping for an App shutdown that already used
+    /// its one signal sequence. The stored App state makes a second STOP,
+    /// TERM, CONT, or KILL structurally unreachable.
+    pub(super) fn retry_app_server(
+        &mut self,
+        grace: Duration,
+        forced: Duration,
+    ) -> Result<PinnedAppGracefulDrain, ProcessError> {
+        if self.resolved {
+            return Err(ProcessError::RetryAfterResolution);
+        }
+        if self.tui.is_some()
+            || self
+                .app_server
+                .as_ref()
+                .is_none_or(|child| child.role != ChildRole::AppServer)
+        {
+            return Err(ProcessError::RoleMismatch {
+                expected: ChildRole::AppServer,
+                actual: self
+                    .app_server
+                    .as_ref()
+                    .map_or(ChildRole::Tui, |child| child.role),
+            });
+        }
+        match shutdown_pair_inner(
+            None,
+            self.app_server.take(),
+            grace,
+            forced,
+            self.tui_shutdown_mode,
+            Some(self.error),
+        ) {
+            Ok(completion) => {
+                let Some(proof) = completion.app_gracefully_drained else {
+                    std::process::abort();
+                };
+                self.resolved = true;
+                Ok(PinnedAppGracefulDrain {
+                    outcome: completion.outcome,
+                    _proof: proof,
+                })
+            }
+            Err(mut unreaped) => {
+                self.error = unreaped.error;
                 self.app_server = unreaped.app_server.take();
                 Err(self.error)
             }
@@ -1395,8 +2408,11 @@ impl fmt::Display for UnreapedChildren {
 
 impl std::error::Error for UnreapedChildren {}
 
-/// Stops TUI before App Server and returns proof only after exact direct waits.
-pub(super) fn shutdown_pair(
+/// Synthetic combined shutdown used only by the internal supervisor fixture.
+/// Production App ownership must use [`shutdown_app_server_child`] so pinned
+/// graceful-drain evidence cannot be erased into a bare outcome.
+#[cfg(any(test, feature = "internal-supervisor-fixture"))]
+pub(super) fn shutdown_fixture_pair(
     tui: Option<ManagedGroupChild>,
     app_server: Option<ManagedGroupChild>,
     grace: Duration,
@@ -1410,17 +2426,86 @@ pub(super) fn shutdown_pair(
         TuiShutdownMode::StartWithTerm,
         None,
     )
+    .map(|completion| completion.outcome)
+}
+
+/// Stops one TUI while allowing its sole PTY-master owner to make bounded
+/// output-drain progress between wait observations.
+///
+/// On Darwin a controlling-terminal process can enter `P_WEXIT` and remain
+/// invisible to `waitpid(2)` while `ttywait()` waits for the PTY master to
+/// consume final output. The callback is deliberately synchronous and
+/// non-owning: the launcher retains the exact PTY master and this process
+/// module retains the exact child wait authority for the whole attempt.
+pub(super) fn shutdown_tui_child_with_output_progress(
+    tui: ManagedGroupChild,
+    grace: Duration,
+    forced: Duration,
+    progress: &mut dyn FnMut() -> Result<(), ProcessError>,
+) -> Result<ShutdownOutcome, Box<UnreapedChildren>> {
+    shutdown_pair_inner_with_tui_output_progress(
+        Some(tui),
+        None,
+        grace,
+        forced,
+        TuiShutdownMode::StartWithTerm,
+        None,
+        Some(progress),
+    )
+    .map(|completion| completion.outcome)
+}
+
+/// Runs the official App Server's one-shot graceful-drain protocol.
+///
+/// Unlike the generic fixture-facing pair helper, this production boundary
+/// returns move-only pinned-App graceful-drain evidence.
+pub(super) fn shutdown_app_server_child(
+    app_server: ManagedGroupChild,
+    grace: Duration,
+    forced: Duration,
+) -> Result<PinnedAppGracefulDrain, Box<UnreapedChildren>> {
+    if app_server.role != ChildRole::AppServer {
+        let actual = app_server.role;
+        return Err(unreaped_children(
+            None,
+            Some(app_server),
+            ProcessError::RoleMismatch {
+                expected: ChildRole::AppServer,
+                actual,
+            },
+            None,
+            TuiShutdownMode::StartWithTerm,
+        ));
+    }
+    let completion = shutdown_pair_inner(
+        None,
+        Some(app_server),
+        grace,
+        forced,
+        TuiShutdownMode::StartWithTerm,
+        None,
+    )?;
+    let Some(proof) = completion.app_gracefully_drained else {
+        // Returning without the capability would release provider/runtime
+        // authority under an internal invariant violation.
+        std::process::abort();
+    };
+    Ok(PinnedAppGracefulDrain {
+        outcome: completion.outcome,
+        _proof: proof,
+    })
 }
 
 /// Shuts down after an identity-checked TUI `HUP` or `TERM` was forwarded.
 ///
-/// Unlike [`shutdown_pair`], this entrypoint never starts another `TERM` on
+/// Unlike [`shutdown_fixture_pair`], this entrypoint never starts another `TERM` on
 /// the proven TUI. It still starts the App Server with `TERM`, observes both
 /// direct children until both exit or the grace deadline, performs a
 /// process-group `KILL` containment sweep, and requires exact waits before
 /// returning proof. If a deadline expires, [`UnreapedChildren::retry`]
 /// retains this mode.
-pub(super) fn shutdown_pair_after_forwarded_tui_signal(
+#[cfg(any(test, feature = "internal-supervisor-fixture"))]
+pub(super) fn shutdown_fixture_pair_after_forwarded_tui_signal(
     tui: ManagedGroupChild,
     app_server: Option<ManagedGroupChild>,
     forwarded: ForwardedTuiSignal,
@@ -1441,21 +2526,117 @@ pub(super) fn shutdown_pair_after_forwarded_tui_signal(
         )
     };
     shutdown_pair_inner(Some(tui), app_server, grace, forced, mode, first_error)
+        .map(|completion| completion.outcome)
+}
+
+pub(super) fn shutdown_tui_after_forwarded_signal_with_output_progress(
+    tui: ManagedGroupChild,
+    forwarded: ForwardedTuiSignal,
+    grace: Duration,
+    forced: Duration,
+    progress: &mut dyn FnMut() -> Result<(), ProcessError>,
+) -> Result<ShutdownOutcome, Box<UnreapedChildren>> {
+    let (mode, first_error) = if forwarded.matches(&tui) {
+        (
+            TuiShutdownMode::SignalAlreadyForwarded(forwarded.signal()),
+            None,
+        )
+    } else {
+        (
+            TuiShutdownMode::StartWithTerm,
+            Some(ProcessError::ForwardedSignalMismatch {
+                role: ChildRole::Tui,
+            }),
+        )
+    };
+    shutdown_pair_inner_with_tui_output_progress(
+        Some(tui),
+        None,
+        grace,
+        forced,
+        mode,
+        first_error,
+        Some(progress),
+    )
+    .map(|completion| completion.outcome)
+}
+
+/// Shuts down after the exact TUI PTY master observed EOF.
+///
+/// EOF is a natural-exit hint, not permission to overwrite the child's Unix
+/// disposition with `TERM`. The TUI therefore gets the full grace window to
+/// become wait-visible without a signal; only the hard containment phase may
+/// use `KILL`. App Server cleanup still starts with `TERM` immediately.
+#[cfg(test)]
+pub(super) fn shutdown_fixture_pair_after_tui_output_eof(
+    tui: ManagedGroupChild,
+    app_server: Option<ManagedGroupChild>,
+    grace: Duration,
+    forced: Duration,
+) -> Result<ShutdownOutcome, Box<UnreapedChildren>> {
+    shutdown_pair_inner(
+        Some(tui),
+        app_server,
+        grace,
+        forced,
+        TuiShutdownMode::OutputEofObserved,
+        None,
+    )
+    .map(|completion| completion.outcome)
+}
+
+pub(super) fn shutdown_tui_after_output_eof_with_output_progress(
+    tui: ManagedGroupChild,
+    grace: Duration,
+    forced: Duration,
+    progress: &mut dyn FnMut() -> Result<(), ProcessError>,
+) -> Result<ShutdownOutcome, Box<UnreapedChildren>> {
+    shutdown_pair_inner_with_tui_output_progress(
+        Some(tui),
+        None,
+        grace,
+        forced,
+        TuiShutdownMode::OutputEofObserved,
+        None,
+        Some(progress),
+    )
+    .map(|completion| completion.outcome)
 }
 
 fn shutdown_pair_inner(
+    tui: Option<ManagedGroupChild>,
+    app_server: Option<ManagedGroupChild>,
+    grace: Duration,
+    forced: Duration,
+    tui_shutdown_mode: TuiShutdownMode,
+    first_error: Option<ProcessError>,
+) -> Result<ShutdownCompletion, Box<UnreapedChildren>> {
+    shutdown_pair_inner_with_tui_output_progress(
+        tui,
+        app_server,
+        grace,
+        forced,
+        tui_shutdown_mode,
+        first_error,
+        None,
+    )
+}
+
+fn shutdown_pair_inner_with_tui_output_progress(
     mut tui: Option<ManagedGroupChild>,
     mut app_server: Option<ManagedGroupChild>,
     grace: Duration,
     forced: Duration,
     tui_shutdown_mode: TuiShutdownMode,
     mut first_error: Option<ProcessError>,
-) -> Result<ShutdownOutcome, Box<UnreapedChildren>> {
+    mut tui_output_progress: Option<&mut dyn FnMut() -> Result<(), ProcessError>>,
+) -> Result<ShutdownCompletion, Box<UnreapedChildren>> {
     clear_drop_deadline(&mut tui);
     clear_drop_deadline(&mut app_server);
 
     let started_at = Instant::now();
     let Some(grace_deadline) = started_at.checked_add(grace) else {
+        invalidate_undrained_app_children(&mut tui, &mut app_server);
         return Err(unreaped_children(
             tui,
             app_server,
@@ -1465,6 +2646,7 @@ fn shutdown_pair_inner(
         ));
     };
     let Some(hard_deadline) = grace_deadline.checked_add(forced) else {
+        invalidate_undrained_app_children(&mut tui, &mut app_server);
         return Err(unreaped_children(
             tui,
             app_server,
@@ -1482,6 +2664,7 @@ fn shutdown_pair_inner(
     begin_child_termination(&mut app_server, grace_deadline, &mut first_error);
 
     loop {
+        run_tui_output_progress(&mut tui_output_progress, &mut first_error);
         observe_child(&mut tui, grace_deadline, &mut first_error);
         observe_child(&mut app_server, grace_deadline, &mut first_error);
         if children_observed(&tui, &app_server) || Instant::now() >= grace_deadline {
@@ -1494,12 +2677,14 @@ fn shutdown_pair_inner(
     sweep_child_with_kill(&mut app_server, hard_deadline, &mut first_error);
 
     loop {
+        run_tui_output_progress(&mut tui_output_progress, &mut first_error);
         reap_child(&mut tui, &mut first_error);
         reap_child(&mut app_server, &mut first_error);
         if children_reaped(&tui, &app_server) {
             break;
         }
         if Instant::now() >= hard_deadline {
+            invalidate_undrained_app_children(&mut tui, &mut app_server);
             if let Some(child) = first_unreaped_child(&tui, &app_server) {
                 record_first_error(
                     &mut first_error,
@@ -1521,6 +2706,20 @@ fn shutdown_pair_inner(
             app_server,
             error,
             Some(hard_deadline),
+            tui_shutdown_mode,
+        ));
+    }
+
+    if !app_children_drained(&tui, &app_server) {
+        let error = first_error.unwrap_or(ProcessError::AppGracefulDrainUnconfirmed {
+            role: ChildRole::AppServer,
+            stage: AppGracefulDrainFailureStage::MissingProof,
+        });
+        return Err(unreaped_children(
+            tui,
+            app_server,
+            error,
+            None,
             tui_shutdown_mode,
         ));
     }
@@ -1553,10 +2752,56 @@ fn shutdown_pair_inner(
         tui: tui_disposition,
         app_server: app_server_disposition,
     };
-    match first_error {
-        Some(error) => Ok(ShutdownOutcome::Failed { children, error }),
-        None => Ok(ShutdownOutcome::Clean(children)),
+    let app_gracefully_drained = app_server.as_ref().and_then(|child| {
+        (child.role == ChildRole::AppServer
+            && child.app_graceful_drain == AppGracefulDrainState::Drained)
+            .then_some(PinnedAppGracefullyDrained {
+                authority: child.authority,
+            })
+    });
+    let outcome = match first_error {
+        Some(error) => ShutdownOutcome::Failed { children, error },
+        None => ShutdownOutcome::Clean(children),
+    };
+    Ok(ShutdownCompletion {
+        outcome,
+        app_gracefully_drained,
+    })
+}
+
+fn run_tui_output_progress(
+    progress: &mut Option<&mut dyn FnMut() -> Result<(), ProcessError>>,
+    first_error: &mut Option<ProcessError>,
+) {
+    if let Some(progress) = progress.as_deref_mut() {
+        if let Err(error) = progress() {
+            record_first_error(first_error, error);
+        }
     }
+}
+
+fn invalidate_undrained_app_children(
+    tui: &mut Option<ManagedGroupChild>,
+    app_server: &mut Option<ManagedGroupChild>,
+) {
+    for child in [tui.as_mut(), app_server.as_mut()].into_iter().flatten() {
+        if child.role == ChildRole::AppServer
+            && child.app_graceful_drain != AppGracefulDrainState::Drained
+        {
+            child.app_graceful_drain = AppGracefulDrainState::Invalid;
+        }
+    }
+}
+
+fn app_children_drained(
+    tui: &Option<ManagedGroupChild>,
+    app_server: &Option<ManagedGroupChild>,
+) -> bool {
+    [tui.as_ref(), app_server.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|child| child.role == ChildRole::AppServer)
+        .all(|child| child.app_graceful_drain == AppGracefulDrainState::Drained)
 }
 
 fn clear_drop_deadline(child: &mut Option<ManagedGroupChild>) {
@@ -1595,6 +2840,9 @@ fn sweep_child_with_kill(
     first_error: &mut Option<ProcessError>,
 ) {
     if let Some(child) = child.as_mut() {
+        if child.role == ChildRole::AppServer {
+            return;
+        }
         if let Err(error) = child.sweep_with_kill(deadline) {
             record_first_error(first_error, error);
         }
@@ -1615,7 +2863,12 @@ fn observe_child(
 
 fn reap_child(child: &mut Option<ManagedGroupChild>, first_error: &mut Option<ProcessError>) {
     if let Some(child) = child.as_mut() {
-        if let Err(error) = child.try_reap_after_containment() {
+        let reaped = if child.role == ChildRole::AppServer {
+            child.try_reap_app_server()
+        } else {
+            child.try_reap_after_containment()
+        };
+        if let Err(error) = reaped {
             record_first_error(first_error, error);
         }
     }
@@ -1702,8 +2955,14 @@ fn cleanup_failed_spawn(
     child: Child,
     expected_group: rustix::process::Pid,
     original_error: ProcessError,
+    containment_policy: GroupContainmentPolicy,
 ) -> SpawnFailure {
-    let failure = SpawnFailure::started(original_error, child, Some(expected_group));
+    let failure = SpawnFailure::started_with_policy(
+        original_error,
+        child,
+        Some(expected_group),
+        containment_policy,
+    );
     let Some(deadline) = Instant::now().checked_add(SPAWN_CLEANUP_TIMEOUT) else {
         return failure;
     };
@@ -1714,7 +2973,7 @@ fn cleanup_failed_spawn(
                 SpawnCleanupKind::ReapedUnannounced(disposition) => disposition,
             };
             SpawnFailure {
-                error: reaped.error,
+                error: original_error,
                 child: None,
                 disposition: Some(disposition),
                 started: true,
@@ -1734,8 +2993,13 @@ fn cleanup_failed_spawn(
     }
 }
 
-fn cleanup_unconfirmed_session(child: Child, original_error: ProcessError) -> SpawnFailure {
-    let failure = SpawnFailure::started(original_error, child, None);
+fn cleanup_unconfirmed_session(
+    child: Child,
+    original_error: ProcessError,
+    containment_policy: GroupContainmentPolicy,
+) -> SpawnFailure {
+    let failure =
+        SpawnFailure::started_with_policy(original_error, child, None, containment_policy);
     let Some(deadline) = Instant::now().checked_add(SPAWN_CLEANUP_TIMEOUT) else {
         return failure;
     };
@@ -1746,7 +3010,7 @@ fn cleanup_unconfirmed_session(child: Child, original_error: ProcessError) -> Sp
                 SpawnCleanupKind::ReapedUnannounced(disposition) => disposition,
             };
             SpawnFailure {
-                error: reaped.error,
+                error: original_error,
                 child: None,
                 disposition: Some(disposition),
                 started: true,
@@ -1786,7 +3050,9 @@ const fn process_error_role(error: ProcessError) -> ChildRole {
         | ProcessError::ForwardedSignalMismatch { role }
         | ProcessError::SuspendTimeout { role }
         | ProcessError::Wait { role }
-        | ProcessError::WaitTimeout { role } => role,
+        | ProcessError::WaitTimeout { role }
+        | ProcessError::TuiOutputDrain { role }
+        | ProcessError::AppGracefulDrainUnconfirmed { role, .. } => role,
         ProcessError::RoleMismatch { actual, .. } => actual,
         ProcessError::RetryAfterResolution | ProcessError::Deadline => ChildRole::AppServer,
     }
@@ -1867,8 +3133,54 @@ mod tests {
     const SESSION_INHERITED_FD_HELPER_ENV: &str = "CALCIFER_PROCESS_SESSION_INHERITED_FD_HELPER";
     const SIGNAL_COUNTING_HELPER_ENV: &str = "CALCIFER_PROCESS_SIGNAL_COUNTING_HELPER";
     const SIGNAL_LOG_ENV: &str = "CALCIFER_PROCESS_SIGNAL_LOG";
+    const SIGNAL_TERM_BEHAVIOR_ENV: &str = "CALCIFER_PROCESS_SIGNAL_TERM_BEHAVIOR";
     const UNREAPED_DROP_ABORT_HELPER_ENV: &str = "CALCIFER_PROCESS_UNREAPED_DROP_ABORT_HELPER";
+    const UNREAPED_DROP_APP_PID_ENV: &str = "CALCIFER_PROCESS_UNREAPED_DROP_APP_PID";
     static SIGNAL_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn typed_tui_readiness_requires_one_token_followed_by_eof() -> Result<(), Box<dyn Error>> {
+        let (mut receiver, sender) = tui_readiness_pair()?;
+        InheritedTuiReadiness::from_stream_for_test(sender.stream).publish()?;
+
+        let proof = receiver.receive(Instant::now() + TEST_DEADLINE)?;
+        assert_eq!(format!("{proof:?}"), "VerifiedTuiReadiness(<verified>)");
+        Ok(())
+    }
+
+    #[test]
+    fn typed_tui_readiness_rejects_malformed_and_duplicate_tokens() -> Result<(), Box<dyn Error>> {
+        for payload in [[0_u8, 0_u8].as_slice(), [TUI_READINESS_TOKEN; 2].as_slice()] {
+            let (mut receiver, mut sender) = tui_readiness_pair()?;
+            sender.stream.write_all(payload)?;
+            sender.stream.shutdown(std::net::Shutdown::Write)?;
+
+            assert_eq!(
+                receiver
+                    .receive(Instant::now() + TEST_DEADLINE)
+                    .err()
+                    .ok_or("invalid readiness must fail")?,
+                TuiReadinessError::Invalid
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_tui_readiness_uses_the_callers_absolute_deadline() -> Result<(), Box<dyn Error>> {
+        let (mut receiver, _sender) = tui_readiness_pair()?;
+        let deadline = Instant::now() + Duration::from_millis(30);
+
+        assert_eq!(
+            receiver
+                .receive(deadline)
+                .err()
+                .ok_or("open silent readiness channel must time out")?,
+            TuiReadinessError::Timeout
+        );
+        assert!(Instant::now() >= deadline);
+        Ok(())
+    }
 
     fn externally_kill_and_reap(pid: rustix::process::Pid) -> Result<(), Box<dyn Error>> {
         rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
@@ -1897,7 +3209,7 @@ mod tests {
                 // Deliberately retain a std Child after another safe waitpid
                 // authority consumed the kernel wait state. Drop must hit
                 // ECHILD and abort instead of treating it as exact reap proof.
-                let failure = SpawnFailure::started(
+                let failure = SpawnFailure::started_fixture(
                     ProcessError::Spawn {
                         role: ChildRole::Tui,
                     },
@@ -1908,7 +3220,7 @@ mod tests {
             }
             Some("spawn-failure-no-group") => {
                 let child = sleep_command("5").spawn()?;
-                let failure = SpawnFailure::started(
+                let failure = SpawnFailure::started_fixture(
                     ProcessError::Spawn {
                         role: ChildRole::Tui,
                     },
@@ -1920,7 +3232,7 @@ mod tests {
             Some("spawn-failure-group-drift") => {
                 let child = sleep_command("5").spawn()?;
                 let expected_group = rustix::process::Pid::from_child(&child);
-                let mut failure = SpawnFailure::started(
+                let mut failure = SpawnFailure::started_fixture(
                     ProcessError::Spawn {
                         role: ChildRole::Tui,
                     },
@@ -1936,7 +3248,7 @@ mod tests {
             }
             Some("managed-child") => {
                 let mut child =
-                    ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+                    ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
                 // Avoid re-signalling an externally reaped numeric group in
                 // this deterministic Drop test; the production safety net
                 // already considers a completed containment sweep sufficient.
@@ -1946,7 +3258,7 @@ mod tests {
             }
             Some("managed-child-group-drift") => {
                 let mut child =
-                    ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+                    ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
                 child.pgid = rustix::process::Pid::from_raw(i32::MAX)
                     .ok_or("the drifted process-group identity was invalid")?;
                 assert!(matches!(
@@ -1960,6 +3272,38 @@ mod tests {
                         action: StopAction::Kill,
                     })
                 ));
+                drop(child);
+            }
+            Some("app-managed-child-no-signal") => {
+                let signal_log =
+                    std::env::var_os(SIGNAL_LOG_ENV).ok_or("missing App Drop signal log path")?;
+                let pid_log = std::env::var_os(UNREAPED_DROP_APP_PID_ENV)
+                    .ok_or("missing App Drop PID log path")?;
+                let mut command = Command::new(std::env::current_exe()?);
+                command
+                    .args([
+                        "--exact",
+                        "providers::codex::supervisor::process::tests::signal_counting_child_helper",
+                        "--nocapture",
+                    ])
+                    .env(SIGNAL_COUNTING_HELPER_ENV, "1")
+                    .env(SIGNAL_LOG_ENV, &signal_log)
+                    .env(SIGNAL_TERM_BEHAVIOR_ENV, "ignore");
+                let child = ManagedGroupChild::spawn_fixture(ChildRole::AppServer, command, false)?;
+                let ready_deadline = Instant::now() + TEST_DEADLINE;
+                loop {
+                    match fs::read(&signal_log) {
+                        Ok(bytes) if bytes == b"R" => break,
+                        Ok(_) | Err(_) if Instant::now() < ready_deadline => {
+                            sleep_until_next_poll(ready_deadline);
+                        }
+                        Ok(bytes) => {
+                            return Err(format!("unexpected App Drop signal log: {bytes:?}").into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                fs::write(pid_log, child.pid.as_raw_pid().to_string())?;
                 drop(child);
             }
             _ => return Err("unknown unreaped Drop helper case".into()),
@@ -1997,11 +3341,56 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_app_drop_aborts_without_sending_a_signal() -> Result<(), Box<dyn Error>> {
+        let signal_log = SignalLog::new("app-drop-no-signal")?;
+        let pid_log = SignalLog::new("app-drop-pid")?;
+        let status = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "providers::codex::supervisor::process::tests::unreaped_drop_abort_child_helper",
+                "--nocapture",
+            ])
+            .env(
+                UNREAPED_DROP_ABORT_HELPER_ENV,
+                "app-managed-child-no-signal",
+            )
+            .env(SIGNAL_LOG_ENV, signal_log.path())
+            .env(UNREAPED_DROP_APP_PID_ENV, pid_log.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        assert_eq!(
+            status.signal(),
+            Some(rustix::process::Signal::ABORT.as_raw()),
+            "ambiguous App Drop did not abort"
+        );
+        assert_eq!(signal_log.contents()?, b"R");
+
+        let raw_pid = String::from_utf8(pid_log.contents()?)?.parse::<i32>()?;
+        let pid = rustix::process::Pid::from_raw(raw_pid).ok_or("invalid retained App PID")?;
+        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)?;
+        let gone_deadline = Instant::now() + TEST_DEADLINE;
+        loop {
+            match rustix::process::getpgid(Some(pid)) {
+                Err(rustix::io::Errno::SRCH) => break,
+                Ok(_) | Err(rustix::io::Errno::INTR) if Instant::now() < gone_deadline => {
+                    sleep_until_next_poll(gone_deadline);
+                }
+                Ok(_) | Err(rustix::io::Errno::INTR) => {
+                    return Err("orphaned App Drop fixture remained live".into());
+                }
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn spawn_cleanup_retains_an_unreaped_leader_when_group_sweep_is_unconfirmed()
     -> Result<(), Box<dyn Error>> {
         let child = sleep_command("5").spawn()?;
         let expected_group = rustix::process::Pid::from_child(&child);
-        let mut failure = SpawnFailure::started(
+        let mut failure = SpawnFailure::started_fixture(
             ProcessError::Spawn {
                 role: ChildRole::Tui,
             },
@@ -2057,6 +3446,125 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_strict_app_shutdown_uses_the_pinned_graceful_contract()
+    -> Result<(), Box<dyn Error>> {
+        let mut app_server =
+            ManagedGroupChild::spawn(ChildRole::AppServer, cooperative_app_command(), true)?;
+        app_server.await_ready(Instant::now() + TEST_DEADLINE)?;
+
+        let outcome = shutdown_fixture_pair(
+            None,
+            Some(app_server),
+            Duration::from_millis(100),
+            TEST_DEADLINE,
+        )?;
+
+        assert_eq!(outcome.failure(), None);
+        assert!(matches!(
+            outcome.children().app_server(),
+            ChildDisposition::Exited {
+                code: 0,
+                stop_action: StopAction::Term,
+            }
+        ));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_eperm_never_treats_an_exited_leader_as_descendant_containment()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::process::CommandExt as _;
+
+        let marker = SignalLog::new("eperm-descendant")?;
+        let mut command =
+            shell_command("/bin/sleep 5 & printf '%s' \"$!\" > \"$DESCENDANT_PID_PATH\"; exit 0");
+        command
+            .process_group(0)
+            .env("DESCENDANT_PID_PATH", marker.path());
+        let child = command.spawn()?;
+        let expected_group = rustix::process::Pid::from_child(&child);
+        let deadline = Instant::now() + TEST_DEADLINE;
+        let descendant = loop {
+            if let Ok(value) = fs::read_to_string(marker.path()) {
+                if let Ok(raw) = value.parse::<i32>() {
+                    if let Some(pid) = rustix::process::Pid::from_raw(raw) {
+                        break pid;
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("descendant PID was not published".into());
+            }
+            sleep_until_next_poll(deadline);
+        };
+        loop {
+            match rustix::process::waitid(
+                rustix::process::WaitId::Pid(expected_group),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ) {
+                Ok(Some(status)) if status.exited() || status.killed() || status.dumped() => break,
+                Ok(_) if Instant::now() < deadline => sleep_until_next_poll(deadline),
+                Ok(_) => return Err("group leader did not become wait-visible".into()),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+        }
+        assert_eq!(rustix::process::getpgid(Some(descendant))?, expected_group);
+
+        let mut failure = SpawnFailure::started(
+            ProcessError::Spawn {
+                role: ChildRole::Tui,
+            },
+            child,
+            Some(expected_group),
+        );
+        failure
+            .child
+            .as_mut()
+            .ok_or("spawn failure lost its direct child")?
+            .force_group_sweep_permission_denied = true;
+        let mut failure = failure
+            .cleanup(deadline)
+            .err()
+            .ok_or("EPERM must retain unconfirmed descendant containment")?;
+        assert_eq!(
+            failure.error(),
+            ProcessError::SpawnContainmentUnconfirmed {
+                role: ChildRole::Tui,
+            }
+        );
+        assert_eq!(rustix::process::getpgid(Some(descendant))?, expected_group);
+
+        failure
+            .child
+            .as_mut()
+            .ok_or("spawn failure lost retry authority")?
+            .force_group_sweep_permission_denied = false;
+        let proof = failure.cleanup(Instant::now() + TEST_DEADLINE).map_err(
+            |failure| -> Box<dyn Error> { format!("cleanup remained live: {failure}").into() },
+        )?;
+        assert!(proof.started_unannounced());
+        let gone_deadline = Instant::now() + TEST_DEADLINE;
+        loop {
+            match rustix::process::getpgid(Some(descendant)) {
+                Err(rustix::io::Errno::SRCH) => break,
+                Ok(_) | Err(rustix::io::Errno::INTR) if Instant::now() < gone_deadline => {
+                    sleep_until_next_poll(gone_deadline);
+                }
+                Ok(_) | Err(rustix::io::Errno::INTR) => {
+                    return Err("contained descendant remained live".into());
+                }
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+        }
+        Ok(())
+    }
+
     struct SignalLog(PathBuf);
 
     impl SignalLog {
@@ -2105,6 +3613,22 @@ mod tests {
         command
     }
 
+    fn cooperative_app_command() -> Command {
+        shell_command(
+            "trap 'exit 0' TERM; printf R; exec >/dev/null; while :; do /bin/sleep 0.01; done",
+        )
+    }
+
+    fn spawn_cooperative_app_fixture() -> Result<ManagedGroupChild, Box<dyn Error>> {
+        let mut app = ManagedGroupChild::spawn_fixture(
+            ChildRole::AppServer,
+            cooperative_app_command(),
+            true,
+        )?;
+        app.await_ready(Instant::now() + TEST_DEADLINE)?;
+        Ok(app)
+    }
+
     fn signal_counting_command(log: &SignalLog) -> Result<Command, Box<dyn Error>> {
         let mut command = Command::new(std::env::current_exe()?);
         command
@@ -2115,6 +3639,15 @@ mod tests {
             ])
             .env(SIGNAL_COUNTING_HELPER_ENV, "1")
             .env(SIGNAL_LOG_ENV, log.path());
+        Ok(command)
+    }
+
+    fn app_server_signal_command(
+        log: &SignalLog,
+        term_behavior: &str,
+    ) -> Result<Command, Box<dyn Error>> {
+        let mut command = signal_counting_command(log)?;
+        command.env(SIGNAL_TERM_BEHAVIOR_ENV, term_behavior);
         Ok(command)
     }
 
@@ -2159,6 +3692,20 @@ mod tests {
                     .append(true)
                     .open(&path)?
                     .write_all(&[marker])?;
+                if signal == signal_hook::consts::signal::SIGTERM {
+                    match std::env::var(SIGNAL_TERM_BEHAVIOR_ENV).as_deref() {
+                        Ok("exit-0") => std::process::exit(0),
+                        Ok("exit-23") => std::process::exit(23),
+                        Ok("self-kill") => {
+                            rustix::process::kill_process(
+                                rustix::process::getpid(),
+                                rustix::process::Signal::KILL,
+                            )?;
+                        }
+                        Ok("ignore") | Err(_) => {}
+                        Ok(_) => return Err("unknown TERM behavior".into()),
+                    }
+                }
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -2214,7 +3761,7 @@ mod tests {
                 "--nocapture",
             ])
             .env(SESSION_HELPER_ENV, "1");
-        let child = ManagedGroupChild::spawn_session_leader(
+        let child = ManagedGroupChild::spawn_fixture_session_leader(
             ChildRole::Tui,
             command,
             Instant::now() + TEST_DEADLINE,
@@ -2224,7 +3771,8 @@ mod tests {
         assert_eq!(identity.pid(), identity.pgid());
         assert_eq!(rustix::process::getsid(Some(pid))?, pid);
 
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         assert_no_wait_authority(identity.pid())
     }
@@ -2257,6 +3805,7 @@ mod tests {
             ChildRole::Tui,
             child,
             Instant::now() + TEST_DEADLINE,
+            GroupContainmentPolicy::SyntheticFixture,
             |pid| {
                 observations += 1;
                 if observations == 1 {
@@ -2269,7 +3818,8 @@ mod tests {
 
         assert!(observations >= 2);
         let identity = child.containment();
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         assert_no_wait_authority(identity.pid())
     }
@@ -2289,7 +3839,7 @@ mod tests {
             .env(SESSION_HELPER_ENV, "1")
             .env(SESSION_INHERITED_FD_HELPER_ENV, "1");
 
-        let child = ManagedGroupChild::spawn_session_leader_with_inherited_fd(
+        let child = ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fd(
             ChildRole::Tui,
             command,
             inherited.as_fd(),
@@ -2307,7 +3857,8 @@ mod tests {
         assert_eq!(identity.pid(), identity.pgid());
         assert_eq!(rustix::process::getsid(Some(pid))?, pid);
 
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         assert_no_wait_authority(identity.pid())
     }
@@ -2316,7 +3867,7 @@ mod tests {
     fn inherited_fd_session_failure_retains_unreaped_authority_without_a_safe_group()
     -> Result<(), Box<dyn Error>> {
         let (_observer, inherited) = UnixStream::pair()?;
-        let mut failure = ManagedGroupChild::spawn_session_leader_with_inherited_fd(
+        let mut failure = ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fd(
             ChildRole::Tui,
             sleep_command("5"),
             inherited.as_fd(),
@@ -2367,8 +3918,8 @@ mod tests {
 
     #[test]
     fn spawn_places_each_child_in_its_own_distinct_process_group() -> Result<(), Box<dyn Error>> {
-        let tui = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
-        let app = ManagedGroupChild::spawn(ChildRole::AppServer, sleep_command("5"), false)?;
+        let tui = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
+        let app = spawn_cooperative_app_fixture()?;
 
         let tui_identity = tui.containment();
         let app_identity = app.containment();
@@ -2378,7 +3929,7 @@ mod tests {
         assert_ne!(tui_identity.pgid(), app_identity.pgid());
         assert_ne!(tui_identity.pgid(), rustix::process::getpgrp().as_raw_pid());
 
-        let outcome = shutdown_pair(
+        let outcome = shutdown_fixture_pair(
             Some(tui),
             Some(app),
             Duration::from_millis(100),
@@ -2395,9 +3946,9 @@ mod tests {
         ));
         assert!(matches!(
             proof.app_server(),
-            ChildDisposition::Signaled {
+            ChildDisposition::Exited {
+                code: 0,
                 stop_action: StopAction::Term,
-                ..
             }
         ));
         assert_no_wait_authority(tui_identity.pid())?;
@@ -2406,15 +3957,183 @@ mod tests {
     }
 
     #[test]
+    fn managed_child_observes_descriptor_isolation_across_its_descendant_group()
+    -> Result<(), Box<dyn Error>> {
+        let (forbidden, _peer) = UnixStream::pair()?;
+        let mut identities = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+        identities.capture(forbidden.as_fd())?;
+        let mut child = ManagedGroupChild::spawn_fixture(
+            ChildRole::AppServer,
+            shell_command(
+                "/bin/sleep 5 >/dev/null & child=$!; trap 'kill \"$child\" 2>/dev/null || :; wait \"$child\" 2>/dev/null || :; exit 0' TERM; printf R; exec >/dev/null; wait \"$child\"",
+            ),
+            true,
+        )?;
+        child.await_ready(Instant::now() + TEST_DEADLINE)?;
+
+        let proof = child
+            .observe_forbidden_descriptors_absent(&identities, Instant::now() + TEST_DEADLINE)?;
+        assert_eq!(proof.member_count(), 2);
+        assert!(proof.descriptor_count() >= 6);
+
+        let outcome =
+            shutdown_fixture_pair(None, Some(child), Duration::from_millis(100), TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn live_descriptor_observation_does_not_retry_a_terminal_child_exit()
+    -> Result<(), Box<dyn Error>> {
+        let (forbidden, _peer) = UnixStream::pair()?;
+        let mut identities = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+        identities.capture(forbidden.as_fd())?;
+        let mut child = ManagedGroupChild::spawn_fixture(
+            ChildRole::Tui,
+            shell_command("printf R; exec >/dev/null; exec /bin/sleep 5"),
+            true,
+        )?;
+        child.await_ready(Instant::now() + TEST_DEADLINE)?;
+        rustix::process::kill_process(child.pid, rustix::process::Signal::TERM)?;
+        let exit_deadline = Instant::now() + TEST_DEADLINE;
+        while !child.observe_exit_without_reaping(exit_deadline)? {
+            sleep_until_next_poll(exit_deadline);
+        }
+
+        let error = child
+            .observe_forbidden_descriptors_absent_while_live(
+                &identities,
+                Instant::now() + Duration::from_millis(100),
+            )
+            .err()
+            .ok_or("an exited direct child must fail descriptor observation")?;
+        assert_eq!(
+            error,
+            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+        );
+
+        let outcome = shutdown_fixture_pair(Some(child), None, Duration::ZERO, TEST_DEADLINE)?;
+        assert_eq!(outcome.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_observation_retries_only_transient_races_until_the_deadline() {
+        let deadline_origin = Instant::now();
+        assert_eq!(
+            descriptor_observation_deadline(
+                deadline_origin,
+                deadline_origin + Duration::from_secs(1),
+            ),
+            deadline_origin + Duration::from_secs(1)
+        );
+        assert_eq!(
+            descriptor_observation_deadline(
+                deadline_origin,
+                deadline_origin + Duration::from_secs(60),
+            ),
+            deadline_origin + DESCRIPTOR_OBSERVATION_SETTLE_TIMEOUT
+        );
+
+        let mut attempts = 0_usize;
+        let value = retry_descriptor_observation(
+            Instant::now() + TEST_DEADLINE,
+            |_| -> Result<u8, DescriptorObservationAttemptError> {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(DescriptorObservationAttemptError::TransientDescriptorChanged)
+                } else {
+                    Ok(7)
+                }
+            },
+        );
+        assert_eq!(value, Ok(7));
+        assert_eq!(attempts, 2);
+
+        let mut process_attempts = 0_usize;
+        let process_race = retry_descriptor_observation(
+            Instant::now() + TEST_DEADLINE,
+            |_| -> Result<u8, DescriptorObservationAttemptError> {
+                process_attempts += 1;
+                if process_attempts == 1 {
+                    Err(DescriptorObservationAttemptError::TransientProcessChanged)
+                } else {
+                    Ok(9)
+                }
+            },
+        );
+        assert_eq!(process_race, Ok(9));
+        assert_eq!(process_attempts, 2);
+
+        const PRIOR_FIXED_ATTEMPT_CAP: usize = 4;
+        let mut delayed_stability_attempts = 0_usize;
+        let delayed_stability = retry_descriptor_observation(
+            Instant::now() + TEST_DEADLINE,
+            |_| -> Result<u8, DescriptorObservationAttemptError> {
+                delayed_stability_attempts += 1;
+                if delayed_stability_attempts <= PRIOR_FIXED_ATTEMPT_CAP {
+                    Err(DescriptorObservationAttemptError::TransientProcessChanged)
+                } else {
+                    Ok(11)
+                }
+            },
+        );
+        assert_eq!(delayed_stability, Ok(11));
+        assert_eq!(delayed_stability_attempts, PRIOR_FIXED_ATTEMPT_CAP + 1);
+
+        let persistent_race = retry_descriptor_observation(
+            Instant::now() + Duration::from_millis(100),
+            |_| -> Result<(), DescriptorObservationAttemptError> {
+                Err(DescriptorObservationAttemptError::TransientDescriptorChanged)
+            },
+        );
+        assert_eq!(
+            persistent_race,
+            Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline)
+        );
+
+        let mut fail_closed_attempts = 0_usize;
+        let forbidden = retry_descriptor_observation(
+            Instant::now() + TEST_DEADLINE,
+            |_| -> Result<(), DescriptorObservationAttemptError> {
+                fail_closed_attempts += 1;
+                Err(DescriptorObservationAttemptError::Terminal(
+                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor,
+                ))
+            },
+        );
+        assert_eq!(
+            forbidden,
+            Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor)
+        );
+        assert_eq!(fail_closed_attempts, 1);
+
+        let mut expired_attempts = 0_usize;
+        let expired = retry_descriptor_observation(
+            Instant::now(),
+            |_| -> Result<(), DescriptorObservationAttemptError> {
+                expired_attempts += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(
+            expired,
+            Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline)
+        );
+        assert_eq!(expired_attempts, 0);
+    }
+
+    #[test]
     fn await_ready_accepts_only_the_exact_one_byte_sentinel() -> Result<(), Box<dyn Error>> {
-        let mut child = ManagedGroupChild::spawn(
+        let mut child = ManagedGroupChild::spawn_fixture(
             ChildRole::Tui,
             shell_command("printf R; exec >/dev/null; exec /bin/sleep 5"),
             true,
         )?;
 
         child.await_ready(Instant::now() + TEST_DEADLINE)?;
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         let proof = outcome.children();
         assert!(matches!(
@@ -2430,7 +4149,7 @@ mod tests {
 
     #[test]
     fn await_ready_rejects_extra_bytes_without_retaining_them() -> Result<(), Box<dyn Error>> {
-        let mut child = ManagedGroupChild::spawn(
+        let mut child = ManagedGroupChild::spawn_fixture(
             ChildRole::Tui,
             shell_command("printf RX; exec >/dev/null; exec /bin/sleep 5"),
             true,
@@ -2449,13 +4168,14 @@ mod tests {
         assert!(!format!("{error:?}").contains("RX"));
         assert!(!error.to_string().contains("RX"));
 
-        let _proof = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let _proof =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         Ok(())
     }
 
     #[test]
     fn await_ready_rejects_a_delayed_second_byte() -> Result<(), Box<dyn Error>> {
-        let mut child = ManagedGroupChild::spawn(
+        let mut child = ManagedGroupChild::spawn_fixture(
             ChildRole::Tui,
             shell_command(
                 "printf R; /bin/sleep 0.05; printf X; exec >/dev/null; exec /bin/sleep 5",
@@ -2475,13 +4195,14 @@ mod tests {
         );
         assert!(!format!("{error:?}").contains('X'));
 
-        let _outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let _outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         Ok(())
     }
 
     #[test]
     fn await_ready_requires_the_writer_to_close_after_the_sentinel() -> Result<(), Box<dyn Error>> {
-        let mut child = ManagedGroupChild::spawn(
+        let mut child = ManagedGroupChild::spawn_fixture(
             ChildRole::Tui,
             shell_command("printf R; exec /bin/sleep 5"),
             true,
@@ -2498,7 +4219,8 @@ mod tests {
             }
         );
 
-        let _outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let _outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         Ok(())
     }
 
@@ -2508,7 +4230,7 @@ mod tests {
         // cannot race the direct child's waitid-visible exit. The guardian must
         // still report the leader's clean early exit and sweep the descendant.
         let command = shell_command("/bin/sleep 1 & exec /bin/sleep 0.2");
-        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, command, true)?;
+        let mut child = ManagedGroupChild::spawn_fixture(ChildRole::Tui, command, true)?;
 
         let error = child
             .await_ready(Instant::now() + TEST_DEADLINE)
@@ -2525,7 +4247,7 @@ mod tests {
             }
         ));
 
-        let outcome = shutdown_pair(Some(child), None, Duration::ZERO, TEST_DEADLINE)?;
+        let outcome = shutdown_fixture_pair(Some(child), None, Duration::ZERO, TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         let proof = outcome.children();
         assert!(matches!(
@@ -2540,7 +4262,7 @@ mod tests {
 
     #[test]
     fn await_ready_reports_a_live_silent_child_as_timeout() -> Result<(), Box<dyn Error>> {
-        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), true)?;
+        let mut child = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), true)?;
 
         let error = child
             .await_ready(Instant::now() + Duration::from_millis(30))
@@ -2553,20 +4275,287 @@ mod tests {
             }
         );
 
-        let _proof = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let _proof =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        Ok(())
+    }
+
+    #[test]
+    fn app_shutdown_sends_exactly_one_term_and_accepts_only_exit_zero() -> Result<(), Box<dyn Error>>
+    {
+        let log = SignalLog::new("app-drained")?;
+        let app = ManagedGroupChild::spawn_fixture(
+            ChildRole::AppServer,
+            app_server_signal_command(&log, "exit-0")?,
+            false,
+        )?;
+        wait_for_signal_log(&log, b"R")?;
+
+        let drained = shutdown_app_server_child(app, Duration::from_millis(100), TEST_DEADLINE)?;
+
+        assert_eq!(log.contents()?, b"RT");
+        assert_eq!(drained.outcome().failure(), None);
+        assert_eq!(
+            drained.outcome().children().app_server(),
+            ChildDisposition::Exited {
+                code: 0,
+                stop_action: StopAction::Term,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn app_shutdown_rejects_early_exit_without_signaling() -> Result<(), Box<dyn Error>> {
+        let mut app = ManagedGroupChild::spawn_fixture(
+            ChildRole::AppServer,
+            shell_command("/bin/sleep 0.05; exit 0"),
+            false,
+        )?;
+        let deadline = Instant::now() + TEST_DEADLINE;
+        while app.poll_liveness(deadline)? != ChildLiveness::Exited {
+            sleep_until_next_poll(deadline);
+        }
+
+        let retained = shutdown_app_server_child(app, Duration::from_millis(100), TEST_DEADLINE)
+            .err()
+            .ok_or("an App exit before the initial TERM must retain authority")?;
+
+        assert_eq!(
+            retained.error(),
+            ProcessError::AppGracefulDrainUnconfirmed {
+                role: ChildRole::AppServer,
+                stage: AppGracefulDrainFailureStage::ExitedBeforeTerm,
+            }
+        );
+        let retained_app = retained
+            .app_server
+            .as_ref()
+            .ok_or("the invalid App authority was discarded")?;
+        assert_eq!(
+            retained_app.disposition,
+            Some(ChildDisposition::Exited {
+                code: 0,
+                stop_action: StopAction::None,
+            })
+        );
+        std::mem::forget(retained);
+        Ok(())
+    }
+
+    #[test]
+    fn app_shutdown_nonzero_or_signal_is_permanently_fail_closed() -> Result<(), Box<dyn Error>> {
+        for (label, behavior) in [("nonzero", "exit-23"), ("signaled", "self-kill")] {
+            let log = SignalLog::new(label)?;
+            let app = ManagedGroupChild::spawn_fixture(
+                ChildRole::AppServer,
+                app_server_signal_command(&log, behavior)?,
+                false,
+            )?;
+            wait_for_signal_log(&log, b"R")?;
+
+            let mut retained =
+                shutdown_app_server_child(app, Duration::from_millis(100), TEST_DEADLINE)
+                    .err()
+                    .ok_or("an abnormal App exit must retain authority")?;
+            assert_eq!(
+                retained.error(),
+                ProcessError::AppGracefulDrainUnconfirmed {
+                    role: ChildRole::AppServer,
+                    stage: AppGracefulDrainFailureStage::InvalidDisposition,
+                }
+            );
+            assert_eq!(log.contents()?, b"RT");
+
+            assert_eq!(
+                retained
+                    .retry_app_server(Duration::from_millis(20), Duration::from_millis(20))
+                    .err(),
+                Some(ProcessError::AppGracefulDrainUnconfirmed {
+                    role: ChildRole::AppServer,
+                    stage: AppGracefulDrainFailureStage::InvalidDisposition,
+                })
+            );
+            assert_eq!(log.contents()?, b"RT");
+            std::mem::forget(retained);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn app_shutdown_deadline_and_retry_never_send_a_second_signal() -> Result<(), Box<dyn Error>> {
+        let log = SignalLog::new("app-deadline")?;
+        let app = ManagedGroupChild::spawn_fixture(
+            ChildRole::AppServer,
+            app_server_signal_command(&log, "ignore")?,
+            false,
+        )?;
+        wait_for_signal_log(&log, b"R")?;
+
+        let mut retained =
+            shutdown_app_server_child(app, Duration::from_millis(20), Duration::from_millis(20))
+                .err()
+                .ok_or("an undrained App must retain authority")?;
+        wait_for_signal_log(&log, b"RT")?;
+
+        assert_eq!(
+            retained
+                .retry_app_server(Duration::from_millis(20), Duration::from_millis(20))
+                .err(),
+            Some(ProcessError::WaitTimeout {
+                role: ChildRole::AppServer,
+            })
+        );
+        assert_eq!(log.contents()?, b"RT");
+
+        let app = retained
+            .app_server
+            .as_ref()
+            .ok_or("the timed-out App authority was discarded")?;
+        rustix::process::kill_process_group(app.pgid, rustix::process::Signal::KILL)?;
+        assert_eq!(
+            retained
+                .retry_app_server(Duration::ZERO, TEST_DEADLINE)
+                .err(),
+            Some(ProcessError::WaitTimeout {
+                role: ChildRole::AppServer,
+            })
+        );
+        assert!(
+            retained
+                .app_server
+                .as_ref()
+                .is_some_and(|app| app.disposition.is_some())
+        );
+        assert_eq!(log.contents()?, b"RT");
+        std::mem::forget(retained);
+        Ok(())
+    }
+
+    #[test]
+    fn app_shutdown_signal_failure_is_not_reclassified_as_delivery() -> Result<(), Box<dyn Error>> {
+        let mut app =
+            ManagedGroupChild::spawn_fixture(ChildRole::AppServer, sleep_command("5"), false)?;
+        app.injected_app_shutdown_fault = Some(InjectedAppShutdownFault::Term);
+
+        let mut retained =
+            shutdown_app_server_child(app, Duration::from_millis(20), Duration::from_millis(20))
+                .err()
+                .ok_or("a failed App TERM must retain authority")?;
+        assert_eq!(
+            retained.error(),
+            ProcessError::Signal {
+                role: ChildRole::AppServer,
+                action: StopAction::Term,
+            }
+        );
+        assert_eq!(
+            retained
+                .retry_app_server(Duration::from_millis(20), Duration::from_millis(20))
+                .err(),
+            Some(ProcessError::Signal {
+                role: ChildRole::AppServer,
+                action: StopAction::Term,
+            })
+        );
+
+        let app = retained
+            .app_server
+            .as_ref()
+            .ok_or("the signal-failed App authority was discarded")?;
+        rustix::process::kill_process_group(app.pgid, rustix::process::Signal::KILL)?;
+        let _ = retained.retry_app_server(Duration::ZERO, TEST_DEADLINE);
+        assert!(
+            retained
+                .app_server
+                .as_ref()
+                .is_some_and(|app| app.disposition.is_some())
+        );
+        std::mem::forget(retained);
+        Ok(())
+    }
+
+    #[test]
+    fn app_shutdown_stop_and_cont_failures_remain_permanently_unconfirmed()
+    -> Result<(), Box<dyn Error>> {
+        for (label, fault) in [
+            ("stop-failure", InjectedAppShutdownFault::Stop),
+            ("cont-failure", InjectedAppShutdownFault::Cont),
+        ] {
+            let log = SignalLog::new(label)?;
+            let mut app = ManagedGroupChild::spawn_fixture(
+                ChildRole::AppServer,
+                app_server_signal_command(&log, "exit-0")?,
+                false,
+            )?;
+            wait_for_signal_log(&log, b"R")?;
+            app.injected_app_shutdown_fault = Some(fault);
+
+            let mut retained = shutdown_app_server_child(
+                app,
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            )
+            .err()
+            .ok_or("an injected STOP/CONT failure returned App drain authority")?;
+            let expected_error = ProcessError::Signal {
+                role: ChildRole::AppServer,
+                action: StopAction::None,
+            };
+            assert_eq!(retained.error(), expected_error);
+            assert_eq!(log.contents()?, b"R");
+            assert_eq!(
+                retained
+                    .retry_app_server(Duration::from_millis(20), Duration::from_millis(20))
+                    .err(),
+                Some(expected_error)
+            );
+            assert_eq!(log.contents()?, b"R");
+
+            let app = retained
+                .app_server
+                .as_ref()
+                .ok_or("the signal-failed App authority was discarded")?;
+            assert_eq!(app.app_graceful_drain, AppGracefulDrainState::Invalid);
+            match fault {
+                InjectedAppShutdownFault::Stop => {
+                    rustix::process::kill_process_group(app.pgid, rustix::process::Signal::KILL)?;
+                }
+                InjectedAppShutdownFault::Cont => {
+                    rustix::process::kill_process(app.pid, rustix::process::Signal::CONT)?;
+                    wait_for_signal_log(&log, b"RT")?;
+                }
+                InjectedAppShutdownFault::Term => unreachable!(),
+            }
+            let _ = retained.retry_app_server(Duration::ZERO, TEST_DEADLINE);
+            assert!(
+                retained
+                    .app_server
+                    .as_ref()
+                    .is_some_and(|app| app.disposition.is_some())
+            );
+            let expected_log = if fault == InjectedAppShutdownFault::Cont {
+                b"RT".as_slice()
+            } else {
+                b"R".as_slice()
+            };
+            assert_eq!(log.contents()?, expected_log);
+            std::mem::forget(retained);
+        }
         Ok(())
     }
 
     #[test]
     fn shutdown_escalates_a_term_ignoring_child_to_kill() -> Result<(), Box<dyn Error>> {
-        let mut child = ManagedGroupChild::spawn(
+        let mut child = ManagedGroupChild::spawn_fixture(
             ChildRole::Tui,
             shell_command("trap '' TERM; printf R; exec >/dev/null; exec /bin/sleep 5"),
             true,
         )?;
         child.await_ready(Instant::now() + TEST_DEADLINE)?;
 
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(30), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(30), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         let proof = outcome.children();
         assert!(matches!(
@@ -2588,15 +4577,18 @@ mod tests {
             ("term", TerminalShutdownSignal::Term, b"RT".as_slice()),
         ] {
             let log = SignalLog::new(label)?;
-            let mut tui =
-                ManagedGroupChild::spawn(ChildRole::Tui, signal_counting_command(&log)?, false)?;
+            let mut tui = ManagedGroupChild::spawn_fixture(
+                ChildRole::Tui,
+                signal_counting_command(&log)?,
+                false,
+            )?;
             wait_for_signal_log(&log, b"R")?;
-            let app = ManagedGroupChild::spawn(ChildRole::AppServer, sleep_command("5"), false)?;
+            let app = spawn_cooperative_app_fixture()?;
 
             let forwarded =
                 tui.forward_terminal_shutdown_signal(signal, Instant::now() + TEST_DEADLINE)?;
             wait_for_signal_log(&log, expected_log)?;
-            let outcome = shutdown_pair_after_forwarded_tui_signal(
+            let outcome = shutdown_fixture_pair_after_forwarded_tui_signal(
                 tui,
                 Some(app),
                 forwarded,
@@ -2615,10 +4607,9 @@ mod tests {
             ));
             assert!(matches!(
                 outcome.children().app_server(),
-                ChildDisposition::Signaled {
-                    signal: 15,
+                ChildDisposition::Exited {
+                    code: 0,
                     stop_action: StopAction::Term,
-                    ..
                 }
             ));
         }
@@ -2631,7 +4622,8 @@ mod tests {
             (TerminalShutdownSignal::Hup, 1),
             (TerminalShutdownSignal::Term, 15),
         ] {
-            let mut tui = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+            let mut tui =
+                ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
             let forwarded =
                 tui.forward_terminal_shutdown_signal(signal, Instant::now() + TEST_DEADLINE)?;
             let deadline = Instant::now() + TEST_DEADLINE;
@@ -2639,7 +4631,7 @@ mod tests {
                 sleep_until_next_poll(deadline);
             }
 
-            let outcome = shutdown_pair_after_forwarded_tui_signal(
+            let outcome = shutdown_fixture_pair_after_forwarded_tui_signal(
                 tui,
                 None,
                 forwarded,
@@ -2660,24 +4652,134 @@ mod tests {
     }
 
     #[test]
+    fn tui_output_eof_shutdown_preserves_natural_exit_code() -> Result<(), Box<dyn Error>> {
+        let tui = ManagedGroupChild::spawn_fixture(
+            ChildRole::Tui,
+            shell_command("/bin/sleep 0.05; exit 23"),
+            false,
+        )?;
+
+        let outcome = shutdown_fixture_pair_after_tui_output_eof(
+            tui,
+            None,
+            Duration::from_millis(500),
+            TEST_DEADLINE,
+        )?;
+
+        assert_eq!(outcome.failure(), None);
+        assert_eq!(
+            outcome.children().tui(),
+            ChildDisposition::Exited {
+                code: 23,
+                stop_action: StopAction::None,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_shutdown_continues_stopped_tui_without_minting_resume_authority()
+    -> Result<(), Box<dyn Error>> {
+        let mut tui = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
+        tui.suspend(
+            Instant::now() + Duration::from_millis(100),
+            Instant::now() + TEST_DEADLINE,
+        )?;
+        let forwarded = tui.forward_terminal_shutdown_signal(
+            TerminalShutdownSignal::Term,
+            Instant::now() + TEST_DEADLINE,
+        )?;
+        tui.continue_after_forwarded_shutdown(&forwarded, Instant::now() + TEST_DEADLINE)?;
+
+        let outcome = shutdown_fixture_pair_after_forwarded_tui_signal(
+            tui,
+            None,
+            forwarded,
+            Duration::from_millis(500),
+            TEST_DEADLINE,
+        )?;
+        assert_eq!(outcome.failure(), None);
+        assert_eq!(
+            outcome.children().tui(),
+            ChildDisposition::Signaled {
+                signal: 15,
+                core_dumped: false,
+                stop_action: StopAction::None,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tui_output_eof_shutdown_preserves_natural_signal() -> Result<(), Box<dyn Error>> {
+        let tui = ManagedGroupChild::spawn_fixture(
+            ChildRole::Tui,
+            shell_command("/bin/sleep 0.05; kill -TERM $$"),
+            false,
+        )?;
+
+        let outcome = shutdown_fixture_pair_after_tui_output_eof(
+            tui,
+            None,
+            Duration::from_millis(500),
+            TEST_DEADLINE,
+        )?;
+
+        assert_eq!(outcome.failure(), None);
+        assert_eq!(
+            outcome.children().tui(),
+            ChildDisposition::Signaled {
+                signal: 15,
+                core_dumped: false,
+                stop_action: StopAction::None,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tui_output_eof_shutdown_contains_a_still_live_child() -> Result<(), Box<dyn Error>> {
+        let tui = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
+
+        let outcome = shutdown_fixture_pair_after_tui_output_eof(
+            tui,
+            None,
+            Duration::from_millis(20),
+            TEST_DEADLINE,
+        )?;
+
+        assert_eq!(outcome.failure(), None);
+        assert!(matches!(
+            outcome.children().tui(),
+            ChildDisposition::Signaled {
+                signal: 9,
+                stop_action: StopAction::Kill,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn forwarded_tui_shutdown_mode_and_wait_ownership_survive_retry() -> Result<(), Box<dyn Error>>
     {
         let log = SignalLog::new("retry-term")?;
-        let mut tui =
-            ManagedGroupChild::spawn(ChildRole::Tui, signal_counting_command(&log)?, false)?;
+        let mut tui = ManagedGroupChild::spawn_fixture(
+            ChildRole::Tui,
+            signal_counting_command(&log)?,
+            false,
+        )?;
         wait_for_signal_log(&log, b"R")?;
         let tui_pid = tui.containment().pid();
-        let app = ManagedGroupChild::spawn(ChildRole::AppServer, sleep_command("5"), false)?;
-        let app_pid = app.containment().pid();
         let forwarded = tui.forward_terminal_shutdown_signal(
             TerminalShutdownSignal::Term,
             Instant::now() + TEST_DEADLINE,
         )?;
         wait_for_signal_log(&log, b"RT")?;
 
-        let mut unreaped = shutdown_pair_after_forwarded_tui_signal(
+        let mut unreaped = shutdown_fixture_pair_after_forwarded_tui_signal(
             tui,
-            Some(app),
+            None,
             forwarded,
             Duration::MAX,
             Duration::ZERO,
@@ -2686,9 +4788,9 @@ mod tests {
         .ok_or("overflowing deadline must retain both child handles")?;
         assert_eq!(unreaped.error(), ProcessError::Deadline);
         assert!(format!("{unreaped:?}").contains("tui_owned: true"));
-        assert!(format!("{unreaped:?}").contains("app_server_owned: true"));
+        assert!(format!("{unreaped:?}").contains("app_server_owned: false"));
 
-        let outcome = unreaped.retry(Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome = unreaped.retry_fixture(Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(log.contents()?, b"RT");
         assert!(matches!(
             outcome.children().tui(),
@@ -2698,18 +4800,13 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            outcome.children().app_server(),
-            ChildDisposition::Signaled {
-                signal: 15,
-                stop_action: StopAction::Term,
-                ..
-            }
-        ));
-        assert_no_wait_authority(tui_pid)?;
-        assert_no_wait_authority(app_pid)?;
         assert_eq!(
-            unreaped.retry(Duration::ZERO, Duration::ZERO),
+            outcome.children().app_server(),
+            ChildDisposition::NotStarted
+        );
+        assert_no_wait_authority(tui_pid)?;
+        assert_eq!(
+            unreaped.retry_fixture(Duration::ZERO, Duration::ZERO),
             Err(ProcessError::RetryAfterResolution)
         );
         Ok(())
@@ -2718,8 +4815,8 @@ mod tests {
     #[test]
     fn forwarded_shutdown_proof_requires_process_local_child_authority()
     -> Result<(), Box<dyn Error>> {
-        let first = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
-        let second = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let first = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
+        let second = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
 
         // Reproduce the strongest numeric spoof available inside this module:
         // metadata matches the target exactly, but the unforgeable generation
@@ -2729,7 +4826,7 @@ mod tests {
             containment: second.containment(),
             authority: first.authority,
         };
-        let outcome = shutdown_pair_after_forwarded_tui_signal(
+        let outcome = shutdown_fixture_pair_after_forwarded_tui_signal(
             second,
             None,
             mismatched,
@@ -2746,14 +4843,15 @@ mod tests {
             }
         ));
 
-        let cleanup = shutdown_pair(Some(first), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let cleanup =
+            shutdown_fixture_pair(Some(first), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(cleanup.failure(), None);
         Ok(())
     }
 
     #[test]
     fn terminal_control_authority_rejects_an_app_server_child() -> Result<(), Box<dyn Error>> {
-        let mut app = ManagedGroupChild::spawn(ChildRole::AppServer, sleep_command("5"), false)?;
+        let mut app = spawn_cooperative_app_fixture()?;
         let deadline = Instant::now() + TEST_DEADLINE;
 
         assert_eq!(
@@ -2785,7 +4883,8 @@ mod tests {
             })
         );
 
-        let outcome = shutdown_pair(None, Some(app), Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(None, Some(app), Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         Ok(())
     }
@@ -2813,7 +4912,7 @@ mod tests {
     #[test]
     fn dropping_a_live_child_best_effort_kills_and_reaps_its_leader() -> Result<(), Box<dyn Error>>
     {
-        let child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let child = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
         let pid = child.containment().pid();
 
         drop(child);
@@ -2827,7 +4926,7 @@ mod tests {
         // An instant exit can legitimately race the mandatory PGID readback during
         // spawn; this fixture instead exits just after containment is published.
         let command = sleep_command("0.2");
-        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, command, false)?;
+        let mut child = ManagedGroupChild::spawn_fixture(ChildRole::Tui, command, false)?;
         let deadline = Instant::now() + TEST_DEADLINE;
 
         loop {
@@ -2840,7 +4939,7 @@ mod tests {
             sleep_until_next_poll(deadline);
         }
 
-        let outcome = shutdown_pair(Some(child), None, Duration::ZERO, TEST_DEADLINE)?;
+        let outcome = shutdown_fixture_pair(Some(child), None, Duration::ZERO, TEST_DEADLINE)?;
         assert!(matches!(
             outcome.children().tui(),
             ChildDisposition::Exited {
@@ -2853,7 +4952,8 @@ mod tests {
 
     #[test]
     fn liveness_poll_keeps_stopped_tui_classified_as_running() -> Result<(), Box<dyn Error>> {
-        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let mut child =
+            ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
         let started_at = Instant::now();
         child.suspend(
             started_at + Duration::from_millis(100),
@@ -2866,7 +4966,8 @@ mod tests {
         );
 
         child.resume(Instant::now() + TEST_DEADLINE)?;
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         Ok(())
     }
@@ -2874,8 +4975,11 @@ mod tests {
     #[test]
     fn suspend_forces_a_tstp_ignoring_tui_group_to_stop() -> Result<(), Box<dyn Error>> {
         let log = SignalLog::new("suspend-fallback")?;
-        let mut child =
-            ManagedGroupChild::spawn(ChildRole::Tui, signal_counting_command(&log)?, false)?;
+        let mut child = ManagedGroupChild::spawn_fixture(
+            ChildRole::Tui,
+            signal_counting_command(&log)?,
+            false,
+        )?;
         wait_for_signal_log(&log, b"R")?;
         let started_at = Instant::now();
 
@@ -2890,7 +4994,8 @@ mod tests {
         );
 
         child.resume(Instant::now() + TEST_DEADLINE)?;
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         Ok(())
     }
@@ -2898,7 +5003,8 @@ mod tests {
     #[test]
     fn repeated_suspend_resume_cycles_do_not_reuse_nonterminal_wait_notifications()
     -> Result<(), Box<dyn Error>> {
-        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let mut child =
+            ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
 
         for _ in 0..2 {
             let started_at = Instant::now();
@@ -2909,7 +5015,8 @@ mod tests {
             child.resume(Instant::now() + TEST_DEADLINE)?;
         }
 
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         Ok(())
     }
@@ -2918,7 +5025,8 @@ mod tests {
     #[test]
     fn resume_does_not_require_a_distinct_continued_wait_notification() -> Result<(), Box<dyn Error>>
     {
-        let mut child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let mut child =
+            ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
         let started_at = Instant::now();
         child.suspend(
             started_at + Duration::from_millis(100),
@@ -2949,21 +5057,32 @@ mod tests {
         }
 
         child.resume(Instant::now() + Duration::from_millis(100))?;
-        let outcome = shutdown_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
+        let outcome =
+            shutdown_fixture_pair(Some(child), None, Duration::from_millis(100), TEST_DEADLINE)?;
         assert_eq!(outcome.failure(), None);
         Ok(())
     }
 
     #[test]
     fn exact_reap_proof_survives_an_earlier_shutdown_failure() -> Result<(), Box<dyn Error>> {
-        let wrong_role = ManagedGroupChild::spawn(ChildRole::AppServer, sleep_command("5"), false)?;
+        let app = spawn_cooperative_app_fixture()?;
 
-        let outcome = shutdown_pair(
-            Some(wrong_role),
+        // Keep the App in its typed slot and inject an earlier observational
+        // failure directly. A role-mismatched slot is intentionally not a
+        // public way to recover App completion authority.
+        let completion = shutdown_pair_inner(
             None,
+            Some(app),
             Duration::from_millis(100),
             TEST_DEADLINE,
+            TuiShutdownMode::StartWithTerm,
+            Some(ProcessError::RoleMismatch {
+                expected: ChildRole::Tui,
+                actual: ChildRole::AppServer,
+            }),
         )?;
+        assert!(completion.app_gracefully_drained.is_some());
+        let outcome = completion.outcome;
 
         assert!(matches!(
             outcome,
@@ -2976,8 +5095,11 @@ mod tests {
             }
         ));
         assert!(matches!(
-            outcome.children().tui(),
-            ChildDisposition::Signaled { .. }
+            outcome.children().app_server(),
+            ChildDisposition::Exited {
+                code: 0,
+                stop_action: StopAction::Term,
+            }
         ));
         Ok(())
     }
@@ -2985,9 +5107,9 @@ mod tests {
     #[test]
     fn invalid_shutdown_deadline_returns_the_live_direct_handle_for_retry()
     -> Result<(), Box<dyn Error>> {
-        let child = ManagedGroupChild::spawn(ChildRole::Tui, sleep_command("5"), false)?;
+        let child = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
 
-        let mut unreaped = shutdown_pair(Some(child), None, Duration::MAX, Duration::ZERO)
+        let mut unreaped = shutdown_fixture_pair(Some(child), None, Duration::MAX, Duration::ZERO)
             .err()
             .ok_or("overflowing deadline must fail")?;
         assert_eq!(unreaped.error(), ProcessError::Deadline);
@@ -3005,11 +5127,96 @@ mod tests {
     }
 
     #[test]
+    fn tui_shutdown_output_progress_runs_without_replacing_exact_reap_or_error()
+    -> Result<(), Box<dyn Error>> {
+        let mut child = ManagedGroupChild::spawn_fixture(
+            ChildRole::Tui,
+            shell_command("trap '' TERM; printf R; exec >/dev/null; exec /bin/sleep 5"),
+            true,
+        )?;
+        child.await_ready(Instant::now() + TEST_DEADLINE)?;
+        let pid = child.containment().pid();
+        let secret = "synthetic-private-pty-payload@example.invalid";
+        let mut calls = 0_u32;
+        let mut progress = || {
+            std::hint::black_box(secret);
+            calls += 1;
+            Err(ProcessError::TuiOutputDrain {
+                role: ChildRole::Tui,
+            })
+        };
+
+        let outcome = shutdown_tui_child_with_output_progress(
+            child,
+            Duration::from_millis(20),
+            TEST_DEADLINE,
+            &mut progress,
+        )?;
+
+        assert!(calls >= 2);
+        assert_eq!(
+            outcome.failure(),
+            Some(ProcessError::TuiOutputDrain {
+                role: ChildRole::Tui,
+            })
+        );
+        assert!(matches!(
+            outcome.children().tui(),
+            ChildDisposition::Signaled {
+                signal: 9,
+                stop_action: StopAction::Kill,
+                ..
+            }
+        ));
+        assert_no_wait_authority(pid)?;
+        assert!(!format!("{outcome:?}").contains(secret));
+        assert_eq!(
+            outcome.failure().map(|error| error.to_string()),
+            Some("supervised TUI shutdown output drain failed".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_tui_retry_reuses_output_progress_and_exact_wait_authority()
+    -> Result<(), Box<dyn Error>> {
+        let child = ManagedGroupChild::spawn_fixture(ChildRole::Tui, sleep_command("5"), false)?;
+        let pid = child.containment().pid();
+        let mut unreaped = shutdown_fixture_pair(Some(child), None, Duration::MAX, Duration::ZERO)
+            .err()
+            .ok_or("overflowing deadline must retain the exact TUI child")?;
+        let calls = std::cell::Cell::new(0_u32);
+        let mut progress = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+
+        let outcome = unreaped.retry_with_tui_output_progress(
+            Duration::from_millis(20),
+            TEST_DEADLINE,
+            &mut progress,
+        )?;
+
+        assert!(calls.get() > 0);
+        assert_eq!(outcome.failure(), Some(ProcessError::Deadline));
+        assert!(matches!(
+            outcome.children().tui(),
+            ChildDisposition::Signaled { .. }
+        ));
+        assert_no_wait_authority(pid)?;
+        assert_eq!(
+            unreaped.retry_with_tui_output_progress(Duration::ZERO, Duration::ZERO, &mut progress,),
+            Err(ProcessError::RetryAfterResolution)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn pre_spawn_failure_is_redacted_and_requires_no_wait_authority() -> Result<(), Box<dyn Error>>
     {
         let command = Command::new("/calcifer-private-sentinel/does-not-exist");
 
-        let failure = ManagedGroupChild::spawn(ChildRole::Tui, command, false)
+        let failure = ManagedGroupChild::spawn_fixture(ChildRole::Tui, command, false)
             .err()
             .ok_or("missing executable must fail")?;
         assert_eq!(failure.state(), SpawnFailureState::NotStarted);
@@ -3024,12 +5231,6 @@ mod tests {
         let proof = failure.cleanup(Instant::now() + TEST_DEADLINE).map_err(
             |failure| -> Box<dyn Error> { format!("cleanup remained live: {failure}").into() },
         )?;
-        assert_eq!(
-            proof.error(),
-            ProcessError::Spawn {
-                role: ChildRole::Tui
-            }
-        );
         assert!(!proof.started_unannounced());
         Ok(())
     }

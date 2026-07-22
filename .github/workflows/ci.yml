@@ -84,7 +84,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 37
+    env:
+      SUPERVISOR_MSRV_RUNS: 2
+      PACKAGE_TEST_COMMAND_OVERHEAD_SECONDS: 300
+      PACKAGE_TEST_ORDINARY_WATCHDOG_SECONDS: 660
+      PACKAGE_TEST_MSRV_WATCHDOG_SECONDS: 1020
+      PACKAGE_TEST_WATCHDOG_TERM_GRACE_SECONDS: 30
+      PACKAGE_TEST_JOB_MARGIN_SECONDS: 420
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -95,17 +102,146 @@ jobs:
       - name: Install supervisor MSRV
         if: runner.os != 'Windows'
         run: rustup toolchain install 1.85.0 --profile minimal
-      - name: Run tests
-        run: cargo +1.96.0 test --all-targets --all-features --locked
-      - name: Run default-unused supervisor fixture at MSRV
-        if: runner.os != 'Windows'
-        run: make supervisor-msrv
-      - name: Probe pinned Codex handoff compatibility
+      - name: Validate deterministic package suite budget
         if: runner.os != 'Windows'
         shell: bash
-        env:
-          CODEX_RELEASE_TAG: rust-v0.144.4
-          CODEX_VERSION: 0.144.4
+        run: |
+          set -euo pipefail
+
+          python3 scripts/run_with_watchdog.py validate-repeated-budget \
+            --rust-source src/providers/codex/supervisor/packaged_smoke.rs \
+            --rust-constant PACKAGE_DETERMINISTIC_SUITE_TIMEOUT \
+            --msrv-runs "${SUPERVISOR_MSRV_RUNS:?}" \
+            --command-overhead-seconds "${PACKAGE_TEST_COMMAND_OVERHEAD_SECONDS:?}" \
+            --ordinary-watchdog-seconds "${PACKAGE_TEST_ORDINARY_WATCHDOG_SECONDS:?}" \
+            --msrv-watchdog-seconds "${PACKAGE_TEST_MSRV_WATCHDOG_SECONDS:?}" \
+            --term-grace-seconds "${PACKAGE_TEST_WATCHDOG_TERM_GRACE_SECONDS:?}" \
+            --job-timeout-minutes 37 \
+            --job-margin-seconds "${PACKAGE_TEST_JOB_MARGIN_SECONDS:?}"
+      - name: Run tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 scripts/run_with_watchdog.py run \
+            --timeout-seconds "${PACKAGE_TEST_ORDINARY_WATCHDOG_SECONDS:?}" \
+            --term-grace-seconds "${PACKAGE_TEST_WATCHDOG_TERM_GRACE_SECONDS:?}" \
+            -- \
+            cargo +1.96.0 test --all-targets --all-features --locked -- --test-threads=1
+      - name: Run tests on Windows
+        if: runner.os == 'Windows'
+        run: cargo +1.96.0 test --all-targets --all-features --locked -- --test-threads=1
+      - name: Run repeated supervisor regression suites at MSRV
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 scripts/run_with_watchdog.py run \
+            --timeout-seconds "${PACKAGE_TEST_MSRV_WATCHDOG_SECONDS:?}" \
+            --term-grace-seconds "${PACKAGE_TEST_WATCHDOG_TERM_GRACE_SECONDS:?}" \
+            -- \
+            make supervisor-msrv
+      - name: Test Linux mount-boundary enforcement
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          command -v jq
+          command -v unshare
+          command -v mount
+          command -v umount
+          sudo -n true
+          uname -a
+
+          test_name='profiles::tests::removal_rejects_same_device_bind_mount_during_validation_and_cleanup'
+          test_binary="$(
+            cargo +1.96.0 test \
+              --lib \
+              --all-features \
+              --locked \
+              --no-run \
+              --message-format=json |
+              jq -r '
+                select(
+                  .reason == "compiler-artifact"
+                  and .profile.test == true
+                  and .target.name == "calcifer"
+                  and (.target.kind | index("lib")) != null
+                  and .executable != null
+                )
+                | .executable
+              ' |
+              tail -n 1
+          )"
+
+          test -n "$test_binary"
+          test -x "$test_binary"
+          # Consume the complete list. `grep -q` can close the pipe after an
+          # early match and make libtest fail with BrokenPipe under pipefail.
+          "$test_binary" --list | grep -Fx "$test_name: test" >/dev/null
+
+          sudo -n unshare \
+            --mount \
+            --propagation private \
+            -- \
+            "$test_binary" \
+            "$test_name" \
+            --exact \
+            --ignored \
+            --nocapture
+
+  pinned-codex-package:
+    name: Pinned Codex (${{ matrix.scenario }}, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            suite: contracts
+            scenario: contracts
+            job_timeout_minutes: 25
+          - os: macos-latest
+            suite: contracts
+            scenario: contracts
+            job_timeout_minutes: 25
+          - os: ubuntu-24.04
+            suite: official-tui
+            scenario: official-tui-normal
+            job_timeout_minutes: 45
+          - os: macos-latest
+            suite: official-tui
+            scenario: official-tui-normal
+            job_timeout_minutes: 45
+          - os: ubuntu-24.04
+            suite: official-tui
+            scenario: official-tui-recovery
+            job_timeout_minutes: 45
+          - os: macos-latest
+            suite: official-tui
+            scenario: official-tui-recovery
+            job_timeout_minutes: 45
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.job_timeout_minutes }}
+    env:
+      CODEX_RELEASE_TAG: rust-v0.144.4
+      CODEX_VERSION: 0.144.4
+      PACKAGE_INTERNAL_FENCE_SECONDS: 1500
+      PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS: 1680
+      PACKAGE_OFFICIAL_TUI_WATCHDOG_MARGIN_SECONDS: 180
+      PACKAGE_OFFICIAL_TUI_JOB_MARGIN_SECONDS: 1020
+      PACKAGE_OFFICIAL_TUI_JOB_TIMEOUT_MINUTES: ${{ matrix.job_timeout_minutes }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Prepare checksum-pinned Codex package
+        shell: bash
         run: |
           set -euo pipefail
           export LC_ALL=C
@@ -134,11 +270,15 @@ jobs:
               ;;
           esac
 
-          scratch="$(mktemp -d "${RUNNER_TEMP:?}/calcifer-codex-handoff.XXXXXX")"
-          cleanup() {
-            rm -rf "${scratch}"
+          scratch="$(mktemp -d "${RUNNER_TEMP:?}/calcifer-codex-compat.XXXXXX")"
+          retain_scratch=false
+          cleanup_prepare_failure() {
+            if [[ "${retain_scratch}" != true ]]; then
+              rm -rf -- "${scratch}"
+            fi
           }
-          trap cleanup EXIT
+          trap cleanup_prepare_failure EXIT
+          echo "CALCIFER_CODEX_PACKAGE_ROOT=${scratch}" >> "${GITHUB_ENV:?}"
 
           archive="${scratch}/codex-${target}.tar.gz"
           release_url="https://github.com/openai/codex/releases/download/${CODEX_RELEASE_TAG}/codex-${target}.tar.gz"
@@ -151,6 +291,8 @@ jobs:
             --connect-timeout 20 \
             --max-time 300 \
             --retry 3 \
+            --retry-all-errors \
+            --retry-max-time 180 \
             --retry-delay 2 \
             --show-error \
             --silent \
@@ -207,8 +349,42 @@ jobs:
             exit 1
           fi
 
-          test_name='providers::codex::handoff_compat::tests::packaged_codex_0_144_4_passes_the_complete_handoff_probe'
-          CALCIFER_CODEX_COMPAT_BINARY="${binary}" \
+          echo "CALCIFER_CODEX_COMPAT_BINARY=${binary}" >> "${GITHUB_ENV:?}"
+          retain_scratch=true
+      - name: Run pinned Codex contract probes
+        if: matrix.suite == 'contracts'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          if [[ ! -f "${CALCIFER_CODEX_COMPAT_BINARY:?}" || -L "${CALCIFER_CODEX_COMPAT_BINARY}" || ! -x "${CALCIFER_CODEX_COMPAT_BINARY}" ]]; then
+            echo "The pinned Codex binary was not a canonical executable file." >&2
+            exit 1
+          fi
+          test_names=(
+            'providers::codex::handoff_compat::tests::packaged_codex_0_144_4_passes_the_complete_handoff_probe'
+            'providers::codex::supervisor::packaged_smoke::packaged_codex_running_turn_obeys_the_pinned_graceful_drain_contract'
+            'providers::codex::supervisor::packaged_smoke::packaged_codex_detached_tool_inherits_no_calcifer_authority'
+            'providers::codex::supervisor::packaged_smoke::packaged_codex_typed_monitor_accepts_usage_and_redacts_provider_failure'
+          )
+          for test_name in "${test_names[@]}"; do
+            discovered="$(
+              cargo +1.96.0 test \
+                --lib \
+                --all-features \
+                --locked \
+                "${test_name}" \
+                -- \
+                --exact \
+                --ignored \
+                --list \
+                --format terse
+            )"
+            if ! grep -Fqx -- "${test_name}: test" <<<"${discovered}"; then
+              echo "Pinned Codex package test was not discovered: ${test_name}" >&2
+              exit 1
+            fi
             cargo +1.96.0 test \
               --lib \
               --all-features \
@@ -218,55 +394,233 @@ jobs:
               --exact \
               --ignored \
               --nocapture
-      - name: Test Linux mount-boundary enforcement
-        if: runner.os == 'Linux'
+          done
+      - name: Build and verify the package TUI launcher fixture
+        if: matrix.suite == 'official-tui'
         shell: bash
         run: |
           set -euo pipefail
+          cargo +1.96.0 build \
+            --bin calcifer-supervisor-fixture \
+            --all-features \
+            --locked
+          built_fixture_directory="$(cd target/debug && pwd -P)"
+          built_fixture="${built_fixture_directory}/calcifer-supervisor-fixture"
+          if [[ ! -f "${built_fixture}" || -L "${built_fixture}" || ! -x "${built_fixture}" ]]; then
+            echo "The dedicated package TUI launcher fixture was not a canonical executable file." >&2
+            exit 1
+          fi
 
-          command -v jq
-          command -v unshare
-          command -v mount
-          command -v umount
-          sudo -n true
-          uname -a
+          # Cargo may hard-link a top-level binary to target/debug/deps. The
+          # netns boundary correctly rejects multiply-linked executable
+          # authority, so stage the exact bytes into the existing private
+          # package root instead of weakening that validator.
+          launcher_directory="${CALCIFER_CODEX_PACKAGE_ROOT:?}/launcher"
+          mkdir -m 0700 "${launcher_directory}"
+          launcher_directory="$(cd "${launcher_directory}" && pwd -P)"
+          fixture_binary="${launcher_directory}/calcifer-supervisor-fixture"
+          (umask 077; cp "${built_fixture}" "${fixture_binary}")
+          chmod 0700 "${fixture_binary}"
+          if ! cmp -s "${built_fixture}" "${fixture_binary}"; then
+            echo "The staged package TUI launcher did not match the locked build." >&2
+            exit 1
+          fi
+          launcher_link_count="$(python3 -c 'import os, sys; print(os.lstat(sys.argv[1]).st_nlink)' "${fixture_binary}")"
+          if [[ "${launcher_link_count}" != 1 ]]; then
+            echo "The staged package TUI launcher was not singly linked." >&2
+            exit 1
+          fi
+          if [[ ! -f "${fixture_binary}" || -L "${fixture_binary}" || ! -O "${fixture_binary}" || ! -x "${fixture_binary}" ]]; then
+            echo "The staged package TUI launcher was not a private runner-owned executable." >&2
+            exit 1
+          fi
+          echo "CALCIFER_PACKAGE_TUI_LAUNCHER=${fixture_binary}" >> "${GITHUB_ENV:?}"
+      - name: Prepare the exact official Codex TUI libtest
+        if: matrix.suite == 'official-tui'
+        shell: bash
+        env:
+          PACKAGE_OFFICIAL_TUI_SCENARIO: ${{ matrix.scenario }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
 
-          test_name='profiles::tests::removal_rejects_same_device_bind_mount_during_validation_and_cleanup'
-          test_binary="$(
-            cargo +1.96.0 test \
-              --lib \
-              --all-features \
-              --locked \
-              --no-run \
-              --message-format=json |
-              jq -r '
-                select(
-                  .reason == "compiler-artifact"
-                  and .profile.test == true
-                  and .target.name == "calcifer"
-                  and (.target.kind | index("lib")) != null
-                  and .executable != null
-                )
-                | .executable
-              ' |
-              tail -n 1
-          )"
+          case "${PACKAGE_OFFICIAL_TUI_SCENARIO:?}" in
+            official-tui-normal)
+              test_name='providers::codex::supervisor::packaged_smoke::packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_and_job_control'
+              ;;
+            official-tui-recovery)
+              test_name='providers::codex::supervisor::packaged_smoke::packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proofs'
+              ;;
+            *)
+              echo "Unknown official TUI scenario: ${PACKAGE_OFFICIAL_TUI_SCENARIO}" >&2
+              exit 1
+              ;;
+          esac
+          if [[ ! -f "${CALCIFER_CODEX_COMPAT_BINARY:?}" || -L "${CALCIFER_CODEX_COMPAT_BINARY}" || ! -x "${CALCIFER_CODEX_COMPAT_BINARY}" ]]; then
+            echo "The pinned Codex binary was not a canonical executable file." >&2
+            exit 1
+          fi
+          if [[ ! -f "${CALCIFER_PACKAGE_TUI_LAUNCHER:?}" || -L "${CALCIFER_PACKAGE_TUI_LAUNCHER}" || ! -x "${CALCIFER_PACKAGE_TUI_LAUNCHER}" ]]; then
+            echo "The package TUI launcher fixture was not a canonical executable file." >&2
+            exit 1
+          fi
+          command -v jq >/dev/null
+          python3 scripts/run_with_watchdog.py validate-budget \
+            --rust-source src/providers/codex/supervisor/packaged_smoke.rs \
+            --rust-constant PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT \
+            --internal-fence-seconds "${PACKAGE_INTERNAL_FENCE_SECONDS:?}" \
+            --watchdog-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS:?}" \
+            --watchdog-margin-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_MARGIN_SECONDS:?}" \
+            --job-timeout-minutes "${PACKAGE_OFFICIAL_TUI_JOB_TIMEOUT_MINUTES:?}" \
+            --job-margin-seconds "${PACKAGE_OFFICIAL_TUI_JOB_MARGIN_SECONDS:?}"
 
-          test -n "$test_binary"
-          test -x "$test_binary"
-          # Consume the complete list. `grep -q` can close the pipe after an
-          # early match and make libtest fail with BrokenPipe under pipefail.
-          "$test_binary" --list | grep -Fx "$test_name: test" >/dev/null
+          metadata_paths=()
+          cleanup_metadata() {
+            if (( ${#metadata_paths[@]} > 0 )); then
+              rm -f -- "${metadata_paths[@]}"
+            fi
+          }
+          trap cleanup_metadata EXIT
+          artifact_json="$(mktemp "${RUNNER_TEMP:?}/calcifer-libtest-artifacts.XXXXXX")"
+          metadata_paths+=("${artifact_json}")
+          artifact_candidates="$(mktemp "${RUNNER_TEMP}/calcifer-libtest-candidates.XXXXXX")"
+          metadata_paths+=("${artifact_candidates}")
+          test_list="$(mktemp "${RUNNER_TEMP}/calcifer-libtest-list.XXXXXX")"
+          metadata_paths+=("${test_list}")
 
-          sudo -n unshare \
-            --mount \
-            --propagation private \
-            -- \
-            "$test_binary" \
-            "$test_name" \
+          # Compilation and dependency resolution happen before the Linux
+          # network boundary. The namespace receives only this exact libtest.
+          cargo +1.96.0 test \
+            --lib \
+            --all-features \
+            --locked \
+            --no-run \
+            --message-format=json \
+            > "${artifact_json}"
+          jq -r '
+            select(
+              .reason == "compiler-artifact"
+              and .profile.test == true
+              and .target.name == "calcifer"
+              and (.target.kind | index("lib")) != null
+              and .executable != null
+            )
+            | .executable
+          ' "${artifact_json}" > "${artifact_candidates}"
+
+          candidate_count="$(awk 'END { print NR + 0 }' "${artifact_candidates}")"
+          if [[ "${candidate_count}" != 1 ]]; then
+            echo "Expected exactly one Calcifer library test binary." >&2
+            exit 1
+          fi
+          IFS= read -r test_binary < "${artifact_candidates}"
+          test_binary_directory="$(cd "$(dirname "${test_binary}")" && pwd -P)"
+          test_binary="${test_binary_directory}/$(basename "${test_binary}")"
+          if [[ ! -f "${test_binary}" || -L "${test_binary}" || ! -x "${test_binary}" ]]; then
+            echo "The Calcifer library test binary was not a canonical executable file." >&2
+            exit 1
+          fi
+
+          # Consume the entire list so libtest cannot observe BrokenPipe.
+          "${test_binary}" \
+            "${test_name}" \
             --exact \
             --ignored \
-            --nocapture
+            --list \
+            --format terse \
+            > "${test_list}"
+          if [[ "$(grep -Fxc -- "${test_name}: test" "${test_list}")" != 1 ]]; then
+            echo "Pinned Codex package test was not discovered: ${test_name}" >&2
+            exit 1
+          fi
+          echo "CALCIFER_PACKAGE_TUI_TEST_BINARY=${test_binary}" >> "${GITHUB_ENV:?}"
+          echo "CALCIFER_PACKAGE_TUI_TEST_NAME=${test_name}" >> "${GITHUB_ENV}"
+      - name: Run official Codex TUI native functional probe
+        if: matrix.suite == 'official-tui' && runner.os != 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          python3 scripts/run_with_watchdog.py run \
+            --timeout-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS:?}" \
+            --term-grace-seconds 30 \
+            -- \
+            "${CALCIFER_PACKAGE_TUI_TEST_BINARY:?}" \
+              "${CALCIFER_PACKAGE_TUI_TEST_NAME:?}" \
+              --exact \
+              --ignored \
+              --nocapture
+      - name: Run official Codex TUI in a loopback-only network namespace
+        if: matrix.suite == 'official-tui' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          command -v sudo >/dev/null
+          command -v unshare >/dev/null
+          command -v setpriv >/dev/null
+          command -v ip >/dev/null
+          sudo -n true
+
+          # There is deliberately no native-network fallback. The helper
+          # fails unless it proves a loopback-only namespace, drops every
+          # capability, clears inherited environment authority and sockets,
+          # and then execs the prebuilt exact libtest directly.
+          python3 scripts/run_with_watchdog.py run \
+            --timeout-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS:?}" \
+            --term-grace-seconds 30 \
+            -- \
+            python3 scripts/run_loopback_netns.py \
+              --test-binary "${CALCIFER_PACKAGE_TUI_TEST_BINARY:?}" \
+              --test-name "${CALCIFER_PACKAGE_TUI_TEST_NAME:?}" \
+              --codex-binary "${CALCIFER_CODEX_COMPAT_BINARY:?}" \
+              --launcher-binary "${CALCIFER_PACKAGE_TUI_LAUNCHER:?}"
+      # The watchdog bounds only its direct command group. A package process
+      # may have created another session, so any failed probe retains its
+      # evidence root until the ephemeral runner performs whole-job teardown.
+      - name: Remove pinned Codex package scratch after successful probes
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_root="${CALCIFER_CODEX_PACKAGE_ROOT:-}"
+          if [[ -z "${package_root}" ]]; then
+            echo "Pinned Codex package scratch was not registered." >&2
+            exit 1
+          fi
+          case "${package_root}" in
+            "${RUNNER_TEMP:?}"/calcifer-codex-compat.*)
+              rm -rf -- "${package_root}"
+              if [[ -e "${package_root}" || -L "${package_root}" ]]; then
+                echo "Pinned Codex package scratch still exists after cleanup." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Refusing to remove an unexpected package scratch path." >&2
+              exit 1
+              ;;
+          esac
+
+  pinned-codex-gate:
+    name: Pinned Codex Package
+    if: always()
+    needs: pinned-codex-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every pinned Codex package scenario
+        shell: bash
+        env:
+          PINNED_CODEX_RESULT: ${{ needs.pinned-codex-package.result }}
+        run: |
+          set -euo pipefail
+          if [[ "${PINNED_CODEX_RESULT:?}" != success ]]; then
+            echo "A pinned Codex package scenario did not succeed." >&2
+            exit 1
+          fi
 
   msrv:
     name: MSRV (1.85.0)

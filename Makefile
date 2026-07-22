@@ -1,5 +1,6 @@
 PREFIX ?= $(HOME)/.local
 MSRV ?= 1.85.0
+SUPERVISOR_MSRV_RUNS ?= 2
 
 .PHONY: fmt fmt-check lint test supervisor-msrv release-package-test docs msrv check install-local
 
@@ -13,10 +14,21 @@ lint:
 	cargo clippy --all-targets --all-features --locked -- -D warnings
 
 test:
-	cargo test --all-targets --all-features --locked
+	cargo test --all-targets --all-features --locked -- --test-threads=1
 
 supervisor-msrv:
-	cargo +$(MSRV) test --test supervisor --all-features --locked -- --test-threads=1
+	@set -eu; \
+	case "$(SUPERVISOR_MSRV_RUNS)" in \
+		''|*[!0-9]*|0*) echo "SUPERVISOR_MSRV_RUNS must be a canonical positive integer" >&2; exit 2 ;; \
+	esac; \
+	run=1; \
+	while [ "$$run" -le "$(SUPERVISOR_MSRV_RUNS)" ]; do \
+		echo "Supervisor MSRV run $$run/$(SUPERVISOR_MSRV_RUNS): library unit suite"; \
+		cargo +$(MSRV) test --lib --all-features --locked -- --test-threads=1; \
+		echo "Supervisor MSRV run $$run/$(SUPERVISOR_MSRV_RUNS): real-exec integration matrix"; \
+		cargo +$(MSRV) test --test supervisor --all-features --locked -- --test-threads=1; \
+		run=$$((run + 1)); \
+	done
 
 release-package-test:
 	python3 -m unittest discover -s scripts -p 'test_*.py'

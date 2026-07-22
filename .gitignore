@@ -7,6 +7,7 @@
 *.swp
 __pycache__/
 *.pyc
+.ruff_cache/
 
 # Local environment and credentials. Real credentials must never be fixtures.
 .env

@@ -39,6 +39,65 @@ pub fn run_internal_supervisor_fixture() -> ExitCode {
     }
 }
 
+/// Returns whether this feature-gated process was entered as the sealed Codex
+/// TUI launcher. This is not a CLI command and is unavailable in normal builds.
+#[cfg(feature = "internal-supervisor-fixture")]
+#[doc(hidden)]
+pub fn internal_tui_launcher_requested() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        providers::codex::internal_tui_launcher_requested()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// Runs the sealed, feature-gated Codex TUI launcher entrypoint.
+#[cfg(feature = "internal-supervisor-fixture")]
+#[doc(hidden)]
+pub fn run_internal_tui_launcher() -> ExitCode {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        providers::codex::run_internal_tui_launcher()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        ExitCode::FAILURE
+    }
+}
+
+/// Returns whether this default-off process was exec'd as the sealed
+/// production-shaped Codex guardian.
+#[cfg(feature = "internal-supervisor-fixture")]
+#[doc(hidden)]
+pub fn internal_production_supervisor_role_requested() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        providers::codex::internal_production_role_requested()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// Runs the sealed production-shaped guardian role. This is an internal exec
+/// boundary, not a public CLI command.
+#[cfg(feature = "internal-supervisor-fixture")]
+#[doc(hidden)]
+pub fn run_internal_production_supervisor_role() -> ExitCode {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        providers::codex::run_internal_production_role()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        ExitCode::FAILURE
+    }
+}
+
 /// Runs Calcifer with an explicit argument iterator.
 ///
 /// This boundary keeps process-global argument handling out of command logic and
@@ -48,6 +107,16 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    #[cfg(feature = "internal-supervisor-fixture")]
+    if internal_production_supervisor_role_requested() {
+        return run_internal_production_supervisor_role();
+    }
+
+    #[cfg(feature = "internal-supervisor-fixture")]
+    if internal_tui_launcher_requested() {
+        return run_internal_tui_launcher();
+    }
+
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let json_requested = args
         .iter()

@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target-reservation primitive, and default-unused fake-child process plus readiness-gated terminal supervisor foundations are implemented. Real supervised Codex/App Server/TUI integration, persistent monitor wiring, the production cross-profile handoff transaction, and automatic failover remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, and an internal Linux/macOS no-gap target-reservation primitive are implemented. A default-unused pinned App Server/typed-monitor/official-TUI supervisor implementation is present. Deterministic recovery and official-package normal/recovery scenarios are green from the 2026-07-20 Issue #54 candidate source on Apple silicon; Ubuntu 24.04/macOS matrix acceptance is pending. Public supervised run/resume, the production cross-profile handoff transaction, active-session failover policy, and automatic failover remain future work.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -78,6 +78,11 @@ Future code that violates one of these invariants requires an architecture decis
     input has no worker before typed readiness, raw-mode readback, and
     `OPEN_GATE` ACK, and no final child disposition is trusted before exact
     waits and terminal restoration.
+20. **Provider release requires a move-only proof.** A successful internal
+    supervisor completion consumes either proof that no App Server was spawned
+    or the pinned one-`SIGTERM`, direct-child code-zero graceful-drain proof.
+    Missing or ambiguous evidence retains authority; ordinary cleanup status,
+    PID disappearance, and a group signal are not release authorization.
 
 ## Codex profile model
 
@@ -203,13 +208,34 @@ compatibility proofs only: production leases, transition journaling and
 recovery, pool policy, authoritative exhaustion selection, and user-state
 handoff remain unimplemented.
 
-## Implemented default-unused Unix terminal kernel
+## Default-unused Unix supervisor implementation
 
-The `internal-supervisor-fixture` path now composes the fake-child process
-authority with a real PTY and outer terminal on Linux and macOS. This is an
-internal failure-injection kernel, not a public supervised command and not a
-real Codex launch. It reads no profile credentials, starts no persistent usage
-monitor, and changes no registry or conversation schema.
+The internal supervisor first composed fake-child process authority with a real
+PTY and outer terminal on Linux and macOS. Issue #54 now also connects that
+kernel to the pinned Codex `0.144.4` App Server, a separately typed monitor, the
+readiness relay, and the official remote TUI. It remains an internal,
+default-unused integration: no public command selects it, and it changes no
+registry or conversation schema.
+
+Independently budgeted checksum-pinned normal-session and retained-recovery
+package scenarios are configured to exercise the production coordinator,
+guardian, provider-session, PTY, input-gate, resize, and stop/resume job-control
+implementations under a test-owned outer-terminal harness. The normal scenario
+passed twice consecutively and retained recovery once on the exact local
+Apple-silicon tree; Ubuntu 24.04/macOS CI readback remains pending. Selected-
+profile admission uses the
+production A-to-B lease path across the coordinator and guardian helpers, and
+the guardian helper enters the shared production guardian-bootstrap core. Its
+only bootstrap variations are a package-specific post-admission loopback rewrite
+and fixed observation root; production supplies neither. The package parent is
+designed to create the completion endpoint and pass it across real package-
+parent-to-coordinator and coordinator-to-guardian `exec` boundaries. The
+guardian may publish only after consuming provider-release proof; the parent is
+configured to check the exact frame and EOF. The test-only package role
+dispatcher and outer-terminal harness are not production entry routing: they do
+not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE`
+dispatcher/parser or persistent shell-anchor role, and these scenarios make no
+parser coverage claim.
 
 The coordinator/guardian exec boundary keeps three channel classes physically
 separate:
@@ -240,9 +266,10 @@ foreground process group alone is not enough. The guardian creates no private
 runtime, fixture worker, PTY, or child before that ACK. The fingerprint remains
 wire-only and redacted in debug output and failures.
 
-The fake TUI later receives a one-shot typed readiness descriptor. All
-provider-style children lack the lease, lifecycle, transfer, terminal,
-recovery, unrelated PTY-master, and outer-tty descriptors after exec.
+The synthetic fixture TUI and the pinned official TUI each receive readiness
+through the same one-shot typed boundary. All provider-style children lack the
+lease, lifecycle, transfer, completion, terminal, recovery, unrelated
+PTY-master, and outer-tty descriptors after exec.
 
 The terminal gate is ordered and linear:
 
@@ -250,7 +277,7 @@ The terminal gate is ordered and linear:
 TERMINAL_ARMED { redacted semantic fingerprint }
   -> constant-time coordinator match
   -> TERMINAL_ARM_ACCEPTED; runtime/worker/child creation now authorized
-  -> fake TUI on controlling PTY; output-only pump
+  -> selected TUI on controlling PTY; output-only pump
   -> exact READY capability; input workers still absent
   -> outer tty identity and foreground revalidation
   -> discard queued input; enter raw mode and read it back
@@ -275,6 +302,153 @@ disarms guardian recovery, emits one terminal `CHILDREN_REAPED` frame, exactly
 waits the guardian, and only then reproduces the TUI's zero, nonzero, or signal
 disposition. Infrastructure, PTY EOF/EIO, signal, identity, restoration, and
 cleanup failures cannot be rewritten as a successful TUI exit.
+
+The production-shaped entry adds a persistent terminal anchor and a physically
+separate completion socket. A and B, lifecycle, terminal, completion, recovery,
+and optional transfer descriptors are close-on-exec and checked as absent from
+the real provider process groups. The anchor accepts exactly one fixed
+eight-byte terminal record and then requires EOF. `CFCMP\x01\r\n` carries only
+provider-release proof; by itself it is not owner, session, anchor, or shell
+success and authorizes no release. A consuming owner must independently satisfy
+its exact-child/coordinator waits and exact frame-plus-EOF checks. Missing,
+invalid, or trailing bytes restore the tty but park the anchor instead of
+releasing an uncertain generation. The separate `CFRET\x01\r\n` record is
+terminal retained evidence and carries no reason, identity, secret, or provider
+payload. Exact retained record plus EOF parks the direct child, immutable tty
+snapshot, and completion
+receiver without returning success or a nonzero shell status.
+
+The same anonymous socket has one bounded reverse operation for the internal
+package owner: one exact 25-byte request followed by write-half shutdown. The
+frame contains `CFRCR\x01`, the fixed retained-generation reason, the transit
+endpoint's big-endian device/inode identity, and `\r\n`. The anchor captures
+the identity directly from the socketpair, and the guardian compares it with
+its own inherited endpoint after exec; it is not supplied through another
+environment value or raw descriptor number. No pathname, marker, reusable
+token, or numeric process identity becomes authority. A valid request or exact
+owner EOF enters the guardian's existing typed cleanup state machine. It may
+retry one eligible retained deadline/cleanup owner, but cannot repeat an App
+signal, skip restore, mint provider release, or publish success. A malformed or
+cross-wired frame alone authorizes nothing; malformed data followed by EOF is
+still only owner-loss cleanup. When recovery races one already-written
+lifecycle command, the guardian can drain at most one command from the prior
+state's closed set after quiescence, without creating an ACK, command proof, or
+normal termination cause. Replay and cross-state commands remain protocol
+failures.
+
+This recovery authority is live and generation-local. It exists only on the
+anonymous endpoint retained by that running owner/guardian generation, is not
+persisted, and does not survive loss of both terminal authorities or a machine
+restart. It is separate from cold conversation resume, which reopens persisted
+history but cannot restore a dead process or in-flight operation.
+
+Only a non-copyable provider-release capability can authorize that record. It
+has two closed construction paths: the App Server provably never started, or
+the exact pinned App direct child was sent its first and only shutdown
+`SIGTERM`, was exactly waited, and exited with code zero. Early exit, nonzero or
+signalled exit, send failure, deadline, a second signal, or forced kill cannot
+mint it. Structured failure owners park with B, the child/runtime authority,
+terminal recovery, and completion sender retained. Accidental Drop of an
+ambiguous App authority aborts without sending another signal.
+
+When a retained owner is nonrecoverable, recovery transport fails, or the sole
+retry returns another retained owner, the guardian consumes the completion
+endpoint and attempts the retained record and write-half shutdown exactly once.
+It then deliberately keeps the concrete typed provider/terminal owner reachable
+inside the parked guardian's non-returning loop even after `EPIPE` or shutdown
+ambiguity. This is a
+terminal, non-retryable state after the sole recovery retry is consumed. It has
+no `ProviderReleaseProof` input and cannot publish `CFCMP`.
+
+This direct-child drain is the reviewed `0.144.4` cooperative shutdown
+contract, not a general process-tree absence theorem. In particular, it does
+not establish that an arbitrary non-child descendant which called `setsid(2)`
+has exited. Issue #55's zero-residue gate is limited to Calcifer-owned direct
+children and recorded known process groups plus identity-checked runtime, FD,
+and socket evidence. The checksum-pinned package smoke is intended
+to verify the narrower boundary Calcifer depends on: the official shell-command
+path can create such a detached probe without leaking eight live supervisor
+authority/control descriptors or denied supervisor/authentication environment
+into it. Accounting and containment for descendants that escape with
+`setsid(2)` is tracked separately by issue #56.
+
+Ubuntu 24.04 and macOS package CI jobs are configured to verify the official archive's
+architecture-specific SHA-256 and single executable before running three
+independently budgeted matrix scenarios behind one aggregate gate. `contracts`
+runs the complete #28 handoff probe plus the #54 live-turn drain, `setsid(2)`
+descriptor/environment-isolation, and typed-monitor success/redacted-error
+probes. `official-tui-normal` is designed to exercise the production
+coordinator/guardian session, PTY, fresh input gates, resize, and group-wide
+stop/continue path. `official-tui-recovery` independently targets #55's retained-
+cleanup recovery and four-proof deletion gate. Both official scenarios are
+designed to carry the completion endpoint across real package-parent-to-
+coordinator and coordinator-to-guardian `exec` boundaries; the parent is
+configured to check the provider-release-gated exact frame and EOF. The guardian
+helper shares the production guardian-bootstrap core, but the test-only role
+dispatcher does not execute the production
+`CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-
+anchor role. These tests use synthetic non-production state or credential-free
+loopback providers and do not authorize public supervised use by themselves.
+The normal scenario passed twice consecutively and retained recovery passed once
+from the 2026-07-20 Issue #54 candidate source on Apple silicon; the Ubuntu 24.04/macOS matrix remains
+pending. Both OS lanes execute the same prebuilt, exactly discovered libtest.
+The Linux lane has no native fallback: it runs inside a fresh namespace after
+enumerating interfaces through the current network namespace rather than an
+inherited sysfs mount. It permits only `lo` plus the exact nine upstream Linux
+fallback-tunnel names, forces every present fallback down, rejects an unknown
+interface before mutation, and proves that the fallback devices have no address
+or route and that only loopback is up. It then drops groups and every capability,
+sets `NoNewPrivs`, clears ambient environment authority, rejects inherited
+sockets, and revalidates those invariants before execution. The macOS lane is
+native functional evidence only.
+
+A separate non-ignored, credential-free deterministic fixture is configured for
+all seven closed recovery checkpoints: startup queued, ready, active, suspended,
+retained quiescing, retained restore pending, and retained cleanup pending. It is
+designed to use the exact production coordinator/guardian/session graph while a
+sealed `cfg(test)` compatibility seam and strict owner-private wrapper replace only
+official compatibility/provider behavior. Production builds parse neither the
+fixture selector nor compatibility override. A checkpoint is observation only:
+the fixture must first prove that it neither completes nor terminates the
+coordinator, then send the sole generation-bound `CFRCR` request. The first four
+checkpoints expect failed-clean with zero inference calls; the three retained
+checkpoints expect completed-clean with exactly one validated loopback inference
+call. Its fourth namespace proof also requires the identity-checked private
+compatibility stage parent to be empty. This is deterministic recovery-phase
+evidence, not Codex-version compatibility evidence. All seven cases passed three
+consecutive local runs from that candidate source; cross-platform CI readback remains
+pending.
+
+The package generation records one internal monotonic fence before spawn. Its
+cleanup path polls for normal completion, sends the one recovery request, wakes
+the exact coordinator only after a fresh stopped-state readback, waits the
+healthy lifecycle budget, and uses retained-`Child` TERM/KILL fallback only
+after that grace. Exact retained or otherwise unproved evidence interrupts this
+sequence immediately in the `cfg(test)` package harness: it emits a fixed,
+redacted failure subtype and terminates libtest with a fixed nonzero
+`_exit`-equivalent status while the exact coordinator `Child`, completion
+receiver, PTY, backend, and scratch Rust owners are still live. It runs no
+destructors, unproved TERM/KILL fallback, completion proof, deletion, or
+cleanup-success publication and produces no signal-driven core dump. This
+test-only exit closes the libtest descriptor table and makes hosted CI fail
+promptly; it is not production retained-owner behavior and proves nothing about
+descendants in another session. A bounded regression parent observes the parked
+helper's fixed readiness handshake before killing and reaping only that exact
+child. Production guardian/anchor retained owners continue to park concrete
+typed authority. A recovery-send error records only a consumed attempt with an
+unknown boundary; it does not claim write-half closure. Deletion still requires
+four independent proofs: exact coordinator-child wait; the exact
+provider-release-only
+`CFCMP\x01\r\n` record followed by EOF, which is not session or shell success;
+absence of every reported known process group; and an identity-checked empty
+runtime with zero retained FD and socket references. This is the full #55
+zero-residue scope; escaped sessions remain #56 work. CI is configured to
+isolate pinned contracts
+and the two official-TUI scenarios into dedicated Linux/macOS jobs behind one
+aggregate gate. The later command watchdog bounds the cargo/libtest process
+group, not provider descendants that
+call `setsid(2)`; catastrophic timeout delegates those escaped sessions to the
+ephemeral runner teardown and makes no Calcifer process-tree cleanup claim.
 
 If the coordinator dies while raw mode may be active, the guardian restores
 through its recovery tty before releasing B. If the guardian dies, the
@@ -314,7 +488,9 @@ The staged process topology, separate lifecycle/lease-transfer channels,
 readiness contract, macOS guardian-loss constraint, and public release gates
 are specified in [ADR 0003](adr/0003-supervised-codex-session.md).
 Its fake-child process and readiness-gated PTY foundations are implemented and
-default-unused; the following real-provider transaction remains planned.
+the pinned same-profile App Server/monitor/TUI integration is implemented and
+default-unused. The following pool, journal, handoff, and public-UX transaction
+remains planned.
 
 ```text
 resolve pinned profile or explicit pool
@@ -499,18 +675,20 @@ The current process launcher:
 - keep both interactive lease descriptors out of the provider process tree, so provider-started background tools cannot pin the profile after Codex exits;
 - retain the provider-side lease if the coordinator is selectively killed, and
   retain the coordinator-side lease if the guardian is selectively killed;
-- treat provider PIDs and process groups only as containment handles: the
-  internal fake-child supervisor foundation releases after the live guardian
-  reports trusted terminal child dispositions, is exactly waited, and closes
-  its selected lifecycle stream; unexpected guardian loss parks with the
-  coordinator lease held; the coordinator never turns previously reported
-  numeric PIDs into delayed signal authority, while the fixed fake children
-  use a guardian-liveness pipe to avoid orphaning on abrupt guardian death;
-- prove in the default-unused Unix terminal fixture that only the live guardian
-  signals the TUI group, HUP/TERM are forwarded once, INT/QUIT can remain
-  attached, WINCH is coalesced, and TSTP/CONT uses restore-before-stop plus a
-  fresh gate; wiring that policy to the official provider remains a public
-  release gate;
+- treat provider PIDs and process groups only as live containment handles: the
+  internal supervisor releases only through a consumed provider-release proof,
+  an exact guardian wait, the fixed provider-release record, and EOF; `CFCMP`
+  alone is never owner/session success; unexpected or
+  ambiguous loss parks with the relevant lease and process authority held, and
+  the coordinator never turns a previously reported numeric PID into delayed
+  signal authority;
+- exercise through the default-unused Unix supervisor that only the live
+  guardian signals the TUI group, HUP/TERM are forwarded once, INT/QUIT can
+  remain attached, WINCH is coalesced, and TSTP/CONT uses
+  restore-before-stop plus a fresh gate; the checksum-pinned
+  `official-tui-normal` scenario covers resize and group-wide stop/continue with
+  the official TUI and passed twice from that candidate source on Apple silicon, while
+  public supervised resume remains a release gate;
 - preserve ordinary child exit codes; the terminal fixture additionally
   preserves nonzero and terminating-signal disposition only after exact waits,
   restoration, recovery disarm, and final guardian proof;
@@ -598,8 +776,8 @@ Before the first stable release, the project still needs reviewed decisions or
 completed implementations for:
 
 - deliberate all-profile re-key recovery after identity-key loss;
-- real Codex/App Server/TUI and persistent-monitor integration on top of the
-  default-unused Linux/macOS process/PTY foundations in
+- public Linux/macOS supervised resume and active-session monitor/failover UX
+  on top of the default-unused pinned integration in
   [ADR 0003](adr/0003-supervised-codex-session.md), plus a separate Windows
   terminal and process-authority design;
 - additional Codex version/schema gates and observation cache TTL/backoff;
