@@ -201,6 +201,8 @@ struct OuterPtyChild {
     reaped: bool,
     kill_marker: PathBuf,
     retained_resolution_marker: Option<PathBuf>,
+    retained_publication_release_marker: Option<PathBuf>,
+    retained_pre_proof_release_marker: Option<PathBuf>,
     failure_quiescence_release_marker: Option<PathBuf>,
     entry_role: bool,
     master: File,
@@ -283,6 +285,18 @@ impl OuterPtyChild {
             kill_marker: fixture.markers.join("test.kill-coordinator"),
             retained_resolution_marker: (scenario == "pty-foreground-reclaim")
                 .then(|| fixture.markers.join("test.resolve-foreground-reclaim")),
+            retained_publication_release_marker: (scenario == "pty-foreground-reclaim").then(
+                || {
+                    fixture
+                        .markers
+                        .join("test.release-foreground-reclaim-publication")
+                },
+            ),
+            retained_pre_proof_release_marker: (scenario == "pty-foreground-reclaim").then(|| {
+                fixture
+                    .markers
+                    .join("test.release-foreground-reclaim-pre-proof")
+            }),
             failure_quiescence_release_marker: matches!(
                 scenario,
                 "pty-tui-exit-before-gate" | "pty-resume-failure"
@@ -712,13 +726,24 @@ impl OuterPtyChild {
         &self.capture
     }
 
-    fn force_kill_and_reap(&mut self) {
+    fn kill_exact_anchor_and_reap(&mut self, timeout: Duration) -> TestResult<ExitStatus> {
         if self.reaped {
-            return;
+            return Err(io::Error::other("the outer PTY anchor was already reaped").into());
         }
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("the outer PTY child was already consumed"))?;
+        // This exact direct Child is the sole cleanup authority for an anchor
+        // parked on unresolved Guardian proof. No marker PID or process-group
+        // observation is used to signal or reap it.
+        child.kill()?;
+        let status = wait_for_child(child, timeout)?;
+        self.reaped = true;
+        Ok(status)
+    }
+
+    fn force_kill_and_reap(&mut self) {
         // Ask the terminal anchor to kill its exact direct coordinator child
         // first. This keeps the synthetic shell session alive for guardian
         // restoration and prevents a failed test from orphaning a retained
@@ -733,6 +758,21 @@ impl OuterPtyChild {
         if let Some(resolution) = &self.retained_resolution_marker {
             let _ = write_private_release_marker_idempotent(resolution);
         }
+        if let Some(release) = &self.retained_pre_proof_release_marker {
+            let _ = write_private_release_marker_idempotent(release);
+        }
+        if let Some(release) = &self.retained_publication_release_marker {
+            let _ = write_private_release_marker_idempotent(release);
+        }
+        // `wait_for_marker` may have already reaped an anchor that violated
+        // the ordering contract. Publish cooperative Guardian releases before
+        // this early return so a failed assertion cannot orphan retained B.
+        if self.reaped {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
         if self.entry_role {
             signal_owned_process_group(child, rustix::process::Signal::TERM);
             if wait_for_child(child, DROP_CLEANUP_TIMEOUT).is_ok() {
@@ -1123,6 +1163,15 @@ esac
                 | "test.release-output"
                 | "test.resolve-cleanup"
                 | "test.resolve-foreground-reclaim"
+                | "test.hold-foreground-reclaim-publication"
+                | "test.probe-foreground-reclaim-anchor"
+                | "test.release-foreground-reclaim-publication"
+                | "test.exit-guardian-before-resolution-proof"
+                | "test.expire-foreground-reclaim-resolution"
+                | "test.fail-foreground-reclaim-first-wait"
+                | "test.fail-foreground-reclaim-verification"
+                | "test.hold-foreground-reclaim-pre-proof"
+                | "test.release-foreground-reclaim-pre-proof"
                 | "test.signal-hup"
                 | "test.signal-int"
                 | "test.signal-quit"
@@ -1151,6 +1200,26 @@ esac
             return Err(io::Error::other("test release marker was not owner-private").into());
         }
         self.assert_marker(name, b"release\n")
+    }
+
+    fn inject_coordinator_killed_marker_conflict(&self) -> TestResult {
+        let path = self.markers.join("coordinator.killed");
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        marker.write_all(b"conflict\n")?;
+        marker.sync_all()?;
+        let metadata = marker.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(io::Error::other("conflict marker was not owner-private").into());
+        }
+        self.assert_marker("coordinator.killed", b"conflict\n")
     }
 
     fn assert_marker_payloads_exclude(&self, needles: &[&[u8]]) -> TestResult {
@@ -2685,7 +2754,40 @@ fn gated_pty_foreground_reclaim_rejects_stale_fallback_without_clobber() -> Test
     fixture.wait_for_provider_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
     fixture.assert_marker_payloads_exclude(&[PRE_READY_SENTINEL, POST_READY_SENTINEL])?;
 
+    fixture.release_test_capability("test.hold-foreground-reclaim-publication")?;
     fixture.release_test_capability("test.resolve-foreground-reclaim")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.foreground-reclaim-trigger-observed",
+        b"observed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    fixture.release_test_capability("test.probe-foreground-reclaim-anchor")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.foreground-reclaim-resolution-held",
+        b"waiting\n",
+        PROCESS_TIMEOUT,
+    )?;
+    if coordinator.try_wait()?.is_some() {
+        return Err(io::Error::other(
+            "foreground reclaim trigger released the living anchor before resolution proof",
+        )
+        .into());
+    }
+    coordinator.assert_anchor_foreground()?;
+    coordinator.assert_raw_transition()?;
+    if original_process_is_gone(guardian, guardian)? {
+        return Err(io::Error::other(
+            "foreground reclaim trigger released retained guardian authority",
+        )
+        .into());
+    }
+    fixture.assert_marker_absent("guardian.foreground-reclaim-resolved")?;
+    fixture.wait_for_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+
+    fixture.release_test_capability("test.release-foreground-reclaim-publication")?;
     coordinator.wait_for_marker(
         &fixture,
         "guardian.foreground-reclaim-resolved",
@@ -2707,6 +2809,237 @@ fn gated_pty_foreground_reclaim_rejects_stale_fallback_without_clobber() -> Test
     fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
     fixture.assert_provider_untouched()?;
     Ok(())
+}
+
+#[test]
+fn gated_pty_foreground_reclaim_pre_proof_write_failure_retains_raw_anchor() -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("pty-foreground-reclaim")?;
+    let mut coordinator = OuterPtyChild::spawn(&fixture, "pty-foreground-reclaim")?;
+
+    fixture.release_test_capability("test.release-ready")?;
+    coordinator.wait_for_marker(&fixture, "gate.open", b"open\n", PROCESS_TIMEOUT)?;
+    coordinator.assert_raw_transition()?;
+    let guardian = fixture.read_pid_marker("guardian.pid")?;
+    let app = fixture.read_pid_marker("app.pid")?;
+    let tui = fixture.read_pid_marker("tui.pid")?;
+    fixture.assert_preserved_runtime(None)?;
+    fixture.wait_for_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+
+    fixture.release_test_capability("test.hold-foreground-reclaim-pre-proof")?;
+    coordinator.request_coordinator_kill()?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.foreground-reclaimed",
+        b"reclaimed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.foreground-reclaim-pre-proof-held",
+        b"waiting\n",
+        PROCESS_TIMEOUT,
+    )?;
+    fixture.inject_coordinator_killed_marker_conflict()?;
+    fixture.release_test_capability("test.release-foreground-reclaim-pre-proof")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.foreground-reclaim-resolution-error",
+        b"observation\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.foreground-reclaim-resolution-retained",
+        b"retained\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "terminal.restore-error",
+        b"not_foreground_process_group",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.foreground-reclaim-retained",
+        b"children-reaped\n",
+        PROCESS_TIMEOUT,
+    )?;
+    wait_pid_gone(app, app, CONTENDER_TIMEOUT)?;
+    wait_pid_gone(tui, tui, CONTENDER_TIMEOUT)?;
+
+    if coordinator.try_wait()?.is_some() {
+        return Err(io::Error::other("pre-proof write failure released the anchor").into());
+    }
+    coordinator.assert_anchor_foreground()?;
+    coordinator.assert_raw_transition()?;
+    fixture.assert_marker("coordinator.killed", b"conflict\n")?;
+    fixture.assert_marker_absent("anchor.restore-refused-observed")?;
+    fixture.assert_marker_absent("terminal.restored")?;
+    fixture.assert_marker_absent("guardian.foreground-reclaim-resolved")?;
+    fixture.assert_preserved_runtime(None)?;
+    if original_process_is_gone(guardian, guardian)? {
+        return Err(io::Error::other("pre-proof failure released Guardian authority").into());
+    }
+    fixture.wait_for_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+
+    fixture.release_test_capability("test.exit-guardian-before-resolution-proof")?;
+    fixture.release_test_capability("test.resolve-foreground-reclaim")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.foreground-reclaim-trigger-observed",
+        b"observed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    wait_pid_gone(guardian, guardian, CONTENDER_TIMEOUT)?;
+    fixture.assert_marker_absent("guardian.foreground-reclaim-resolved")?;
+    fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(0, CONTENDER_TIMEOUT)?;
+
+    let status = coordinator.kill_exact_anchor_and_reap(PROCESS_TIMEOUT)?;
+    if status.success() || status.signal().is_none() {
+        return Err(io::Error::other("exact anchor cleanup did not observe a signal exit").into());
+    }
+    coordinator.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+    fixture.assert_marker_absent("terminal.restored")?;
+    fixture.assert_marker_absent("guardian.foreground-reclaim-resolved")?;
+    fixture.assert_marker_payloads_exclude(&[PRE_READY_SENTINEL, POST_READY_SENTINEL])?;
+    fixture.assert_preserved_runtime(None)?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+fn assert_foreground_reclaim_pre_reap_fault_retains_raw_anchor(
+    fault_capability: &str,
+    fault_marker: &str,
+) -> TestResult {
+    let _serial = serial_guard();
+    let fixture = SupervisorCase::new("pty-foreground-reclaim")?;
+    let mut coordinator = OuterPtyChild::spawn(&fixture, "pty-foreground-reclaim")?;
+
+    fixture.release_test_capability("test.release-ready")?;
+    coordinator.wait_for_marker(&fixture, "gate.open", b"open\n", PROCESS_TIMEOUT)?;
+    coordinator.assert_raw_transition()?;
+    let guardian = fixture.read_pid_marker("guardian.pid")?;
+    let app = fixture.read_pid_marker("app.pid")?;
+    let tui = fixture.read_pid_marker("tui.pid")?;
+    assert_group_leader(guardian)?;
+    assert_group_leader(app)?;
+    assert_group_leader(tui)?;
+    fixture.assert_preserved_runtime(None)?;
+    fixture.wait_for_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(EXIT_BUSY, CONTENDER_TIMEOUT)?;
+
+    fixture.release_test_capability(fault_capability)?;
+    coordinator.request_coordinator_kill()?;
+    for (name, payload) in [
+        ("anchor.coordinator-frozen", b"stopped\n".as_slice()),
+        (fault_marker, b"injected\n".as_slice()),
+        ("coordinator.killed", b"killed\n".as_slice()),
+        (
+            "terminal.restore-error",
+            b"not_foreground_process_group".as_slice(),
+        ),
+        (
+            "guardian.foreground-reclaim-retained",
+            b"children-reaped\n".as_slice(),
+        ),
+        ("anchor.restore-refused-observed", b"observed\n".as_slice()),
+    ] {
+        coordinator.wait_for_marker(&fixture, name, payload, PROCESS_TIMEOUT)?;
+    }
+    wait_pid_gone(app, app, CONTENDER_TIMEOUT)?;
+    wait_pid_gone(tui, tui, CONTENDER_TIMEOUT)?;
+    if original_process_is_gone(guardian, guardian)? {
+        return Err(io::Error::other("guardian left before the exit fault was armed").into());
+    }
+
+    fixture.release_test_capability("test.exit-guardian-before-resolution-proof")?;
+    fixture.release_test_capability("test.resolve-foreground-reclaim")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "guardian.foreground-reclaim-trigger-observed",
+        b"observed\n",
+        PROCESS_TIMEOUT,
+    )?;
+    wait_pid_gone(guardian, guardian, CONTENDER_TIMEOUT)?;
+    fixture.assert_marker_absent("guardian.foreground-reclaim-resolved")?;
+
+    fixture.release_test_capability("test.probe-foreground-reclaim-anchor")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.foreground-reclaim-resolution-held",
+        b"waiting\n",
+        PROCESS_TIMEOUT,
+    )?;
+    if coordinator.try_wait()?.is_some() {
+        return Err(io::Error::other("missing proof released the living anchor").into());
+    }
+    coordinator.assert_anchor_foreground()?;
+    coordinator.assert_raw_transition()?;
+    fixture.assert_marker_absent("terminal.restored")?;
+    fixture.assert_marker_absent("guardian.foreground-reclaim-resolved")?;
+    fixture.assert_preserved_runtime(None)?;
+
+    // Guardian exit drops B, so both exclusion locks become available. The
+    // living raw anchor independently retains only its exact terminal snapshot
+    // and direct coordinator Child authority.
+    fixture.wait_for_contender(0, CONTENDER_TIMEOUT)?;
+    fixture.wait_for_provider_contender(0, CONTENDER_TIMEOUT)?;
+
+    fixture.release_test_capability("test.expire-foreground-reclaim-resolution")?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.foreground-reclaim-resolution-error",
+        b"missing\n",
+        PROCESS_TIMEOUT,
+    )?;
+    coordinator.wait_for_marker(
+        &fixture,
+        "anchor.foreground-reclaim-resolution-retained",
+        b"retained\n",
+        PROCESS_TIMEOUT,
+    )?;
+    if coordinator.try_wait()?.is_some() {
+        return Err(io::Error::other("unresolved proof released the retained anchor").into());
+    }
+    coordinator.assert_anchor_foreground()?;
+    coordinator.assert_raw_transition()?;
+    fixture.assert_marker_absent("terminal.restored")?;
+    fixture.assert_marker_absent("guardian.foreground-reclaim-resolved")?;
+    fixture.assert_marker_payloads_exclude(&[PRE_READY_SENTINEL, POST_READY_SENTINEL])?;
+
+    let status = coordinator.kill_exact_anchor_and_reap(PROCESS_TIMEOUT)?;
+    if status.success() || status.signal().is_none() {
+        return Err(io::Error::other("exact anchor cleanup did not observe a signal exit").into());
+    }
+    coordinator.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+    fixture.assert_marker_absent("terminal.restored")?;
+    fixture.assert_marker_absent("guardian.foreground-reclaim-resolved")?;
+    fixture.assert_preserved_runtime(None)?;
+    fixture.assert_provider_untouched()?;
+    Ok(())
+}
+
+#[test]
+fn gated_pty_foreground_reclaim_first_wait_failure_retry_reap_without_guardian_proof_retains_raw_anchor()
+-> TestResult {
+    assert_foreground_reclaim_pre_reap_fault_retains_raw_anchor(
+        "test.fail-foreground-reclaim-first-wait",
+        "anchor.foreground-reclaim-first-wait-failed",
+    )
+}
+
+#[test]
+fn gated_pty_foreground_reclaim_verification_failure_retry_reap_without_guardian_proof_retains_raw_anchor()
+-> TestResult {
+    assert_foreground_reclaim_pre_reap_fault_retains_raw_anchor(
+        "test.fail-foreground-reclaim-verification",
+        "anchor.foreground-reclaim-verification-failed",
+    )
 }
 
 #[test]

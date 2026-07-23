@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use super::super::handoff_compat::{
     CodexHandoffCapability, CodexHandoffError, CodexHandoffFailure, CodexHandoffResolution,
-    PinnedExecutableStage, PinnedStageError, verify_codex_handoff_compatibility,
+    CompatibilityTimeoutOrigin, PinnedExecutableStage, PinnedStageError,
+    verify_codex_handoff_compatibility,
 };
 #[cfg(test)]
 use super::super::handoff_compat::{PinnedStageCleanupFault, PinnedStageCreateFailure};
@@ -353,6 +354,10 @@ impl AuthorizedCompatibilityFailure {
         self.failure.cleanup_error()
     }
 
+    pub(super) const fn compatibility_timeout_origin(&self) -> Option<CompatibilityTimeoutOrigin> {
+        self.failure.timeout_origin()
+    }
+
     #[cfg(test)]
     pub(super) fn into_parts(self) -> (ProviderLaunchAuthorization, CodexHandoffFailure) {
         (self.authorization, self.failure)
@@ -389,6 +394,7 @@ impl fmt::Debug for AuthorizedCompatibilityFailure {
         formatter
             .debug_struct("AuthorizedCompatibilityFailure")
             .field("error", &self.error())
+            .field("timeout_origin", &self.compatibility_timeout_origin())
             .field("cleanup_error", &self.cleanup_error())
             .field("retained", &self.has_retained_probe_ownership())
             .finish_non_exhaustive()
@@ -420,6 +426,10 @@ impl AuthorizedCompatibilityResolution {
         self.resolution.cleanup_error()
     }
 
+    pub(super) const fn compatibility_timeout_origin(&self) -> Option<CompatibilityTimeoutOrigin> {
+        self.resolution.timeout_origin()
+    }
+
     pub(super) fn release(self) -> CodexHandoffError {
         let Self {
             authorization,
@@ -436,6 +446,7 @@ impl fmt::Debug for AuthorizedCompatibilityResolution {
         formatter
             .debug_struct("AuthorizedCompatibilityResolution")
             .field("error", &self.error())
+            .field("timeout_origin", &self.compatibility_timeout_origin())
             .field("cleanup_error", &self.cleanup_error())
             .finish_non_exhaustive()
     }

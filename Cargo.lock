@@ -116,6 +116,7 @@ dependencies = [
  "ureq",
  "uuid",
  "which",
+ "zeroize",
 ]
 
 [[package]]

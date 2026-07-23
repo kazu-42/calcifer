@@ -265,6 +265,7 @@ enum FixtureError {
     Process,
     Worker,
     Deadline,
+    ForegroundReclaimResolutionUnresolved,
     Invariant,
 }
 
@@ -281,6 +282,9 @@ impl std::fmt::Display for FixtureError {
             Self::Process => "fixture process operation failed",
             Self::Worker => "fixture worker failed",
             Self::Deadline => "fixture deadline expired",
+            Self::ForegroundReclaimResolutionUnresolved => {
+                "foreground reclaim resolution remains unresolved"
+            }
             Self::Invariant => "fixture invariant failed",
         })
     }

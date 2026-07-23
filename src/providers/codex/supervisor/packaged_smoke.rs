@@ -14,7 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -35,7 +35,8 @@ use super::channel::{
 };
 use super::coordinator::{
     CoordinatorBounds, CoordinatorRunOutcome, CoordinatorTerminalReport,
-    DescriptorIsolationTestSeam, ProductionCoordinator,
+    DescriptorIsolationTestSeam, PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS,
+    PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS, ProductionCoordinator,
 };
 use super::coordinator_terminal::CoordinatorTerminal;
 use super::entry::{
@@ -46,8 +47,8 @@ use super::guardian::{
     GuardianBounds, GuardianRunOutcome, GuardianSetupError, PACKAGED_APP_NOT_STARTED_MARKER,
     PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS, PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER,
     PACKAGED_STARTUP_FAILURE_MARKERS, PACKAGED_TUI_NOT_STARTED_MARKER, PackagedGuardianSeams,
-    ProductionGuardianConfig, run_production_guardian_with_test_seams,
-    write_packaged_startup_failure_marker,
+    PackagedSecondRetention, ProductionGuardianConfig, packaged_concrete_second_retention_for_test,
+    run_production_guardian_with_test_seams, write_packaged_startup_failure_marker,
 };
 use super::process::{ManagedGroupChild, shutdown_app_server_child};
 use super::protocol::{
@@ -65,7 +66,10 @@ use super::session::{
     PackagedSessionObservation, PackagedTuiOutputMatcher, arm_packaged_session_observation,
     take_packaged_session_observation,
 };
-use super::startup::{PACKAGED_APP_SOCKET_FAILURE_MARKERS, PACKAGED_COMPATIBILITY_FAILURE_MARKERS};
+use super::startup::{
+    PACKAGED_APP_SOCKET_FAILURE_MARKERS, PACKAGED_COMPATIBILITY_FAILURE_MARKERS,
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS,
+};
 use super::terminal::{
     PtyMaster, PtyOwner, RecoveryTty, TerminalChannelPair, TerminalEndpoint, TerminalSize,
     claim_controlling_terminal_from_stdin, termios_semantically_equal,
@@ -544,6 +548,7 @@ const PACKAGE_PS_PROCESS_FIELDS: &str = "pid=,pgid=,uid=,state=";
 // startup bound is deliberately wider than production's unchanged defaults.
 const PACKAGE_SUPERVISOR_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(180);
 const PACKAGE_SUPERVISOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+const PACKAGE_SUPERVISOR_OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 // The deterministic path still traverses compatibility, App, monitor, TUI
 // planning, and descriptor gates before the relay starts. Reserve a bounded
 // pre-relay interval plus the fixture's target-specific relay interval. If
@@ -614,6 +619,13 @@ const PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE: u8 = 86;
 const PACKAGE_UNPROVEN_CLEANUP_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
 const PACKAGE_UNPROVEN_CLEANUP_KILL_WAIT: Duration = Duration::from_secs(2);
 const PACKAGE_UNPROVEN_CLEANUP_DIAGNOSTIC_LIMIT: u64 = 4 * 1024;
+const PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV: &str =
+    "CALCIFER_PACKAGE_CONCRETE_SECOND_RETENTION_HELPER";
+const PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_TEST: &str = concat!(
+    "providers::codex::supervisor::packaged_smoke::",
+    "packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_until_owned_reap"
+);
+const PACKAGE_CONCRETE_SECOND_RETENTION_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES: [(RecoveryCheckpoint, &str); 7] = [
     (RecoveryCheckpoint::StartupQueued, "startup-queued-v1"),
@@ -1724,6 +1736,18 @@ impl FixedPackageStartupFailure {
     }
 }
 
+/// A closed, payload-free coordinator retention origin projected by the
+/// package harness. This diagnostic is independent of recovery authority and
+/// of the immutable primary/downstream-secondary failure ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedPackageCoordinatorOrigin(&'static str);
+
+impl FixedPackageCoordinatorOrigin {
+    const fn marker(self) -> &'static str {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackageStartupFailureMarkerProbe {
     Absent,
@@ -1789,7 +1813,9 @@ struct PackageRecoveryFailureEvidence {
     primary: Option<PackageRecoveryDriveFailure>,
     drive_context: Option<PackageRecoveryDriveFailure>,
     secondary: Option<&'static str>,
+    coordinator_origin: Option<FixedPackageCoordinatorOrigin>,
     retry_observations: PackageInitialGateRetryObservations,
+    recovery_case: Option<(PackageRecoveryTrigger, RecoveryCheckpoint)>,
 }
 
 impl PackageRecoveryFailureEvidence {
@@ -1822,8 +1848,23 @@ impl PackageRecoveryFailureEvidence {
         self.secondary.get_or_insert(candidate);
     }
 
+    fn snapshot_coordinator_origin(&mut self, candidate: Option<FixedPackageCoordinatorOrigin>) {
+        let Some(candidate) = candidate else {
+            return;
+        };
+        self.coordinator_origin.get_or_insert(candidate);
+    }
+
     fn snapshot_retry_observations(&mut self, observations: PackageInitialGateRetryObservations) {
         self.retry_observations.merge(observations);
+    }
+
+    fn snapshot_recovery_case(
+        &mut self,
+        trigger: PackageRecoveryTrigger,
+        checkpoint: RecoveryCheckpoint,
+    ) {
+        self.recovery_case.get_or_insert((trigger, checkpoint));
     }
 
     const fn primary_marker(self) -> Option<&'static str> {
@@ -1841,8 +1882,21 @@ impl PackageRecoveryFailureEvidence {
         self.secondary
     }
 
+    const fn coordinator_origin(self) -> Option<FixedPackageCoordinatorOrigin> {
+        self.coordinator_origin
+    }
+
     const fn retry_observations(self) -> PackageInitialGateRetryObservations {
         self.retry_observations
+    }
+
+    const fn recovery_case_marker(self) -> Option<&'static str> {
+        match self.recovery_case {
+            Some((trigger, checkpoint)) => {
+                Some(package_recovery_case_failure_marker(trigger, checkpoint))
+            }
+            None => None,
+        }
     }
 }
 
@@ -2095,7 +2149,7 @@ const fn package_checkpoint_wait_failure_marker(error: CompletionError) -> &'sta
     }
 }
 
-fn record_package_diagnostic_marker(report: &Path, marker: &'static str) {
+pub(super) fn record_package_diagnostic_marker(report: &Path, marker: &'static str) {
     // Package observers run concurrently with the helper processes that emit
     // these diagnostics. Publish by no-replace rename so a visible marker is
     // always the complete immutable payload, including when two helpers race
@@ -3079,6 +3133,139 @@ fn package_phase_markers_are_private_monotonic_and_retention_has_priority()
 }
 
 #[test]
+fn package_coordinator_origin_scanner_is_closed_error_first_and_separate_from_failure_ordering()
+-> Result<(), Box<dyn Error>> {
+    let catalog: BTreeSet<_> = fixed_package_coordinator_origin_catalog().collect();
+    assert_eq!(
+        catalog.len(),
+        PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS.len()
+            + PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS.len(),
+        "the coordinator origin catalogs overlapped or contained duplicates"
+    );
+    assert!(
+        PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS
+            .iter()
+            .all(|marker| {
+                marker.is_ascii()
+                    && marker.starts_with("coordinator-retained.error.")
+                    && !marker.contains('/')
+                    && !marker.contains(' ')
+            })
+    );
+    assert!(
+        PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS
+            .iter()
+            .all(|marker| {
+                marker.is_ascii()
+                    && marker.starts_with("coordinator-retained.reason.")
+                    && !marker.contains('/')
+                    && !marker.contains(' ')
+            })
+    );
+
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+
+    for marker in fixed_package_coordinator_origin_catalog() {
+        let path = report.join(marker);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            latest_fixed_package_coordinator_origin_from_report(&report),
+            Some(FixedPackageCoordinatorOrigin(marker))
+        );
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a coordinator-only diagnostic entered the primary/secondary failure catalog"
+        );
+        fs::remove_file(path)?;
+    }
+
+    let fallback_reason = PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[0];
+    let exact_error = PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS
+        [PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS.len() - 1];
+    write_private_new(&report.join(fallback_reason), b"classified\n")?;
+    assert_eq!(
+        latest_fixed_package_coordinator_origin_from_report(&report),
+        Some(FixedPackageCoordinatorOrigin(fallback_reason))
+    );
+    write_private_new(&report.join(exact_error), b"classified\n")?;
+    assert_eq!(
+        latest_fixed_package_coordinator_origin_from_report(&report),
+        Some(FixedPackageCoordinatorOrigin(exact_error)),
+        "a broader retention reason masked the exact coordinator error"
+    );
+    fs::remove_file(report.join(exact_error))?;
+    assert_eq!(
+        latest_fixed_package_coordinator_origin_from_report(&report),
+        Some(FixedPackageCoordinatorOrigin(fallback_reason))
+    );
+    fs::remove_file(report.join(fallback_reason))?;
+
+    for rejected in [
+        "coordinator-retained.error",
+        "coordinator-retained.reason",
+        "coordinator-retained.error.user-controlled",
+        "coordinator-retained.reason.user-controlled",
+        "coordinator-retained.error.deadline.extended",
+        "coordinator-retained.reason.lifecycle-lost.extended",
+    ] {
+        let path = report.join(rejected);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            latest_fixed_package_coordinator_origin_from_report(&report),
+            None,
+            "a prefix-only, unknown, or extended coordinator origin was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    let marker = PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[0];
+    let marker_path = report.join(marker);
+    for payload in [
+        b"payload\n".as_slice(),
+        b"classified\nprivate-payload".as_slice(),
+    ] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            latest_fixed_package_coordinator_origin_from_report(&report),
+            None,
+            "payload-bearing or oversized coordinator evidence was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("coordinator-origin-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        latest_fixed_package_coordinator_origin_from_report(&report),
+        None,
+        "a symlinked coordinator origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        latest_fixed_package_coordinator_origin_from_report(&report),
+        None,
+        "a hardlinked coordinator origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        latest_fixed_package_coordinator_origin_from_report(&report),
+        None,
+        "a wrong-mode coordinator origin was trusted"
+    );
+    fs::remove_file(marker_path)?;
+    scratch.cleanup()
+}
+
+#[test]
 fn package_failure_report_scanner_bridges_only_the_closed_compatibility_catalog()
 -> Result<(), Box<dyn Error>> {
     use std::collections::BTreeSet;
@@ -3115,6 +3302,167 @@ fn package_failure_report_scanner_bridges_only_the_closed_compatibility_catalog(
         None,
         "the scanner must not return a prefix match or a raw report filename"
     );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_failure_report_scanner_bridges_only_trusted_compatibility_timeout_origins()
+-> Result<(), Box<dyn Error>> {
+    use std::collections::BTreeSet;
+
+    let catalog: BTreeSet<_> = PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        catalog.len(),
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.len()
+    );
+    assert!(catalog.iter().all(|marker| {
+        marker.is_ascii()
+            && marker.starts_with("startup-failure.compatibility.timeout-origin.")
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
+
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    for marker in PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
+        .iter()
+        .copied()
+    {
+        let path = report.join(marker);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some(marker)
+        );
+        fs::remove_file(path)?;
+    }
+
+    let origin = PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS[4];
+    let subtype = "startup-failure.compatibility.subtype.timeout";
+    write_private_new(&report.join(subtype), b"classified\n")?;
+    write_private_new(&report.join(origin), b"classified\n")?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some(origin),
+        "the exact timeout origin must outrank its public timeout subtype"
+    );
+    fs::remove_file(report.join(origin))?;
+    fs::remove_file(report.join(subtype))?;
+
+    for unknown in [
+        "startup-failure.compatibility.timeout-origin",
+        "startup-failure.compatibility.timeout-origin.user-controlled",
+        "startup-failure.compatibility.timeout-origin.version-child-exit.private",
+    ] {
+        let path = report.join(unknown);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a prefix, unknown, or extended timeout origin was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    let marker_path = report.join(origin);
+    for payload in [b"private\n".as_slice(), b"classified\nprivate\n".as_slice()] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a payload-bearing timeout origin was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("timeout-origin-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a symlinked timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a hardlinked timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a wrong-mode timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let fifo_status = Command::new("/usr/bin/mkfifo").arg(&marker_path).status()?;
+    if !fifo_status.success() {
+        return Err("could not create the compatibility timeout-origin FIFO fixture".into());
+    }
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a FIFO timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let socket_source = scratch.root.join("z");
+    let socket_listener = UnixListener::bind(&socket_source)?;
+    fs::set_permissions(&socket_source, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&socket_source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a socket timeout origin was trusted"
+    );
+    drop(socket_listener);
+    fs::remove_file(marker_path)?;
+    scratch.cleanup()
+}
+
+#[test]
+fn package_initial_gate_prefers_compatibility_origin_then_subtype_then_generic()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let generic = "startup-failure.compatibility";
+    let subtype = "startup-failure.compatibility.subtype.timeout";
+    let origin = "startup-failure.compatibility.timeout-origin.version-child-exit";
+    for marker in [generic, subtype, origin] {
+        write_private_new(&report.join(marker), b"classified\n")?;
+    }
+
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(origin)),
+        "the compatibility subtype or generic marker masked its exact timeout origin"
+    );
+    fs::remove_file(report.join(origin))?;
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(subtype)),
+        "the generic marker masked its compatibility subtype"
+    );
+    fs::remove_file(report.join(subtype))?;
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(generic))
+    );
+
+    fs::remove_file(report.join(generic))?;
     scratch.cleanup()
 }
 
@@ -3673,21 +4021,48 @@ fn package_recovery_failure_evidence_is_immutable_distinct_and_causally_typed()
     let drive = PackageRecoveryDriveFailure::InitialGate;
     let later_terminal =
         "startup-failure.session-readiness.subtype.terminal-pump.terminal-channel-write";
+    let coordinator_origin =
+        FixedPackageCoordinatorOrigin(PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10]);
+    let later_coordinator_origin =
+        FixedPackageCoordinatorOrigin(PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[7]);
     let startup = FixedPackageStartupFailure::from_marker(later_terminal)
         .ok_or("the closed startup catalog did not construct fixed evidence")?;
 
     let mut unselected = PackageRecoveryFailureEvidence::default();
+    assert_eq!(unselected.recovery_case_marker(), None);
     unselected.snapshot_secondary(Some(later_terminal));
+    unselected.snapshot_coordinator_origin(Some(coordinator_origin));
+    unselected.snapshot_coordinator_origin(Some(later_coordinator_origin));
     assert_eq!(
         unselected.secondary_marker(),
         None,
         "a candidate without a selected primary became duplicate secondary evidence"
+    );
+    assert_eq!(
+        unselected.coordinator_origin(),
+        Some(coordinator_origin),
+        "the independent coordinator origin was gated on a recovery primary or overwritten"
+    );
+
+    unselected.snapshot_recovery_case(
+        PackageRecoveryTrigger::GenerationBoundRequest,
+        RecoveryCheckpoint::Ready,
+    );
+    unselected.snapshot_recovery_case(
+        PackageRecoveryTrigger::OwnerEof,
+        RecoveryCheckpoint::Suspended,
+    );
+    assert_eq!(
+        unselected.recovery_case_marker(),
+        Some("recovery.case-failed.request.ready-v1"),
+        "a later recovery matrix cell overwrote the initiating case"
     );
 
     let mut drive_evidence = PackageRecoveryFailureEvidence::default();
     drive_evidence.snapshot_error(&drive);
     drive_evidence.snapshot_error(&PackageRecoveryDriveFailure::RawMode);
     drive_evidence.snapshot_secondary(Some(drive.marker()));
+    drive_evidence.snapshot_coordinator_origin(Some(coordinator_origin));
     assert_eq!(
         drive_evidence.primary_marker(),
         Some(PackageRecoveryDriveFailure::InitialGate.marker())
@@ -3696,6 +4071,20 @@ fn package_recovery_failure_evidence_is_immutable_distinct_and_causally_typed()
     drive_evidence.snapshot_secondary(Some(later_terminal));
     drive_evidence.snapshot_secondary(Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[1]));
     assert_eq!(drive_evidence.secondary_marker(), Some(later_terminal));
+    drive_evidence.snapshot_coordinator_origin(Some(later_coordinator_origin));
+    assert_eq!(
+        drive_evidence.coordinator_origin(),
+        Some(coordinator_origin),
+        "a later coordinator diagnostic overwrote the initiating origin"
+    );
+    assert_ne!(
+        drive_evidence.primary_marker(),
+        Some(coordinator_origin.marker())
+    );
+    assert_ne!(
+        drive_evidence.secondary_marker(),
+        Some(coordinator_origin.marker())
+    );
 
     let startup_error = PackageRecoveryStartupDriveFailure::new(startup, drive);
     let mut startup_evidence = PackageRecoveryFailureEvidence::default();
@@ -4961,7 +5350,8 @@ fn packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_
     combine_package_exercise_and_cleanup_with_evidence(
         exercise,
         cleanup,
-        PackageOperationFailureEvidence::primary(exercise_phase),
+        PackageOperationFailureEvidence::primary(exercise_phase)
+            .with_coordinator_origin(harness.latest_fixed_coordinator_origin()),
         cleanup_phase,
         None,
         handoff_probe_phase,
@@ -5028,6 +5418,7 @@ fn packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proof
         recovery,
         cleanup,
         PackageOperationFailureEvidence::new(recovery_phase, recovery_secondary_failure)
+            .with_coordinator_origin(harness.latest_fixed_coordinator_origin())
             .with_retry_observations(recovery_retry_observations),
         cleanup_phase,
         None,
@@ -5351,6 +5742,7 @@ fn packaged_deterministic_drive_failure_consumes_recovery_and_cleans() -> Result
         exercise,
         cleanup,
         PackageOperationFailureEvidence::new(exercise_phase, exercise_secondary_failure)
+            .with_coordinator_origin(harness.latest_fixed_coordinator_origin())
             .with_retry_observations(exercise_retry_observations),
         cleanup_phase,
         Some(package_recovery_case_failure_marker(
@@ -5437,6 +5829,29 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
         Some(startup_marker),
         "the generic startup alias masked the exact reproduced secondary evidence"
     );
+    let coordinator_origin_marker = PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[5];
+    let coordinator_reason_marker = PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[7];
+    assert_eq!(
+        harness.latest_fixed_coordinator_origin(),
+        Some(FixedPackageCoordinatorOrigin(coordinator_origin_marker)),
+        "the real retained coordinator origin was not published before parent recovery"
+    );
+    assert!(
+        fixed_package_failure_marker_is_valid(&report, coordinator_origin_marker),
+        "the exact coordinator error was not durably published"
+    );
+    assert!(
+        fixed_package_failure_marker_is_valid(&report, coordinator_reason_marker),
+        "the broader coordinator reason was not durably published after its exact error"
+    );
+    assert!(
+        !report.join("coordinator.report").exists(),
+        "the origin assertions did not exercise a live retained coordinator"
+    );
+    assert!(
+        started.elapsed() < PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT,
+        "the markers were published only after the coordinator's long Guardian wait"
+    );
 
     let second = PackageGenerationCleanupOperations::request_recovery_once(
         &mut harness,
@@ -5498,6 +5913,11 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
         Some(startup_marker),
         "started-generation cleanup changed the immutable causal evidence"
     );
+    assert_eq!(
+        retained_failure_evidence.coordinator_origin(),
+        Some(FixedPackageCoordinatorOrigin(coordinator_origin_marker)),
+        "started-generation cleanup changed the immutable coordinator origin"
+    );
     let retry_observations = retained_failure_evidence.retry_observations();
     drop(harness);
 
@@ -5536,6 +5956,7 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
                 retained_failure_evidence.primary_marker(),
                 retained_failure_evidence.secondary_marker(),
             )
+            .with_coordinator_origin(retained_failure_evidence.coordinator_origin())
             .with_retry_observations(retry_observations),
             cleanup_phase,
             Some(recovery_case),
@@ -5550,6 +5971,10 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
     assert!(combined_failure.exercise_failed);
     assert!(!combined_failure.cleanup_failed);
     assert_eq!(combined_failure.exercise_phase, Some(primary));
+    assert_eq!(
+        combined_failure.coordinator_origin,
+        Some(FixedPackageCoordinatorOrigin(coordinator_origin_marker))
+    );
     assert_eq!(
         combined_failure.secondary_failure_detail,
         Some(startup_marker)
@@ -5574,6 +5999,251 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
         "explicit evidence cleanup left real early-startup scratch behind"
     );
     Ok(())
+}
+
+#[test]
+fn packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_until_owned_reap()
+-> Result<(), Box<dyn Error>> {
+    if let Some(mode) = std::env::var_os(PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV) {
+        if mode != OsStr::new("1") {
+            return Err("the concrete second-retention helper mode was invalid".into());
+        }
+        return run_packaged_concrete_second_retention_helper();
+    }
+
+    let _process_guard = package_process_test_guard();
+    let mut scratch = OwnedConcreteSecondRetentionScratch::create()?;
+    let report = scratch.root().join("supervisor-report");
+    private_directory(&report)?;
+    let mut child = OwnedConcreteSecondRetentionChild::spawn(scratch.root())?;
+    let ordered_second_retention = [
+        "guardian-recovery.retained.reason.cleanup-unconfirmed",
+        "guardian-recovery.retained.owner.startup-cleanup",
+        "guardian-recovery.retained",
+    ];
+
+    // The same helper used by the package Guardian writes this exact array
+    // sequentially and then enters the generation's non-returning park.
+    // Observing the generic marker is therefore the last publication barrier;
+    // it can never grant wait, signal, release, or cleanup authority back to
+    // the parent.
+    child.wait_for_marker(
+        &report.join(ordered_second_retention[2]),
+        b"classified\n",
+        Instant::now() + PACKAGE_CONCRETE_SECOND_RETENTION_CHILD_TIMEOUT,
+    )?;
+    for marker in ordered_second_retention {
+        let path = report.join(marker);
+        let metadata = fs::symlink_metadata(&path)?;
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(
+            read_private_bounded(&path, b"classified\n".len())?,
+            b"classified\n"
+        );
+    }
+    for conflicting in PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS {
+        if !ordered_second_retention.contains(&conflicting) {
+            assert!(
+                !report.join(conflicting).exists(),
+                "the concrete second retention published a conflicting marker"
+            );
+        }
+    }
+    child.assert_stably_live_after_publication()?;
+    child.terminate_parked_and_reap()?;
+    let root = scratch.root().to_path_buf();
+    scratch.cleanup()?;
+    assert!(
+        !root.exists(),
+        "second-retention cleanup left scratch residue"
+    );
+    Ok(())
+}
+
+fn publish_packaged_second_retention_and_park(
+    report: &Path,
+    mut retained: impl PackagedSecondRetention,
+) -> ! {
+    let (budget_consumed, markers) = {
+        let generation = retained.generation();
+        (
+            generation.packaged_recovery_budget_is_consumed_and_exhausted(),
+            generation.packaged_recovery_marker_names(),
+        )
+    };
+    if !budget_consumed {
+        retained.park();
+    }
+    for marker in markers {
+        record_package_diagnostic_marker(report, marker);
+    }
+    retained.park()
+}
+
+fn run_packaged_concrete_second_retention_helper() -> Result<(), Box<dyn Error>> {
+    let root = package_supervisor_root()?;
+    let report = checked_package_subdirectory(&root, "supervisor-report")?;
+    let retained = packaged_concrete_second_retention_for_test()?;
+    publish_packaged_second_retention_and_park(&report, retained)
+}
+
+struct OwnedConcreteSecondRetentionScratch {
+    scratch: Option<PackageScratch>,
+    root: PathBuf,
+}
+
+impl OwnedConcreteSecondRetentionScratch {
+    fn create() -> Result<Self, Box<dyn Error>> {
+        let scratch = PackageScratch::create()?;
+        let root = scratch.root.clone();
+        Ok(Self {
+            scratch: Some(scratch),
+            root,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn cleanup(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scratch
+            .take()
+            .ok_or("the concrete second-retention scratch was already cleaned")?
+            .cleanup()
+    }
+}
+
+impl Drop for OwnedConcreteSecondRetentionScratch {
+    fn drop(&mut self) {
+        if let Some(scratch) = self.scratch.take() {
+            let _ = scratch.cleanup();
+        }
+    }
+}
+
+struct OwnedConcreteSecondRetentionChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl OwnedConcreteSecondRetentionChild {
+    fn spawn(root: &Path) -> Result<Self, Box<dyn Error>> {
+        let helper = fs::canonicalize(std::env::current_exe()?)?;
+        let mut command = Command::new(helper);
+        command
+            .args([
+                "--exact",
+                PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV, "1")
+            .env(PACKAGE_SUPERVISOR_ROOT_ENV, root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let child = command.spawn()?;
+        drop(command);
+        Ok(Self {
+            child,
+            reaped: false,
+        })
+    }
+
+    fn wait_for_marker(
+        &mut self,
+        path: &Path,
+        expected: &[u8],
+        deadline: Instant,
+    ) -> Result<(), Box<dyn Error>> {
+        loop {
+            match read_private_bounded(path, expected.len().saturating_add(1)) {
+                Ok(bytes) if bytes == expected => return Ok(()),
+                Ok(_) => return Err("the concrete second-retention marker was invalid".into()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                return Err(format!(
+                    "the concrete second-retention child exited before publication: {status}"
+                )
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err("the concrete second-retention marker exceeded its deadline".into());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_stably_live_after_publication(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.child.try_wait()?.is_some() {
+            self.reaped = true;
+            return Err("the concrete retained owner exited at publication".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+        if self.child.try_wait()?.is_some() {
+            self.reaped = true;
+            return Err("the concrete retained owner did not remain live".into());
+        }
+        Ok(())
+    }
+
+    fn terminate_parked_and_reap(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.reaped {
+            return Err("the concrete second-retention child was already reaped".into());
+        }
+        if let Some(status) = self.child.try_wait()? {
+            self.reaped = true;
+            return Err(format!(
+                "the concrete retained owner exited before owned termination: {status}"
+            )
+            .into());
+        }
+        self.child.kill()?;
+        let status = self.child.wait()?;
+        self.reaped = true;
+        if status.signal() != Some(rustix::process::Signal::KILL.as_raw()) {
+            return Err(format!(
+                "the concrete retained owner was not killed and reaped exactly: {status}"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn kill_and_reap(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.reaped {
+            return Ok(());
+        }
+        if self.child.try_wait()?.is_none() {
+            match self.child.kill() {
+                Ok(()) => {}
+                Err(error) => {
+                    if self.child.try_wait()?.is_none() {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        self.child.wait()?;
+        self.reaped = true;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedConcreteSecondRetentionChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.kill_and_reap();
+    }
 }
 
 #[test]
@@ -5696,6 +6366,13 @@ fn run_deterministic_recovery_case_with_trigger(
         checkpoint,
         suite_budget,
     )?;
+    harness
+        .recovery_failure_evidence
+        .snapshot_recovery_case(trigger, checkpoint);
+    let recovery_case = harness
+        .recovery_failure_evidence
+        .recovery_case_marker()
+        .ok_or("the selected package recovery case was not snapshotted")?;
     let exercise = (|| -> Result<(), Box<dyn Error>> {
         harness.trigger_selected_recovery(trigger)?;
         let second = PackageGenerationCleanupOperations::request_recovery_once(
@@ -5757,9 +6434,10 @@ fn run_deterministic_recovery_case_with_trigger(
         exercise,
         cleanup,
         PackageOperationFailureEvidence::new(exercise_phase, exercise_secondary_failure)
+            .with_coordinator_origin(harness.latest_fixed_coordinator_origin())
             .with_retry_observations(exercise_retry_observations),
         cleanup_phase,
-        Some(package_recovery_case_failure_marker(trigger, checkpoint)),
+        Some(recovery_case),
         harness.latest_handoff_probe_phase(),
         preserved_evidence_root,
     )?;
@@ -7174,6 +7852,19 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
         let causal = std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV)
             .is_some_and(|mode| mode == PACKAGE_UNPROVEN_CLEANUP_CAUSAL_EXIT_HELPER_MODE);
         let (_output_sender, output_result) = mpsc::sync_channel(1);
+        let handoff_probe_observation = PackageHandoffProbeObservation::new();
+        let output_worker = if causal {
+            for (phase, _) in PACKAGE_HANDOFF_PROBE_PHASES[..8].iter().copied() {
+                assert!(handoff_probe_observation.advance(phase));
+            }
+            Some(thread::spawn(|| {
+                loop {
+                    thread::park();
+                }
+            }))
+        } else {
+            None
+        };
         let mut harness = OfficialTuiPackageHarness {
             _provider_suite_budget: PackageProviderSuiteBudget::Deterministic {
                 _lease: PackageDeterministicSuiteLease {
@@ -7199,9 +7890,9 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             output_result,
             startup_sentinel_observed: None,
             response_sentinel_observed: None,
-            output_worker: None,
+            output_worker,
             output_finished: true,
-            last_handoff_probe_phase: None,
+            handoff_probe_observation,
             recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
             last_fixed_failure_detail: None,
             last_fixed_cleanup_failure_detail: None,
@@ -7210,9 +7901,18 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             harness
                 .recovery_failure_evidence
                 .snapshot_error(&PackageRecoveryDriveFailure::InitialGate);
+            harness.recovery_failure_evidence.snapshot_recovery_case(
+                PackageRecoveryTrigger::GenerationBoundRequest,
+                RecoveryCheckpoint::RetainedCleanupPending,
+            );
             harness
                 .recovery_failure_evidence
                 .snapshot_secondary(Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]));
+            harness
+                .recovery_failure_evidence
+                .snapshot_coordinator_origin(Some(FixedPackageCoordinatorOrigin(
+                    PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10],
+                )));
             let mut retry_observations = PackageInitialGateRetryObservations::NONE;
             retry_observations.insert(PackageInitialGateRetryObservation::StartupScan);
             retry_observations.insert(PackageInitialGateRetryObservation::MarkerRead);
@@ -7250,10 +7950,20 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
         "unproven package cleanup did not exit with its fixed status"
     );
     assert_eq!(output.status.signal(), None);
-    assert!(output.diagnostic.contains(concat!(
-        "package-generation-cleanup-unproven:",
-        "phase=scratch-missing,failure=unclassified,secondary=none,retry_observations=none"
-    )));
+    let projected: Vec<_> = output
+        .diagnostic
+        .lines()
+        .filter(|line| line.starts_with("package-generation-cleanup-unproven:"))
+        .collect();
+    assert_eq!(
+        projected,
+        [concat!(
+            "package-generation-cleanup-unproven:",
+            "phase=scratch-missing,failure=unclassified,secondary=none,handoff_probe_phase=none,",
+            "retry_observations=none,",
+            "coordinator_origin=none,recovery_case=none"
+        )]
+    );
     assert!(
         !output
             .diagnostic
@@ -7270,16 +7980,27 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
         Some(i32::from(PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE))
     );
     assert_eq!(causal.status.signal(), None);
-    assert!(causal.diagnostic.contains(&format!(
+    let expected_causal_projection = format!(
         concat!(
             "package-generation-cleanup-unproven:",
-            "phase=scratch-missing,failure={},secondary={},retry_observations={},{}"
+            "phase=scratch-missing,failure={},secondary={},handoff_probe_phase={},",
+            "retry_observations={},{}",
+            ",coordinator_origin={},recovery_case={}"
         ),
         PackageRecoveryDriveFailure::InitialGate.marker(),
         PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0],
+        PackageHandoffProbePhase::ForkResponseValidated.fixed_label(),
         PackageInitialGateRetryObservation::MarkerRead.marker(),
-        PackageInitialGateRetryObservation::StartupScan.marker()
-    )));
+        PackageInitialGateRetryObservation::StartupScan.marker(),
+        PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10],
+        "recovery.case-failed.request.retained-cleanup-pending-v1"
+    );
+    let causal_projected: Vec<_> = causal
+        .diagnostic
+        .lines()
+        .filter(|line| line.starts_with("package-generation-cleanup-unproven:"))
+        .collect();
+    assert_eq!(causal_projected, [expected_causal_projection.as_str()]);
     assert!(!causal.diagnostic.contains("private provider payload"));
     assert!(!causal.diagnostic.contains("credential"));
     assert!(
@@ -7718,7 +8439,7 @@ struct OfficialTuiPackageHarness {
     response_sentinel_observed: Option<Receiver<()>>,
     output_worker: Option<JoinHandle<()>>,
     output_finished: bool,
-    last_handoff_probe_phase: Option<PackageHandoffProbePhase>,
+    handoff_probe_observation: PackageHandoffProbeObservation,
     recovery_failure_evidence: PackageRecoveryFailureEvidence,
     last_fixed_failure_detail: Option<&'static str>,
     last_fixed_cleanup_failure_detail: Option<&'static str>,
@@ -7971,6 +8692,7 @@ struct PackageExerciseCleanupFailure {
     exercise_failed: bool,
     cleanup_failed: bool,
     exercise_phase: Option<&'static str>,
+    coordinator_origin: Option<FixedPackageCoordinatorOrigin>,
     secondary_failure_detail: Option<&'static str>,
     retry_observations: PackageInitialGateRetryObservations,
     cleanup_phase: Option<&'static str>,
@@ -7982,6 +8704,7 @@ struct PackageExerciseCleanupFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackageOperationFailureEvidence {
     primary: Option<&'static str>,
+    coordinator_origin: Option<FixedPackageCoordinatorOrigin>,
     secondary: Option<&'static str>,
     retry_observations: PackageInitialGateRetryObservations,
 }
@@ -7990,6 +8713,7 @@ impl PackageOperationFailureEvidence {
     const fn new(primary: Option<&'static str>, secondary: Option<&'static str>) -> Self {
         Self {
             primary,
+            coordinator_origin: None,
             secondary,
             retry_observations: PackageInitialGateRetryObservations::NONE,
         }
@@ -8006,6 +8730,14 @@ impl PackageOperationFailureEvidence {
         self.retry_observations = retry_observations;
         self
     }
+
+    const fn with_coordinator_origin(
+        mut self,
+        coordinator_origin: Option<FixedPackageCoordinatorOrigin>,
+    ) -> Self {
+        self.coordinator_origin = coordinator_origin;
+        self
+    }
 }
 
 impl fmt::Debug for PackageExerciseCleanupFailure {
@@ -8015,6 +8747,7 @@ impl fmt::Debug for PackageExerciseCleanupFailure {
             .field("exercise_failed", &self.exercise_failed)
             .field("cleanup_failed", &self.cleanup_failed)
             .field("exercise_phase", &self.exercise_phase)
+            .field("coordinator_origin", &self.coordinator_origin)
             .field("secondary_failure_detail", &self.secondary_failure_detail)
             .field("retry_observations", &self.retry_observations)
             .field("cleanup_phase", &self.cleanup_phase)
@@ -8035,6 +8768,9 @@ impl fmt::Display for PackageExerciseCleanupFailure {
         }?;
         if let Some(phase) = self.exercise_phase {
             write!(formatter, " at fixed phase {phase}")?;
+        }
+        if let Some(origin) = self.coordinator_origin {
+            write!(formatter, "; fixed coordinator origin {}", origin.marker())?;
         }
         if let Some(detail) = self.secondary_failure_detail {
             write!(formatter, "; fixed secondary failure {detail}")?;
@@ -8155,6 +8891,7 @@ fn combine_package_exercise_and_cleanup_with_evidence(
             exercise_failed: exercise.is_err(),
             cleanup_failed: cleanup.is_err(),
             exercise_phase: failure_evidence.primary,
+            coordinator_origin: failure_evidence.coordinator_origin,
             secondary_failure_detail: failure_evidence.secondary,
             retry_observations: failure_evidence.retry_observations,
             cleanup_phase,
@@ -8166,7 +8903,8 @@ fn combine_package_exercise_and_cleanup_with_evidence(
 }
 
 fn package_operation_failure_can_finalize_during_cleanup(marker: &'static str) -> bool {
-    PACKAGED_COMPATIBILITY_FAILURE_MARKERS.contains(&marker)
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.contains(&marker)
+        || PACKAGED_COMPATIBILITY_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_APP_SOCKET_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.contains(&marker)
         || PACKAGE_JOB_CONTROL_FAILURE_MARKERS.contains(&marker)
@@ -8313,6 +9051,9 @@ fn package_exercise_and_cleanup_failures_are_aggregated_with_fixed_redacted_labe
                 Some(PackageRecoveryDriveFailure::InitialGate.marker()),
                 Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]),
             )
+            .with_coordinator_origin(Some(FixedPackageCoordinatorOrigin(
+                PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10],
+            )))
             .with_retry_observations(causal_retry_observations),
             None,
             None,
@@ -8325,16 +9066,19 @@ fn package_exercise_and_cleanup_failures_are_aggregated_with_fixed_redacted_labe
         causal_recovery.to_string(),
         format!(
             concat!(
-                "package exercise failed at fixed phase {}; fixed secondary failure {}; ",
+                "package exercise failed at fixed phase {}; fixed coordinator origin {}; ",
+                "fixed secondary failure {}; ",
                 "fixed retry observations {},{}"
             ),
             PackageRecoveryDriveFailure::InitialGate.marker(),
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10],
             PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0],
             PackageInitialGateRetryObservation::MarkerRead.marker(),
             PackageInitialGateRetryObservation::StartupScan.marker()
         )
     );
     let causal_debug = format!("{causal_recovery:?}");
+    assert!(causal_debug.contains(PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10]));
     assert!(causal_debug.contains(PackageInitialGateRetryObservation::MarkerRead.marker()));
     assert!(causal_debug.contains(PackageInitialGateRetryObservation::StartupScan.marker()));
     assert!(!causal_debug.contains("private retained"));
@@ -8458,7 +9202,7 @@ fn official_tui_pre_generation_cleanup_joins_backend_and_deletes_owned_scratch_w
         response_sentinel_observed: None,
         output_worker: None,
         output_finished: true,
-        last_handoff_probe_phase: None,
+        handoff_probe_observation: PackageHandoffProbeObservation::new(),
         recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
@@ -8515,7 +9259,7 @@ fn deterministic_case_cleanup_preserves_owned_scratch_when_exercise_failed()
         response_sentinel_observed: None,
         output_worker: None,
         output_finished: true,
-        last_handoff_probe_phase: None,
+        handoff_probe_observation: PackageHandoffProbeObservation::new(),
         recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
@@ -8582,7 +9326,7 @@ fn official_tui_pre_generation_cleanup_aggregates_infrastructure_failures_before
         response_sentinel_observed: None,
         output_worker: Some(output_worker),
         output_finished: false,
-        last_handoff_probe_phase: None,
+        handoff_probe_observation: PackageHandoffProbeObservation::new(),
         recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
@@ -8673,7 +9417,7 @@ fn started_official_harness_for_network_cleanup_test()
         response_sentinel_observed: None,
         output_worker: Some(output_worker),
         output_finished: false,
-        last_handoff_probe_phase: None,
+        handoff_probe_observation: PackageHandoffProbeObservation::new(),
         recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
@@ -9619,7 +10363,7 @@ impl OfficialTuiPackageHarness {
             response_sentinel_observed: None,
             output_worker: None,
             output_finished: false,
-            last_handoff_probe_phase: None,
+            handoff_probe_observation: PackageHandoffProbeObservation::new(),
             recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
             last_fixed_failure_detail: None,
             last_fixed_cleanup_failure_detail: None,
@@ -9666,6 +10410,7 @@ impl OfficialTuiPackageHarness {
             // recovery, process, filesystem, or socket authority.
             let (startup_sentinel_sender, startup_sentinel_observed) = mpsc::sync_channel(1);
             let (response_sentinel_sender, response_sentinel_observed) = mpsc::sync_channel(1);
+            let handoff_probe_observation = harness.handoff_probe_observation.clone();
             let output_worker = thread::Builder::new()
                 .name("calcifer-package-official-tui-output".to_owned())
                 .spawn(move || {
@@ -9674,6 +10419,7 @@ impl OfficialTuiPackageHarness {
                         cancellation,
                         startup_sentinel_sender,
                         response_sentinel_sender,
+                        handoff_probe_observation,
                     );
                     let _ = output_sender.send(result);
                 })?;
@@ -10643,21 +11389,25 @@ impl OfficialTuiPackageHarness {
             .recovery_failure_evidence
             .drive_context()
             .map(PackageRecoveryDriveFailure::marker);
-        let candidate = self
-            .scratch
-            .as_ref()
-            .and_then(|scratch| {
-                Self::latest_fixed_failure_detail_from_report_excluding(
-                    &scratch.root.join("supervisor-report"),
-                    primary,
-                    drive_context,
+        let (candidate, coordinator_origin) =
+            self.scratch.as_ref().map_or((None, None), |scratch| {
+                let report = scratch.root.join("supervisor-report");
+                (
+                    Self::latest_fixed_failure_detail_from_report_excluding(
+                        &report,
+                        primary,
+                        drive_context,
+                    ),
+                    latest_fixed_package_coordinator_origin_from_report(&report),
                 )
-            })
-            .or_else(|| {
-                self.last_fixed_failure_detail
-                    .filter(|marker| Some(*marker) != primary && Some(*marker) != drive_context)
             });
+        let candidate = candidate.or_else(|| {
+            self.last_fixed_failure_detail
+                .filter(|marker| Some(*marker) != primary && Some(*marker) != drive_context)
+        });
         self.recovery_failure_evidence.snapshot_secondary(candidate);
+        self.recovery_failure_evidence
+            .snapshot_coordinator_origin(coordinator_origin);
         let retry_observations =
             self.scratch
                 .as_ref()
@@ -10672,6 +11422,10 @@ impl OfficialTuiPackageHarness {
 
     fn latest_fixed_secondary_failure_detail(&self) -> Option<&'static str> {
         self.recovery_failure_evidence.secondary_marker()
+    }
+
+    fn latest_fixed_coordinator_origin(&self) -> Option<FixedPackageCoordinatorOrigin> {
+        self.recovery_failure_evidence.coordinator_origin()
     }
 
     fn latest_fixed_retry_observations(&self) -> PackageInitialGateRetryObservations {
@@ -10695,7 +11449,7 @@ impl OfficialTuiPackageHarness {
     }
 
     fn latest_handoff_probe_phase(&self) -> Option<PackageHandoffProbePhase> {
-        self.last_handoff_probe_phase
+        self.handoff_probe_observation.latest()
     }
 
     fn latest_fixed_failure_or_phase_from_report(report: &Path) -> &'static str {
@@ -10720,9 +11474,10 @@ impl OfficialTuiPackageHarness {
     }
 
     fn fixed_failure_catalog() -> impl Iterator<Item = &'static str> {
-        PACKAGED_COMPATIBILITY_FAILURE_MARKERS
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
             .iter()
             .copied()
+            .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_JOB_CONTROL_FAILURE_MARKERS.iter().copied())
@@ -10872,7 +11627,9 @@ impl OfficialTuiPackageHarness {
         }
         self.output_finished = true;
         self.output_cancel.take();
-        self.last_handoff_probe_phase = result.handoff_probe_phase;
+        if self.latest_handoff_probe_phase() != result.handoff_probe_phase {
+            return Err("live handoff phase diverged from the completed PTY drain".into());
+        }
         Ok(result)
     }
 
@@ -11024,7 +11781,12 @@ impl OfficialTuiPackageHarness {
             }
             match self.output_result.recv_timeout(Duration::from_secs(2)) {
                 Ok(Ok(drain)) => {
-                    self.last_handoff_probe_phase = drain.handoff_probe_phase;
+                    if self.latest_handoff_probe_phase() != drain.handoff_probe_phase {
+                        failures.record(
+                            PackageHarnessCleanupPhase::PtyOutputDrain,
+                            "live handoff phase diverged from the completed PTY drain".into(),
+                        );
+                    }
                 }
                 Ok(Err(error)) => {
                     failures.record(PackageHarnessCleanupPhase::PtyOutputDrain, error.into())
@@ -11242,13 +12004,24 @@ impl OfficialTuiPackageHarness {
                 stderr,
                 concat!(
                     "package-generation-cleanup-unproven:",
-                    "phase={},failure={},secondary={},retry_observations={}"
+                    "phase={},failure={},secondary={},handoff_probe_phase={},",
+                    "retry_observations={},coordinator_origin={},",
+                    "recovery_case={}"
                 ),
                 self.latest_fixed_phase(),
                 self.latest_fixed_failure_detail().unwrap_or("unclassified"),
                 self.latest_fixed_secondary_failure_detail()
                     .unwrap_or("none"),
-                self.latest_fixed_retry_observations()
+                self.latest_handoff_probe_phase()
+                    .map(PackageHandoffProbePhase::fixed_label)
+                    .unwrap_or("none"),
+                self.latest_fixed_retry_observations(),
+                self.latest_fixed_coordinator_origin()
+                    .map(FixedPackageCoordinatorOrigin::marker)
+                    .unwrap_or("none"),
+                self.recovery_failure_evidence
+                    .recovery_case_marker()
+                    .unwrap_or("none")
             );
             let _ = stderr.flush();
         }
@@ -11619,6 +12392,7 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
                 CoordinatorBounds::new(
                     PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
                     Duration::from_millis(20),
+                    PACKAGE_SUPERVISOR_OUTPUT_STALL_TIMEOUT,
                 )?,
             )
             .unwrap_or_else(|failure| {
@@ -11626,7 +12400,8 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
                 loop {
                     thread::park();
                 }
-            });
+            })
+            .with_packaged_retention_diagnostics(report_root.clone(), false);
             return match coordinator.run() {
                 CoordinatorRunOutcome::Terminal(result) => {
                     drop(result.into_authority());
@@ -11652,6 +12427,7 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
     let bounds = CoordinatorBounds::new(
         PACKAGE_SUPERVISOR_STARTUP_TIMEOUT,
         Duration::from_millis(20),
+        PACKAGE_SUPERVISOR_OUTPUT_STALL_TIMEOUT,
     )?;
     // The exact early-startup regression forces the native descriptor scan to
     // remain in its documented ProcessChanged retry state. The coordinator
@@ -11677,7 +12453,11 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
                 bounds,
             )
         }
-        .map_err(|_| "package production coordinator assembly failed")?;
+        .map_err(|_| "package production coordinator assembly failed")?
+        .with_packaged_retention_diagnostics(
+            report_root.clone(),
+            startup_fault == Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore),
+        );
     match coordinator.run() {
         CoordinatorRunOutcome::Terminal(result) => {
             let projection =
@@ -11781,10 +12561,7 @@ fn run_package_guardian_helper() -> Result<(), Box<dyn Error>> {
             match retained.await_recovery() {
                 GuardianRunOutcome::Terminal(disposition) => disposition,
                 GuardianRunOutcome::Retained(retained) => {
-                    for marker in retained.packaged_recovery_marker_names() {
-                        record_package_diagnostic_marker(&report_root, marker);
-                    }
-                    retained.park()
+                    publish_packaged_second_retention_and_park(&report_root, retained)
                 }
             }
         }
@@ -12709,6 +13486,80 @@ impl PackageHandoffProbePhase {
     }
 }
 
+impl PackageHandoffProbePhase {
+    const fn ordinal(self) -> u8 {
+        match self {
+            Self::VersionGatePassed => 1,
+            Self::SchemaGatePassed => 2,
+            Self::ForkAppServerSpawned => 3,
+            Self::InitializeRequestSent => 4,
+            Self::InitializeResponseReceived => 5,
+            Self::ForkRequestSent => 6,
+            Self::ForkResponseReceived => 7,
+            Self::ForkResponseValidated => 8,
+            Self::ForkAppServerShutdown => 9,
+            Self::FingerprintsStable => 10,
+            Self::ForkGatePassed => 11,
+            Self::RemoteAppServerReady => 12,
+            Self::ReadinessProxyReady => 13,
+            Self::RemoteTuiSpawned => 14,
+            Self::RemoteTuiReadResumeReady => 15,
+            Self::ReadinessProxyShutdown => 16,
+            Self::RemoteAppServerShutdown => 17,
+        }
+    }
+
+    const fn from_ordinal(ordinal: u8) -> Option<Self> {
+        match ordinal {
+            1 => Some(Self::VersionGatePassed),
+            2 => Some(Self::SchemaGatePassed),
+            3 => Some(Self::ForkAppServerSpawned),
+            4 => Some(Self::InitializeRequestSent),
+            5 => Some(Self::InitializeResponseReceived),
+            6 => Some(Self::ForkRequestSent),
+            7 => Some(Self::ForkResponseReceived),
+            8 => Some(Self::ForkResponseValidated),
+            9 => Some(Self::ForkAppServerShutdown),
+            10 => Some(Self::FingerprintsStable),
+            11 => Some(Self::ForkGatePassed),
+            12 => Some(Self::RemoteAppServerReady),
+            13 => Some(Self::ReadinessProxyReady),
+            14 => Some(Self::RemoteTuiSpawned),
+            15 => Some(Self::RemoteTuiReadResumeReady),
+            16 => Some(Self::ReadinessProxyShutdown),
+            17 => Some(Self::RemoteAppServerShutdown),
+            _ => None,
+        }
+    }
+}
+
+/// A closed, monotonic, observation-only projection of the output worker's
+/// latest complete handoff marker. It contains no terminal bytes and grants no
+/// process, cleanup, completion, retry, or filesystem authority.
+#[derive(Clone)]
+struct PackageHandoffProbeObservation {
+    latest_ordinal: Arc<AtomicU8>,
+}
+
+impl PackageHandoffProbeObservation {
+    fn new() -> Self {
+        Self {
+            latest_ordinal: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    fn advance(&self, phase: PackageHandoffProbePhase) -> bool {
+        let next = phase.ordinal();
+        self.latest_ordinal
+            .compare_exchange(next - 1, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn latest(&self) -> Option<PackageHandoffProbePhase> {
+        PackageHandoffProbePhase::from_ordinal(self.latest_ordinal.load(Ordering::Acquire))
+    }
+}
+
 const PACKAGE_HANDOFF_PROBE_PHASES: [(PackageHandoffProbePhase, &[u8]); 17] = [
     (
         PackageHandoffProbePhase::VersionGatePassed,
@@ -12789,16 +13640,18 @@ struct PackageHandoffProbeProgress {
     next_index: usize,
     next_matcher: Option<PackageFixedOutputMatcher>,
     latest: Option<PackageHandoffProbePhase>,
+    observation: PackageHandoffProbeObservation,
 }
 
 impl PackageHandoffProbeProgress {
-    fn new() -> Self {
+    fn new(observation: PackageHandoffProbeObservation) -> Self {
         Self {
             next_index: 0,
             next_matcher: Some(PackageFixedOutputMatcher::new(
                 PACKAGE_HANDOFF_PROBE_PHASES[0].1,
             )),
             latest: None,
+            observation,
         }
     }
 
@@ -12811,7 +13664,11 @@ impl PackageHandoffProbeProgress {
             if !matcher.seen() {
                 continue;
             }
-            self.latest = Some(PACKAGE_HANDOFF_PROBE_PHASES[self.next_index].0);
+            let phase = PACKAGE_HANDOFF_PROBE_PHASES[self.next_index].0;
+            if !self.observation.advance(phase) {
+                return;
+            }
+            self.latest = Some(phase);
             self.next_index += 1;
             self.next_matcher = PACKAGE_HANDOFF_PROBE_PHASES
                 .get(self.next_index)
@@ -12857,12 +13714,13 @@ fn drain_package_pty_output(
     cancellation: Receiver<()>,
     startup_sentinel_observed: SyncSender<()>,
     response_sentinel_observed: SyncSender<()>,
+    handoff_probe_observation: PackageHandoffProbeObservation,
 ) -> Result<PackageOutputDrain, String> {
     let mut total = 0_usize;
     let mut startup_matcher =
         PackageFixedOutputMatcher::new(PACKAGE_SUPERVISOR_STARTUP_SENTINEL.as_bytes());
     let mut response_matcher = PackagedTuiOutputMatcher::new();
-    let mut handoff_probe_progress = PackageHandoffProbeProgress::new();
+    let mut handoff_probe_progress = PackageHandoffProbeProgress::new(handoff_probe_observation);
     let mut startup_sentinel_observed = Some(startup_sentinel_observed);
     let mut response_sentinel_observed = Some(response_sentinel_observed);
     let mut buffer = [0_u8; 8192];
@@ -12948,9 +13806,11 @@ fn package_fixed_output_matcher_detects_startup_history_across_chunks_without_re
 
 #[test]
 fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix() {
-    let mut progress = PackageHandoffProbeProgress::new();
+    let observation = PackageHandoffProbeObservation::new();
+    let mut progress = PackageHandoffProbeProgress::new(observation.clone());
     progress.observe(b"private terminal output and credentials");
     assert_eq!(progress.latest(), None);
+    assert_eq!(observation.latest(), None);
 
     progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[7].1);
     progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[16].1);
@@ -12959,11 +13819,13 @@ fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix
         None,
         "isolated later markers must not manufacture skipped progress"
     );
+    assert_eq!(observation.latest(), None);
 
     for (expected, marker) in PACKAGE_HANDOFF_PROBE_PHASES[..6].iter().copied() {
         progress.observe(marker);
         progress.observe(b"\n");
         assert_eq!(progress.latest(), Some(expected));
+        assert_eq!(observation.latest(), Some(expected));
     }
     progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[6].1);
     assert_eq!(
@@ -12974,6 +13836,10 @@ fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix
     progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[7].1);
     assert_eq!(
         progress.latest(),
+        Some(PackageHandoffProbePhase::ForkResponseValidated)
+    );
+    assert_eq!(
+        observation.latest(),
         Some(PackageHandoffProbePhase::ForkResponseValidated)
     );
 
@@ -12988,6 +13854,27 @@ fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix
     assert_eq!(
         progress.latest(),
         Some(PackageHandoffProbePhase::ForkAppServerShutdown)
+    );
+}
+
+#[test]
+fn package_handoff_probe_observation_advances_only_one_fixed_phase_at_a_time() {
+    let observation = PackageHandoffProbeObservation::new();
+
+    assert!(!observation.advance(PackageHandoffProbePhase::SchemaGatePassed));
+    assert_eq!(observation.latest(), None);
+    assert!(observation.advance(PackageHandoffProbePhase::VersionGatePassed));
+    assert!(!observation.advance(PackageHandoffProbePhase::VersionGatePassed));
+    assert!(!observation.advance(PackageHandoffProbePhase::ForkAppServerSpawned));
+    assert_eq!(
+        observation.latest(),
+        Some(PackageHandoffProbePhase::VersionGatePassed)
+    );
+    assert!(observation.advance(PackageHandoffProbePhase::SchemaGatePassed));
+    assert!(!observation.advance(PackageHandoffProbePhase::VersionGatePassed));
+    assert_eq!(
+        observation.latest(),
+        Some(PackageHandoffProbePhase::SchemaGatePassed)
     );
 }
 
@@ -13010,16 +13897,22 @@ fn package_pty_output_drain_publishes_distinct_startup_and_response_observations
     let (_cancel, cancellation) = mpsc::sync_channel(1);
     let (startup_sender, startup_observed) = mpsc::sync_channel(1);
     let (response_sender, response_observed) = mpsc::sync_channel(1);
+    let handoff_probe_observation = PackageHandoffProbeObservation::new();
     let drain = drain_package_pty_output(
         File::from(descriptor),
         cancellation,
         startup_sender,
         response_sender,
+        handoff_probe_observation.clone(),
     )?;
 
     assert!(drain.response_sentinel_seen);
     assert_eq!(
         drain.handoff_probe_phase,
+        Some(PackageHandoffProbePhase::ForkResponseValidated)
+    );
+    assert_eq!(
+        handoff_probe_observation.latest(),
         Some(PackageHandoffProbePhase::ForkResponseValidated)
     );
     assert_eq!(startup_observed.recv_timeout(IO_TIMEOUT), Ok(()));
@@ -13046,14 +13939,17 @@ fn package_pty_output_drain_does_not_treat_startup_history_as_current_response()
     let (_cancel, cancellation) = mpsc::sync_channel(1);
     let (startup_sender, startup_observed) = mpsc::sync_channel(1);
     let (response_sender, response_observed) = mpsc::sync_channel(1);
+    let handoff_probe_observation = PackageHandoffProbeObservation::new();
     let drain = drain_package_pty_output(
         File::from(descriptor),
         cancellation,
         startup_sender,
         response_sender,
+        handoff_probe_observation.clone(),
     )?;
 
     assert!(!drain.response_sentinel_seen);
+    assert_eq!(handoff_probe_observation.latest(), None);
     assert_eq!(startup_observed.recv_timeout(IO_TIMEOUT), Ok(()));
     assert_eq!(
         startup_observed.try_recv(),
@@ -13316,10 +14212,27 @@ fn fixed_package_failure_marker_is_valid(report: &Path, marker: &str) -> bool {
         .is_ok_and(|payload| payload == b"classified\n")
 }
 
+fn fixed_package_coordinator_origin_catalog() -> impl Iterator<Item = &'static str> {
+    // An exact coordinator error is the initiating origin. The broader reason
+    // is used only when no valid exact error survived publication.
+    PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS
+        .into_iter()
+        .chain(PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS)
+}
+
+fn latest_fixed_package_coordinator_origin_from_report(
+    report: &Path,
+) -> Option<FixedPackageCoordinatorOrigin> {
+    fixed_package_coordinator_origin_catalog()
+        .find(|marker| fixed_package_failure_marker_is_valid(report, marker))
+        .map(FixedPackageCoordinatorOrigin)
+}
+
 fn fixed_package_startup_failure_marker(name: &str) -> Option<&'static str> {
-    PACKAGED_COMPATIBILITY_FAILURE_MARKERS
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
         .iter()
         .copied()
+        .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_STARTUP_FAILURE_MARKERS.iter().copied())
@@ -13445,6 +14358,15 @@ fn fixed_package_startup_failure_from_report(
         PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
         failure => return failure,
     };
+    let compatibility_origin = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
     let compatibility = match scan_fixed_package_startup_failure_marker_catalog(
         report,
         PACKAGED_COMPATIBILITY_FAILURE_MARKERS,
@@ -13476,7 +14398,7 @@ fn fixed_package_startup_failure_from_report(
         return PackageStartupFailureMarkerProbe::Absent;
     };
     let detail = match generic.marker() {
-        "startup-failure.compatibility" => compatibility,
+        "startup-failure.compatibility" => compatibility_origin.or(compatibility),
         "startup-failure.app-socket" => app_socket,
         "startup-failure.session-readiness" => session_readiness,
         _ => None,

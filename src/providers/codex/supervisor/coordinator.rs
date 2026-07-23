@@ -9,6 +9,8 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::ExitStatusExt;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,29 +34,39 @@ use super::signals::{
 use super::terminal::{RestoredTerminalProof, TerminalSize};
 
 /// Per-operation limits. A session may live indefinitely, but no lifecycle
-/// read/write, pump fragment, control handshake, or exact child wait inherits
-/// an unbounded deadline.
+/// read/write, pending output fragment, control handshake, or exact child wait
+/// inherits an unbounded deadline. The output-stall bound is deliberately
+/// longer than the control cadence and shorter than a lifecycle phase: output
+/// backpressure therefore never blocks control polling, while a permanent
+/// stall retains with its terminal origin before a generic phase timeout wins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CoordinatorBounds {
     phase_timeout: Duration,
     poll_interval: Duration,
+    output_stall_timeout: Duration,
 }
 
 impl CoordinatorBounds {
     pub(super) fn new(
         phase_timeout: Duration,
         poll_interval: Duration,
+        output_stall_timeout: Duration,
     ) -> Result<Self, CoordinatorSetupError> {
         if phase_timeout.is_zero()
             || poll_interval.is_zero()
+            || output_stall_timeout.is_zero()
             || poll_interval > phase_timeout
+            || poll_interval >= output_stall_timeout
+            || output_stall_timeout >= phase_timeout
             || Instant::now().checked_add(phase_timeout).is_none()
+            || Instant::now().checked_add(output_stall_timeout).is_none()
         {
             return Err(CoordinatorSetupError::Deadline);
         }
         Ok(Self {
             phase_timeout,
             poll_interval,
+            output_stall_timeout,
         })
     }
 
@@ -311,19 +323,54 @@ impl CoordinatorDriveError {
 }
 
 #[cfg(test)]
+pub(super) const PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS: [&str; 19] = [
+    "coordinator-retained.error.deadline",
+    "coordinator-retained.error.lifecycle",
+    "coordinator-retained.error.protocol",
+    "coordinator-retained.error.snapshot",
+    "coordinator-retained.error.terminal.setup",
+    "coordinator-retained.error.terminal.deadline",
+    "coordinator-retained.error.terminal.outer-eof",
+    "coordinator-retained.error.terminal.channel-read",
+    "coordinator-retained.error.terminal.channel-write",
+    "coordinator-retained.error.terminal.outer-read",
+    "coordinator-retained.error.terminal.outer-write",
+    "coordinator-retained.error.terminal.raw-transition",
+    "coordinator-retained.error.terminal.foreground",
+    "coordinator-retained.error.terminal.window-size",
+    "coordinator-retained.error.terminal.restore",
+    "coordinator-retained.error.terminal.shutdown",
+    "coordinator-retained.error.signal",
+    "coordinator-retained.error.guardian",
+    "coordinator-retained.error.descriptor-isolation",
+];
+
+#[cfg(test)]
+pub(super) const PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS: [&str; 8] = [
+    "coordinator-retained.reason.lifecycle-lost",
+    "coordinator-retained.reason.protocol-invalid",
+    "coordinator-retained.reason.guardian-exited",
+    "coordinator-retained.reason.shutdown-deadline",
+    "coordinator-retained.reason.children-not-reaped",
+    "coordinator-retained.reason.worker-not-joined",
+    "coordinator-retained.reason.cleanup-unconfirmed",
+    "coordinator-retained.reason.invariant-unconfirmed",
+];
+
+#[cfg(test)]
 const fn packaged_coordinator_failure_marker(error: CoordinatorDriveError) -> &'static str {
     match error {
-        CoordinatorDriveError::Deadline => "coordinator-retained.error.deadline",
-        CoordinatorDriveError::Lifecycle => "coordinator-retained.error.lifecycle",
-        CoordinatorDriveError::Protocol => "coordinator-retained.error.protocol",
-        CoordinatorDriveError::Snapshot => "coordinator-retained.error.snapshot",
+        CoordinatorDriveError::Deadline => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[0],
+        CoordinatorDriveError::Lifecycle => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[1],
+        CoordinatorDriveError::Protocol => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[2],
+        CoordinatorDriveError::Snapshot => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[3],
         CoordinatorDriveError::Terminal(error) => {
             packaged_coordinator_terminal_failure_marker(error)
         }
-        CoordinatorDriveError::Signal => "coordinator-retained.error.signal",
-        CoordinatorDriveError::Guardian => "coordinator-retained.error.guardian",
+        CoordinatorDriveError::Signal => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[16],
+        CoordinatorDriveError::Guardian => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[17],
         CoordinatorDriveError::DescriptorIsolation(_) => {
-            "coordinator-retained.error.descriptor-isolation"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[18]
         }
     }
 }
@@ -333,46 +380,67 @@ const fn packaged_coordinator_terminal_failure_marker(
     error: CoordinatorTerminalError,
 ) -> &'static str {
     match error {
-        CoordinatorTerminalError::Setup => "coordinator-retained.error.terminal.setup",
-        CoordinatorTerminalError::Deadline => "coordinator-retained.error.terminal.deadline",
+        CoordinatorTerminalError::Setup => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[4],
+        CoordinatorTerminalError::Deadline => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[5],
         CoordinatorTerminalError::OuterTerminalEof => {
-            "coordinator-retained.error.terminal.outer-eof"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[6]
         }
         CoordinatorTerminalError::TerminalChannelRead => {
-            "coordinator-retained.error.terminal.channel-read"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[7]
         }
         CoordinatorTerminalError::TerminalChannelWrite => {
-            "coordinator-retained.error.terminal.channel-write"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[8]
         }
         CoordinatorTerminalError::OuterTerminalRead => {
-            "coordinator-retained.error.terminal.outer-read"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[9]
         }
         CoordinatorTerminalError::OuterTerminalWrite => {
-            "coordinator-retained.error.terminal.outer-write"
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10]
         }
-        CoordinatorTerminalError::RawTransition => {
-            "coordinator-retained.error.terminal.raw-transition"
-        }
-        CoordinatorTerminalError::Foreground => "coordinator-retained.error.terminal.foreground",
-        CoordinatorTerminalError::WindowSize => "coordinator-retained.error.terminal.window-size",
-        CoordinatorTerminalError::Restore => "coordinator-retained.error.terminal.restore",
-        CoordinatorTerminalError::Shutdown => "coordinator-retained.error.terminal.shutdown",
+        CoordinatorTerminalError::RawTransition => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[11],
+        CoordinatorTerminalError::Foreground => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[12],
+        CoordinatorTerminalError::WindowSize => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[13],
+        CoordinatorTerminalError::Restore => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[14],
+        CoordinatorTerminalError::Shutdown => PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[15],
     }
 }
 
 #[cfg(test)]
 const fn packaged_coordinator_retention_reason_marker(reason: RetentionReason) -> &'static str {
     match reason {
-        RetentionReason::LifecycleLost => "coordinator-retained.reason.lifecycle-lost",
-        RetentionReason::ProtocolInvalid => "coordinator-retained.reason.protocol-invalid",
-        RetentionReason::GuardianExited => "coordinator-retained.reason.guardian-exited",
-        RetentionReason::ShutdownDeadline => "coordinator-retained.reason.shutdown-deadline",
-        RetentionReason::ChildrenNotReaped => "coordinator-retained.reason.children-not-reaped",
-        RetentionReason::WorkerNotJoined => "coordinator-retained.reason.worker-not-joined",
-        RetentionReason::CleanupUnconfirmed => "coordinator-retained.reason.cleanup-unconfirmed",
-        RetentionReason::InvariantUnconfirmed => {
-            "coordinator-retained.reason.invariant-unconfirmed"
-        }
+        RetentionReason::LifecycleLost => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[0],
+        RetentionReason::ProtocolInvalid => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[1],
+        RetentionReason::GuardianExited => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[2],
+        RetentionReason::ShutdownDeadline => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[3],
+        RetentionReason::ChildrenNotReaped => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[4],
+        RetentionReason::WorkerNotJoined => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[5],
+        RetentionReason::CleanupUnconfirmed => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[6],
+        RetentionReason::InvariantUnconfirmed => PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS[7],
+    }
+}
+
+#[cfg(test)]
+const fn packaged_coordinator_retained_marker_names(
+    error: CoordinatorDriveError,
+    reason: RetentionReason,
+) -> [&'static str; 2] {
+    // Preserve commit order: the exact coordinator error is durable before
+    // the broader retention reason is projected. These names are diagnostic
+    // observations only and never grant cleanup or profile authority.
+    [
+        packaged_coordinator_failure_marker(error),
+        packaged_coordinator_retention_reason_marker(reason),
+    ]
+}
+
+#[cfg(test)]
+fn publish_packaged_coordinator_retained_markers(
+    error: CoordinatorDriveError,
+    reason: RetentionReason,
+    mut publish: impl FnMut(&'static str),
+) {
+    for marker in packaged_coordinator_retained_marker_names(error, reason) {
+        publish(marker);
     }
 }
 
@@ -536,6 +604,32 @@ enum CoordinatorTerminalOwner {
     Finished(RestoredTerminalProof),
 }
 
+fn pump_output_with_exact_owner<Owner>(
+    owner: Owner,
+    observed: Instant,
+    outer_deadline: Instant,
+    has_pending_output: impl Fn(&Owner) -> bool,
+    pump: impl FnOnce(
+        Owner,
+    )
+        -> Result<(Owner, CoordinatorPumpProgress), (Owner, CoordinatorTerminalError)>,
+) -> Result<(Owner, CoordinatorPumpProgress), (Owner, CoordinatorDriveError)> {
+    if observed >= outer_deadline && !has_pending_output(&owner) {
+        return Err((owner, CoordinatorDriveError::Deadline));
+    }
+    match pump(owner) {
+        Ok(turn) => Ok(turn),
+        Err((owner, CoordinatorTerminalError::Deadline)) if !has_pending_output(&owner) => {
+            // The caller's precheck can race the terminal pump's own clock
+            // observation. Only the exact returned owner can prove whether a
+            // frame was accepted in between: an empty owner preserves the
+            // generic outer-deadline origin.
+            Err((owner, CoordinatorDriveError::Deadline))
+        }
+        Err((owner, error)) => Err((owner, CoordinatorDriveError::Terminal(error))),
+    }
+}
+
 impl fmt::Debug for CoordinatorTerminalOwner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -587,11 +681,12 @@ impl CoordinatorTerminalOwner {
 
     fn pump_output_once(
         self,
-        deadline: Instant,
+        stall_timeout: Duration,
+        outer_deadline: Instant,
     ) -> Result<(Self, CoordinatorPumpProgress), (Self, CoordinatorTerminalError)> {
         macro_rules! pump {
             ($owner:expr, $variant:ident) => {
-                match (*$owner).pump_output_once(deadline) {
+                match (*$owner).pump_output_once(stall_timeout, outer_deadline) {
                     Ok(turn) => {
                         let progress = turn.progress();
                         Ok((Self::$variant(Box::new(turn.into_owner())), progress))
@@ -617,6 +712,73 @@ impl CoordinatorTerminalOwner {
                 Ok((owner, CoordinatorPumpProgress::Idle))
             }
         }
+    }
+
+    fn has_pending_output(&self) -> bool {
+        match self {
+            Self::OutputOnly(owner) => owner.has_pending_output(),
+            Self::GateReady(owner) => owner.has_pending_output(),
+            Self::RawAwaitAck(owner) => owner.has_pending_output(),
+            Self::Active(owner) => owner.has_pending_output(),
+            Self::Paused(owner) => owner.has_pending_output(),
+            Self::SuspendedRestored(owner) => owner.has_pending_output(),
+            Self::ResumeRaw(owner) => owner.has_pending_output(),
+            Self::Quiesced(owner) => owner.has_pending_output(),
+            Self::Restored(owner) => owner.has_pending_output(),
+            Self::Finished(_) => false,
+        }
+    }
+
+    fn scrub_pending_output(self) -> Self {
+        match self {
+            Self::OutputOnly(owner) => Self::OutputOnly(Box::new((*owner).scrub_pending_output())),
+            Self::GateReady(owner) => Self::GateReady(Box::new((*owner).scrub_pending_output())),
+            Self::RawAwaitAck(owner) => {
+                Self::RawAwaitAck(Box::new((*owner).scrub_pending_output()))
+            }
+            Self::Active(owner) => Self::Active(Box::new((*owner).scrub_pending_output())),
+            Self::Paused(owner) => Self::Paused(Box::new((*owner).scrub_pending_output())),
+            Self::SuspendedRestored(owner) => {
+                Self::SuspendedRestored(Box::new((*owner).scrub_pending_output()))
+            }
+            Self::ResumeRaw(owner) => Self::ResumeRaw(Box::new((*owner).scrub_pending_output())),
+            Self::Quiesced(owner) => Self::Quiesced(Box::new((*owner).scrub_pending_output())),
+            Self::Restored(owner) => Self::Restored(Box::new((*owner).scrub_pending_output())),
+            owner @ Self::Finished(_) => owner,
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_output_is_scrubbed_for_test(&self) -> bool {
+        match self {
+            Self::OutputOnly(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::GateReady(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::RawAwaitAck(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::Active(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::Paused(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::SuspendedRestored(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::ResumeRaw(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::Quiesced(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::Restored(owner) => owner.pending_output_is_scrubbed_for_test(),
+            Self::Finished(_) => true,
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_output_shape_for_test(&self) -> Option<(usize, usize, bool)> {
+        let shape = match self {
+            Self::OutputOnly(owner) => owner.pending_output_shape_for_test(),
+            Self::GateReady(owner) => owner.pending_output_shape_for_test(),
+            Self::RawAwaitAck(owner) => owner.pending_output_shape_for_test(),
+            Self::Active(owner) => owner.pending_output_shape_for_test(),
+            Self::Paused(owner) => owner.pending_output_shape_for_test(),
+            Self::SuspendedRestored(owner) => owner.pending_output_shape_for_test(),
+            Self::ResumeRaw(owner) => owner.pending_output_shape_for_test(),
+            Self::Quiesced(owner) => owner.pending_output_shape_for_test(),
+            Self::Restored(owner) => owner.pending_output_shape_for_test(),
+            Self::Finished(_) => return None,
+        };
+        Some(shape)
     }
 
     fn pump_input_once(
@@ -781,6 +943,64 @@ impl CoordinatorTerminalOwner {
             owner => Err((owner, CoordinatorDriveError::Protocol)),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetentionTerminalCleanupPolicy {
+    #[cfg(test)]
+    force_restore_failure: bool,
+    #[cfg(test)]
+    force_finish_failure: bool,
+}
+
+fn prepare_terminal_for_retention(
+    terminal: CoordinatorTerminalOwner,
+    mut reason: RetentionReason,
+    policy: RetentionTerminalCleanupPolicy,
+) -> (CoordinatorTerminalOwner, RetentionReason) {
+    #[cfg(test)]
+    let restoration = if policy.force_restore_failure {
+        Err((
+            terminal,
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Restore),
+        ))
+    } else {
+        terminal.restore()
+    };
+    #[cfg(not(test))]
+    let restoration = {
+        let _ = policy;
+        terminal.restore()
+    };
+    let terminal = match restoration {
+        Ok(terminal) => terminal,
+        Err((terminal, _)) => {
+            reason = RetentionReason::InvariantUnconfirmed;
+            terminal
+        }
+    };
+    #[cfg(test)]
+    let finish = if policy.force_finish_failure {
+        Err((
+            terminal,
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Shutdown),
+        ))
+    } else {
+        terminal.finish()
+    };
+    #[cfg(not(test))]
+    let finish = terminal.finish();
+    let terminal = match finish {
+        Ok(terminal) => terminal,
+        Err((terminal, _)) => {
+            reason = RetentionReason::InvariantUnconfirmed;
+            terminal
+        }
+    };
+    // Cleanup failures retain their exact typed owner. Scrubbing is therefore
+    // an explicit final transition rather than an incidental destructor side
+    // effect, and it must run on every branch.
+    (terminal.scrub_pending_output(), reason)
 }
 
 /// Complete protocol terminal payload retained until exact guardian wait and
@@ -969,11 +1189,16 @@ impl RetainedCoordinatorGeneration {
     }
 
     #[cfg(test)]
+    fn terminal_output_is_scrubbed_for_test(&self) -> bool {
+        self.owners
+            .terminal
+            .as_ref()
+            .is_some_and(CoordinatorTerminalOwner::pending_output_is_scrubbed_for_test)
+    }
+
+    #[cfg(test)]
     pub(super) const fn packaged_marker_names(&self) -> [&'static str; 2] {
-        [
-            packaged_coordinator_failure_marker(self.failure),
-            packaged_coordinator_retention_reason_marker(self.reason),
-        ]
+        packaged_coordinator_retained_marker_names(self.failure, self.reason)
     }
 
     pub(super) fn into_retained_lease(self) -> RetainedCoordinatorLease {
@@ -1111,6 +1336,12 @@ pub(super) struct ProductionCoordinator {
     session_failed: bool,
     #[cfg(test)]
     descriptor_isolation_test_seam: Option<DescriptorIsolationTestSeam>,
+    #[cfg(test)]
+    packaged_retention_report_root: Option<PathBuf>,
+    #[cfg(test)]
+    retain_after_packaged_startup_failure: bool,
+    #[cfg(test)]
+    output_pending_observer: Option<std::sync::mpsc::Sender<()>>,
 }
 
 enum ActiveOutcome {
@@ -1188,6 +1419,12 @@ impl ProductionCoordinator {
             session_failed: false,
             #[cfg(test)]
             descriptor_isolation_test_seam,
+            #[cfg(test)]
+            packaged_retention_report_root: None,
+            #[cfg(test)]
+            retain_after_packaged_startup_failure: false,
+            #[cfg(test)]
+            output_pending_observer: None,
         })
     }
 
@@ -1201,6 +1438,25 @@ impl ProductionCoordinator {
         seam: DescriptorIsolationTestSeam,
     ) -> Result<Self, Box<CoordinatorSetupFailure>> {
         Self::assemble_with_test_seam(authority, guardian, lifecycle, terminal, bounds, Some(seam))
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_packaged_retention_diagnostics(
+        mut self,
+        report_root: PathBuf,
+        retain_after_startup_failure: bool,
+    ) -> Self {
+        // This test-only sink receives fixed marker names only. It is not a
+        // process, lease, cleanup, retry, or recovery authority.
+        self.packaged_retention_report_root = Some(report_root);
+        self.retain_after_packaged_startup_failure = retain_after_startup_failure;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_output_pending_observer(mut self, observer: std::sync::mpsc::Sender<()>) -> Self {
+        self.output_pending_observer = Some(observer);
+        self
     }
 
     pub(super) fn run(mut self) -> CoordinatorRunOutcome {
@@ -1306,7 +1562,15 @@ impl ProductionCoordinator {
                             .map_err(classify_protocol_error)?,
                     );
                 }
-                GuardianEvent::Failed { .. } => return Ok(BootstrapOutcome::Failed),
+                GuardianEvent::Failed { .. } => {
+                    #[cfg(test)]
+                    if self.retain_after_packaged_startup_failure {
+                        return Err(CoordinatorDriveError::Terminal(
+                            CoordinatorTerminalError::Deadline,
+                        ));
+                    }
+                    return Ok(BootstrapOutcome::Failed);
+                }
                 _ => return Err(CoordinatorDriveError::Protocol),
             }
         }
@@ -1403,7 +1667,7 @@ impl ProductionCoordinator {
     fn run_active(&mut self) -> Result<ActiveOutcome, CoordinatorDriveError> {
         loop {
             let turn_deadline = self.bounds.phase_deadline()?;
-            self.pump_output(self.bounds.turn_deadline(turn_deadline)?)?;
+            self.pump_output_before(turn_deadline)?;
             self.pump_input(self.bounds.turn_deadline(turn_deadline)?)?;
 
             if let Some(action) = self.signals.next_active() {
@@ -1510,9 +1774,7 @@ impl ProductionCoordinator {
 
         let deadline = self.bounds.phase_deadline()?;
         loop {
-            if Instant::now() >= deadline {
-                return Err(CoordinatorDriveError::Deadline);
-            }
+            self.pump_output_before(deadline)?;
             if let Some(action) = self.signals.next_suspended() {
                 match action {
                     CoordinatorSignalAction::Continue => return self.resume_after_continue(),
@@ -1527,7 +1789,6 @@ impl ProductionCoordinator {
                     }
                 }
             }
-            self.pump_output(self.bounds.turn_deadline(deadline)?)?;
             if self.lifecycle_readable(self.bounds.turn_deadline(deadline)?)? {
                 return match self.lifecycle.receive(deadline)? {
                     GuardianEvent::Failed { .. } => Ok(ControlOutcome::Failed),
@@ -1575,10 +1836,7 @@ impl ProductionCoordinator {
     fn await_quiescence(&mut self) -> Result<(), CoordinatorDriveError> {
         let deadline = self.bounds.phase_deadline()?;
         loop {
-            if Instant::now() >= deadline {
-                return Err(CoordinatorDriveError::Deadline);
-            }
-            self.pump_output(self.bounds.turn_deadline(deadline)?)?;
+            self.pump_output_before(deadline)?;
             if !self.lifecycle_readable(self.bounds.turn_deadline(deadline)?)? {
                 self.ensure_guardian_live()?;
                 continue;
@@ -1672,10 +1930,11 @@ impl ProductionCoordinator {
         deadline: Instant,
     ) -> Result<GuardianEvent, CoordinatorDriveError> {
         loop {
-            if Instant::now() >= deadline {
-                return Err(CoordinatorDriveError::Deadline);
-            }
-            self.pump_output(self.bounds.turn_deadline(deadline)?)?;
+            // Output is deliberately observed before lifecycle readability.
+            // If both become ready at the same outer fence, a pending output
+            // stall retains its exact terminal origin instead of being
+            // flattened into either a generic deadline or a lifecycle frame.
+            self.pump_output_before(deadline)?;
             if self.lifecycle_readable(self.bounds.turn_deadline(deadline)?)? {
                 return self.lifecycle.receive(deadline);
             }
@@ -1714,19 +1973,35 @@ impl ProductionCoordinator {
         lifecycle_descriptor_readable(&self.lifecycle, deadline)
     }
 
-    fn pump_output(&mut self, deadline: Instant) -> Result<(), CoordinatorDriveError> {
+    fn pump_output_before(&mut self, outer_deadline: Instant) -> Result<(), CoordinatorDriveError> {
         let owner = self
             .terminal
             .take()
             .ok_or(CoordinatorDriveError::Protocol)?;
-        match owner.pump_output_once(deadline) {
-            Ok((owner, _)) => {
+        match pump_output_with_exact_owner(
+            owner,
+            Instant::now(),
+            outer_deadline,
+            CoordinatorTerminalOwner::has_pending_output,
+            |owner| owner.pump_output_once(self.bounds.output_stall_timeout, outer_deadline),
+        ) {
+            Ok((owner, progress)) => {
                 self.terminal = Some(owner);
+                #[cfg(not(test))]
+                let _ = progress;
+                #[cfg(test)]
+                if progress == CoordinatorPumpProgress::OutputPending {
+                    if let Some(observer) = self.output_pending_observer.take() {
+                        observer
+                            .send(())
+                            .map_err(|_| CoordinatorDriveError::Protocol)?;
+                    }
+                }
                 Ok(())
             }
             Err((owner, error)) => {
                 self.terminal = Some(owner);
-                Err(CoordinatorDriveError::Terminal(error))
+                Err(error)
             }
         }
     }
@@ -1750,14 +2025,17 @@ impl ProductionCoordinator {
 
     fn drain_output(&mut self, deadline: Instant) -> Result<(), CoordinatorDriveError> {
         loop {
-            if Instant::now() >= deadline {
-                return Err(CoordinatorDriveError::Deadline);
-            }
             let owner = self
                 .terminal
                 .take()
                 .ok_or(CoordinatorDriveError::Protocol)?;
-            match owner.pump_output_once(self.bounds.turn_deadline(deadline)?) {
+            match pump_output_with_exact_owner(
+                owner,
+                Instant::now(),
+                deadline,
+                CoordinatorTerminalOwner::has_pending_output,
+                |owner| owner.pump_output_once(self.bounds.output_stall_timeout, deadline),
+            ) {
                 Ok((owner, progress)) => {
                     self.terminal = Some(owner);
                     if matches!(
@@ -1766,10 +2044,17 @@ impl ProductionCoordinator {
                     ) {
                         return Ok(());
                     }
+                    if progress == CoordinatorPumpProgress::OutputPending {
+                        thread::sleep(
+                            self.bounds
+                                .poll_interval
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
+                    }
                 }
                 Err((owner, error)) => {
                     self.terminal = Some(owner);
-                    return Err(CoordinatorDriveError::Terminal(error));
+                    return Err(error);
                 }
             }
         }
@@ -1860,6 +2145,12 @@ impl ProductionCoordinator {
             session_failed: _,
             #[cfg(test)]
                 descriptor_isolation_test_seam: _,
+            #[cfg(test)]
+                packaged_retention_report_root: _,
+            #[cfg(test)]
+                retain_after_packaged_startup_failure: _,
+            #[cfg(test)]
+                output_pending_observer: _,
         } = self;
         let restoration = match terminal {
             Some(CoordinatorTerminalOwner::Finished(restoration)) => restoration,
@@ -1888,20 +2179,22 @@ impl ProductionCoordinator {
         if lifecycle_shutdown.is_err() {
             reason = RetentionReason::InvariantUnconfirmed;
         }
-        let terminal = match terminal.restore() {
-            Ok(terminal) => terminal,
-            Err((terminal, _)) => {
-                reason = RetentionReason::InvariantUnconfirmed;
-                terminal
-            }
-        };
-        let terminal = match terminal.finish() {
-            Ok(terminal) => terminal,
-            Err((terminal, _)) => {
-                reason = RetentionReason::InvariantUnconfirmed;
-                terminal
-            }
-        };
+        let (terminal, reason) = prepare_terminal_for_retention(
+            terminal,
+            reason,
+            RetentionTerminalCleanupPolicy::default(),
+        );
+
+        #[cfg(test)]
+        if let Some(report_root) = self.packaged_retention_report_root.as_deref() {
+            // Publish after the exact retention reason is final but before
+            // the bounded Guardian wait. The package parent can otherwise
+            // observe Guardian retention and terminate this helper before
+            // `run()` returns its retained generation.
+            publish_packaged_coordinator_retained_markers(error, reason, |marker| {
+                super::packaged_smoke::record_package_diagnostic_marker(report_root, marker);
+            });
+        }
 
         if self.guardian_status.is_none() {
             let deadline = self
@@ -1963,7 +2256,7 @@ mod tests {
 
     use super::super::channel::LifecyclePair;
     use super::super::protocol::{
-        ChildRole, GuardianCommandReceiver, SessionTerminationCause, StopAction,
+        ChildRole, GuardianCommandReceiver, ProtocolError, SessionTerminationCause, StopAction,
         project_terminal_semantics, send_guardian_event,
     };
     use super::super::runtime::PrivateRuntime;
@@ -1990,104 +2283,256 @@ mod tests {
     const PRODUCTION_MATRIX_APP_GROUP_MARKER: &str = "matrix-app-group.identity";
     const PRODUCTION_MATRIX_TUI_GROUP_MARKER: &str = "matrix-tui-group.identity";
     const PRODUCTION_MATRIX_OUTPUT: &[u8] = b"calcifer-production-coordinator-output";
+    const PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT: &[u8] =
+        b"calcifer-production-coordinator-backpressure-output";
+    const PRODUCTION_MATRIX_BACKPRESSURE_HOLD: Duration = Duration::from_millis(100);
+    const PRODUCTION_MATRIX_TRANSIENT_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+    const PRODUCTION_MATRIX_PERMANENT_STALL_TIMEOUT: Duration = Duration::from_millis(500);
     const MATRIX_UNPROVEN_CHILD_CLEANUP_EXIT_CODE: u8 = 93;
 
     #[test]
-    fn packaged_retention_diagnostics_are_closed_fixed_and_payload_free() {
+    fn coordinator_bounds_keep_output_stalls_between_control_and_phase_deadlines()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let valid = CoordinatorBounds::new(
+            Duration::from_secs(15),
+            Duration::from_millis(20),
+            Duration::from_secs(10),
+        )?;
+        assert_eq!(valid.poll_interval, Duration::from_millis(20));
+        assert_eq!(valid.output_stall_timeout, Duration::from_secs(10));
+        assert_eq!(valid.phase_timeout, Duration::from_secs(15));
+
+        for (phase, poll, output) in [
+            (
+                Duration::ZERO,
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+            ),
+            (
+                Duration::from_secs(1),
+                Duration::ZERO,
+                Duration::from_millis(2),
+            ),
+            (
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                Duration::ZERO,
+            ),
+            (
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            ),
+            (
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+                Duration::from_secs(1),
+            ),
+        ] {
+            assert_eq!(
+                CoordinatorBounds::new(phase, poll, output),
+                Err(CoordinatorSetupError::Deadline)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_deadline_gap_classifies_the_exact_returned_owner() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct SyntheticOwner {
+            pending: bool,
+        }
+
+        let before = Instant::now();
+        let outer_deadline = before + Duration::from_millis(10);
+        let after = outer_deadline + Duration::from_millis(1);
+        let mut io_calls = 0_usize;
+
+        // The coordinator precheck was before the fence, but the terminal
+        // pump's injected observation crossed it before accepting any frame.
+        // The exact returned empty owner reclassifies this as the generic
+        // caller deadline, with no read or write after expiry.
+        let empty = pump_output_with_exact_owner(
+            SyntheticOwner { pending: false },
+            before,
+            outer_deadline,
+            |owner| owner.pending,
+            |owner| {
+                assert!(after >= outer_deadline);
+                Err((owner, CoordinatorTerminalError::Deadline))
+            },
+        );
         assert_eq!(
-            [
+            empty,
+            Err((
+                SyntheticOwner { pending: false },
                 CoordinatorDriveError::Deadline,
-                CoordinatorDriveError::Lifecycle,
-                CoordinatorDriveError::Protocol,
-                CoordinatorDriveError::Snapshot,
-                CoordinatorDriveError::Terminal(CoordinatorTerminalError::Restore),
-                CoordinatorDriveError::Signal,
-                CoordinatorDriveError::Guardian,
-                CoordinatorDriveError::DescriptorIsolation(
-                    calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor,
-                ),
-            ]
-            .map(packaged_coordinator_failure_marker),
-            [
-                "coordinator-retained.error.deadline",
-                "coordinator-retained.error.lifecycle",
-                "coordinator-retained.error.protocol",
-                "coordinator-retained.error.snapshot",
-                "coordinator-retained.error.terminal.restore",
-                "coordinator-retained.error.signal",
-                "coordinator-retained.error.guardian",
-                "coordinator-retained.error.descriptor-isolation",
-            ]
+            ))
+        );
+        assert_eq!(io_calls, 0);
+
+        // An already-pending owner crosses the same fence through the terminal
+        // deadline path. The pump performs only its clock check.
+        let existing = pump_output_with_exact_owner(
+            SyntheticOwner { pending: true },
+            after,
+            outer_deadline,
+            |owner| owner.pending,
+            |owner| Err((owner, CoordinatorTerminalError::Deadline)),
         );
         assert_eq!(
-            [
-                CoordinatorTerminalError::Setup,
-                CoordinatorTerminalError::Deadline,
-                CoordinatorTerminalError::OuterTerminalEof,
-                CoordinatorTerminalError::TerminalChannelRead,
-                CoordinatorTerminalError::TerminalChannelWrite,
-                CoordinatorTerminalError::OuterTerminalRead,
-                CoordinatorTerminalError::OuterTerminalWrite,
-                CoordinatorTerminalError::RawTransition,
-                CoordinatorTerminalError::Foreground,
-                CoordinatorTerminalError::WindowSize,
-                CoordinatorTerminalError::Restore,
-                CoordinatorTerminalError::Shutdown,
-            ]
-            .map(|error| packaged_coordinator_failure_marker(
-                CoordinatorDriveError::Terminal(error)
-            )),
-            [
-                "coordinator-retained.error.terminal.setup",
-                "coordinator-retained.error.terminal.deadline",
-                "coordinator-retained.error.terminal.outer-eof",
-                "coordinator-retained.error.terminal.channel-read",
-                "coordinator-retained.error.terminal.channel-write",
-                "coordinator-retained.error.terminal.outer-read",
-                "coordinator-retained.error.terminal.outer-write",
-                "coordinator-retained.error.terminal.raw-transition",
-                "coordinator-retained.error.terminal.foreground",
-                "coordinator-retained.error.terminal.window-size",
-                "coordinator-retained.error.terminal.restore",
-                "coordinator-retained.error.terminal.shutdown",
-            ]
+            existing,
+            Err((
+                SyntheticOwner { pending: true },
+                CoordinatorDriveError::Terminal(CoordinatorTerminalError::Deadline),
+            ))
+        );
+        assert_eq!(io_calls, 0);
+
+        // A frame accepted after the coordinator precheck but before the
+        // terminal's post-read fence is likewise terminal-originated. No
+        // outer write is attempted after that post-read expiry observation.
+        let accepted = pump_output_with_exact_owner(
+            SyntheticOwner { pending: false },
+            before,
+            outer_deadline,
+            |owner| owner.pending,
+            |mut owner| {
+                io_calls += 1;
+                owner.pending = true;
+                Err((owner, CoordinatorTerminalError::Deadline))
+            },
         );
         assert_eq!(
-            [
-                RetentionReason::LifecycleLost,
-                RetentionReason::ProtocolInvalid,
-                RetentionReason::GuardianExited,
-                RetentionReason::ShutdownDeadline,
-                RetentionReason::ChildrenNotReaped,
-                RetentionReason::WorkerNotJoined,
-                RetentionReason::CleanupUnconfirmed,
-                RetentionReason::InvariantUnconfirmed,
-            ]
-            .map(packaged_coordinator_retention_reason_marker),
-            [
-                "coordinator-retained.reason.lifecycle-lost",
-                "coordinator-retained.reason.protocol-invalid",
-                "coordinator-retained.reason.guardian-exited",
-                "coordinator-retained.reason.shutdown-deadline",
-                "coordinator-retained.reason.children-not-reaped",
-                "coordinator-retained.reason.worker-not-joined",
-                "coordinator-retained.reason.cleanup-unconfirmed",
-                "coordinator-retained.reason.invariant-unconfirmed",
-            ]
+            accepted,
+            Err((
+                SyntheticOwner { pending: true },
+                CoordinatorDriveError::Terminal(CoordinatorTerminalError::Deadline),
+            ))
+        );
+        assert_eq!(io_calls, 1);
+
+        let expired_empty = pump_output_with_exact_owner(
+            SyntheticOwner { pending: false },
+            after,
+            outer_deadline,
+            |owner| owner.pending,
+            |_| -> Result<_, (SyntheticOwner, CoordinatorTerminalError)> {
+                panic!("an expired empty owner performed a terminal pump")
+            },
+        );
+        assert_eq!(
+            expired_empty,
+            Err((
+                SyntheticOwner { pending: false },
+                CoordinatorDriveError::Deadline,
+            ))
+        );
+        assert_eq!(io_calls, 1);
+    }
+
+    #[test]
+    fn packaged_retention_diagnostics_are_closed_fixed_and_payload_free() {
+        let errors = [
+            CoordinatorDriveError::Deadline,
+            CoordinatorDriveError::Lifecycle,
+            CoordinatorDriveError::Protocol,
+            CoordinatorDriveError::Snapshot,
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Setup),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Deadline),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::OuterTerminalEof),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::TerminalChannelRead),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::TerminalChannelWrite),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::OuterTerminalRead),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::OuterTerminalWrite),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::RawTransition),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Foreground),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::WindowSize),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Restore),
+            CoordinatorDriveError::Terminal(CoordinatorTerminalError::Shutdown),
+            CoordinatorDriveError::Signal,
+            CoordinatorDriveError::Guardian,
+            CoordinatorDriveError::DescriptorIsolation(
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor,
+            ),
+        ];
+        let reasons = [
+            RetentionReason::LifecycleLost,
+            RetentionReason::ProtocolInvalid,
+            RetentionReason::GuardianExited,
+            RetentionReason::ShutdownDeadline,
+            RetentionReason::ChildrenNotReaped,
+            RetentionReason::WorkerNotJoined,
+            RetentionReason::CleanupUnconfirmed,
+            RetentionReason::InvariantUnconfirmed,
+        ];
+
+        assert_eq!(
+            errors.map(packaged_coordinator_failure_marker),
+            PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS
+        );
+        assert_eq!(
+            reasons.map(packaged_coordinator_retention_reason_marker),
+            PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS
         );
 
         let synthetic_secret = "synthetic-private-profile@example.invalid";
-        for marker in [
-            packaged_coordinator_failure_marker(CoordinatorDriveError::Protocol),
-            packaged_coordinator_retention_reason_marker(RetentionReason::ProtocolInvalid),
-        ] {
+        let markers = PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS
+            .iter()
+            .chain(PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        for (index, marker) in markers.iter().copied().enumerate() {
+            assert_eq!(
+                markers
+                    .iter()
+                    .filter(|candidate| **candidate == marker)
+                    .count(),
+                1,
+                "closed coordinator catalog marker {index} was duplicated: {marker}"
+            );
             assert!(!marker.contains(synthetic_secret));
+            assert!(marker.starts_with("coordinator-retained."));
+            assert!(!marker.ends_with('.'));
+            assert!(!marker.contains(".."));
             assert!(
                 marker
                     .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-' || byte == b'.')
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-' || byte == b'.'),
+                "closed coordinator catalog marker {index} was not fixed payload-free syntax: {marker}"
             );
         }
+
+        for error in errors {
+            for reason in reasons {
+                let names = packaged_coordinator_retained_marker_names(error, reason);
+                assert_eq!(names[0], packaged_coordinator_failure_marker(error));
+                assert_eq!(
+                    names[1],
+                    packaged_coordinator_retention_reason_marker(reason)
+                );
+                assert!(PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS.contains(&names[0]));
+                assert!(PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS.contains(&names[1]));
+                assert!(names[0].starts_with("coordinator-retained.error."));
+                assert!(names[1].starts_with("coordinator-retained.reason."));
+            }
+        }
+
+        let error = CoordinatorDriveError::Terminal(CoordinatorTerminalError::Deadline);
+        let reason = RetentionReason::InvariantUnconfirmed;
+        let mut published = Vec::new();
+        publish_packaged_coordinator_retained_markers(error, reason, |marker| {
+            published.push(marker);
+        });
+        assert_eq!(
+            published,
+            [
+                packaged_coordinator_failure_marker(error),
+                packaged_coordinator_retention_reason_marker(reason),
+            ],
+            "the broader retention reason was published before the exact coordinator error"
+        );
     }
 
     #[test]
@@ -2645,6 +3090,8 @@ mod tests {
     enum ProductionMatrixCase {
         Eof,
         DataThenEof,
+        OutputBackpressureTransient,
+        OutputBackpressurePermanent,
         ExitTwentyThree,
         ForwardedHup,
         ForwardedTerm,
@@ -2654,9 +3101,11 @@ mod tests {
     }
 
     impl ProductionMatrixCase {
-        const ALL: [Self; 7] = [
+        const ALL: [Self; 9] = [
             Self::Eof,
             Self::DataThenEof,
+            Self::OutputBackpressureTransient,
+            Self::OutputBackpressurePermanent,
             Self::ExitTwentyThree,
             Self::ForwardedHup,
             Self::ForwardedTerm,
@@ -2668,6 +3117,8 @@ mod tests {
             match self {
                 Self::Eof => "eof",
                 Self::DataThenEof => "data-eof",
+                Self::OutputBackpressureTransient => "output-backpressure-transient",
+                Self::OutputBackpressurePermanent => "output-backpressure-permanent",
                 Self::ExitTwentyThree => "exit-23",
                 Self::ForwardedHup => "forward-hup",
                 Self::ForwardedTerm => "forward-term",
@@ -2684,12 +3135,29 @@ mod tests {
                 .find(|case| case.as_str() == value)
         }
 
+        const fn uses_output_backpressure(self) -> bool {
+            matches!(
+                self,
+                Self::OutputBackpressureTransient | Self::OutputBackpressurePermanent
+            )
+        }
+
+        const fn output_stall_timeout(self) -> Duration {
+            match self {
+                Self::OutputBackpressureTransient => PRODUCTION_MATRIX_TRANSIENT_STALL_TIMEOUT,
+                Self::OutputBackpressurePermanent => PRODUCTION_MATRIX_PERMANENT_STALL_TIMEOUT,
+                _ => Duration::from_secs(1),
+            }
+        }
+
         const fn termination_cause(self) -> SessionTerminationCause {
             match self {
                 Self::ForwardedHup => SessionTerminationCause::ForwardedHup,
                 Self::ForwardedTerm => SessionTerminationCause::ForwardedTerm,
                 Self::Eof
                 | Self::DataThenEof
+                | Self::OutputBackpressureTransient
+                | Self::OutputBackpressurePermanent
                 | Self::ExitTwentyThree
                 | Self::SuspendResume
                 | Self::LifecycleLost
@@ -2715,6 +3183,8 @@ mod tests {
                 },
                 Self::Eof
                 | Self::DataThenEof
+                | Self::OutputBackpressureTransient
+                | Self::OutputBackpressurePermanent
                 | Self::SuspendResume
                 | Self::LifecycleLost
                 | Self::CoordinatorAuthorityLeak => ChildDisposition::Exited {
@@ -2733,6 +3203,8 @@ mod tests {
                 }
                 Self::Eof
                 | Self::DataThenEof
+                | Self::OutputBackpressureTransient
+                | Self::OutputBackpressurePermanent
                 | Self::SuspendResume
                 | Self::CoordinatorAuthorityLeak => {
                     "if IFS= read -r _; then exit 0; else exit 99; fi"
@@ -3309,6 +3781,63 @@ mod tests {
                 )?;
                 rustix::process::kill_process(pid, rustix::process::Signal::CONT)?;
             }
+            ProductionMatrixCase::OutputBackpressureTransient => {
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-saturated",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-enqueued",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-pending",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-peer-held",
+                    parent_deadline,
+                )?;
+                // The peer resumes kernel output flow only after holding an
+                // observed pending owner across many 5 ms control turns.
+                wait_for_matrix_output(
+                    master.as_ref().ok_or("matrix PTY master was missing")?,
+                    PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT,
+                    parent_deadline,
+                )?;
+            }
+            ProductionMatrixCase::OutputBackpressurePermanent => {
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-saturated",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-enqueued",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-pending",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
+                    "coordinator-output-deadline-retained",
+                    parent_deadline,
+                )?;
+                let final_termios = rustix::termios::tcgetattr(
+                    master.as_ref().ok_or("matrix PTY master was missing")?,
+                )?;
+                if !termios_semantically_equal(&initial_termios, &final_termios) {
+                    return Err("output-stall retention did not restore the outer terminal".into());
+                }
+            }
             ProductionMatrixCase::Eof
             | ProductionMatrixCase::DataThenEof
             | ProductionMatrixCase::ExitTwentyThree
@@ -3323,7 +3852,9 @@ mod tests {
                 parent_deadline,
             )?;
         }
-        expect_matrix_line(&line_receiver, "coordinator-finished", parent_deadline)?;
+        if case != ProductionMatrixCase::OutputBackpressurePermanent {
+            expect_matrix_line(&line_receiver, "coordinator-finished", parent_deadline)?;
+        }
         if case == ProductionMatrixCase::SuspendResume {
             let final_termios = rustix::termios::tcgetattr(
                 master.as_ref().ok_or("matrix PTY master was missing")?,
@@ -3374,6 +3905,9 @@ mod tests {
 
         let (coordinator_terminal, guardian_terminal) = TerminalChannelPair::new()?.split();
         let terminal = CoordinatorTerminal::capture(std::io::stdin(), coordinator_terminal)?;
+        if case == ProductionMatrixCase::OutputBackpressurePermanent {
+            verify_retention_cleanup_scrubs_failure_owners()?;
+        }
         let snapshot = terminal.snapshot_fingerprint();
         let (coordinator_lifecycle, guardian_lifecycle) = LifecyclePair::new()?.split_for_test();
         let inherited_a = if case == ProductionMatrixCase::CoordinatorAuthorityLeak {
@@ -3399,6 +3933,7 @@ mod tests {
         let bounds = CoordinatorBounds::new(
             TEST_PRODUCTION_MATRIX_PHASE_TIMEOUT,
             Duration::from_millis(5),
+            case.output_stall_timeout(),
         )?;
         let coordinator = match ProductionCoordinator::assemble(
             authority,
@@ -3424,6 +3959,24 @@ mod tests {
                 return Err(format!("production coordinator assembly failed: {error}").into());
             }
         };
+        let (output_pending_observer, output_pending_receiver) = if case.uses_output_backpressure()
+        {
+            let (observer, receiver) = mpsc::channel();
+            (Some(observer), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let coordinator = match output_pending_observer {
+            Some(observer) => coordinator.with_output_pending_observer(observer),
+            None => coordinator,
+        };
+        let (mut retained_outcome_sender, retained_outcome_receiver) =
+            if case == ProductionMatrixCase::OutputBackpressurePermanent {
+                let (sender, receiver) = UnixStream::pair()?;
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
         // The peer only acquires the process-group owners after coordinator
         // assembly succeeds. A scoped thread then makes its join mandatory on
         // normal return and unwind before the helper can call `process::exit`.
@@ -3437,9 +3990,17 @@ mod tests {
                     trigger,
                     app_group,
                     tui_group,
+                    output_pending_receiver,
+                    retained_outcome_receiver,
                 )
             });
             let outcome = coordinator.run();
+            if matches!(&outcome, CoordinatorRunOutcome::Retained(_)) {
+                if let Some(mut sender) = retained_outcome_sender.take() {
+                    sender.write_all(b"R")?;
+                    sender.shutdown(std::net::Shutdown::Write)?;
+                }
+            }
             let peer_result = peer.join().map_err(|_| "matrix guardian peer panicked")?;
             Ok::<_, Box<dyn std::error::Error>>((outcome, peer_result))
         })?;
@@ -3495,6 +4056,39 @@ mod tests {
             (ProductionMatrixCase::LifecycleLost, CoordinatorRunOutcome::Terminal(_)) => {
                 return Err("lifecycle loss manufactured terminal authority".into());
             }
+            (
+                ProductionMatrixCase::OutputBackpressurePermanent,
+                CoordinatorRunOutcome::Retained(retained),
+            ) => {
+                if retained.reason() != RetentionReason::InvariantUnconfirmed
+                    || retained.failure_for_test()
+                        != CoordinatorDriveError::Terminal(CoordinatorTerminalError::Deadline)
+                    || !retained.terminal_output_is_scrubbed_for_test()
+                {
+                    let reason = retained.reason();
+                    let failure = retained.failure_for_test();
+                    let scrubbed = retained.terminal_output_is_scrubbed_for_test();
+                    drop(retained.release_for_test());
+                    return Err(format!(
+                        "permanent output stall retained the wrong state: {reason:?}, failure={failure:?}, scrubbed={scrubbed}"
+                    )
+                    .into());
+                }
+                drop(retained.release_for_test());
+                peer_result.map_err(|error| {
+                    format!("permanent output-stall guardian peer failed: {error}")
+                })?;
+                wait_for_matrix_group_gone(app_group_pid, Instant::now() + TEST_TIMEOUT)?;
+                wait_for_matrix_group_gone(tui_group_pid, Instant::now() + TEST_TIMEOUT)?;
+                eprintln!("coordinator-output-deadline-retained");
+                return Ok(());
+            }
+            (
+                ProductionMatrixCase::OutputBackpressurePermanent,
+                CoordinatorRunOutcome::Terminal(_),
+            ) => {
+                return Err("permanent output stall lost its terminal deadline origin".into());
+            }
             (_, CoordinatorRunOutcome::Retained(retained)) => {
                 let reason = retained.reason();
                 let failure = retained.failure_for_test();
@@ -3531,12 +4125,222 @@ mod tests {
         Ok(())
     }
 
+    struct MatrixOutputFlowGuard {
+        stdout: std::io::Stdout,
+        resumed: bool,
+    }
+
+    impl MatrixOutputFlowGuard {
+        fn suspend_and_saturate() -> Result<Self, &'static str> {
+            let stdout = std::io::stdout();
+            rustix::termios::tcflow(&stdout, rustix::termios::Action::OOff)
+                .map_err(|_| "matrix outer PTY output suspension failed")?;
+            let guard = Self {
+                stdout,
+                resumed: false,
+            };
+            saturate_matrix_outer_output(&guard.stdout)?;
+            Ok(guard)
+        }
+
+        fn resume(&mut self) -> Result<(), &'static str> {
+            rustix::termios::tcflow(&self.stdout, rustix::termios::Action::OOn)
+                .map_err(|_| "matrix outer PTY output resume failed")?;
+            self.resumed = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for MatrixOutputFlowGuard {
+        fn drop(&mut self) {
+            if !self.resumed {
+                let _ = rustix::termios::tcflow(&self.stdout, rustix::termios::Action::OOn);
+            }
+        }
+    }
+
+    fn saturate_matrix_outer_output(stdout: &std::io::Stdout) -> Result<(), &'static str> {
+        let original =
+            rustix::fs::fcntl_getfl(stdout).map_err(|_| "matrix stdout status read failed")?;
+        rustix::fs::fcntl_setfl(stdout, original | rustix::fs::OFlags::NONBLOCK)
+            .map_err(|_| "matrix stdout nonblocking setup failed")?;
+        let saturation = {
+            let mut stdout = stdout.lock();
+            let filler = [b'B'; super::super::terminal::TERMINAL_BUFFER_CAPACITY];
+            fill_matrix_outer_output_queue(&mut stdout, &filler)
+        };
+        let restoration = rustix::fs::fcntl_setfl(stdout, original);
+        match (saturation, restoration) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(_)) => Err("matrix stdout status restoration failed"),
+            (Err(_), Err(_)) => Err("matrix saturation and stdout restoration failed"),
+        }
+    }
+
+    fn fill_matrix_outer_output_queue(
+        writer: &mut impl Write,
+        bulk: &[u8],
+    ) -> Result<(), &'static str> {
+        const MAX_ACCEPTED_BYTES: usize = super::super::terminal::TERMINAL_BUFFER_CAPACITY * 1024;
+
+        if bulk.is_empty() {
+            return Err("matrix outer PTY saturation buffer was empty");
+        }
+
+        let mut accepted = 0_usize;
+        loop {
+            if accepted >= MAX_ACCEPTED_BYTES {
+                return Err("matrix outer PTY saturation exceeded its byte bound");
+            }
+            let remaining_budget = MAX_ACCEPTED_BYTES - accepted;
+            let request = &bulk[..bulk.len().min(remaining_budget)];
+            match writer.write(request) {
+                Ok(0) => return Err("matrix outer PTY accepted a zero-byte write"),
+                Ok(written) if written <= request.len() => {
+                    accepted = accepted
+                        .checked_add(written)
+                        .ok_or("matrix outer PTY saturation byte count overflowed")?;
+                }
+                Ok(_) => return Err("matrix outer PTY reported an invalid bulk write"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => return Err("matrix outer PTY saturation failed"),
+            }
+        }
+
+        // A large nonblocking PTY write may report WouldBlock while a smaller
+        // fragment still fits. Seal that same-instant residual capacity one
+        // byte at a time. Durable backpressure comes from the surrounding
+        // output-flow guard, not from assuming this queue snapshot stays full.
+        let seal = [b'B'];
+        loop {
+            if accepted >= MAX_ACCEPTED_BYTES {
+                return Err("matrix outer PTY saturation exceeded its byte bound");
+            }
+            match writer.write(&seal) {
+                Ok(0) => return Err("matrix outer PTY accepted a zero-byte write"),
+                Ok(1) => {
+                    accepted = accepted
+                        .checked_add(1)
+                        .ok_or("matrix outer PTY saturation byte count overflowed")?;
+                }
+                Ok(_) => return Err("matrix outer PTY reported an invalid seal write"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(_) => return Err("matrix outer PTY saturation failed"),
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_output_saturation_seals_residual_sub_fragment_capacity() {
+        struct ResidualCapacityWriter {
+            remaining: usize,
+            bulk_would_block: usize,
+            seal_writes: usize,
+            seal_would_block: usize,
+        }
+
+        impl Write for ResidualCapacityWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.remaining {
+                    if bytes.len() == 1 {
+                        self.seal_would_block += 1;
+                    } else {
+                        self.bulk_would_block += 1;
+                    }
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                if bytes.len() == 1 {
+                    self.seal_writes += 1;
+                }
+                self.remaining -= bytes.len();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bulk = [b'B'; super::super::terminal::TERMINAL_BUFFER_CAPACITY];
+        let mut writer = ResidualCapacityWriter {
+            remaining: bulk.len() + PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT.len(),
+            bulk_would_block: 0,
+            seal_writes: 0,
+            seal_would_block: 0,
+        };
+
+        assert_eq!(fill_matrix_outer_output_queue(&mut writer, &bulk), Ok(()));
+
+        assert_eq!(writer.bulk_would_block, 1);
+        assert_eq!(
+            writer.seal_writes,
+            PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT.len()
+        );
+        assert_eq!(writer.seal_would_block, 1);
+        assert_eq!(writer.remaining, 0);
+    }
+
+    fn verify_retention_cleanup_scrubs_failure_owners() -> Result<(), Box<dyn std::error::Error>> {
+        for (policy, expected_state) in [
+            (
+                RetentionTerminalCleanupPolicy {
+                    force_restore_failure: true,
+                    force_finish_failure: false,
+                },
+                "quiesced",
+            ),
+            (
+                RetentionTerminalCleanupPolicy {
+                    force_restore_failure: false,
+                    force_finish_failure: true,
+                },
+                "restored",
+            ),
+        ] {
+            let (coordinator_endpoint, peer) = TerminalChannelPair::new()?.split();
+            let mut terminal =
+                CoordinatorTerminal::capture(std::io::stdin(), coordinator_endpoint)?;
+            terminal.load_pending_output_for_test(
+                b"private-retained-output-sentinel",
+                Instant::now() + TEST_TIMEOUT,
+            )?;
+            let owner = CoordinatorTerminalOwner::OutputOnly(Box::new(terminal)).quiesce();
+            let (owner, reason) =
+                prepare_terminal_for_retention(owner, RetentionReason::LifecycleLost, policy);
+
+            assert_eq!(reason, RetentionReason::InvariantUnconfirmed);
+            assert!(owner.pending_output_is_scrubbed_for_test());
+            assert_eq!(owner.pending_output_shape_for_test(), Some((0, 0, true)));
+            assert!(matches!(
+                (&owner, expected_state),
+                (CoordinatorTerminalOwner::Quiesced(_), "quiesced")
+                    | (CoordinatorTerminalOwner::Restored(_), "restored")
+            ));
+            // Scrubbing must preserve both sides of the exact channel and the
+            // typed restore/finish owner; dropping an FD would make either
+            // invariant check fail and is not accepted as payload removal.
+            {
+                let mut forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+                owner.append_forbidden_descriptors(&mut forbidden)?;
+            }
+            peer.verify_invariants()?;
+        }
+        Ok(())
+    }
+
     fn validate_matrix_child_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let anchor = std::fs::canonicalize(std::env::temp_dir())?;
         PrivateRuntime::validate_fixture_path(root, &anchor)
             .map_err(|_| "matrix test root identity was invalid".into())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the real-process matrix keeps each protocol and cleanup owner explicit"
+    )]
     fn run_matrix_guardian_peer(
         case: ProductionMatrixCase,
         snapshot: TerminalSnapshotFingerprint,
@@ -3545,6 +4349,8 @@ mod tests {
         mut trigger: ChildStdin,
         app_group: MatrixScanGroup,
         tui_group: MatrixScanGroup,
+        output_pending_receiver: Option<Receiver<()>>,
+        retained_outcome_receiver: Option<UnixStream>,
     ) -> Result<(), &'static str> {
         let mut receiver = GuardianCommandReceiver::new_terminal(lifecycle);
         matrix_event(&mut receiver, GuardianEvent::LeaseCommitted)?;
@@ -3640,6 +4446,8 @@ mod tests {
             }
             ProductionMatrixCase::Eof
             | ProductionMatrixCase::DataThenEof
+            | ProductionMatrixCase::OutputBackpressureTransient
+            | ProductionMatrixCase::OutputBackpressurePermanent
             | ProductionMatrixCase::ExitTwentyThree
             | ProductionMatrixCase::LifecycleLost
             | ProductionMatrixCase::CoordinatorAuthorityLeak => {}
@@ -3648,29 +4456,97 @@ mod tests {
         if case == ProductionMatrixCase::DataThenEof {
             write_matrix_terminal(&terminal, PRODUCTION_MATRIX_OUTPUT)?;
         }
-        terminal
-            .shutdown(TerminalShutdown::Write)
-            .map_err(|_| "terminal peer half-close failed")?;
-        if case == ProductionMatrixCase::LifecycleLost {
-            // Close lifecycle while the direct guardian child is still
-            // definitely alive. This makes channel loss, rather than a racing
-            // wait-visible child, the retained root cause. The trigger stays
-            // owned by this thread until after the coordinator has observed
-            // EOF and entered bounded retention.
-            drop(receiver);
-            drop(terminal);
-            std::thread::sleep(Duration::from_millis(150));
-            return Ok(());
+        let mut output_flow = if case.uses_output_backpressure() {
+            let guard = MatrixOutputFlowGuard::suspend_and_saturate()?;
+            eprintln!("output-backpressure-saturated");
+            Some(guard)
+        } else {
+            None
+        };
+        if case.uses_output_backpressure() {
+            write_matrix_terminal(&terminal, PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT)?;
+            eprintln!("output-backpressure-enqueued");
+            output_pending_receiver
+                .ok_or("output backpressure pending observer was missing")?
+                .recv_timeout(TEST_TIMEOUT)
+                .map_err(|_| "output backpressure pending owner was not observed")?;
+            eprintln!("output-backpressure-pending");
         }
-        // Force the production loop to observe terminal-channel EOF before
-        // lifecycle quiescence; EOF is sticky data-path state, never the
-        // authority that replaces this later typed event.
-        std::thread::sleep(Duration::from_millis(75));
-        matrix_event(&mut receiver, GuardianEvent::TerminalQuiesced)?;
-        matrix_command(&mut receiver, CoordinatorCommand::TerminalRestored)?;
-        let _restored = receiver
-            .take_verified_terminal_restored_command()
-            .map_err(|_| "missing restored command proof")?;
+        if case == ProductionMatrixCase::OutputBackpressureTransient {
+            std::thread::sleep(PRODUCTION_MATRIX_BACKPRESSURE_HOLD.saturating_mul(2));
+            // The peer endpoint is intentionally still live at this marker;
+            // recovery must come from releasing outer-terminal backpressure,
+            // never from manufacturing terminal-channel EOF.
+            terminal
+                .verify_invariants()
+                .map_err(|_| "transient output peer closed during backpressure")?;
+            output_flow
+                .as_mut()
+                .ok_or("transient output flow owner was missing")?
+                .resume()?;
+            eprintln!("output-backpressure-peer-held");
+        }
+        if case == ProductionMatrixCase::OutputBackpressurePermanent {
+            // The instance-scoped observer proves the exact pending owner
+            // before lifecycle progress is committed. Kernel output flow stays
+            // suspended until either retention closes this channel or a bad
+            // implementation advances the complete terminal transcript.
+            matrix_event(&mut receiver, GuardianEvent::TerminalQuiesced)?;
+            match receiver.receive(Instant::now() + TEST_TIMEOUT) {
+                Err(ProtocolError::UnexpectedEof) => {
+                    output_flow
+                        .as_mut()
+                        .ok_or("permanent output flow owner was missing")?
+                        .resume()?;
+                    trigger
+                        .write_all(b"finish\n")
+                        .map_err(|_| "permanent-stall guardian trigger failed")?;
+                    trigger
+                        .flush()
+                        .map_err(|_| "permanent-stall guardian trigger flush failed")?;
+                    wait_for_matrix_retained_outcome(
+                        retained_outcome_receiver
+                            .ok_or("permanent retained outcome channel was missing")?,
+                    )?;
+                    return Ok(());
+                }
+                Err(_) => return Err("permanent output stall lifecycle ended incorrectly"),
+                Ok(CoordinatorCommand::TerminalRestored) => {
+                    let _restored = receiver
+                        .take_verified_terminal_restored_command()
+                        .map_err(|_| "missing unexpected restored command proof")?;
+                    output_flow
+                        .as_mut()
+                        .ok_or("permanent output flow owner was missing")?
+                        .resume()?;
+                }
+                Ok(_) => return Err("permanent output stall received an unexpected command"),
+            }
+        } else {
+            terminal
+                .shutdown(TerminalShutdown::Write)
+                .map_err(|_| "terminal peer half-close failed")?;
+            if case == ProductionMatrixCase::LifecycleLost {
+                // Close lifecycle while the direct guardian child is still
+                // definitely alive. This makes channel loss, rather than a racing
+                // wait-visible child, the retained root cause. The trigger stays
+                // owned by this thread until after the coordinator has observed
+                // EOF and entered bounded retention.
+                drop(receiver);
+                drop(terminal);
+                std::thread::sleep(Duration::from_millis(150));
+                return Ok(());
+            }
+            // Force the production loop to observe terminal-channel EOF before
+            // lifecycle quiescence; EOF is sticky data-path state, never the
+            // authority that replaces this later typed event.
+            std::thread::sleep(Duration::from_millis(75));
+            matrix_event(&mut receiver, GuardianEvent::TerminalQuiesced)?;
+            matrix_command(&mut receiver, CoordinatorCommand::TerminalRestored)?;
+            let _restored = receiver
+                .take_verified_terminal_restored_command()
+                .map_err(|_| "missing restored command proof")?;
+        }
         matrix_event(&mut receiver, GuardianEvent::TerminalRecoveryDisarmed)?;
         trigger
             .write_all(b"finish\n")
@@ -3701,6 +4577,32 @@ mod tests {
             .into_disposition();
         if verified != guardian_exit {
             return Err("guardian exit proof mismatch");
+        }
+        if case == ProductionMatrixCase::OutputBackpressurePermanent {
+            Err("permanent output stall advanced beyond terminal retention")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_matrix_retained_outcome(mut receiver: UnixStream) -> Result<(), &'static str> {
+        receiver
+            .set_read_timeout(Some(TEST_TIMEOUT))
+            .map_err(|_| "permanent retained outcome timeout setup failed")?;
+        let mut frame = [0_u8; 1];
+        receiver
+            .read_exact(&mut frame)
+            .map_err(|_| "permanent retained outcome was not published")?;
+        if frame != *b"R" {
+            return Err("permanent retained outcome frame was invalid");
+        }
+        let mut trailing = [0_u8; 1];
+        if receiver
+            .read(&mut trailing)
+            .map_err(|_| "permanent retained outcome EOF failed")?
+            != 0
+        {
+            return Err("permanent retained outcome had trailing bytes");
         }
         Ok(())
     }

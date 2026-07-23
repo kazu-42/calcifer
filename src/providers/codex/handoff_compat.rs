@@ -150,11 +150,109 @@ pub(crate) enum CodexHandoffError {
     Spawn,
 }
 
+/// A closed, payload-free origin for a compatibility timeout before the first
+/// version-gate milestone.
+///
+/// These values carry no process, filesystem, cleanup, retry, or completion
+/// authority. They only preserve the first exact deadline boundary while the
+/// public compatibility category remains [`CodexHandoffError::Timeout`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompatibilityTimeoutOrigin {
+    DeadlineOverflow,
+    SourceCapture,
+    ProbeStageCopyDurability,
+    ProbeStageRecapture,
+    VersionChildExit,
+    VersionStdoutDrain,
+}
+
+impl CompatibilityTimeoutOrigin {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 6] = [
+        Self::DeadlineOverflow,
+        Self::SourceCapture,
+        Self::ProbeStageCopyDurability,
+        Self::ProbeStageRecapture,
+        Self::VersionChildExit,
+        Self::VersionStdoutDrain,
+    ];
+
+    #[cfg(test)]
+    pub(crate) const fn fixed_label(self) -> &'static str {
+        match self {
+            Self::DeadlineOverflow => "deadline-overflow",
+            Self::SourceCapture => "source-capture",
+            Self::ProbeStageCopyDurability => "probe-stage-copy-durability",
+            Self::ProbeStageRecapture => "probe-stage-recapture",
+            Self::VersionChildExit => "version-child-exit",
+            Self::VersionStdoutDrain => "version-stdout-drain",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CodexHandoffCause {
+    error: CodexHandoffError,
+    timeout_origin: Option<CompatibilityTimeoutOrigin>,
+    cleanup_error: Option<CodexHandoffError>,
+}
+
+impl CodexHandoffCause {
+    pub(super) const fn at_timeout_boundary(
+        error: CodexHandoffError,
+        origin: CompatibilityTimeoutOrigin,
+    ) -> Self {
+        Self {
+            error,
+            timeout_origin: if matches!(error, CodexHandoffError::Timeout) {
+                Some(origin)
+            } else {
+                None
+            },
+            cleanup_error: None,
+        }
+    }
+
+    pub(super) const fn timeout(origin: CompatibilityTimeoutOrigin) -> Self {
+        Self {
+            error: CodexHandoffError::Timeout,
+            timeout_origin: Some(origin),
+            cleanup_error: None,
+        }
+    }
+
+    pub(super) const fn timeout_with_cleanup(
+        origin: CompatibilityTimeoutOrigin,
+        cleanup_error: Option<CodexHandoffError>,
+    ) -> Self {
+        Self {
+            error: CodexHandoffError::Timeout,
+            timeout_origin: Some(origin),
+            cleanup_error,
+        }
+    }
+
+    pub(super) const fn release(self) -> CodexHandoffError {
+        self.error
+    }
+}
+
+impl From<CodexHandoffError> for CodexHandoffCause {
+    fn from(error: CodexHandoffError) -> Self {
+        Self {
+            error,
+            timeout_origin: None,
+            cleanup_error: None,
+        }
+    }
+}
+
 /// A compatibility failure that retains any filesystem authority created
 /// before the failure became observable.
 #[must_use = "handoff failure can retain staged filesystem ownership"]
 pub(crate) struct CodexHandoffFailure {
     error: CodexHandoffError,
+    timeout_origin: Option<CompatibilityTimeoutOrigin>,
     cleanup_error: Option<CodexHandoffError>,
     #[cfg(unix)]
     retained: Option<runtime::CodexHandoffRetention>,
@@ -163,15 +261,43 @@ pub(crate) struct CodexHandoffFailure {
 impl CodexHandoffFailure {
     #[cfg(unix)]
     fn with_retained(error: CodexHandoffError, retained: runtime::CodexHandoffRetention) -> Self {
+        Self::with_retained_cause(error.into(), retained)
+    }
+
+    #[cfg(unix)]
+    fn with_retained_cause(
+        cause: CodexHandoffCause,
+        retained: runtime::CodexHandoffRetention,
+    ) -> Self {
         Self {
-            error,
-            cleanup_error: None,
+            error: cause.error,
+            timeout_origin: cause.timeout_origin,
+            cleanup_error: cause.cleanup_error,
             retained: Some(retained),
+        }
+    }
+
+    #[cfg(test)]
+    const fn timeout(origin: CompatibilityTimeoutOrigin) -> Self {
+        Self::from_cause(CodexHandoffCause::timeout(origin))
+    }
+
+    const fn from_cause(cause: CodexHandoffCause) -> Self {
+        Self {
+            error: cause.error,
+            timeout_origin: cause.timeout_origin,
+            cleanup_error: cause.cleanup_error,
+            #[cfg(unix)]
+            retained: None,
         }
     }
 
     pub(crate) const fn error(&self) -> CodexHandoffError {
         self.error
+    }
+
+    pub(crate) const fn timeout_origin(&self) -> Option<CompatibilityTimeoutOrigin> {
+        self.timeout_origin
     }
 
     pub(crate) const fn has_retained_ownership(&self) -> bool {
@@ -204,22 +330,26 @@ impl CodexHandoffFailure {
     ) -> Result<CodexHandoffResolution, Box<Self>> {
         let Self {
             error,
+            timeout_origin,
             cleanup_error,
             retained,
         } = *self;
         let Some(retained) = retained else {
             return Ok(CodexHandoffResolution {
                 error,
+                timeout_origin,
                 cleanup_error,
             });
         };
         match runtime::resolve_handoff_retention(retained, deadline) {
             Ok(()) => Ok(CodexHandoffResolution {
                 error,
+                timeout_origin,
                 cleanup_error,
             }),
             Err(failure) => Err(Box::new(Self {
                 error,
+                timeout_origin,
                 cleanup_error: cleanup_error.or(Some(failure.error)),
                 retained: Some(failure.retained),
             })),
@@ -229,12 +359,13 @@ impl CodexHandoffFailure {
 
 impl From<CodexHandoffError> for CodexHandoffFailure {
     fn from(error: CodexHandoffError) -> Self {
-        Self {
-            error,
-            cleanup_error: None,
-            #[cfg(unix)]
-            retained: None,
-        }
+        Self::from_cause(error.into())
+    }
+}
+
+impl From<CodexHandoffCause> for CodexHandoffFailure {
+    fn from(cause: CodexHandoffCause) -> Self {
+        Self::from_cause(cause)
     }
 }
 
@@ -243,6 +374,7 @@ impl fmt::Debug for CodexHandoffFailure {
         formatter
             .debug_struct("CodexHandoffFailure")
             .field("error", &self.error)
+            .field("timeout_origin", &self.timeout_origin)
             .field("cleanup_error", &self.cleanup_error)
             .field("retained", &self.has_retained_ownership())
             .finish_non_exhaustive()
@@ -264,6 +396,7 @@ impl std::error::Error for CodexHandoffFailure {}
 #[must_use = "resolved compatibility cleanup must be projected to startup"]
 pub(crate) struct CodexHandoffResolution {
     error: CodexHandoffError,
+    timeout_origin: Option<CompatibilityTimeoutOrigin>,
     cleanup_error: Option<CodexHandoffError>,
 }
 
@@ -271,6 +404,10 @@ pub(crate) struct CodexHandoffResolution {
 impl CodexHandoffResolution {
     pub(crate) const fn error(&self) -> CodexHandoffError {
         self.error
+    }
+
+    pub(crate) const fn timeout_origin(&self) -> Option<CompatibilityTimeoutOrigin> {
+        self.timeout_origin
     }
 
     pub(crate) const fn cleanup_error(&self) -> Option<CodexHandoffError> {
@@ -288,6 +425,7 @@ impl fmt::Debug for CodexHandoffResolution {
         formatter
             .debug_struct("CodexHandoffResolution")
             .field("error", &self.error)
+            .field("timeout_origin", &self.timeout_origin)
             .field("cleanup_error", &self.cleanup_error)
             .finish()
     }
@@ -881,6 +1019,53 @@ mod tests {
                 "error schema mutation {document}:{pointer} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn compatibility_timeout_origins_are_closed_unique_and_payload_free() {
+        use std::collections::BTreeSet;
+
+        let labels = CompatibilityTimeoutOrigin::ALL.map(CompatibilityTimeoutOrigin::fixed_label);
+        let unique = labels.into_iter().collect::<BTreeSet<_>>();
+
+        assert_eq!(unique.len(), CompatibilityTimeoutOrigin::ALL.len());
+        assert_eq!(
+            labels,
+            [
+                "deadline-overflow",
+                "source-capture",
+                "probe-stage-copy-durability",
+                "probe-stage-recapture",
+                "version-child-exit",
+                "version-stdout-drain",
+            ]
+        );
+        assert!(labels.into_iter().all(|label| {
+            label.is_ascii()
+                && !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        }));
+    }
+
+    #[test]
+    fn compatibility_timeout_origin_survives_resolution_without_cleanup_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for origin in CompatibilityTimeoutOrigin::ALL {
+            let failure = Box::new(CodexHandoffFailure::timeout(origin));
+
+            assert_eq!(failure.error(), CodexHandoffError::Timeout);
+            assert_eq!(failure.timeout_origin(), Some(origin));
+            let resolution = match failure.resolve(std::time::Instant::now()) {
+                Ok(resolution) => resolution,
+                Err(_) => return Err("origin-only timeout retained cleanup authority".into()),
+            };
+            assert_eq!(resolution.error(), CodexHandoffError::Timeout);
+            assert_eq!(resolution.timeout_origin(), Some(origin));
+            assert_eq!(resolution.release(), CodexHandoffError::Timeout);
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
