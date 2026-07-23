@@ -574,8 +574,9 @@ impl<State> CoordinatorTerminal<State> {
     ///
     /// A transient outer-terminal stall retains the exact fragment and offset
     /// across turns so the coordinator can service lifecycle and signal work.
-    /// The first pending turn also fixes one absolute stall deadline; retries
-    /// never extend it.
+    /// The first pending turn fixes one inactivity deadline. Forward progress
+    /// renews that window for the remaining bytes, while `WouldBlock` never
+    /// extends it; the caller's outer phase deadline remains an absolute cap.
     pub(super) fn pump_output_once(
         mut self,
         stall_timeout: Duration,
@@ -692,9 +693,20 @@ fn pump_output_state_once(
             *stall_deadline = None;
             Ok(CoordinatorPumpProgress::Output)
         }
-        TerminalWrite::Progress { .. } | TerminalWrite::WouldBlock => {
-            Ok(CoordinatorPumpProgress::OutputPending)
+        TerminalWrite::Progress { .. } => {
+            let observed = now();
+            let local_deadline = observed
+                .checked_add(stall_timeout)
+                .ok_or(CoordinatorTerminalError::Deadline)?;
+            let renewed_deadline = local_deadline.min(outer_deadline);
+            *stall_deadline = Some(renewed_deadline);
+            if observed >= renewed_deadline {
+                Err(CoordinatorTerminalError::Deadline)
+            } else {
+                Ok(CoordinatorPumpProgress::OutputPending)
+            }
         }
+        TerminalWrite::WouldBlock => Ok(CoordinatorPumpProgress::OutputPending),
     }
 }
 
@@ -865,6 +877,171 @@ mod tests {
         );
         assert_eq!((reads, writes), (1, 2));
         assert_eq!(output.remaining_bytes_for_test(), b"fixed-pending-sentinel");
+        Ok(())
+    }
+
+    #[test]
+    fn partial_output_progress_renews_only_the_inactivity_window() -> Result<(), Box<dyn Error>> {
+        let base = Instant::now();
+        let stall_timeout = Duration::from_millis(20);
+        let outer_deadline = base + Duration::from_millis(100);
+        let mut output = PendingTerminalOutput::new();
+        let mut stall_deadline = None;
+        let mut output_closed = false;
+        let mut writes = 0_usize;
+
+        let mut initial_clock = [base, base, base].into_iter();
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                stall_timeout,
+                outer_deadline,
+                || match initial_clock.next() {
+                    Some(observed) => observed,
+                    None => panic!("missing initial clock observation"),
+                },
+                |output| {
+                    output
+                        .load_for_test(b"progress-renewal-sentinel")
+                        .map_err(|_| CoordinatorTerminalError::TerminalChannelRead)?;
+                    Ok(PendingTerminalRead::Data)
+                },
+                |_| {
+                    writes += 1;
+                    Ok(TerminalWrite::WouldBlock)
+                },
+            )?,
+            CoordinatorPumpProgress::OutputPending
+        );
+        assert_eq!(stall_deadline, Some(base + stall_timeout));
+
+        let progress_at = base + Duration::from_millis(15);
+        let observed_after_progress = base + Duration::from_millis(16);
+        let mut progress_clock = [progress_at, progress_at, observed_after_progress].into_iter();
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                stall_timeout,
+                outer_deadline,
+                || match progress_clock.next() {
+                    Some(observed) => observed,
+                    None => panic!("missing progress clock observation"),
+                },
+                |_| panic!("pending output performed another read"),
+                |_| {
+                    writes += 1;
+                    Ok(TerminalWrite::Progress {
+                        written: 1,
+                        remaining: 1,
+                    })
+                },
+            )?,
+            CoordinatorPumpProgress::OutputPending
+        );
+        let renewed_deadline = observed_after_progress + stall_timeout;
+        assert_eq!(stall_deadline, Some(renewed_deadline));
+
+        let would_block_at = base + Duration::from_millis(30);
+        let mut blocked_clock = [would_block_at, would_block_at].into_iter();
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                stall_timeout,
+                outer_deadline,
+                || match blocked_clock.next() {
+                    Some(observed) => observed,
+                    None => panic!("missing blocked clock observation"),
+                },
+                |_| panic!("pending output performed another read"),
+                |_| {
+                    writes += 1;
+                    Ok(TerminalWrite::WouldBlock)
+                },
+            )?,
+            CoordinatorPumpProgress::OutputPending
+        );
+        assert_eq!(stall_deadline, Some(renewed_deadline));
+
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                stall_timeout,
+                outer_deadline,
+                || renewed_deadline,
+                |_| panic!("expired pending output performed a read"),
+                |_| {
+                    writes += 1;
+                    Ok(TerminalWrite::WouldBlock)
+                },
+            ),
+            Err(CoordinatorTerminalError::Deadline)
+        );
+        assert_eq!(writes, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_output_progress_never_renews_past_the_outer_fence() -> Result<(), Box<dyn Error>> {
+        let base = Instant::now();
+        let outer_deadline = base + Duration::from_millis(100);
+        let progress_at = base + Duration::from_millis(90);
+        let observed_after_progress = base + Duration::from_millis(91);
+        let mut observations = [progress_at, progress_at, observed_after_progress].into_iter();
+        let mut output = PendingTerminalOutput::new();
+        output.load_for_test(b"outer-fence-progress-sentinel")?;
+        let mut stall_deadline = Some(base + Duration::from_millis(95));
+        let mut output_closed = false;
+        let mut writes = 0_usize;
+
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                Duration::from_millis(20),
+                outer_deadline,
+                || match observations.next() {
+                    Some(observed) => observed,
+                    None => panic!("missing capped clock observation"),
+                },
+                |_| panic!("pending output performed another read"),
+                |_| {
+                    writes += 1;
+                    Ok(TerminalWrite::Progress {
+                        written: 1,
+                        remaining: 1,
+                    })
+                },
+            )?,
+            CoordinatorPumpProgress::OutputPending
+        );
+        assert_eq!(stall_deadline, Some(outer_deadline));
+
+        assert_eq!(
+            pump_output_state_once(
+                &mut output,
+                &mut stall_deadline,
+                &mut output_closed,
+                Duration::from_millis(20),
+                outer_deadline,
+                || outer_deadline,
+                |_| panic!("expired pending output performed a read"),
+                |_| {
+                    writes += 1;
+                    Ok(TerminalWrite::WouldBlock)
+                },
+            ),
+            Err(CoordinatorTerminalError::Deadline)
+        );
+        assert_eq!(writes, 1);
         Ok(())
     }
 

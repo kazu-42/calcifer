@@ -1340,6 +1340,8 @@ pub(super) struct ProductionCoordinator {
     packaged_retention_report_root: Option<PathBuf>,
     #[cfg(test)]
     retain_after_packaged_startup_failure: bool,
+    #[cfg(test)]
+    output_pending_observer: Option<std::sync::mpsc::Sender<()>>,
 }
 
 enum ActiveOutcome {
@@ -1421,6 +1423,8 @@ impl ProductionCoordinator {
             packaged_retention_report_root: None,
             #[cfg(test)]
             retain_after_packaged_startup_failure: false,
+            #[cfg(test)]
+            output_pending_observer: None,
         })
     }
 
@@ -1446,6 +1450,12 @@ impl ProductionCoordinator {
         // process, lease, cleanup, retry, or recovery authority.
         self.packaged_retention_report_root = Some(report_root);
         self.retain_after_packaged_startup_failure = retain_after_startup_failure;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_output_pending_observer(mut self, observer: std::sync::mpsc::Sender<()>) -> Self {
+        self.output_pending_observer = Some(observer);
         self
     }
 
@@ -1975,8 +1985,18 @@ impl ProductionCoordinator {
             CoordinatorTerminalOwner::has_pending_output,
             |owner| owner.pump_output_once(self.bounds.output_stall_timeout, outer_deadline),
         ) {
-            Ok((owner, _)) => {
+            Ok((owner, progress)) => {
                 self.terminal = Some(owner);
+                #[cfg(not(test))]
+                let _ = progress;
+                #[cfg(test)]
+                if progress == CoordinatorPumpProgress::OutputPending {
+                    if let Some(observer) = self.output_pending_observer.take() {
+                        observer
+                            .send(())
+                            .map_err(|_| CoordinatorDriveError::Protocol)?;
+                    }
+                }
                 Ok(())
             }
             Err((owner, error)) => {
@@ -2129,6 +2149,8 @@ impl ProductionCoordinator {
                 packaged_retention_report_root: _,
             #[cfg(test)]
                 retain_after_packaged_startup_failure: _,
+            #[cfg(test)]
+                output_pending_observer: _,
         } = self;
         let restoration = match terminal {
             Some(CoordinatorTerminalOwner::Finished(restoration)) => restoration,
@@ -2234,7 +2256,7 @@ mod tests {
 
     use super::super::channel::LifecyclePair;
     use super::super::protocol::{
-        ChildRole, GuardianCommandReceiver, SessionTerminationCause, StopAction,
+        ChildRole, GuardianCommandReceiver, ProtocolError, SessionTerminationCause, StopAction,
         project_terminal_semantics, send_guardian_event,
     };
     use super::super::runtime::PrivateRuntime;
@@ -2265,7 +2287,7 @@ mod tests {
         b"calcifer-production-coordinator-backpressure-output";
     const PRODUCTION_MATRIX_BACKPRESSURE_HOLD: Duration = Duration::from_millis(100);
     const PRODUCTION_MATRIX_TRANSIENT_STALL_TIMEOUT: Duration = Duration::from_millis(500);
-    const PRODUCTION_MATRIX_PERMANENT_STALL_TIMEOUT: Duration = Duration::from_millis(80);
+    const PRODUCTION_MATRIX_PERMANENT_STALL_TIMEOUT: Duration = Duration::from_millis(500);
     const MATRIX_UNPROVEN_CHILD_CLEANUP_EXIT_CODE: u8 = 93;
 
     #[test]
@@ -3696,14 +3718,6 @@ mod tests {
             .ok_or("matrix PTY master was missing")?
             .enable_nonblocking()?;
 
-        if case.uses_output_backpressure() {
-            expect_matrix_line(
-                &line_receiver,
-                "output-backpressure-saturated",
-                parent_deadline,
-            )?;
-        }
-
         if case == ProductionMatrixCase::CoordinatorAuthorityLeak {
             expect_matrix_line(
                 &line_receiver,
@@ -3770,16 +3784,17 @@ mod tests {
             ProductionMatrixCase::OutputBackpressureTransient => {
                 expect_matrix_line(
                     &line_receiver,
+                    "output-backpressure-saturated",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
                     "output-backpressure-enqueued",
                     parent_deadline,
                 )?;
-                // The queue remains saturated across many 5 ms coordinator
-                // control turns. Only this explicit parent release begins
-                // draining the outer PTY.
-                std::thread::sleep(PRODUCTION_MATRIX_BACKPRESSURE_HOLD);
-                wait_for_matrix_output(
-                    master.as_ref().ok_or("matrix PTY master was missing")?,
-                    PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT,
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-pending",
                     parent_deadline,
                 )?;
                 expect_matrix_line(
@@ -3787,11 +3802,28 @@ mod tests {
                     "output-backpressure-peer-held",
                     parent_deadline,
                 )?;
+                // The peer resumes kernel output flow only after holding an
+                // observed pending owner across many 5 ms control turns.
+                wait_for_matrix_output(
+                    master.as_ref().ok_or("matrix PTY master was missing")?,
+                    PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT,
+                    parent_deadline,
+                )?;
             }
             ProductionMatrixCase::OutputBackpressurePermanent => {
                 expect_matrix_line(
                     &line_receiver,
+                    "output-backpressure-saturated",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
                     "output-backpressure-enqueued",
+                    parent_deadline,
+                )?;
+                expect_matrix_line(
+                    &line_receiver,
+                    "output-backpressure-pending",
                     parent_deadline,
                 )?;
                 expect_matrix_line(
@@ -3853,10 +3885,6 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         claim_controlling_terminal_from_stdin()?;
         validate_matrix_child_root(root)?;
-        if case.uses_output_backpressure() {
-            saturate_matrix_outer_output()?;
-            eprintln!("output-backpressure-saturated");
-        }
         let registry = Registry::at(root.to_path_buf());
         let pending = registry.begin_codex_registration("matrix")?;
         let mut auth = OpenOptions::new()
@@ -3931,6 +3959,24 @@ mod tests {
                 return Err(format!("production coordinator assembly failed: {error}").into());
             }
         };
+        let (output_pending_observer, output_pending_receiver) = if case.uses_output_backpressure()
+        {
+            let (observer, receiver) = mpsc::channel();
+            (Some(observer), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let coordinator = match output_pending_observer {
+            Some(observer) => coordinator.with_output_pending_observer(observer),
+            None => coordinator,
+        };
+        let (mut retained_outcome_sender, retained_outcome_receiver) =
+            if case == ProductionMatrixCase::OutputBackpressurePermanent {
+                let (sender, receiver) = UnixStream::pair()?;
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
         // The peer only acquires the process-group owners after coordinator
         // assembly succeeds. A scoped thread then makes its join mandatory on
         // normal return and unwind before the helper can call `process::exit`.
@@ -3944,9 +3990,17 @@ mod tests {
                     trigger,
                     app_group,
                     tui_group,
+                    output_pending_receiver,
+                    retained_outcome_receiver,
                 )
             });
             let outcome = coordinator.run();
+            if matches!(&outcome, CoordinatorRunOutcome::Retained(_)) {
+                if let Some(mut sender) = retained_outcome_sender.take() {
+                    sender.write_all(b"R")?;
+                    sender.shutdown(std::net::Shutdown::Write)?;
+                }
+            }
             let peer_result = peer.join().map_err(|_| "matrix guardian peer panicked")?;
             Ok::<_, Box<dyn std::error::Error>>((outcome, peer_result))
         })?;
@@ -4071,32 +4125,162 @@ mod tests {
         Ok(())
     }
 
-    fn saturate_matrix_outer_output() -> Result<(), Box<dyn std::error::Error>> {
-        let stdout = std::io::stdout();
-        let original = rustix::fs::fcntl_getfl(&stdout)?;
-        rustix::fs::fcntl_setfl(&stdout, original | rustix::fs::OFlags::NONBLOCK)?;
+    struct MatrixOutputFlowGuard {
+        stdout: std::io::Stdout,
+        resumed: bool,
+    }
+
+    impl MatrixOutputFlowGuard {
+        fn suspend_and_saturate() -> Result<Self, &'static str> {
+            let stdout = std::io::stdout();
+            rustix::termios::tcflow(&stdout, rustix::termios::Action::OOff)
+                .map_err(|_| "matrix outer PTY output suspension failed")?;
+            let guard = Self {
+                stdout,
+                resumed: false,
+            };
+            saturate_matrix_outer_output(&guard.stdout)?;
+            Ok(guard)
+        }
+
+        fn resume(&mut self) -> Result<(), &'static str> {
+            rustix::termios::tcflow(&self.stdout, rustix::termios::Action::OOn)
+                .map_err(|_| "matrix outer PTY output resume failed")?;
+            self.resumed = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for MatrixOutputFlowGuard {
+        fn drop(&mut self) {
+            if !self.resumed {
+                let _ = rustix::termios::tcflow(&self.stdout, rustix::termios::Action::OOn);
+            }
+        }
+    }
+
+    fn saturate_matrix_outer_output(stdout: &std::io::Stdout) -> Result<(), &'static str> {
+        let original =
+            rustix::fs::fcntl_getfl(stdout).map_err(|_| "matrix stdout status read failed")?;
+        rustix::fs::fcntl_setfl(stdout, original | rustix::fs::OFlags::NONBLOCK)
+            .map_err(|_| "matrix stdout nonblocking setup failed")?;
         let saturation = {
             let mut stdout = stdout.lock();
             let filler = [b'B'; super::super::terminal::TERMINAL_BUFFER_CAPACITY];
-            loop {
-                match stdout.write(&filler) {
-                    Ok(0) => break Err("matrix outer PTY accepted a zero-byte write"),
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break Ok(()),
-                    Err(_) => break Err("matrix outer PTY saturation failed"),
-                }
-            }
+            fill_matrix_outer_output_queue(&mut stdout, &filler)
         };
-        let restoration = rustix::fs::fcntl_setfl(&stdout, original);
+        let restoration = rustix::fs::fcntl_setfl(stdout, original);
         match (saturation, restoration) {
             (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error.into()),
-            (Ok(()), Err(_)) => Err("matrix stdout status restoration failed".into()),
-            (Err(error), Err(_)) => {
-                Err(format!("{error}; matrix stdout status restoration also failed").into())
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(_)) => Err("matrix stdout status restoration failed"),
+            (Err(_), Err(_)) => Err("matrix saturation and stdout restoration failed"),
+        }
+    }
+
+    fn fill_matrix_outer_output_queue(
+        writer: &mut impl Write,
+        bulk: &[u8],
+    ) -> Result<(), &'static str> {
+        const MAX_ACCEPTED_BYTES: usize = super::super::terminal::TERMINAL_BUFFER_CAPACITY * 1024;
+
+        if bulk.is_empty() {
+            return Err("matrix outer PTY saturation buffer was empty");
+        }
+
+        let mut accepted = 0_usize;
+        loop {
+            if accepted >= MAX_ACCEPTED_BYTES {
+                return Err("matrix outer PTY saturation exceeded its byte bound");
+            }
+            let remaining_budget = MAX_ACCEPTED_BYTES - accepted;
+            let request = &bulk[..bulk.len().min(remaining_budget)];
+            match writer.write(request) {
+                Ok(0) => return Err("matrix outer PTY accepted a zero-byte write"),
+                Ok(written) if written <= request.len() => {
+                    accepted = accepted
+                        .checked_add(written)
+                        .ok_or("matrix outer PTY saturation byte count overflowed")?;
+                }
+                Ok(_) => return Err("matrix outer PTY reported an invalid bulk write"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => return Err("matrix outer PTY saturation failed"),
             }
         }
+
+        // A large nonblocking PTY write may report WouldBlock while a smaller
+        // fragment still fits. Seal that same-instant residual capacity one
+        // byte at a time. Durable backpressure comes from the surrounding
+        // output-flow guard, not from assuming this queue snapshot stays full.
+        let seal = [b'B'];
+        loop {
+            if accepted >= MAX_ACCEPTED_BYTES {
+                return Err("matrix outer PTY saturation exceeded its byte bound");
+            }
+            match writer.write(&seal) {
+                Ok(0) => return Err("matrix outer PTY accepted a zero-byte write"),
+                Ok(1) => {
+                    accepted = accepted
+                        .checked_add(1)
+                        .ok_or("matrix outer PTY saturation byte count overflowed")?;
+                }
+                Ok(_) => return Err("matrix outer PTY reported an invalid seal write"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(_) => return Err("matrix outer PTY saturation failed"),
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_output_saturation_seals_residual_sub_fragment_capacity() {
+        struct ResidualCapacityWriter {
+            remaining: usize,
+            bulk_would_block: usize,
+            seal_writes: usize,
+            seal_would_block: usize,
+        }
+
+        impl Write for ResidualCapacityWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.remaining {
+                    if bytes.len() == 1 {
+                        self.seal_would_block += 1;
+                    } else {
+                        self.bulk_would_block += 1;
+                    }
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                if bytes.len() == 1 {
+                    self.seal_writes += 1;
+                }
+                self.remaining -= bytes.len();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bulk = [b'B'; super::super::terminal::TERMINAL_BUFFER_CAPACITY];
+        let mut writer = ResidualCapacityWriter {
+            remaining: bulk.len() + PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT.len(),
+            bulk_would_block: 0,
+            seal_writes: 0,
+            seal_would_block: 0,
+        };
+
+        assert_eq!(fill_matrix_outer_output_queue(&mut writer, &bulk), Ok(()));
+
+        assert_eq!(writer.bulk_would_block, 1);
+        assert_eq!(
+            writer.seal_writes,
+            PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT.len()
+        );
+        assert_eq!(writer.seal_would_block, 1);
+        assert_eq!(writer.remaining, 0);
     }
 
     fn verify_retention_cleanup_scrubs_failure_owners() -> Result<(), Box<dyn std::error::Error>> {
@@ -4153,6 +4337,10 @@ mod tests {
             .map_err(|_| "matrix test root identity was invalid".into())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the real-process matrix keeps each protocol and cleanup owner explicit"
+    )]
     fn run_matrix_guardian_peer(
         case: ProductionMatrixCase,
         snapshot: TerminalSnapshotFingerprint,
@@ -4161,6 +4349,8 @@ mod tests {
         mut trigger: ChildStdin,
         app_group: MatrixScanGroup,
         tui_group: MatrixScanGroup,
+        output_pending_receiver: Option<Receiver<()>>,
+        retained_outcome_receiver: Option<UnixStream>,
     ) -> Result<(), &'static str> {
         let mut receiver = GuardianCommandReceiver::new_terminal(lifecycle);
         matrix_event(&mut receiver, GuardianEvent::LeaseCommitted)?;
@@ -4266,9 +4456,21 @@ mod tests {
         if case == ProductionMatrixCase::DataThenEof {
             write_matrix_terminal(&terminal, PRODUCTION_MATRIX_OUTPUT)?;
         }
+        let mut output_flow = if case.uses_output_backpressure() {
+            let guard = MatrixOutputFlowGuard::suspend_and_saturate()?;
+            eprintln!("output-backpressure-saturated");
+            Some(guard)
+        } else {
+            None
+        };
         if case.uses_output_backpressure() {
             write_matrix_terminal(&terminal, PRODUCTION_MATRIX_BACKPRESSURE_OUTPUT)?;
             eprintln!("output-backpressure-enqueued");
+            output_pending_receiver
+                .ok_or("output backpressure pending observer was missing")?
+                .recv_timeout(TEST_TIMEOUT)
+                .map_err(|_| "output backpressure pending owner was not observed")?;
+            eprintln!("output-backpressure-pending");
         }
         if case == ProductionMatrixCase::OutputBackpressureTransient {
             std::thread::sleep(PRODUCTION_MATRIX_BACKPRESSURE_HOLD.saturating_mul(2));
@@ -4278,49 +4480,73 @@ mod tests {
             terminal
                 .verify_invariants()
                 .map_err(|_| "transient output peer closed during backpressure")?;
+            output_flow
+                .as_mut()
+                .ok_or("transient output flow owner was missing")?
+                .resume()?;
             eprintln!("output-backpressure-peer-held");
         }
         if case == ProductionMatrixCase::OutputBackpressurePermanent {
-            // Commit lifecycle progress well before the output deadline and
-            // leave it readable while shutdown drains the still-pending frame.
-            // The coordinator's pump-first policy must retain Terminal(Deadline)
-            // rather than flattening this into lifecycle or generic timeout.
-            std::thread::sleep(PRODUCTION_MATRIX_PERMANENT_STALL_TIMEOUT / 4);
+            // The instance-scoped observer proves the exact pending owner
+            // before lifecycle progress is committed. Kernel output flow stays
+            // suspended until either retention closes this channel or a bad
+            // implementation advances the complete terminal transcript.
             matrix_event(&mut receiver, GuardianEvent::TerminalQuiesced)?;
-            if receiver.receive(Instant::now() + TEST_TIMEOUT).is_ok() {
-                return Err("permanent output stall advanced beyond terminal retention");
+            match receiver.receive(Instant::now() + TEST_TIMEOUT) {
+                Err(ProtocolError::UnexpectedEof) => {
+                    output_flow
+                        .as_mut()
+                        .ok_or("permanent output flow owner was missing")?
+                        .resume()?;
+                    trigger
+                        .write_all(b"finish\n")
+                        .map_err(|_| "permanent-stall guardian trigger failed")?;
+                    trigger
+                        .flush()
+                        .map_err(|_| "permanent-stall guardian trigger flush failed")?;
+                    wait_for_matrix_retained_outcome(
+                        retained_outcome_receiver
+                            .ok_or("permanent retained outcome channel was missing")?,
+                    )?;
+                    return Ok(());
+                }
+                Err(_) => return Err("permanent output stall lifecycle ended incorrectly"),
+                Ok(CoordinatorCommand::TerminalRestored) => {
+                    let _restored = receiver
+                        .take_verified_terminal_restored_command()
+                        .map_err(|_| "missing unexpected restored command proof")?;
+                    output_flow
+                        .as_mut()
+                        .ok_or("permanent output flow owner was missing")?
+                        .resume()?;
+                }
+                Ok(_) => return Err("permanent output stall received an unexpected command"),
             }
-            trigger
-                .write_all(b"finish\n")
-                .map_err(|_| "permanent-stall guardian trigger failed")?;
-            trigger
-                .flush()
-                .map_err(|_| "permanent-stall guardian trigger flush failed")?;
-            return Ok(());
+        } else {
+            terminal
+                .shutdown(TerminalShutdown::Write)
+                .map_err(|_| "terminal peer half-close failed")?;
+            if case == ProductionMatrixCase::LifecycleLost {
+                // Close lifecycle while the direct guardian child is still
+                // definitely alive. This makes channel loss, rather than a racing
+                // wait-visible child, the retained root cause. The trigger stays
+                // owned by this thread until after the coordinator has observed
+                // EOF and entered bounded retention.
+                drop(receiver);
+                drop(terminal);
+                std::thread::sleep(Duration::from_millis(150));
+                return Ok(());
+            }
+            // Force the production loop to observe terminal-channel EOF before
+            // lifecycle quiescence; EOF is sticky data-path state, never the
+            // authority that replaces this later typed event.
+            std::thread::sleep(Duration::from_millis(75));
+            matrix_event(&mut receiver, GuardianEvent::TerminalQuiesced)?;
+            matrix_command(&mut receiver, CoordinatorCommand::TerminalRestored)?;
+            let _restored = receiver
+                .take_verified_terminal_restored_command()
+                .map_err(|_| "missing restored command proof")?;
         }
-        terminal
-            .shutdown(TerminalShutdown::Write)
-            .map_err(|_| "terminal peer half-close failed")?;
-        if case == ProductionMatrixCase::LifecycleLost {
-            // Close lifecycle while the direct guardian child is still
-            // definitely alive. This makes channel loss, rather than a racing
-            // wait-visible child, the retained root cause. The trigger stays
-            // owned by this thread until after the coordinator has observed
-            // EOF and entered bounded retention.
-            drop(receiver);
-            drop(terminal);
-            std::thread::sleep(Duration::from_millis(150));
-            return Ok(());
-        }
-        // Force the production loop to observe terminal-channel EOF before
-        // lifecycle quiescence; EOF is sticky data-path state, never the
-        // authority that replaces this later typed event.
-        std::thread::sleep(Duration::from_millis(75));
-        matrix_event(&mut receiver, GuardianEvent::TerminalQuiesced)?;
-        matrix_command(&mut receiver, CoordinatorCommand::TerminalRestored)?;
-        let _restored = receiver
-            .take_verified_terminal_restored_command()
-            .map_err(|_| "missing restored command proof")?;
         matrix_event(&mut receiver, GuardianEvent::TerminalRecoveryDisarmed)?;
         trigger
             .write_all(b"finish\n")
@@ -4351,6 +4577,32 @@ mod tests {
             .into_disposition();
         if verified != guardian_exit {
             return Err("guardian exit proof mismatch");
+        }
+        if case == ProductionMatrixCase::OutputBackpressurePermanent {
+            Err("permanent output stall advanced beyond terminal retention")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_matrix_retained_outcome(mut receiver: UnixStream) -> Result<(), &'static str> {
+        receiver
+            .set_read_timeout(Some(TEST_TIMEOUT))
+            .map_err(|_| "permanent retained outcome timeout setup failed")?;
+        let mut frame = [0_u8; 1];
+        receiver
+            .read_exact(&mut frame)
+            .map_err(|_| "permanent retained outcome was not published")?;
+        if frame != *b"R" {
+            return Err("permanent retained outcome frame was invalid");
+        }
+        let mut trailing = [0_u8; 1];
+        if receiver
+            .read(&mut trailing)
+            .map_err(|_| "permanent retained outcome EOF failed")?
+            != 0
+        {
+            return Err("permanent retained outcome had trailing bytes");
         }
         Ok(())
     }
