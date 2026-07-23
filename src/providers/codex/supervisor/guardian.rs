@@ -5,6 +5,8 @@
 //! thereafter exist only inside the provider/startup/session linear owners.
 
 use std::fmt;
+#[cfg(test)]
+use std::fs::File;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::os::fd::AsFd;
@@ -19,9 +21,11 @@ use crate::profiles::{Profile, Registry};
 #[cfg(test)]
 use crate::providers::codex::remote::ReadinessProxyError;
 
+#[cfg(test)]
+use super::channel::LifecyclePair;
 use super::channel::{ChannelError, LifecycleEndpoint, bootstrap_guardian_from_stdin};
 #[cfg(test)]
-use super::entry::RecoveryCheckpoint;
+use super::entry::{AnchorCompletion, CompletionPair, RecoveryCheckpoint};
 use super::entry::{CompletionError, GuardianCompletion, RecoveryRequestPoll};
 #[cfg(test)]
 use super::packaged_smoke::write_private_atomic_new;
@@ -57,6 +61,9 @@ use super::startup::{
 #[cfg(test)]
 use super::startup::{
     PackagedRuntimeFailureStage, PackagedStartupQuiescePhase,
+    arm_packaged_startup_cleanup_second_retention,
+    concrete_startup_cleanup_failure_for_guardian_test,
+    finish_concrete_startup_cleanup_failure_for_guardian_test,
     start_supervised_session_with_test_compatibility,
 };
 use super::terminal::{RecoveryTty, TerminalEndpoint, TerminalError, TerminalSnapshot};
@@ -1211,6 +1218,12 @@ impl RetainedGuardianGeneration {
         ]
     }
 
+    #[cfg(test)]
+    pub(super) fn packaged_recovery_budget_is_consumed_and_exhausted(&mut self) -> bool {
+        self.recovery_budget == RetainedRecoveryBudget::Consumed
+            && self.recovery_budget.begin_retry().is_none()
+    }
+
     /// Waits on the exact anonymous owner endpoint and performs at most one
     /// fresh bounded retry of the retained linear owner. A malformed request
     /// never authorizes recovery; its eventual peer EOF is independently an
@@ -1300,6 +1313,158 @@ impl RetainedGuardianGeneration {
     pub(super) fn park(self: Box<Self>) -> ! {
         self.publish_retained_unrecoverable_and_park()
     }
+}
+
+/// Test-only owner for the real second-retained branch. The wrapper keeps the
+/// anonymous recovery/lifecycle peers and physical PTY alive alongside the
+/// exact retained generation; none of those authorities is reconstructed from
+/// a marker, descriptor number, PID, or filesystem path.
+#[cfg(test)]
+pub(super) struct PackagedConcreteSecondRetention {
+    retained: Option<Box<RetainedGuardianGeneration>>,
+    _anchor: AnchorCompletion,
+    _coordinator_lifecycle: LifecycleEndpoint,
+    _terminal_peer: TerminalEndpoint,
+    _terminal_master_keepalive: File,
+}
+
+#[cfg(test)]
+impl PackagedConcreteSecondRetention {
+    pub(super) fn marker_names(&self) -> [&'static str; 3] {
+        self.retained
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .packaged_recovery_marker_names()
+    }
+
+    pub(super) fn recovery_budget_is_consumed_and_exhausted(&mut self) -> bool {
+        self.retained
+            .as_mut()
+            .is_some_and(|retained| retained.packaged_recovery_budget_is_consumed_and_exhausted())
+    }
+
+    /// Releases only the exact concrete startup-cleanup owner already held by
+    /// this wrapper. A failed cleanup remains deliberately pinned until the
+    /// bounded subprocess exits and the kernel closes its descriptor table.
+    pub(super) fn release(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut retained = self
+            .retained
+            .take()
+            .ok_or("the concrete second retention was already released")?;
+        if !retained.packaged_recovery_budget_is_consumed_and_exhausted() {
+            std::mem::forget(retained);
+            return Err("the concrete second retention recovered a retry budget".into());
+        }
+        let lifecycle = retained
+            .lifecycle
+            .take()
+            .ok_or("the concrete second retention lost its lifecycle")?;
+        let owner = retained
+            .owner
+            .take()
+            .ok_or("the concrete second retention lost its owner")?;
+        drop(retained);
+
+        let failure = match owner {
+            RetainedGuardianOwner::StartupCleanup(failure) => failure,
+            owner => {
+                owner.pin_authority();
+                std::mem::forget((owner, lifecycle));
+                return Err("the concrete second retention changed owner kind".into());
+            }
+        };
+        let report = match finish_concrete_startup_cleanup_failure_for_guardian_test(failure) {
+            Ok(report) => report,
+            Err(failure) => {
+                std::mem::forget((failure, lifecycle));
+                return Err("the concrete retained owner did not finish after release".into());
+            }
+        };
+        if report.startup_error() != SupervisedStartupError::Runtime
+            || !report.cleanup_errors_empty()
+            || !report.terminal_reportable()
+            || report.is_success()
+        {
+            std::mem::forget((report, lifecycle));
+            return Err("the concrete retained owner produced an invalid cleanup report".into());
+        }
+        drop(report);
+        drop(lifecycle);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn packaged_concrete_second_retention_bounds() -> GuardianBounds {
+    GuardianBounds {
+        phase_timeout: Duration::from_secs(1),
+        poll_interval: Duration::from_millis(20),
+        startup_timeout: Duration::from_secs(1),
+        compatibility_timeout: Duration::from_secs(1),
+        relay_start_timeout: Duration::from_secs(1),
+        containment_timeout: Duration::from_secs(1),
+        tui_grace: Duration::from_millis(10),
+        tui_forced: Duration::from_millis(10),
+        relay_shutdown_timeout: Duration::from_secs(1),
+        monitor_shutdown_timeout: Duration::from_secs(1),
+        app_grace: Duration::from_millis(10),
+        app_forced: Duration::from_millis(10),
+        app_cleanup_timeout: Duration::from_secs(1),
+        build_cleanup_timeout: Duration::from_secs(1),
+    }
+}
+
+/// Exercises the production `await_recovery -> retry_retained_owner` path
+/// with a real lifecycle channel and a concrete StartupCleanup owner. The
+/// one-shot startup seam forces exactly that retry to retain the same owner;
+/// the returned wrapper can later finish it without manufacturing authority.
+#[cfg(test)]
+pub(super) fn packaged_concrete_second_retention_for_test()
+-> Result<PackagedConcreteSecondRetention, Box<dyn std::error::Error>> {
+    let (failure, terminal_peer, terminal_master_keepalive) =
+        concrete_startup_cleanup_failure_for_guardian_test()?;
+    let (mut anchor, transit) = CompletionPair::new()?.split();
+    let (coordinator_lifecycle, guardian_lifecycle) = LifecyclePair::new()?.split_for_test();
+    let bounds = packaged_concrete_second_retention_bounds();
+    let lifecycle = GuardianLifecycle::new(guardian_lifecycle, transit.into_guardian(), bounds);
+    let retained = Box::new(RetainedGuardianGeneration {
+        lifecycle: Some(lifecycle),
+        owner: Some(RetainedGuardianOwner::StartupCleanup(failure)),
+        reason: GuardianRetentionReason::CleanupUnconfirmed,
+        recovery_budget: RetainedRecoveryBudget::available(),
+    });
+
+    anchor.request_recovery(Instant::now() + Duration::from_secs(1))?;
+    if !arm_packaged_startup_cleanup_second_retention() {
+        std::mem::forget(retained);
+        return Err("the concrete second-retention seam was already armed".into());
+    }
+    let mut retained = match retained.await_recovery() {
+        GuardianRunOutcome::Retained(retained) => retained,
+        GuardianRunOutcome::Terminal(_) => {
+            return Err(
+                "the concrete recovery retry unexpectedly reached a terminal outcome".into(),
+            );
+        }
+    };
+    let expected = [
+        "guardian-recovery.retained.reason.cleanup-unconfirmed",
+        "guardian-recovery.retained.owner.startup-cleanup",
+        "guardian-recovery.retained",
+    ];
+    if retained.packaged_recovery_marker_names() != expected
+        || !retained.packaged_recovery_budget_is_consumed_and_exhausted()
+    {
+        std::mem::forget(retained);
+        return Err("the concrete recovery retry lost its owner or consumed budget".into());
+    }
+    Ok(PackagedConcreteSecondRetention {
+        retained: Some(retained),
+        _anchor: anchor,
+        _coordinator_lifecycle: coordinator_lifecycle,
+        _terminal_peer: terminal_peer,
+        _terminal_master_keepalive: terminal_master_keepalive,
+    })
 }
 
 /// Keeps the exact retained provider/terminal owner structurally reachable

@@ -13,7 +13,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -47,8 +47,8 @@ use super::guardian::{
     GuardianBounds, GuardianRunOutcome, GuardianSetupError, PACKAGED_APP_NOT_STARTED_MARKER,
     PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS, PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER,
     PACKAGED_STARTUP_FAILURE_MARKERS, PACKAGED_TUI_NOT_STARTED_MARKER, PackagedGuardianSeams,
-    ProductionGuardianConfig, run_production_guardian_with_test_seams,
-    write_packaged_startup_failure_marker,
+    ProductionGuardianConfig, packaged_concrete_second_retention_for_test,
+    run_production_guardian_with_test_seams, write_packaged_startup_failure_marker,
 };
 use super::process::{ManagedGroupChild, shutdown_app_server_child};
 use super::protocol::{
@@ -616,6 +616,14 @@ const PACKAGE_UNPROVEN_CLEANUP_EXIT_CODE: u8 = 86;
 const PACKAGE_UNPROVEN_CLEANUP_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
 const PACKAGE_UNPROVEN_CLEANUP_KILL_WAIT: Duration = Duration::from_secs(2);
 const PACKAGE_UNPROVEN_CLEANUP_DIAGNOSTIC_LIMIT: u64 = 4 * 1024;
+const PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV: &str =
+    "CALCIFER_PACKAGE_CONCRETE_SECOND_RETENTION_HELPER";
+const PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_TEST: &str = concat!(
+    "providers::codex::supervisor::packaged_smoke::",
+    "packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_until_owned_reap"
+);
+const PACKAGE_CONCRETE_SECOND_RETENTION_RELEASE: &[u8] = b"release\n";
+const PACKAGE_CONCRETE_SECOND_RETENTION_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES: [(RecoveryCheckpoint, &str); 7] = [
     (RecoveryCheckpoint::StartupQueued, "startup-queued-v1"),
@@ -1805,6 +1813,7 @@ struct PackageRecoveryFailureEvidence {
     secondary: Option<&'static str>,
     coordinator_origin: Option<FixedPackageCoordinatorOrigin>,
     retry_observations: PackageInitialGateRetryObservations,
+    recovery_case: Option<(PackageRecoveryTrigger, RecoveryCheckpoint)>,
 }
 
 impl PackageRecoveryFailureEvidence {
@@ -1848,6 +1857,14 @@ impl PackageRecoveryFailureEvidence {
         self.retry_observations.merge(observations);
     }
 
+    fn snapshot_recovery_case(
+        &mut self,
+        trigger: PackageRecoveryTrigger,
+        checkpoint: RecoveryCheckpoint,
+    ) {
+        self.recovery_case.get_or_insert((trigger, checkpoint));
+    }
+
     const fn primary_marker(self) -> Option<&'static str> {
         match self.primary {
             Some(failure) => Some(failure.marker()),
@@ -1869,6 +1886,15 @@ impl PackageRecoveryFailureEvidence {
 
     const fn retry_observations(self) -> PackageInitialGateRetryObservations {
         self.retry_observations
+    }
+
+    const fn recovery_case_marker(self) -> Option<&'static str> {
+        match self.recovery_case {
+            Some((trigger, checkpoint)) => {
+                Some(package_recovery_case_failure_marker(trigger, checkpoint))
+            }
+            None => None,
+        }
     }
 }
 
@@ -3840,6 +3866,7 @@ fn package_recovery_failure_evidence_is_immutable_distinct_and_causally_typed()
         .ok_or("the closed startup catalog did not construct fixed evidence")?;
 
     let mut unselected = PackageRecoveryFailureEvidence::default();
+    assert_eq!(unselected.recovery_case_marker(), None);
     unselected.snapshot_secondary(Some(later_terminal));
     unselected.snapshot_coordinator_origin(Some(coordinator_origin));
     unselected.snapshot_coordinator_origin(Some(later_coordinator_origin));
@@ -3852,6 +3879,20 @@ fn package_recovery_failure_evidence_is_immutable_distinct_and_causally_typed()
         unselected.coordinator_origin(),
         Some(coordinator_origin),
         "the independent coordinator origin was gated on a recovery primary or overwritten"
+    );
+
+    unselected.snapshot_recovery_case(
+        PackageRecoveryTrigger::GenerationBoundRequest,
+        RecoveryCheckpoint::Ready,
+    );
+    unselected.snapshot_recovery_case(
+        PackageRecoveryTrigger::OwnerEof,
+        RecoveryCheckpoint::Suspended,
+    );
+    assert_eq!(
+        unselected.recovery_case_marker(),
+        Some("recovery.case-failed.request.ready-v1"),
+        "a later recovery matrix cell overwrote the initiating case"
     );
 
     let mut drive_evidence = PackageRecoveryFailureEvidence::default();
@@ -5798,6 +5839,275 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
 }
 
 #[test]
+fn packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_until_owned_reap()
+-> Result<(), Box<dyn Error>> {
+    if std::env::var_os(PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV).is_some() {
+        return run_packaged_concrete_second_retention_helper();
+    }
+
+    let _process_guard = package_process_test_guard();
+    let mut scratch = OwnedConcreteSecondRetentionScratch::create()?;
+    let report = scratch.root().join("supervisor-report");
+    private_directory(&report)?;
+    let mut child = OwnedConcreteSecondRetentionChild::spawn(scratch.root())?;
+    let ordered_second_retention = [
+        "guardian-recovery.retained.reason.cleanup-unconfirmed",
+        "guardian-recovery.retained.owner.startup-cleanup",
+        "guardian-recovery.retained",
+    ];
+
+    // The helper writes this exact array sequentially. Observing the generic
+    // marker is therefore the last publication barrier; it can never grant
+    // wait, signal, release, or cleanup authority back to the parent.
+    child.wait_for_marker(
+        &report.join(ordered_second_retention[2]),
+        b"classified\n",
+        Instant::now() + PACKAGE_CONCRETE_SECOND_RETENTION_CHILD_TIMEOUT,
+    )?;
+    for marker in ordered_second_retention {
+        let path = report.join(marker);
+        let metadata = fs::symlink_metadata(&path)?;
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(
+            read_private_bounded(&path, b"classified\n".len())?,
+            b"classified\n"
+        );
+    }
+    for conflicting in PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS {
+        if !ordered_second_retention.contains(&conflicting) {
+            assert!(
+                !report.join(conflicting).exists(),
+                "the concrete second retention published a conflicting marker"
+            );
+        }
+    }
+    child.assert_stably_live_after_publication()?;
+    child.release_and_reap(Instant::now() + PACKAGE_CONCRETE_SECOND_RETENTION_CHILD_TIMEOUT)?;
+    let root = scratch.root().to_path_buf();
+    scratch.cleanup()?;
+    assert!(
+        !root.exists(),
+        "second-retention cleanup left scratch residue"
+    );
+    Ok(())
+}
+
+fn run_packaged_concrete_second_retention_helper() -> Result<(), Box<dyn Error>> {
+    let root = package_supervisor_root()?;
+    let report = checked_package_subdirectory(&root, "supervisor-report")?;
+    let mut retained = packaged_concrete_second_retention_for_test()?;
+    if !retained.recovery_budget_is_consumed_and_exhausted() {
+        return Err("the concrete second-retention helper recovered a third retry".into());
+    }
+    for marker in retained.marker_names() {
+        record_package_diagnostic_marker(&report, marker);
+    }
+
+    let mut release = [0_u8; PACKAGE_CONCRETE_SECOND_RETENTION_RELEASE.len()];
+    let mut stdin = io::stdin().lock();
+    stdin.read_exact(&mut release)?;
+    if release != PACKAGE_CONCRETE_SECOND_RETENTION_RELEASE {
+        return Err("the concrete second-retention release frame was invalid".into());
+    }
+    let mut trailing = [0_u8; 1];
+    if stdin.read(&mut trailing)? != 0 {
+        return Err("the concrete second-retention release frame had trailing bytes".into());
+    }
+    drop(stdin);
+    retained.release()
+}
+
+struct OwnedConcreteSecondRetentionScratch {
+    scratch: Option<PackageScratch>,
+    root: PathBuf,
+}
+
+impl OwnedConcreteSecondRetentionScratch {
+    fn create() -> Result<Self, Box<dyn Error>> {
+        let scratch = PackageScratch::create()?;
+        let root = scratch.root.clone();
+        Ok(Self {
+            scratch: Some(scratch),
+            root,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn cleanup(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scratch
+            .take()
+            .ok_or("the concrete second-retention scratch was already cleaned")?
+            .cleanup()
+    }
+}
+
+impl Drop for OwnedConcreteSecondRetentionScratch {
+    fn drop(&mut self) {
+        if let Some(scratch) = self.scratch.take() {
+            let _ = scratch.cleanup();
+        }
+    }
+}
+
+struct OwnedConcreteSecondRetentionChild {
+    child: Child,
+    release: Option<ChildStdin>,
+    reaped: bool,
+}
+
+impl OwnedConcreteSecondRetentionChild {
+    fn spawn(root: &Path) -> Result<Self, Box<dyn Error>> {
+        let helper = fs::canonicalize(std::env::current_exe()?)?;
+        let mut command = Command::new(helper);
+        command
+            .args([
+                "--exact",
+                PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV, "1")
+            .env(PACKAGE_SUPERVISOR_ROOT_ENV, root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let mut child = command.spawn()?;
+        drop(command);
+        let release = child.stdin.take();
+        let mut owned = Self {
+            child,
+            release,
+            reaped: false,
+        };
+        if owned.release.is_none() {
+            let _ = owned.kill_and_reap();
+            return Err("the concrete second-retention child lost its release pipe".into());
+        }
+        Ok(owned)
+    }
+
+    fn wait_for_marker(
+        &mut self,
+        path: &Path,
+        expected: &[u8],
+        deadline: Instant,
+    ) -> Result<(), Box<dyn Error>> {
+        loop {
+            match read_private_bounded(path, expected.len().saturating_add(1)) {
+                Ok(bytes) if bytes == expected => return Ok(()),
+                Ok(_) => return Err("the concrete second-retention marker was invalid".into()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                return Err(format!(
+                    "the concrete second-retention child exited before publication: {status}"
+                )
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err("the concrete second-retention marker exceeded its deadline".into());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_stably_live_after_publication(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.child.try_wait()?.is_some() {
+            self.reaped = true;
+            return Err("the concrete retained owner exited at publication".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+        if self.child.try_wait()?.is_some() {
+            self.reaped = true;
+            return Err("the concrete retained owner did not remain live".into());
+        }
+        Ok(())
+    }
+
+    fn send_release(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut release = self
+            .release
+            .take()
+            .ok_or("the concrete second-retention release was already sent")?;
+        release.write_all(PACKAGE_CONCRETE_SECOND_RETENTION_RELEASE)?;
+        release.flush()?;
+        drop(release);
+        Ok(())
+    }
+
+    fn release_and_reap(&mut self, deadline: Instant) -> Result<(), Box<dyn Error>> {
+        self.send_release()?;
+        match wait_for_package_child(&mut self.child, deadline) {
+            Ok(status) => {
+                self.reaped = true;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "the concrete second-retention child failed during release: {status}"
+                    )
+                    .into())
+                }
+            }
+            Err(error) => {
+                let _ = self.kill_and_reap();
+                Err(error)
+            }
+        }
+    }
+
+    fn kill_and_reap(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.reaped {
+            return Ok(());
+        }
+        if self.child.try_wait()?.is_none() {
+            match self.child.kill() {
+                Ok(()) => {}
+                Err(error) => {
+                    if self.child.try_wait()?.is_none() {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        self.child.wait()?;
+        self.reaped = true;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedConcreteSecondRetentionChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        if self.release.is_some() {
+            let _ = self.send_release();
+        }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.reaped = true;
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+        let _ = self.kill_and_reap();
+    }
+}
+
+#[test]
 #[ignore = "focused one-checkpoint diagnostic; exhaustive matrix is nonignored"]
 fn packaged_codex_deterministic_fixture_recovers_startup_queued_only() -> Result<(), Box<dyn Error>>
 {
@@ -5917,6 +6227,13 @@ fn run_deterministic_recovery_case_with_trigger(
         checkpoint,
         suite_budget,
     )?;
+    harness
+        .recovery_failure_evidence
+        .snapshot_recovery_case(trigger, checkpoint);
+    let recovery_case = harness
+        .recovery_failure_evidence
+        .recovery_case_marker()
+        .ok_or("the selected package recovery case was not snapshotted")?;
     let exercise = (|| -> Result<(), Box<dyn Error>> {
         harness.trigger_selected_recovery(trigger)?;
         let second = PackageGenerationCleanupOperations::request_recovery_once(
@@ -5981,7 +6298,7 @@ fn run_deterministic_recovery_case_with_trigger(
             .with_coordinator_origin(harness.latest_fixed_coordinator_origin())
             .with_retry_observations(exercise_retry_observations),
         cleanup_phase,
-        Some(package_recovery_case_failure_marker(trigger, checkpoint)),
+        Some(recovery_case),
         harness.latest_handoff_probe_phase(),
         preserved_evidence_root,
     )?;
@@ -7432,6 +7749,10 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             harness
                 .recovery_failure_evidence
                 .snapshot_error(&PackageRecoveryDriveFailure::InitialGate);
+            harness.recovery_failure_evidence.snapshot_recovery_case(
+                PackageRecoveryTrigger::GenerationBoundRequest,
+                RecoveryCheckpoint::RetainedCleanupPending,
+            );
             harness
                 .recovery_failure_evidence
                 .snapshot_secondary(Some(PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0]));
@@ -7487,7 +7808,7 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
         [concat!(
             "package-generation-cleanup-unproven:",
             "phase=scratch-missing,failure=unclassified,secondary=none,retry_observations=none,",
-            "coordinator_origin=none"
+            "coordinator_origin=none,recovery_case=none"
         )]
     );
     assert!(
@@ -7510,13 +7831,14 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
         concat!(
             "package-generation-cleanup-unproven:",
             "phase=scratch-missing,failure={},secondary={},retry_observations={},{}",
-            ",coordinator_origin={}"
+            ",coordinator_origin={},recovery_case={}"
         ),
         PackageRecoveryDriveFailure::InitialGate.marker(),
         PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0],
         PackageInitialGateRetryObservation::MarkerRead.marker(),
         PackageInitialGateRetryObservation::StartupScan.marker(),
-        PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10]
+        PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10],
+        "recovery.case-failed.request.retained-cleanup-pending-v1"
     );
     let causal_projected: Vec<_> = causal
         .diagnostic
@@ -11516,7 +11838,8 @@ impl OfficialTuiPackageHarness {
                 stderr,
                 concat!(
                     "package-generation-cleanup-unproven:",
-                    "phase={},failure={},secondary={},retry_observations={},coordinator_origin={}"
+                    "phase={},failure={},secondary={},retry_observations={},coordinator_origin={},",
+                    "recovery_case={}"
                 ),
                 self.latest_fixed_phase(),
                 self.latest_fixed_failure_detail().unwrap_or("unclassified"),
@@ -11525,6 +11848,9 @@ impl OfficialTuiPackageHarness {
                 self.latest_fixed_retry_observations(),
                 self.latest_fixed_coordinator_origin()
                     .map(FixedPackageCoordinatorOrigin::marker)
+                    .unwrap_or("none"),
+                self.recovery_failure_evidence
+                    .recovery_case_marker()
                     .unwrap_or("none")
             );
             let _ = stderr.flush();
