@@ -3104,13 +3104,354 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct PrivatePidTestRoot {
+        path: PathBuf,
+        identity: (u64, u64),
+    }
+
+    #[cfg(unix)]
+    impl PrivatePidTestRoot {
+        fn new(label: &str) -> io::Result<Self> {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+            let path = std::env::temp_dir().join(format!("cf-{label}-{}", uuid::Uuid::new_v4()));
+            fs::DirBuilder::new().mode(0o700).create(&path)?;
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o7777 != 0o700
+            {
+                let _ = fs::remove_dir(&path);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PID test root was not private",
+                ));
+            }
+            Ok(Self {
+                path,
+                identity: (metadata.dev(), metadata.ino()),
+            })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PrivatePidTestRoot {
+        fn drop(&mut self) {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            if fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+                metadata.file_type().is_dir()
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.permissions().mode() & 0o7777 == 0o700
+                    && (metadata.dev(), metadata.ino()) == self.identity
+            }) {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn parse_published_test_pid(raw_pid: &str) -> io::Result<rustix::process::Pid> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "escaped process PID publication was not canonical",
+            )
+        };
+        if raw_pid.is_empty()
+            || raw_pid.starts_with('0')
+            || !raw_pid.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid());
+        }
+        let raw = raw_pid.parse::<i32>().map_err(|_| invalid())?;
+        let pid = rustix::process::Pid::from_raw(raw).ok_or_else(invalid)?;
+        if pid.as_raw_nonzero().get().to_string() != raw_pid {
+            return Err(invalid());
+        }
+        Ok(pid)
+    }
+
+    #[cfg(unix)]
+    fn read_published_test_pid(path: &Path) -> io::Result<rustix::process::Pid> {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "escaped process PID publication was not a stable private file",
+            )
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PID parent was missing"))?;
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "PID filename was missing")
+        })?;
+        let visible_parent = fs::symlink_metadata(parent)?;
+        let directory = File::from(
+            rustix::fs::open(
+                parent,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
+        let opened_parent = directory.metadata()?;
+        if !opened_parent.file_type().is_dir()
+            || opened_parent.uid() != rustix::process::geteuid().as_raw()
+            || opened_parent.permissions().mode() & 0o7777 != 0o700
+            || opened_parent.dev() != visible_parent.dev()
+            || opened_parent.ino() != visible_parent.ino()
+        {
+            return Err(invalid());
+        }
+        let mut published = File::from(
+            rustix::fs::openat(
+                directory.as_fd(),
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
+        let before = published.metadata()?;
+        if !before.file_type().is_file()
+            || before.uid() != rustix::process::geteuid().as_raw()
+            || before.permissions().mode() & 0o7777 != 0o600
+            || before.nlink() != 1
+            || !(1..=10).contains(&before.len())
+        {
+            return Err(invalid());
+        }
+        let mut raw_pid = String::new();
+        published.read_to_string(&mut raw_pid)?;
+        let after = published.metadata()?;
+        if !after.file_type().is_file()
+            || after.uid() != rustix::process::geteuid().as_raw()
+            || after.permissions().mode() & 0o7777 != 0o600
+            || after.nlink() != 1
+            || (after.dev(), after.ino()) != (before.dev(), before.ino())
+            || after.len() != before.len()
+            || usize::try_from(after.len()) != Ok(raw_pid.len())
+        {
+            return Err(invalid());
+        }
+        parse_published_test_pid(&raw_pid)
+    }
+
+    #[cfg(unix)]
+    fn publish_test_pid_atomically(path: &Path, raw_pid: i32) -> io::Result<()> {
+        publish_test_pid_atomically_with_hooks(path, raw_pid, || Ok(()), || Ok(()))
+    }
+
+    #[cfg(unix)]
+    fn publish_test_pid_atomically_with_before_publish<F>(
+        path: &Path,
+        raw_pid: i32,
+        before_publish: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        publish_test_pid_atomically_with_hooks(path, raw_pid, before_publish, || Ok(()))
+    }
+
+    #[cfg(unix)]
+    fn publish_test_pid_atomically_with_hooks<F, G>(
+        path: &Path,
+        raw_pid: i32,
+        before_publish: F,
+        after_publish: G,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+        G: FnOnce() -> io::Result<()>,
+    {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let payload = raw_pid.to_string();
+        parse_published_test_pid(&payload)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PID parent was missing"))?;
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "PID filename was missing")
+        })?;
+        let visible_parent = fs::symlink_metadata(parent)?;
+        let directory = File::from(
+            rustix::fs::open(
+                parent,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
+        let opened_parent = directory.metadata()?;
+        if !opened_parent.file_type().is_dir()
+            || opened_parent.uid() != rustix::process::geteuid().as_raw()
+            || opened_parent.permissions().mode() & 0o7777 != 0o700
+            || opened_parent.dev() != visible_parent.dev()
+            || opened_parent.ino() != visible_parent.ino()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PID publication parent was not a stable private directory",
+            ));
+        }
+        let temporary_name = format!(".calcifer-test-pid-{}.tmp", uuid::Uuid::new_v4());
+        let mut temporary = File::from(
+            rustix::fs::openat(
+                directory.as_fd(),
+                temporary_name.as_str(),
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .map_err(io::Error::from)?,
+        );
+        let created = temporary.metadata()?;
+        let identity = (created.dev(), created.ino());
+        let mut published_to_final = false;
+
+        let publication = (|| -> io::Result<()> {
+            if !created.file_type().is_file()
+                || created.uid() != rustix::process::geteuid().as_raw()
+                || created.permissions().mode() & 0o7777 != 0o600
+                || created.nlink() != 1
+                || created.len() != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PID temporary file was not private",
+                ));
+            }
+            temporary.write_all(payload.as_bytes())?;
+            temporary.sync_all()?;
+            let durable = temporary.metadata()?;
+            if !durable.file_type().is_file()
+                || durable.uid() != rustix::process::geteuid().as_raw()
+                || durable.permissions().mode() & 0o7777 != 0o600
+                || durable.nlink() != 1
+                || (durable.dev(), durable.ino()) != identity
+                || usize::try_from(durable.len()) != Ok(payload.len())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PID temporary file changed before publication",
+                ));
+            }
+            before_publish()?;
+            rustix::fs::renameat_with(
+                directory.as_fd(),
+                temporary_name.as_str(),
+                directory.as_fd(),
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(io::Error::from)?;
+            published_to_final = true;
+            after_publish()?;
+            let published = File::from(
+                rustix::fs::openat(
+                    directory.as_fd(),
+                    name,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(io::Error::from)?,
+            );
+            let published_metadata = published.metadata()?;
+            if !published_metadata.file_type().is_file()
+                || published_metadata.uid() != rustix::process::geteuid().as_raw()
+                || published_metadata.permissions().mode() & 0o7777 != 0o600
+                || published_metadata.nlink() != 1
+                || (published_metadata.dev(), published_metadata.ino()) != identity
+                || usize::try_from(published_metadata.len()) != Ok(payload.len())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PID publication identity changed",
+                ));
+            }
+            directory.sync_all()?;
+            Ok(())
+        })();
+
+        if publication.is_err() {
+            let cleanup_name = if published_to_final {
+                name
+            } else {
+                OsStr::new(temporary_name.as_str())
+            };
+            if let Ok(descriptor) = rustix::fs::openat(
+                directory.as_fd(),
+                cleanup_name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                let candidate = File::from(descriptor);
+                if candidate.metadata().is_ok_and(|metadata| {
+                    metadata.file_type().is_file()
+                        && metadata.uid() == rustix::process::geteuid().as_raw()
+                        && metadata.permissions().mode() & 0o7777 == 0o600
+                        && metadata.nlink() == 1
+                        && (metadata.dev(), metadata.ino()) == identity
+                }) {
+                    drop(candidate);
+                    let _ = rustix::fs::unlinkat(
+                        directory.as_fd(),
+                        cleanup_name,
+                        rustix::fs::AtFlags::empty(),
+                    );
+                    let _ = directory.sync_all();
+                }
+            }
+        }
+        publication
+    }
+
+    #[cfg(unix)]
+    fn expect_pid_publication_collision(path: &Path) -> io::Result<()> {
+        match publish_test_pid_atomically(path, 43) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!("PID collision returned an unexpected error: {error}"),
+            )),
+            Ok(()) => Err(io::Error::other(
+                "PID publication replaced a pre-existing filesystem node",
+            )),
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn completed_request_shutdown_bounds_a_background_pipe_owner()
     -> Result<(), Box<dyn std::error::Error>> {
-        let escaped_pid_file = std::env::temp_dir().join(format!(
-            "calcifer-app-server-escaped-pid-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let escaped_root = PrivatePidTestRoot::new("app-server-escaped-pid")?;
+        let escaped_pid_file = escaped_root.path().join("pid");
         let helper = fs::canonicalize(std::env::current_exe()?)?;
         let mut command = Command::new("/bin/sh");
         command
@@ -3126,12 +3467,8 @@ mod tests {
             .checked_add(Duration::from_secs(2))
             .ok_or("PID-file deadline overflowed")?;
         let escaped_pid = loop {
-            match fs::read_to_string(&escaped_pid_file) {
-                Ok(raw_pid) => {
-                    let raw_pid = raw_pid.parse::<i32>()?;
-                    break rustix::process::Pid::from_raw(raw_pid)
-                        .ok_or("escaped process PID was invalid")?;
-                }
+            match read_published_test_pid(&escaped_pid_file) {
+                Ok(pid) => break pid,
                 Err(error)
                     if error.kind() == io::ErrorKind::NotFound
                         && Instant::now() < pid_file_deadline =>
@@ -3179,13 +3516,151 @@ mod tests {
             .map(PathBuf::from)
             .ok_or("escaped pipe-owner helper was not explicitly requested")?;
         rustix::process::setsid()?;
-        fs::write(
-            pid_file,
-            rustix::process::getpid().as_raw_nonzero().to_string(),
-        )?;
+        publish_test_pid_atomically(&pid_file, rustix::process::getpid().as_raw_nonzero().get())?;
         println!("pipe-held");
         io::stdout().flush()?;
         thread::sleep(Duration::from_secs(30));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_pipe_owner_pid_publication_is_atomic_canonical_and_no_replace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PrivatePidTestRoot::new("atomic-test-pid")?;
+        let pid_file = root.path().join("pid");
+        publish_test_pid_atomically_with_before_publish(
+            &pid_file,
+            42,
+            || match fs::read_to_string(&pid_file) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(io::Error::other(
+                    "the final PID path became visible before complete publication",
+                )),
+                Err(error) => Err(error),
+            },
+        )?;
+
+        assert_eq!(fs::read_to_string(&pid_file)?, "42");
+        assert_eq!(
+            read_published_test_pid(&pid_file)?.as_raw_nonzero().get(),
+            42
+        );
+        for malformed in ["", "0", "0012", "+12", "-12", "12\n", "private"] {
+            let error = match parse_published_test_pid(malformed) {
+                Ok(pid) => {
+                    return Err(format!(
+                        "malformed PID publication was accepted as {}: {malformed:?}",
+                        pid.as_raw_nonzero()
+                    )
+                    .into());
+                }
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "malformed PID publication was accepted: {malformed:?}"
+            );
+        }
+
+        expect_pid_publication_collision(&pid_file)?;
+        assert_eq!(fs::read_to_string(&pid_file)?, "42");
+        fs::remove_file(pid_file)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_post_rename_pid_publication_removes_only_its_owned_inode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PrivatePidTestRoot::new("post-rename-test-pid")?;
+        let pid_file = root.path().join("pid");
+        let failure = match publish_test_pid_atomically_with_hooks(
+            &pid_file,
+            42,
+            || Ok(()),
+            || Err(io::Error::other("injected post-rename publication failure")),
+        ) {
+            Ok(()) => return Err("injected post-rename failure unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(failure.kind(), io::ErrorKind::Other);
+        match fs::symlink_metadata(&pid_file) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err("failed publication left the final PID inode visible".into()),
+            Err(error) => return Err(error.into()),
+        }
+        if fs::read_dir(root.path())?.next().is_some() {
+            return Err("failed publication left a PID temporary inode behind".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_publication_refuses_preexisting_ambiguous_filesystem_nodes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{
+            DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt, symlink,
+        };
+        use std::os::unix::net::UnixListener;
+
+        let root = PrivatePidTestRoot::new("nodes")?;
+        let sentinel = root.path().join("sentinel");
+        let mut sentinel_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&sentinel)?;
+        sentinel_file.write_all(b"sentinel")?;
+        sentinel_file.sync_all()?;
+
+        let symlink_path = root.path().join("symlink");
+        symlink(&sentinel, &symlink_path)?;
+        expect_pid_publication_collision(&symlink_path)?;
+        assert!(
+            fs::symlink_metadata(&symlink_path)?
+                .file_type()
+                .is_symlink()
+        );
+        if read_published_test_pid(&symlink_path).is_ok() {
+            return Err("PID reader accepted a symlink publication".into());
+        }
+
+        let directory_path = root.path().join("directory");
+        fs::DirBuilder::new().mode(0o700).create(&directory_path)?;
+        expect_pid_publication_collision(&directory_path)?;
+        if read_published_test_pid(&directory_path).is_ok() {
+            return Err("PID reader accepted a directory publication".into());
+        }
+
+        let hardlink_path = root.path().join("hardlink");
+        fs::hard_link(&sentinel, &hardlink_path)?;
+        expect_pid_publication_collision(&hardlink_path)?;
+        if read_published_test_pid(&hardlink_path).is_ok() {
+            return Err("PID reader accepted a multiply-linked publication".into());
+        }
+
+        let wrong_mode_path = root.path().join("wrong-mode");
+        fs::write(&wrong_mode_path, b"42")?;
+        fs::set_permissions(&wrong_mode_path, fs::Permissions::from_mode(0o644))?;
+        expect_pid_publication_collision(&wrong_mode_path)?;
+        if read_published_test_pid(&wrong_mode_path).is_ok() {
+            return Err("PID reader accepted a wrong-mode publication".into());
+        }
+
+        let socket_path = root.path().join("socket");
+        let socket = UnixListener::bind(&socket_path)?;
+        expect_pid_publication_collision(&socket_path)?;
+        assert!(fs::symlink_metadata(&socket_path)?.file_type().is_socket());
+        if read_published_test_pid(&socket_path).is_ok() {
+            return Err("PID reader accepted a socket publication".into());
+        }
+        drop(socket);
+
+        assert_eq!(fs::read_to_string(&sentinel)?, "sentinel");
         Ok(())
     }
 
@@ -3305,10 +3780,8 @@ mod tests {
     #[test]
     fn version_probe_reports_stdout_drain_timeout_origin() -> Result<(), Box<dyn std::error::Error>>
     {
-        let escaped_pid_file = std::env::temp_dir().join(format!(
-            "calcifer-version-escaped-pid-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let escaped_root = PrivatePidTestRoot::new("version-escaped-pid")?;
+        let escaped_pid_file = escaped_root.path().join("pid");
         let helper = fs::canonicalize(std::env::current_exe()?)?;
         let mut command = Command::new("/bin/sh");
         command
@@ -3326,11 +3799,7 @@ mod tests {
             Instant::now() + Duration::from_millis(300),
             None,
         );
-        let escaped_pid = fs::read_to_string(&escaped_pid_file)?
-            .parse::<i32>()
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-            .ok_or("escaped version helper PID was invalid")?;
+        let escaped_pid = read_published_test_pid(&escaped_pid_file)?;
         let escaped_cleanup =
             rustix::process::kill_process(escaped_pid, rustix::process::Signal::KILL);
         fs::remove_file(&escaped_pid_file)?;
@@ -3363,10 +3832,7 @@ mod tests {
             .map(PathBuf::from)
             .ok_or("escaped version helper was not explicitly requested")?;
         rustix::process::setsid()?;
-        fs::write(
-            pid_file,
-            rustix::process::getpid().as_raw_nonzero().to_string(),
-        )?;
+        publish_test_pid_atomically(&pid_file, rustix::process::getpid().as_raw_nonzero().get())?;
         thread::sleep(Duration::from_secs(30));
         Ok(())
     }
