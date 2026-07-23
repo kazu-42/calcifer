@@ -3104,7 +3104,7 @@ fn concrete_guardian_terminal_restored_command()
 /// Builds a real post-restore startup-cleanup owner without starting an App,
 /// relay, monitor, or TUI child. The returned terminal peers keep the exact
 /// physical PTY and anonymous terminal channel live until the package helper
-/// explicitly releases the retained owner.
+/// is killed and reaped by its direct parent while the retained owner is parked.
 #[cfg(test)]
 pub(super) fn concrete_startup_cleanup_failure_for_guardian_test()
 -> Result<(StartupCleanupFailure, TerminalEndpoint, File), Box<dyn std::error::Error>> {
@@ -3147,13 +3147,6 @@ pub(super) fn concrete_startup_cleanup_failure_for_guardian_test()
         peer,
         master_keepalive,
     ))
-}
-
-#[cfg(test)]
-pub(super) fn finish_concrete_startup_cleanup_failure_for_guardian_test(
-    failure: StartupCleanupFailure,
-) -> Result<StartupCleanupReport, StartupCleanupFailure> {
-    failure.retry(concrete_guardian_startup_shutdown_bounds())
 }
 
 impl fmt::Debug for StartupCleanupFailure {

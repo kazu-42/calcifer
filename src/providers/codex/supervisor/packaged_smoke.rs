@@ -13,7 +13,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -47,7 +47,7 @@ use super::guardian::{
     GuardianBounds, GuardianRunOutcome, GuardianSetupError, PACKAGED_APP_NOT_STARTED_MARKER,
     PACKAGED_GUARDIAN_RECOVERY_RETAINED_MARKERS, PACKAGED_GUARDIAN_STARTUP_ARMED_MARKER,
     PACKAGED_STARTUP_FAILURE_MARKERS, PACKAGED_TUI_NOT_STARTED_MARKER, PackagedGuardianSeams,
-    ProductionGuardianConfig, packaged_concrete_second_retention_for_test,
+    PackagedSecondRetention, ProductionGuardianConfig, packaged_concrete_second_retention_for_test,
     run_production_guardian_with_test_seams, write_packaged_startup_failure_marker,
 };
 use super::process::{ManagedGroupChild, shutdown_app_server_child};
@@ -622,7 +622,6 @@ const PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_TEST: &str = concat!(
     "providers::codex::supervisor::packaged_smoke::",
     "packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_until_owned_reap"
 );
-const PACKAGE_CONCRETE_SECOND_RETENTION_RELEASE: &[u8] = b"release\n";
 const PACKAGE_CONCRETE_SECOND_RETENTION_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES: [(RecoveryCheckpoint, &str); 7] = [
@@ -5859,9 +5858,11 @@ fn packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_
         "guardian-recovery.retained",
     ];
 
-    // The helper writes this exact array sequentially. Observing the generic
-    // marker is therefore the last publication barrier; it can never grant
-    // wait, signal, release, or cleanup authority back to the parent.
+    // The same helper used by the package Guardian writes this exact array
+    // sequentially and then enters the generation's non-returning park.
+    // Observing the generic marker is therefore the last publication barrier;
+    // it can never grant wait, signal, release, or cleanup authority back to
+    // the parent.
     child.wait_for_marker(
         &report.join(ordered_second_retention[2]),
         b"classified\n",
@@ -5888,7 +5889,7 @@ fn packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_
         }
     }
     child.assert_stably_live_after_publication()?;
-    child.release_and_reap(Instant::now() + PACKAGE_CONCRETE_SECOND_RETENTION_CHILD_TIMEOUT)?;
+    child.terminate_parked_and_reap()?;
     let root = scratch.root().to_path_buf();
     scratch.cleanup()?;
     assert!(
@@ -5898,29 +5899,31 @@ fn packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_
     Ok(())
 }
 
+fn publish_packaged_second_retention_and_park(
+    report: &Path,
+    mut retained: impl PackagedSecondRetention,
+) -> ! {
+    let (budget_consumed, markers) = {
+        let generation = retained.generation();
+        (
+            generation.packaged_recovery_budget_is_consumed_and_exhausted(),
+            generation.packaged_recovery_marker_names(),
+        )
+    };
+    if !budget_consumed {
+        retained.park();
+    }
+    for marker in markers {
+        record_package_diagnostic_marker(report, marker);
+    }
+    retained.park()
+}
+
 fn run_packaged_concrete_second_retention_helper() -> Result<(), Box<dyn Error>> {
     let root = package_supervisor_root()?;
     let report = checked_package_subdirectory(&root, "supervisor-report")?;
-    let mut retained = packaged_concrete_second_retention_for_test()?;
-    if !retained.recovery_budget_is_consumed_and_exhausted() {
-        return Err("the concrete second-retention helper recovered a third retry".into());
-    }
-    for marker in retained.marker_names() {
-        record_package_diagnostic_marker(&report, marker);
-    }
-
-    let mut release = [0_u8; PACKAGE_CONCRETE_SECOND_RETENTION_RELEASE.len()];
-    let mut stdin = io::stdin().lock();
-    stdin.read_exact(&mut release)?;
-    if release != PACKAGE_CONCRETE_SECOND_RETENTION_RELEASE {
-        return Err("the concrete second-retention release frame was invalid".into());
-    }
-    let mut trailing = [0_u8; 1];
-    if stdin.read(&mut trailing)? != 0 {
-        return Err("the concrete second-retention release frame had trailing bytes".into());
-    }
-    drop(stdin);
-    retained.release()
+    let retained = packaged_concrete_second_retention_for_test()?;
+    publish_packaged_second_retention_and_park(&report, retained)
 }
 
 struct OwnedConcreteSecondRetentionScratch {
@@ -5960,7 +5963,6 @@ impl Drop for OwnedConcreteSecondRetentionScratch {
 
 struct OwnedConcreteSecondRetentionChild {
     child: Child,
-    release: Option<ChildStdin>,
     reaped: bool,
 }
 
@@ -5977,22 +5979,15 @@ impl OwnedConcreteSecondRetentionChild {
             ])
             .env(PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV, "1")
             .env(PACKAGE_SUPERVISOR_ROOT_ENV, root)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
-        let mut child = command.spawn()?;
+        let child = command.spawn()?;
         drop(command);
-        let release = child.stdin.take();
-        let mut owned = Self {
+        Ok(Self {
             child,
-            release,
             reaped: false,
-        };
-        if owned.release.is_none() {
-            let _ = owned.kill_and_reap();
-            return Err("the concrete second-retention child lost its release pipe".into());
-        }
-        Ok(owned)
+        })
     }
 
     fn wait_for_marker(
@@ -6035,36 +6030,27 @@ impl OwnedConcreteSecondRetentionChild {
         Ok(())
     }
 
-    fn send_release(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut release = self
-            .release
-            .take()
-            .ok_or("the concrete second-retention release was already sent")?;
-        release.write_all(PACKAGE_CONCRETE_SECOND_RETENTION_RELEASE)?;
-        release.flush()?;
-        drop(release);
-        Ok(())
-    }
-
-    fn release_and_reap(&mut self, deadline: Instant) -> Result<(), Box<dyn Error>> {
-        self.send_release()?;
-        match wait_for_package_child(&mut self.child, deadline) {
-            Ok(status) => {
-                self.reaped = true;
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "the concrete second-retention child failed during release: {status}"
-                    )
-                    .into())
-                }
-            }
-            Err(error) => {
-                let _ = self.kill_and_reap();
-                Err(error)
-            }
+    fn terminate_parked_and_reap(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.reaped {
+            return Err("the concrete second-retention child was already reaped".into());
         }
+        if let Some(status) = self.child.try_wait()? {
+            self.reaped = true;
+            return Err(format!(
+                "the concrete retained owner exited before owned termination: {status}"
+            )
+            .into());
+        }
+        self.child.kill()?;
+        let status = self.child.wait()?;
+        self.reaped = true;
+        if status.signal() != Some(rustix::process::Signal::KILL.as_raw()) {
+            return Err(format!(
+                "the concrete retained owner was not killed and reaped exactly: {status}"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn kill_and_reap(&mut self) -> Result<(), Box<dyn Error>> {
@@ -6091,20 +6077,6 @@ impl Drop for OwnedConcreteSecondRetentionChild {
     fn drop(&mut self) {
         if self.reaped {
             return;
-        }
-        if self.release.is_some() {
-            let _ = self.send_release();
-        }
-        let deadline = Instant::now() + Duration::from_millis(250);
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    self.reaped = true;
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
         }
         let _ = self.kill_and_reap();
     }
@@ -12394,10 +12366,7 @@ fn run_package_guardian_helper() -> Result<(), Box<dyn Error>> {
             match retained.await_recovery() {
                 GuardianRunOutcome::Terminal(disposition) => disposition,
                 GuardianRunOutcome::Retained(retained) => {
-                    for marker in retained.packaged_recovery_marker_names() {
-                        record_package_diagnostic_marker(&report_root, marker);
-                    }
-                    retained.park()
+                    publish_packaged_second_retention_and_park(&report_root, retained)
                 }
             }
         }

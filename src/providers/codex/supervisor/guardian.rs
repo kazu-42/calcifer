@@ -63,7 +63,6 @@ use super::startup::{
     PackagedRuntimeFailureStage, PackagedStartupQuiescePhase,
     arm_packaged_startup_cleanup_second_retention,
     concrete_startup_cleanup_failure_for_guardian_test,
-    finish_concrete_startup_cleanup_failure_for_guardian_test,
     start_supervised_session_with_test_compatibility,
 };
 use super::terminal::{RecoveryTty, TerminalEndpoint, TerminalError, TerminalSnapshot};
@@ -1329,68 +1328,45 @@ pub(super) struct PackagedConcreteSecondRetention {
 }
 
 #[cfg(test)]
-impl PackagedConcreteSecondRetention {
-    pub(super) fn marker_names(&self) -> [&'static str; 3] {
-        self.retained
-            .as_ref()
-            .unwrap_or_else(|| std::process::abort())
-            .packaged_recovery_marker_names()
+pub(super) trait PackagedSecondRetention {
+    fn generation(&mut self) -> &mut RetainedGuardianGeneration;
+    fn park(self) -> !;
+}
+
+#[cfg(test)]
+impl PackagedSecondRetention for Box<RetainedGuardianGeneration> {
+    fn generation(&mut self) -> &mut RetainedGuardianGeneration {
+        self.as_mut()
     }
 
-    pub(super) fn recovery_budget_is_consumed_and_exhausted(&mut self) -> bool {
+    fn park(self) -> ! {
+        RetainedGuardianGeneration::park(self)
+    }
+}
+
+#[cfg(test)]
+impl PackagedSecondRetention for PackagedConcreteSecondRetention {
+    fn generation(&mut self) -> &mut RetainedGuardianGeneration {
         self.retained
             .as_mut()
-            .is_some_and(|retained| retained.packaged_recovery_budget_is_consumed_and_exhausted())
+            .unwrap_or_else(|| std::process::abort())
     }
 
-    /// Releases only the exact concrete startup-cleanup owner already held by
-    /// this wrapper. A failed cleanup remains deliberately pinned until the
-    /// bounded subprocess exits and the kernel closes its descriptor table.
-    pub(super) fn release(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut retained = self
+    /// Enters the same fail-closed park used by the package Guardian while the
+    /// fixture's peer endpoints and physical PTY remain live locals. The
+    /// bounded parent owns the only termination and reap authority.
+    fn park(mut self) -> ! {
+        let retained = self
             .retained
             .take()
-            .ok_or("the concrete second retention was already released")?;
-        if !retained.packaged_recovery_budget_is_consumed_and_exhausted() {
-            std::mem::forget(retained);
-            return Err("the concrete second retention recovered a retry budget".into());
-        }
-        let lifecycle = retained
-            .lifecycle
-            .take()
-            .ok_or("the concrete second retention lost its lifecycle")?;
-        let owner = retained
-            .owner
-            .take()
-            .ok_or("the concrete second retention lost its owner")?;
-        drop(retained);
-
-        let failure = match owner {
-            RetainedGuardianOwner::StartupCleanup(failure) => failure,
-            owner => {
-                owner.pin_authority();
-                std::mem::forget((owner, lifecycle));
-                return Err("the concrete second retention changed owner kind".into());
-            }
-        };
-        let report = match finish_concrete_startup_cleanup_failure_for_guardian_test(failure) {
-            Ok(report) => report,
-            Err(failure) => {
-                std::mem::forget((failure, lifecycle));
-                return Err("the concrete retained owner did not finish after release".into());
-            }
-        };
-        if report.startup_error() != SupervisedStartupError::Runtime
-            || !report.cleanup_errors_empty()
-            || !report.terminal_reportable()
-            || report.is_success()
-        {
-            std::mem::forget((report, lifecycle));
-            return Err("the concrete retained owner produced an invalid cleanup report".into());
-        }
-        drop(report);
-        drop(lifecycle);
-        Ok(())
+            .unwrap_or_else(|| std::process::abort());
+        std::hint::black_box((
+            &self._anchor,
+            &self._coordinator_lifecycle,
+            &self._terminal_peer,
+            &self._terminal_master_keepalive,
+        ));
+        RetainedGuardianGeneration::park(retained)
     }
 }
 
@@ -1417,7 +1393,7 @@ fn packaged_concrete_second_retention_bounds() -> GuardianBounds {
 /// Exercises the production `await_recovery -> retry_retained_owner` path
 /// with a real lifecycle channel and a concrete StartupCleanup owner. The
 /// one-shot startup seam forces exactly that retry to retain the same owner;
-/// the returned wrapper can later finish it without manufacturing authority.
+/// the returned wrapper can only enter the production-shaped fail-closed park.
 #[cfg(test)]
 pub(super) fn packaged_concrete_second_retention_for_test()
 -> Result<PackagedConcreteSecondRetention, Box<dyn std::error::Error>> {
