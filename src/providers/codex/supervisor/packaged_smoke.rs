@@ -3433,6 +3433,40 @@ fn package_failure_report_scanner_bridges_only_trusted_compatibility_timeout_ori
 }
 
 #[test]
+fn package_initial_gate_prefers_compatibility_origin_then_subtype_then_generic()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let generic = "startup-failure.compatibility";
+    let subtype = "startup-failure.compatibility.subtype.timeout";
+    let origin = "startup-failure.compatibility.timeout-origin.version-child-exit";
+    for marker in [generic, subtype, origin] {
+        write_private_new(&report.join(marker), b"classified\n")?;
+    }
+
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(origin)),
+        "the compatibility subtype or generic marker masked its exact timeout origin"
+    );
+    fs::remove_file(report.join(origin))?;
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(subtype)),
+        "the generic marker masked its compatibility subtype"
+    );
+    fs::remove_file(report.join(subtype))?;
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(generic))
+    );
+
+    fs::remove_file(report.join(generic))?;
+    scratch.cleanup()
+}
+
+#[test]
 fn package_failure_report_scanner_bridges_only_the_closed_app_socket_catalog()
 -> Result<(), Box<dyn Error>> {
     use std::collections::BTreeSet;
@@ -14176,6 +14210,15 @@ fn fixed_package_startup_failure_from_report(
         PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
         failure => return failure,
     };
+    let compatibility_origin = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
     let compatibility = match scan_fixed_package_startup_failure_marker_catalog(
         report,
         PACKAGED_COMPATIBILITY_FAILURE_MARKERS,
@@ -14207,7 +14250,7 @@ fn fixed_package_startup_failure_from_report(
         return PackageStartupFailureMarkerProbe::Absent;
     };
     let detail = match generic.marker() {
-        "startup-failure.compatibility" => compatibility,
+        "startup-failure.compatibility" => compatibility_origin.or(compatibility),
         "startup-failure.app-socket" => app_socket,
         "startup-failure.session-readiness" => session_readiness,
         _ => None,
