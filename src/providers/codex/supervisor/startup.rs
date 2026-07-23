@@ -690,6 +690,22 @@ const fn packaged_compatibility_failure_marker(error: CodexHandoffError) -> &'st
 }
 
 #[cfg(test)]
+const fn packaged_compatibility_failure_detail_markers(
+    origin: Option<CompatibilityTimeoutOrigin>,
+    error: CodexHandoffError,
+) -> [Option<&'static str>; 2] {
+    let origin = if matches!(error, CodexHandoffError::Timeout) {
+        match origin {
+            Some(origin) => Some(packaged_compatibility_timeout_origin_marker(origin)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    [origin, Some(packaged_compatibility_failure_marker(error))]
+}
+
+#[cfg(test)]
 pub(super) const PACKAGED_APP_SOCKET_FAILURE_MARKERS: &[&str] = &[
     "startup-failure.app-socket.subtype.cross-session-socket",
     "startup-failure.app-socket.subtype.descriptor-isolation.invalid-argument",
@@ -1204,31 +1220,20 @@ impl SupervisedStartupFailure {
     }
 
     #[cfg(test)]
-    pub(super) fn packaged_compatibility_failure_marker(&self) -> Option<&'static str> {
+    pub(super) fn packaged_compatibility_failure_detail_markers(
+        &self,
+    ) -> Option<[Option<&'static str>; 2]> {
         if self.error != SupervisedStartupError::Compatibility {
             return None;
         }
         match &self.owner {
             StartupFailureOwner::Partial(owner) => match &owner.build {
                 StartupBuildAuthority::CompatibilityFailure(failure) => {
-                    Some(packaged_compatibility_failure_marker(failure.error()))
+                    Some(packaged_compatibility_failure_detail_markers(
+                        failure.compatibility_timeout_origin(),
+                        failure.error(),
+                    ))
                 }
-                _ => None,
-            },
-            StartupFailureOwner::Session(_) => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn packaged_compatibility_timeout_origin_marker(&self) -> Option<&'static str> {
-        if self.error != SupervisedStartupError::Compatibility {
-            return None;
-        }
-        match &self.owner {
-            StartupFailureOwner::Partial(owner) => match &owner.build {
-                StartupBuildAuthority::CompatibilityFailure(failure) => failure
-                    .compatibility_timeout_origin()
-                    .map(packaged_compatibility_timeout_origin_marker),
                 _ => None,
             },
             StartupFailureOwner::Session(_) => None,
@@ -4828,6 +4833,35 @@ mod tests {
                 && !marker.contains('/')
                 && !marker.contains(' ')
         }));
+
+        for (origin, marker) in CompatibilityTimeoutOrigin::ALL.into_iter().zip(mapped) {
+            assert_eq!(
+                packaged_compatibility_failure_detail_markers(
+                    Some(origin),
+                    CodexHandoffError::Timeout,
+                ),
+                [
+                    Some(marker),
+                    Some("startup-failure.compatibility.subtype.timeout"),
+                ],
+                "the timeout subtype was ordered before its exact origin"
+            );
+        }
+        assert_eq!(
+            packaged_compatibility_failure_detail_markers(None, CodexHandoffError::Timeout),
+            [None, Some("startup-failure.compatibility.subtype.timeout"),]
+        );
+        assert_eq!(
+            packaged_compatibility_failure_detail_markers(
+                Some(CompatibilityTimeoutOrigin::SourceCapture),
+                CodexHandoffError::Transport,
+            ),
+            [
+                None,
+                Some("startup-failure.compatibility.subtype.transport"),
+            ],
+            "a non-timeout failure emitted a timeout origin"
+        );
     }
 
     #[test]

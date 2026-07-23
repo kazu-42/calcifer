@@ -1913,11 +1913,10 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
             SupervisedStartupError::Deadline => "startup-failure.deadline",
         },
     };
-    if let Some(marker) = failure.packaged_compatibility_timeout_origin_marker() {
-        write_packaged_startup_failure_marker(report_root, marker);
-    }
-    if let Some(marker) = failure.packaged_compatibility_failure_marker() {
-        write_packaged_startup_failure_marker(report_root, marker);
+    if let Some(markers) = failure.packaged_compatibility_failure_detail_markers() {
+        for marker in markers.into_iter().flatten() {
+            write_packaged_startup_failure_marker(report_root, marker);
+        }
     }
     if let Some(classification) = failure.packaged_tui_launch_failure_classification() {
         write_packaged_startup_failure_marker(report_root, classification.state_marker());
