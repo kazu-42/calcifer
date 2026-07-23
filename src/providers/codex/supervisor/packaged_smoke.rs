@@ -66,7 +66,10 @@ use super::session::{
     PackagedSessionObservation, PackagedTuiOutputMatcher, arm_packaged_session_observation,
     take_packaged_session_observation,
 };
-use super::startup::{PACKAGED_APP_SOCKET_FAILURE_MARKERS, PACKAGED_COMPATIBILITY_FAILURE_MARKERS};
+use super::startup::{
+    PACKAGED_APP_SOCKET_FAILURE_MARKERS, PACKAGED_COMPATIBILITY_FAILURE_MARKERS,
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS,
+};
 use super::terminal::{
     PtyMaster, PtyOwner, RecoveryTty, TerminalChannelPair, TerminalEndpoint, TerminalSize,
     claim_controlling_terminal_from_stdin, termios_semantically_equal,
@@ -3299,6 +3302,133 @@ fn package_failure_report_scanner_bridges_only_the_closed_compatibility_catalog(
         None,
         "the scanner must not return a prefix match or a raw report filename"
     );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_failure_report_scanner_bridges_only_trusted_compatibility_timeout_origins()
+-> Result<(), Box<dyn Error>> {
+    use std::collections::BTreeSet;
+
+    let catalog: BTreeSet<_> = PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        catalog.len(),
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.len()
+    );
+    assert!(catalog.iter().all(|marker| {
+        marker.is_ascii()
+            && marker.starts_with("startup-failure.compatibility.timeout-origin.")
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
+
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    for marker in PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
+        .iter()
+        .copied()
+    {
+        let path = report.join(marker);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some(marker)
+        );
+        fs::remove_file(path)?;
+    }
+
+    let origin = PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS[4];
+    let subtype = "startup-failure.compatibility.subtype.timeout";
+    write_private_new(&report.join(subtype), b"classified\n")?;
+    write_private_new(&report.join(origin), b"classified\n")?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some(origin),
+        "the exact timeout origin must outrank its public timeout subtype"
+    );
+    fs::remove_file(report.join(origin))?;
+    fs::remove_file(report.join(subtype))?;
+
+    for unknown in [
+        "startup-failure.compatibility.timeout-origin",
+        "startup-failure.compatibility.timeout-origin.user-controlled",
+        "startup-failure.compatibility.timeout-origin.version-child-exit.private",
+    ] {
+        let path = report.join(unknown);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a prefix, unknown, or extended timeout origin was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    let marker_path = report.join(origin);
+    for payload in [b"private\n".as_slice(), b"classified\nprivate\n".as_slice()] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a payload-bearing timeout origin was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("timeout-origin-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a symlinked timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a hardlinked timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a wrong-mode timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let fifo_status = Command::new("/usr/bin/mkfifo").arg(&marker_path).status()?;
+    if !fifo_status.success() {
+        return Err("could not create the compatibility timeout-origin FIFO fixture".into());
+    }
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a FIFO timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let socket_source = scratch.root.join("z");
+    let socket_listener = UnixListener::bind(&socket_source)?;
+    fs::set_permissions(&socket_source, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&socket_source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a socket timeout origin was trusted"
+    );
+    drop(socket_listener);
+    fs::remove_file(marker_path)?;
     scratch.cleanup()
 }
 
@@ -8723,7 +8853,8 @@ fn combine_package_exercise_and_cleanup_with_evidence(
 }
 
 fn package_operation_failure_can_finalize_during_cleanup(marker: &'static str) -> bool {
-    PACKAGED_COMPATIBILITY_FAILURE_MARKERS.contains(&marker)
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.contains(&marker)
+        || PACKAGED_COMPATIBILITY_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_APP_SOCKET_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.contains(&marker)
         || PACKAGE_JOB_CONTROL_FAILURE_MARKERS.contains(&marker)
@@ -11291,9 +11422,10 @@ impl OfficialTuiPackageHarness {
     }
 
     fn fixed_failure_catalog() -> impl Iterator<Item = &'static str> {
-        PACKAGED_COMPATIBILITY_FAILURE_MARKERS
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
             .iter()
             .copied()
+            .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_JOB_CONTROL_FAILURE_MARKERS.iter().copied())
@@ -13915,9 +14047,10 @@ fn latest_fixed_package_coordinator_origin_from_report(
 }
 
 fn fixed_package_startup_failure_marker(name: &str) -> Option<&'static str> {
-    PACKAGED_COMPATIBILITY_FAILURE_MARKERS
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
         .iter()
         .copied()
+        .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_STARTUP_FAILURE_MARKERS.iter().copied())

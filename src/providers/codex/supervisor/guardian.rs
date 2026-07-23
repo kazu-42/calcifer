@@ -1913,6 +1913,9 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
             SupervisedStartupError::Deadline => "startup-failure.deadline",
         },
     };
+    if let Some(marker) = failure.packaged_compatibility_timeout_origin_marker() {
+        write_packaged_startup_failure_marker(report_root, marker);
+    }
     if let Some(marker) = failure.packaged_compatibility_failure_marker() {
         write_packaged_startup_failure_marker(report_root, marker);
     }

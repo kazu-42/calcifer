@@ -661,12 +661,90 @@ pub(crate) fn probe_codex_version(
     )
 }
 
+/// A closed, payload-free timeout boundary inside the bounded `codex
+/// --version` probe. The compatibility gate maps these values into its own
+/// pre-version timeout catalog without exposing process identity or output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexVersionProbeTimeoutOrigin {
+    ChildExit,
+    StdoutDrain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CodexVersionProbeFailure {
+    error: CodexThreadError,
+    timeout_origin: Option<CodexVersionProbeTimeoutOrigin>,
+    cleanup_error: Option<CodexThreadError>,
+}
+
+impl CodexVersionProbeFailure {
+    const fn timeout(origin: CodexVersionProbeTimeoutOrigin) -> Self {
+        Self {
+            error: CodexThreadError::Timeout,
+            timeout_origin: Some(origin),
+            cleanup_error: None,
+        }
+    }
+
+    const fn timeout_with_cleanup(
+        origin: CodexVersionProbeTimeoutOrigin,
+        cleanup_error: Option<CodexThreadError>,
+    ) -> Self {
+        Self {
+            error: CodexThreadError::Timeout,
+            timeout_origin: Some(origin),
+            cleanup_error,
+        }
+    }
+
+    pub(crate) const fn error(self) -> CodexThreadError {
+        self.error
+    }
+
+    pub(crate) const fn timeout_origin(self) -> Option<CodexVersionProbeTimeoutOrigin> {
+        self.timeout_origin
+    }
+
+    pub(crate) const fn cleanup_error(self) -> Option<CodexThreadError> {
+        self.cleanup_error
+    }
+
+    const fn release(self) -> CodexThreadError {
+        self.error
+    }
+}
+
+impl From<CodexThreadError> for CodexVersionProbeFailure {
+    fn from(error: CodexThreadError) -> Self {
+        Self {
+            error,
+            timeout_origin: None,
+            cleanup_error: None,
+        }
+    }
+}
+
 fn probe_codex_version_command(
-    mut command: Command,
+    command: Command,
     working_directory: &Path,
     deadline: Instant,
     inherited_provider_lease: Option<&File>,
 ) -> Result<String, CodexThreadError> {
+    probe_codex_version_command_with_origin(
+        command,
+        working_directory,
+        deadline,
+        inherited_provider_lease,
+    )
+    .map_err(CodexVersionProbeFailure::release)
+}
+
+pub(crate) fn probe_codex_version_command_with_origin(
+    mut command: Command,
+    working_directory: &Path,
+    deadline: Instant,
+    inherited_provider_lease: Option<&File>,
+) -> Result<String, CodexVersionProbeFailure> {
     configure_own_process_group(&mut command);
     command
         .arg("--version")
@@ -675,12 +753,13 @@ fn probe_codex_version_command(
         .stderr(Stdio::null())
         .current_dir(working_directory);
     let mut child = spawn_with_optional_inherited_fd(command, inherited_provider_lease)
-        .map_err(|_| CodexThreadError::Spawn)?;
+        .map_err(|_| CodexVersionProbeFailure::from(CodexThreadError::Spawn))?;
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            force_terminate_process_tree(&mut child).map_err(|_| CodexThreadError::Transport)?;
-            return Err(CodexThreadError::Spawn);
+            force_terminate_process_tree(&mut child)
+                .map_err(|_| CodexVersionProbeFailure::from(CodexThreadError::Transport))?;
+            return Err(CodexThreadError::Spawn.into());
         }
     };
     let (output_sender, output_receiver) = mpsc::sync_channel(1);
@@ -696,8 +775,9 @@ fn probe_codex_version_command(
         }) {
         Ok(reader) => reader,
         Err(_) => {
-            force_terminate_process_tree(&mut child).map_err(|_| CodexThreadError::Transport)?;
-            return Err(CodexThreadError::Spawn);
+            force_terminate_process_tree(&mut child)
+                .map_err(|_| CodexVersionProbeFailure::from(CodexThreadError::Transport))?;
+            return Err(CodexThreadError::Spawn.into());
         }
     };
 
@@ -705,48 +785,75 @@ fn probe_codex_version_command(
         match child_exit_observed_without_reaping(&mut child) {
             Ok(true) => {
                 let status = reap_exited_process_tree(&mut child)
-                    .map_err(|_| CodexThreadError::Transport)?;
+                    .map_err(|_| CodexVersionProbeFailure::from(CodexThreadError::Transport))?;
                 let remaining = match deadline.checked_duration_since(Instant::now()) {
                     Some(remaining) => remaining,
                     None => {
-                        let _ = reader.join();
-                        return Err(CodexThreadError::Timeout);
+                        // The pipe can remain open in an escaped descendant.
+                        // Dropping the handle detaches that reader instead of
+                        // violating the probe's authoritative deadline.
+                        drop(reader);
+                        return Err(CodexVersionProbeFailure::timeout(
+                            CodexVersionProbeTimeoutOrigin::StdoutDrain,
+                        ));
                     }
                 };
                 let bytes = match output_receiver.recv_timeout(remaining) {
                     Ok(Ok(bytes)) => bytes,
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
-                        let _ = reader.join();
-                        return Err(CodexThreadError::Transport);
+                        join_version_reader_until(reader, deadline)?;
+                        return Err(CodexThreadError::Transport.into());
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        let _ = reader.join();
-                        return Err(CodexThreadError::Timeout);
+                        drop(reader);
+                        return Err(CodexVersionProbeFailure::timeout(
+                            CodexVersionProbeTimeoutOrigin::StdoutDrain,
+                        ));
                     }
                 };
-                reader.join().map_err(|_| CodexThreadError::Transport)?;
+                join_version_reader_until(reader, deadline)?;
                 if !status.success() {
-                    return Err(CodexThreadError::Provider);
+                    return Err(CodexThreadError::Provider.into());
                 }
-                return parse_codex_version_output(&bytes);
+                return parse_codex_version_output(&bytes).map_err(Into::into);
             }
             Ok(false) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(false) => {
-                force_terminate_process_tree(&mut child)
-                    .map_err(|_| CodexThreadError::Transport)?;
-                let _ = reader.join();
-                return Err(CodexThreadError::Timeout);
+                // Preserve the first timeout boundary even when best-effort
+                // process-tree or pipe cleanup also fails. No compatibility
+                // capability is returned from this path.
+                let cleanup_error = force_terminate_process_tree(&mut child)
+                    .err()
+                    .map(|_| CodexThreadError::Transport);
+                drop(reader);
+                return Err(CodexVersionProbeFailure::timeout_with_cleanup(
+                    CodexVersionProbeTimeoutOrigin::ChildExit,
+                    cleanup_error,
+                ));
             }
             Err(_) => {
                 force_terminate_process_tree(&mut child)
-                    .map_err(|_| CodexThreadError::Transport)?;
-                let _ = reader.join();
-                return Err(CodexThreadError::Transport);
+                    .map_err(|_| CodexVersionProbeFailure::from(CodexThreadError::Transport))?;
+                join_version_reader_until(reader, deadline)?;
+                return Err(CodexThreadError::Transport.into());
             }
         }
     }
+}
+
+fn join_version_reader_until(
+    reader: JoinHandle<()>,
+    deadline: Instant,
+) -> Result<(), CodexVersionProbeFailure> {
+    join_app_server_io_handle_until(reader, deadline).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            CodexVersionProbeFailure::timeout(CodexVersionProbeTimeoutOrigin::StdoutDrain)
+        } else {
+            CodexThreadError::Transport.into()
+        }
+    })
 }
 
 fn parse_codex_version_output(bytes: &[u8]) -> Result<String, CodexThreadError> {
@@ -3127,6 +3234,105 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "the inherited stdout descriptor must not stall the reader join"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_reports_child_exit_timeout_origin() -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap '' HUP TERM; sleep 30"]);
+        let started = Instant::now();
+
+        let failure = match probe_codex_version_command_with_origin(
+            command,
+            Path::new("/tmp"),
+            Instant::now() + Duration::from_millis(100),
+            None,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => return Err("the non-exiting version child did not time out".into()),
+        };
+
+        assert_eq!(failure.error(), CodexThreadError::Timeout);
+        assert_eq!(
+            failure.timeout_origin(),
+            Some(CodexVersionProbeTimeoutOrigin::ChildExit)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "child-exit cleanup exceeded its fixed test bound"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_reports_stdout_drain_timeout_origin() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let escaped_pid_file = std::env::temp_dir().join(format!(
+            "calcifer-version-escaped-pid-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper = fs::canonicalize(std::env::current_exe()?)?;
+        let mut command = Command::new("/bin/sh");
+        command
+            .env("CALCIFER_TEST_ESCAPED_HELPER", helper)
+            .env("CALCIFER_TEST_ESCAPED_PID_FILE", &escaped_pid_file)
+            .args([
+                "-c",
+                "( \"$CALCIFER_TEST_ESCAPED_HELPER\" providers::codex::tests::version_probe_escaped_stdout_owner_helper --exact --ignored --nocapture; : ) & while [ ! -s \"$CALCIFER_TEST_ESCAPED_PID_FILE\" ]; do sleep 0.01; done; printf 'codex-cli 0.144.4\\n'; exit 0",
+            ]);
+        let started = Instant::now();
+
+        let result = probe_codex_version_command_with_origin(
+            command,
+            Path::new("/tmp"),
+            Instant::now() + Duration::from_millis(300),
+            None,
+        );
+        let escaped_pid = fs::read_to_string(&escaped_pid_file)?
+            .parse::<i32>()
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or("escaped version helper PID was invalid")?;
+        let escaped_cleanup =
+            rustix::process::kill_process(escaped_pid, rustix::process::Signal::KILL);
+        fs::remove_file(&escaped_pid_file)?;
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => return Err("an escaped stdout owner did not time out the drain".into()),
+        };
+
+        assert_eq!(failure.error(), CodexThreadError::Timeout);
+        assert_eq!(
+            failure.timeout_origin(),
+            Some(CodexVersionProbeTimeoutOrigin::StdoutDrain)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stdout-drain detection exceeded its fixed test bound"
+        );
+        assert!(matches!(
+            escaped_cleanup,
+            Ok(()) | Err(rustix::io::Errno::SRCH)
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "internal subprocess for escaped version-pipe containment"]
+    fn version_probe_escaped_stdout_owner_helper() -> Result<(), Box<dyn std::error::Error>> {
+        let pid_file = std::env::var_os("CALCIFER_TEST_ESCAPED_PID_FILE")
+            .map(PathBuf::from)
+            .ok_or("escaped version helper was not explicitly requested")?;
+        rustix::process::setsid()?;
+        fs::write(
+            pid_file,
+            rustix::process::getpid().as_raw_nonzero().to_string(),
+        )?;
+        thread::sleep(Duration::from_secs(30));
         Ok(())
     }
 
