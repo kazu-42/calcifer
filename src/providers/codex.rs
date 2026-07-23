@@ -752,6 +752,11 @@ pub(crate) fn probe_codex_version_command_with_origin(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .current_dir(working_directory);
+    if Instant::now() >= deadline {
+        return Err(CodexVersionProbeFailure::timeout(
+            CodexVersionProbeTimeoutOrigin::ChildExit,
+        ));
+    }
     let mut child = spawn_with_optional_inherited_fd(command, inherited_provider_lease)
         .map_err(|_| CodexVersionProbeFailure::from(CodexThreadError::Spawn))?;
     let stdout = match child.stdout.take() {
@@ -3233,6 +3238,36 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the inherited stdout descriptor must not stall the reader join"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_probe_does_not_spawn_after_absolute_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonexistent_executable = std::env::temp_dir().join(format!(
+            "calcifer-expired-version-probe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let working_directory = std::env::temp_dir();
+        assert!(!nonexistent_executable.exists());
+
+        // Attempting to spawn this missing executable deterministically returns
+        // `Spawn`, so `Timeout` proves the deadline guard ran before OS spawn.
+        let failure = match probe_codex_version_command_with_origin(
+            Command::new(&nonexistent_executable),
+            &working_directory,
+            Instant::now(),
+            None,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => return Err("an expired version probe unexpectedly succeeded".into()),
+        };
+
+        assert_eq!(failure.error(), CodexThreadError::Timeout);
+        assert_eq!(
+            failure.timeout_origin(),
+            Some(CodexVersionProbeTimeoutOrigin::ChildExit)
         );
         Ok(())
     }
