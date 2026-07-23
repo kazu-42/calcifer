@@ -22,7 +22,7 @@ use crate::providers::codex::monitor::{
 };
 
 #[cfg(test)]
-use super::super::handoff_compat::CodexHandoffError;
+use super::super::handoff_compat::{CodexHandoffError, CompatibilityTimeoutOrigin};
 #[cfg(test)]
 use super::launcher::PackagedRemoteTuiLaunchFailureClassification;
 use super::launcher::{
@@ -643,6 +643,42 @@ pub(super) const PACKAGED_COMPATIBILITY_FAILURE_MARKERS: &[&str] = &[
 ];
 
 #[cfg(test)]
+pub(super) const PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS: &[&str] = &[
+    "startup-failure.compatibility.timeout-origin.deadline-overflow",
+    "startup-failure.compatibility.timeout-origin.source-capture",
+    "startup-failure.compatibility.timeout-origin.probe-stage-copy-durability",
+    "startup-failure.compatibility.timeout-origin.probe-stage-recapture",
+    "startup-failure.compatibility.timeout-origin.version-child-exit",
+    "startup-failure.compatibility.timeout-origin.version-stdout-drain",
+];
+
+#[cfg(test)]
+const fn packaged_compatibility_timeout_origin_marker(
+    origin: CompatibilityTimeoutOrigin,
+) -> &'static str {
+    match origin {
+        CompatibilityTimeoutOrigin::DeadlineOverflow => {
+            "startup-failure.compatibility.timeout-origin.deadline-overflow"
+        }
+        CompatibilityTimeoutOrigin::SourceCapture => {
+            "startup-failure.compatibility.timeout-origin.source-capture"
+        }
+        CompatibilityTimeoutOrigin::ProbeStageCopyDurability => {
+            "startup-failure.compatibility.timeout-origin.probe-stage-copy-durability"
+        }
+        CompatibilityTimeoutOrigin::ProbeStageRecapture => {
+            "startup-failure.compatibility.timeout-origin.probe-stage-recapture"
+        }
+        CompatibilityTimeoutOrigin::VersionChildExit => {
+            "startup-failure.compatibility.timeout-origin.version-child-exit"
+        }
+        CompatibilityTimeoutOrigin::VersionStdoutDrain => {
+            "startup-failure.compatibility.timeout-origin.version-stdout-drain"
+        }
+    }
+}
+
+#[cfg(test)]
 const fn packaged_compatibility_failure_marker(error: CodexHandoffError) -> &'static str {
     match error {
         CodexHandoffError::Unsupported => "startup-failure.compatibility.subtype.unsupported",
@@ -651,6 +687,22 @@ const fn packaged_compatibility_failure_marker(error: CodexHandoffError) -> &'st
         CodexHandoffError::Transport => "startup-failure.compatibility.subtype.transport",
         CodexHandoffError::Spawn => "startup-failure.compatibility.subtype.spawn",
     }
+}
+
+#[cfg(test)]
+const fn packaged_compatibility_failure_detail_markers(
+    origin: Option<CompatibilityTimeoutOrigin>,
+    error: CodexHandoffError,
+) -> [Option<&'static str>; 2] {
+    let origin = if matches!(error, CodexHandoffError::Timeout) {
+        match origin {
+            Some(origin) => Some(packaged_compatibility_timeout_origin_marker(origin)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    [origin, Some(packaged_compatibility_failure_marker(error))]
 }
 
 #[cfg(test)]
@@ -1168,14 +1220,19 @@ impl SupervisedStartupFailure {
     }
 
     #[cfg(test)]
-    pub(super) fn packaged_compatibility_failure_marker(&self) -> Option<&'static str> {
+    pub(super) fn packaged_compatibility_failure_detail_markers(
+        &self,
+    ) -> Option<[Option<&'static str>; 2]> {
         if self.error != SupervisedStartupError::Compatibility {
             return None;
         }
         match &self.owner {
             StartupFailureOwner::Partial(owner) => match &owner.build {
                 StartupBuildAuthority::CompatibilityFailure(failure) => {
-                    Some(packaged_compatibility_failure_marker(failure.error()))
+                    Some(packaged_compatibility_failure_detail_markers(
+                        failure.compatibility_timeout_origin(),
+                        failure.error(),
+                    ))
                 }
                 _ => None,
             },
@@ -4755,6 +4812,56 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), mapped.len());
+    }
+
+    #[test]
+    fn packaged_compatibility_timeout_origin_markers_are_closed_and_fixed() {
+        let mapped =
+            CompatibilityTimeoutOrigin::ALL.map(packaged_compatibility_timeout_origin_marker);
+
+        assert_eq!(
+            mapped.as_slice(),
+            PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
+        );
+        let mut unique = mapped.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), mapped.len());
+        assert!(mapped.into_iter().all(|marker| {
+            marker.is_ascii()
+                && marker.starts_with("startup-failure.compatibility.timeout-origin.")
+                && !marker.contains('/')
+                && !marker.contains(' ')
+        }));
+
+        for (origin, marker) in CompatibilityTimeoutOrigin::ALL.into_iter().zip(mapped) {
+            assert_eq!(
+                packaged_compatibility_failure_detail_markers(
+                    Some(origin),
+                    CodexHandoffError::Timeout,
+                ),
+                [
+                    Some(marker),
+                    Some("startup-failure.compatibility.subtype.timeout"),
+                ],
+                "the timeout subtype was ordered before its exact origin"
+            );
+        }
+        assert_eq!(
+            packaged_compatibility_failure_detail_markers(None, CodexHandoffError::Timeout),
+            [None, Some("startup-failure.compatibility.subtype.timeout"),]
+        );
+        assert_eq!(
+            packaged_compatibility_failure_detail_markers(
+                Some(CompatibilityTimeoutOrigin::SourceCapture),
+                CodexHandoffError::Transport,
+            ),
+            [
+                None,
+                Some("startup-failure.compatibility.subtype.transport"),
+            ],
+            "a non-timeout failure emitted a timeout origin"
+        );
     }
 
     #[test]

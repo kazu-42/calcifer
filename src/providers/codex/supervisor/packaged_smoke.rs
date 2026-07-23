@@ -14,7 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -66,7 +66,10 @@ use super::session::{
     PackagedSessionObservation, PackagedTuiOutputMatcher, arm_packaged_session_observation,
     take_packaged_session_observation,
 };
-use super::startup::{PACKAGED_APP_SOCKET_FAILURE_MARKERS, PACKAGED_COMPATIBILITY_FAILURE_MARKERS};
+use super::startup::{
+    PACKAGED_APP_SOCKET_FAILURE_MARKERS, PACKAGED_COMPATIBILITY_FAILURE_MARKERS,
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS,
+};
 use super::terminal::{
     PtyMaster, PtyOwner, RecoveryTty, TerminalChannelPair, TerminalEndpoint, TerminalSize,
     claim_controlling_terminal_from_stdin, termios_semantically_equal,
@@ -3299,6 +3302,167 @@ fn package_failure_report_scanner_bridges_only_the_closed_compatibility_catalog(
         None,
         "the scanner must not return a prefix match or a raw report filename"
     );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_failure_report_scanner_bridges_only_trusted_compatibility_timeout_origins()
+-> Result<(), Box<dyn Error>> {
+    use std::collections::BTreeSet;
+
+    let catalog: BTreeSet<_> = PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        catalog.len(),
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.len()
+    );
+    assert!(catalog.iter().all(|marker| {
+        marker.is_ascii()
+            && marker.starts_with("startup-failure.compatibility.timeout-origin.")
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
+
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    for marker in PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
+        .iter()
+        .copied()
+    {
+        let path = report.join(marker);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some(marker)
+        );
+        fs::remove_file(path)?;
+    }
+
+    let origin = PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS[4];
+    let subtype = "startup-failure.compatibility.subtype.timeout";
+    write_private_new(&report.join(subtype), b"classified\n")?;
+    write_private_new(&report.join(origin), b"classified\n")?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some(origin),
+        "the exact timeout origin must outrank its public timeout subtype"
+    );
+    fs::remove_file(report.join(origin))?;
+    fs::remove_file(report.join(subtype))?;
+
+    for unknown in [
+        "startup-failure.compatibility.timeout-origin",
+        "startup-failure.compatibility.timeout-origin.user-controlled",
+        "startup-failure.compatibility.timeout-origin.version-child-exit.private",
+    ] {
+        let path = report.join(unknown);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a prefix, unknown, or extended timeout origin was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    let marker_path = report.join(origin);
+    for payload in [b"private\n".as_slice(), b"classified\nprivate\n".as_slice()] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a payload-bearing timeout origin was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("timeout-origin-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a symlinked timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a hardlinked timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a wrong-mode timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let fifo_status = Command::new("/usr/bin/mkfifo").arg(&marker_path).status()?;
+    if !fifo_status.success() {
+        return Err("could not create the compatibility timeout-origin FIFO fixture".into());
+    }
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a FIFO timeout origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let socket_source = scratch.root.join("z");
+    let socket_listener = UnixListener::bind(&socket_source)?;
+    fs::set_permissions(&socket_source, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&socket_source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a socket timeout origin was trusted"
+    );
+    drop(socket_listener);
+    fs::remove_file(marker_path)?;
+    scratch.cleanup()
+}
+
+#[test]
+fn package_initial_gate_prefers_compatibility_origin_then_subtype_then_generic()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let generic = "startup-failure.compatibility";
+    let subtype = "startup-failure.compatibility.subtype.timeout";
+    let origin = "startup-failure.compatibility.timeout-origin.version-child-exit";
+    for marker in [generic, subtype, origin] {
+        write_private_new(&report.join(marker), b"classified\n")?;
+    }
+
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(origin)),
+        "the compatibility subtype or generic marker masked its exact timeout origin"
+    );
+    fs::remove_file(report.join(origin))?;
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(subtype)),
+        "the generic marker masked its compatibility subtype"
+    );
+    fs::remove_file(report.join(subtype))?;
+    assert_eq!(
+        fixed_package_startup_failure_from_report(&report, Instant::now() + IO_TIMEOUT),
+        PackageStartupFailureMarkerProbe::Valid(FixedPackageStartupFailure(generic))
+    );
+
+    fs::remove_file(report.join(generic))?;
     scratch.cleanup()
 }
 
@@ -7688,6 +7852,19 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
         let causal = std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV)
             .is_some_and(|mode| mode == PACKAGE_UNPROVEN_CLEANUP_CAUSAL_EXIT_HELPER_MODE);
         let (_output_sender, output_result) = mpsc::sync_channel(1);
+        let handoff_probe_observation = PackageHandoffProbeObservation::new();
+        let output_worker = if causal {
+            for (phase, _) in PACKAGE_HANDOFF_PROBE_PHASES[..8].iter().copied() {
+                assert!(handoff_probe_observation.advance(phase));
+            }
+            Some(thread::spawn(|| {
+                loop {
+                    thread::park();
+                }
+            }))
+        } else {
+            None
+        };
         let mut harness = OfficialTuiPackageHarness {
             _provider_suite_budget: PackageProviderSuiteBudget::Deterministic {
                 _lease: PackageDeterministicSuiteLease {
@@ -7713,9 +7890,9 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
             output_result,
             startup_sentinel_observed: None,
             response_sentinel_observed: None,
-            output_worker: None,
+            output_worker,
             output_finished: true,
-            last_handoff_probe_phase: None,
+            handoff_probe_observation,
             recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
             last_fixed_failure_detail: None,
             last_fixed_cleanup_failure_detail: None,
@@ -7782,7 +7959,8 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
         projected,
         [concat!(
             "package-generation-cleanup-unproven:",
-            "phase=scratch-missing,failure=unclassified,secondary=none,retry_observations=none,",
+            "phase=scratch-missing,failure=unclassified,secondary=none,handoff_probe_phase=none,",
+            "retry_observations=none,",
             "coordinator_origin=none,recovery_case=none"
         )]
     );
@@ -7805,11 +7983,13 @@ fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci(
     let expected_causal_projection = format!(
         concat!(
             "package-generation-cleanup-unproven:",
-            "phase=scratch-missing,failure={},secondary={},retry_observations={},{}",
+            "phase=scratch-missing,failure={},secondary={},handoff_probe_phase={},",
+            "retry_observations={},{}",
             ",coordinator_origin={},recovery_case={}"
         ),
         PackageRecoveryDriveFailure::InitialGate.marker(),
         PACKAGED_SESSION_TERMINAL_FAILURE_MARKERS[0],
+        PackageHandoffProbePhase::ForkResponseValidated.fixed_label(),
         PackageInitialGateRetryObservation::MarkerRead.marker(),
         PackageInitialGateRetryObservation::StartupScan.marker(),
         PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[10],
@@ -8259,7 +8439,7 @@ struct OfficialTuiPackageHarness {
     response_sentinel_observed: Option<Receiver<()>>,
     output_worker: Option<JoinHandle<()>>,
     output_finished: bool,
-    last_handoff_probe_phase: Option<PackageHandoffProbePhase>,
+    handoff_probe_observation: PackageHandoffProbeObservation,
     recovery_failure_evidence: PackageRecoveryFailureEvidence,
     last_fixed_failure_detail: Option<&'static str>,
     last_fixed_cleanup_failure_detail: Option<&'static str>,
@@ -8723,7 +8903,8 @@ fn combine_package_exercise_and_cleanup_with_evidence(
 }
 
 fn package_operation_failure_can_finalize_during_cleanup(marker: &'static str) -> bool {
-    PACKAGED_COMPATIBILITY_FAILURE_MARKERS.contains(&marker)
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.contains(&marker)
+        || PACKAGED_COMPATIBILITY_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_APP_SOCKET_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.contains(&marker)
         || PACKAGE_JOB_CONTROL_FAILURE_MARKERS.contains(&marker)
@@ -9021,7 +9202,7 @@ fn official_tui_pre_generation_cleanup_joins_backend_and_deletes_owned_scratch_w
         response_sentinel_observed: None,
         output_worker: None,
         output_finished: true,
-        last_handoff_probe_phase: None,
+        handoff_probe_observation: PackageHandoffProbeObservation::new(),
         recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
@@ -9078,7 +9259,7 @@ fn deterministic_case_cleanup_preserves_owned_scratch_when_exercise_failed()
         response_sentinel_observed: None,
         output_worker: None,
         output_finished: true,
-        last_handoff_probe_phase: None,
+        handoff_probe_observation: PackageHandoffProbeObservation::new(),
         recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
@@ -9145,7 +9326,7 @@ fn official_tui_pre_generation_cleanup_aggregates_infrastructure_failures_before
         response_sentinel_observed: None,
         output_worker: Some(output_worker),
         output_finished: false,
-        last_handoff_probe_phase: None,
+        handoff_probe_observation: PackageHandoffProbeObservation::new(),
         recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
@@ -9236,7 +9417,7 @@ fn started_official_harness_for_network_cleanup_test()
         response_sentinel_observed: None,
         output_worker: Some(output_worker),
         output_finished: false,
-        last_handoff_probe_phase: None,
+        handoff_probe_observation: PackageHandoffProbeObservation::new(),
         recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
         last_fixed_failure_detail: None,
         last_fixed_cleanup_failure_detail: None,
@@ -10182,7 +10363,7 @@ impl OfficialTuiPackageHarness {
             response_sentinel_observed: None,
             output_worker: None,
             output_finished: false,
-            last_handoff_probe_phase: None,
+            handoff_probe_observation: PackageHandoffProbeObservation::new(),
             recovery_failure_evidence: PackageRecoveryFailureEvidence::default(),
             last_fixed_failure_detail: None,
             last_fixed_cleanup_failure_detail: None,
@@ -10229,6 +10410,7 @@ impl OfficialTuiPackageHarness {
             // recovery, process, filesystem, or socket authority.
             let (startup_sentinel_sender, startup_sentinel_observed) = mpsc::sync_channel(1);
             let (response_sentinel_sender, response_sentinel_observed) = mpsc::sync_channel(1);
+            let handoff_probe_observation = harness.handoff_probe_observation.clone();
             let output_worker = thread::Builder::new()
                 .name("calcifer-package-official-tui-output".to_owned())
                 .spawn(move || {
@@ -10237,6 +10419,7 @@ impl OfficialTuiPackageHarness {
                         cancellation,
                         startup_sentinel_sender,
                         response_sentinel_sender,
+                        handoff_probe_observation,
                     );
                     let _ = output_sender.send(result);
                 })?;
@@ -11266,7 +11449,7 @@ impl OfficialTuiPackageHarness {
     }
 
     fn latest_handoff_probe_phase(&self) -> Option<PackageHandoffProbePhase> {
-        self.last_handoff_probe_phase
+        self.handoff_probe_observation.latest()
     }
 
     fn latest_fixed_failure_or_phase_from_report(report: &Path) -> &'static str {
@@ -11291,9 +11474,10 @@ impl OfficialTuiPackageHarness {
     }
 
     fn fixed_failure_catalog() -> impl Iterator<Item = &'static str> {
-        PACKAGED_COMPATIBILITY_FAILURE_MARKERS
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
             .iter()
             .copied()
+            .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_JOB_CONTROL_FAILURE_MARKERS.iter().copied())
@@ -11443,7 +11627,9 @@ impl OfficialTuiPackageHarness {
         }
         self.output_finished = true;
         self.output_cancel.take();
-        self.last_handoff_probe_phase = result.handoff_probe_phase;
+        if self.latest_handoff_probe_phase() != result.handoff_probe_phase {
+            return Err("live handoff phase diverged from the completed PTY drain".into());
+        }
         Ok(result)
     }
 
@@ -11595,7 +11781,12 @@ impl OfficialTuiPackageHarness {
             }
             match self.output_result.recv_timeout(Duration::from_secs(2)) {
                 Ok(Ok(drain)) => {
-                    self.last_handoff_probe_phase = drain.handoff_probe_phase;
+                    if self.latest_handoff_probe_phase() != drain.handoff_probe_phase {
+                        failures.record(
+                            PackageHarnessCleanupPhase::PtyOutputDrain,
+                            "live handoff phase diverged from the completed PTY drain".into(),
+                        );
+                    }
                 }
                 Ok(Err(error)) => {
                     failures.record(PackageHarnessCleanupPhase::PtyOutputDrain, error.into())
@@ -11813,12 +12004,16 @@ impl OfficialTuiPackageHarness {
                 stderr,
                 concat!(
                     "package-generation-cleanup-unproven:",
-                    "phase={},failure={},secondary={},retry_observations={},coordinator_origin={},",
+                    "phase={},failure={},secondary={},handoff_probe_phase={},",
+                    "retry_observations={},coordinator_origin={},",
                     "recovery_case={}"
                 ),
                 self.latest_fixed_phase(),
                 self.latest_fixed_failure_detail().unwrap_or("unclassified"),
                 self.latest_fixed_secondary_failure_detail()
+                    .unwrap_or("none"),
+                self.latest_handoff_probe_phase()
+                    .map(PackageHandoffProbePhase::fixed_label)
                     .unwrap_or("none"),
                 self.latest_fixed_retry_observations(),
                 self.latest_fixed_coordinator_origin()
@@ -13291,6 +13486,80 @@ impl PackageHandoffProbePhase {
     }
 }
 
+impl PackageHandoffProbePhase {
+    const fn ordinal(self) -> u8 {
+        match self {
+            Self::VersionGatePassed => 1,
+            Self::SchemaGatePassed => 2,
+            Self::ForkAppServerSpawned => 3,
+            Self::InitializeRequestSent => 4,
+            Self::InitializeResponseReceived => 5,
+            Self::ForkRequestSent => 6,
+            Self::ForkResponseReceived => 7,
+            Self::ForkResponseValidated => 8,
+            Self::ForkAppServerShutdown => 9,
+            Self::FingerprintsStable => 10,
+            Self::ForkGatePassed => 11,
+            Self::RemoteAppServerReady => 12,
+            Self::ReadinessProxyReady => 13,
+            Self::RemoteTuiSpawned => 14,
+            Self::RemoteTuiReadResumeReady => 15,
+            Self::ReadinessProxyShutdown => 16,
+            Self::RemoteAppServerShutdown => 17,
+        }
+    }
+
+    const fn from_ordinal(ordinal: u8) -> Option<Self> {
+        match ordinal {
+            1 => Some(Self::VersionGatePassed),
+            2 => Some(Self::SchemaGatePassed),
+            3 => Some(Self::ForkAppServerSpawned),
+            4 => Some(Self::InitializeRequestSent),
+            5 => Some(Self::InitializeResponseReceived),
+            6 => Some(Self::ForkRequestSent),
+            7 => Some(Self::ForkResponseReceived),
+            8 => Some(Self::ForkResponseValidated),
+            9 => Some(Self::ForkAppServerShutdown),
+            10 => Some(Self::FingerprintsStable),
+            11 => Some(Self::ForkGatePassed),
+            12 => Some(Self::RemoteAppServerReady),
+            13 => Some(Self::ReadinessProxyReady),
+            14 => Some(Self::RemoteTuiSpawned),
+            15 => Some(Self::RemoteTuiReadResumeReady),
+            16 => Some(Self::ReadinessProxyShutdown),
+            17 => Some(Self::RemoteAppServerShutdown),
+            _ => None,
+        }
+    }
+}
+
+/// A closed, monotonic, observation-only projection of the output worker's
+/// latest complete handoff marker. It contains no terminal bytes and grants no
+/// process, cleanup, completion, retry, or filesystem authority.
+#[derive(Clone)]
+struct PackageHandoffProbeObservation {
+    latest_ordinal: Arc<AtomicU8>,
+}
+
+impl PackageHandoffProbeObservation {
+    fn new() -> Self {
+        Self {
+            latest_ordinal: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    fn advance(&self, phase: PackageHandoffProbePhase) -> bool {
+        let next = phase.ordinal();
+        self.latest_ordinal
+            .compare_exchange(next - 1, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn latest(&self) -> Option<PackageHandoffProbePhase> {
+        PackageHandoffProbePhase::from_ordinal(self.latest_ordinal.load(Ordering::Acquire))
+    }
+}
+
 const PACKAGE_HANDOFF_PROBE_PHASES: [(PackageHandoffProbePhase, &[u8]); 17] = [
     (
         PackageHandoffProbePhase::VersionGatePassed,
@@ -13371,16 +13640,18 @@ struct PackageHandoffProbeProgress {
     next_index: usize,
     next_matcher: Option<PackageFixedOutputMatcher>,
     latest: Option<PackageHandoffProbePhase>,
+    observation: PackageHandoffProbeObservation,
 }
 
 impl PackageHandoffProbeProgress {
-    fn new() -> Self {
+    fn new(observation: PackageHandoffProbeObservation) -> Self {
         Self {
             next_index: 0,
             next_matcher: Some(PackageFixedOutputMatcher::new(
                 PACKAGE_HANDOFF_PROBE_PHASES[0].1,
             )),
             latest: None,
+            observation,
         }
     }
 
@@ -13393,7 +13664,11 @@ impl PackageHandoffProbeProgress {
             if !matcher.seen() {
                 continue;
             }
-            self.latest = Some(PACKAGE_HANDOFF_PROBE_PHASES[self.next_index].0);
+            let phase = PACKAGE_HANDOFF_PROBE_PHASES[self.next_index].0;
+            if !self.observation.advance(phase) {
+                return;
+            }
+            self.latest = Some(phase);
             self.next_index += 1;
             self.next_matcher = PACKAGE_HANDOFF_PROBE_PHASES
                 .get(self.next_index)
@@ -13439,12 +13714,13 @@ fn drain_package_pty_output(
     cancellation: Receiver<()>,
     startup_sentinel_observed: SyncSender<()>,
     response_sentinel_observed: SyncSender<()>,
+    handoff_probe_observation: PackageHandoffProbeObservation,
 ) -> Result<PackageOutputDrain, String> {
     let mut total = 0_usize;
     let mut startup_matcher =
         PackageFixedOutputMatcher::new(PACKAGE_SUPERVISOR_STARTUP_SENTINEL.as_bytes());
     let mut response_matcher = PackagedTuiOutputMatcher::new();
-    let mut handoff_probe_progress = PackageHandoffProbeProgress::new();
+    let mut handoff_probe_progress = PackageHandoffProbeProgress::new(handoff_probe_observation);
     let mut startup_sentinel_observed = Some(startup_sentinel_observed);
     let mut response_sentinel_observed = Some(response_sentinel_observed);
     let mut buffer = [0_u8; 8192];
@@ -13530,9 +13806,11 @@ fn package_fixed_output_matcher_detects_startup_history_across_chunks_without_re
 
 #[test]
 fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix() {
-    let mut progress = PackageHandoffProbeProgress::new();
+    let observation = PackageHandoffProbeObservation::new();
+    let mut progress = PackageHandoffProbeProgress::new(observation.clone());
     progress.observe(b"private terminal output and credentials");
     assert_eq!(progress.latest(), None);
+    assert_eq!(observation.latest(), None);
 
     progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[7].1);
     progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[16].1);
@@ -13541,11 +13819,13 @@ fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix
         None,
         "isolated later markers must not manufacture skipped progress"
     );
+    assert_eq!(observation.latest(), None);
 
     for (expected, marker) in PACKAGE_HANDOFF_PROBE_PHASES[..6].iter().copied() {
         progress.observe(marker);
         progress.observe(b"\n");
         assert_eq!(progress.latest(), Some(expected));
+        assert_eq!(observation.latest(), Some(expected));
     }
     progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[6].1);
     assert_eq!(
@@ -13556,6 +13836,10 @@ fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix
     progress.observe(PACKAGE_HANDOFF_PROBE_PHASES[7].1);
     assert_eq!(
         progress.latest(),
+        Some(PackageHandoffProbePhase::ForkResponseValidated)
+    );
+    assert_eq!(
+        observation.latest(),
         Some(PackageHandoffProbePhase::ForkResponseValidated)
     );
 
@@ -13570,6 +13854,27 @@ fn package_handoff_probe_progress_requires_a_contiguous_allowlisted_phase_prefix
     assert_eq!(
         progress.latest(),
         Some(PackageHandoffProbePhase::ForkAppServerShutdown)
+    );
+}
+
+#[test]
+fn package_handoff_probe_observation_advances_only_one_fixed_phase_at_a_time() {
+    let observation = PackageHandoffProbeObservation::new();
+
+    assert!(!observation.advance(PackageHandoffProbePhase::SchemaGatePassed));
+    assert_eq!(observation.latest(), None);
+    assert!(observation.advance(PackageHandoffProbePhase::VersionGatePassed));
+    assert!(!observation.advance(PackageHandoffProbePhase::VersionGatePassed));
+    assert!(!observation.advance(PackageHandoffProbePhase::ForkAppServerSpawned));
+    assert_eq!(
+        observation.latest(),
+        Some(PackageHandoffProbePhase::VersionGatePassed)
+    );
+    assert!(observation.advance(PackageHandoffProbePhase::SchemaGatePassed));
+    assert!(!observation.advance(PackageHandoffProbePhase::VersionGatePassed));
+    assert_eq!(
+        observation.latest(),
+        Some(PackageHandoffProbePhase::SchemaGatePassed)
     );
 }
 
@@ -13592,16 +13897,22 @@ fn package_pty_output_drain_publishes_distinct_startup_and_response_observations
     let (_cancel, cancellation) = mpsc::sync_channel(1);
     let (startup_sender, startup_observed) = mpsc::sync_channel(1);
     let (response_sender, response_observed) = mpsc::sync_channel(1);
+    let handoff_probe_observation = PackageHandoffProbeObservation::new();
     let drain = drain_package_pty_output(
         File::from(descriptor),
         cancellation,
         startup_sender,
         response_sender,
+        handoff_probe_observation.clone(),
     )?;
 
     assert!(drain.response_sentinel_seen);
     assert_eq!(
         drain.handoff_probe_phase,
+        Some(PackageHandoffProbePhase::ForkResponseValidated)
+    );
+    assert_eq!(
+        handoff_probe_observation.latest(),
         Some(PackageHandoffProbePhase::ForkResponseValidated)
     );
     assert_eq!(startup_observed.recv_timeout(IO_TIMEOUT), Ok(()));
@@ -13628,14 +13939,17 @@ fn package_pty_output_drain_does_not_treat_startup_history_as_current_response()
     let (_cancel, cancellation) = mpsc::sync_channel(1);
     let (startup_sender, startup_observed) = mpsc::sync_channel(1);
     let (response_sender, response_observed) = mpsc::sync_channel(1);
+    let handoff_probe_observation = PackageHandoffProbeObservation::new();
     let drain = drain_package_pty_output(
         File::from(descriptor),
         cancellation,
         startup_sender,
         response_sender,
+        handoff_probe_observation.clone(),
     )?;
 
     assert!(!drain.response_sentinel_seen);
+    assert_eq!(handoff_probe_observation.latest(), None);
     assert_eq!(startup_observed.recv_timeout(IO_TIMEOUT), Ok(()));
     assert_eq!(
         startup_observed.try_recv(),
@@ -13915,9 +14229,10 @@ fn latest_fixed_package_coordinator_origin_from_report(
 }
 
 fn fixed_package_startup_failure_marker(name: &str) -> Option<&'static str> {
-    PACKAGED_COMPATIBILITY_FAILURE_MARKERS
+    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
         .iter()
         .copied()
+        .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_STARTUP_FAILURE_MARKERS.iter().copied())
@@ -14043,6 +14358,15 @@ fn fixed_package_startup_failure_from_report(
         PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
         failure => return failure,
     };
+    let compatibility_origin = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
     let compatibility = match scan_fixed_package_startup_failure_marker_catalog(
         report,
         PACKAGED_COMPATIBILITY_FAILURE_MARKERS,
@@ -14074,7 +14398,7 @@ fn fixed_package_startup_failure_from_report(
         return PackageStartupFailureMarkerProbe::Absent;
     };
     let detail = match generic.marker() {
-        "startup-failure.compatibility" => compatibility,
+        "startup-failure.compatibility" => compatibility_origin.or(compatibility),
         "startup-failure.app-socket" => app_socket,
         "startup-failure.session-readiness" => session_readiness,
         _ => None,
