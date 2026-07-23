@@ -20,6 +20,7 @@ use std::time::Duration;
 use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
 use rustix::net::{AddressFamily, SendFlags, SocketType};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use super::protocol::{TerminalSnapshotFingerprint, VerifiedOpenGateAck, VerifiedReady};
 
@@ -130,6 +131,134 @@ impl fmt::Debug for TerminalBuffer {
         let _ = &self.bytes;
         formatter.write_str("TerminalBuffer(<redacted>)")
     }
+}
+
+/// One fixed coordinator-output fragment retained across nonblocking outer
+/// terminal writes.
+///
+/// Unlike [`TerminalChunk`], this owner may survive a pump turn. Its bounded
+/// length and offset preserve ordering without allocating or reading another
+/// terminal-channel fragment while the current bytes remain pending.
+#[must_use = "pending terminal output must be forwarded or zeroized"]
+pub(super) struct PendingTerminalOutput {
+    buffer: TerminalBuffer,
+    length: usize,
+    offset: usize,
+}
+
+impl PendingTerminalOutput {
+    pub(super) const fn new() -> Self {
+        Self {
+            buffer: TerminalBuffer::new(),
+            length: 0,
+            offset: 0,
+        }
+    }
+
+    pub(super) const fn is_pending(&self) -> bool {
+        self.offset < self.length
+    }
+
+    /// Removes every retained terminal byte without releasing either endpoint
+    /// authority. Retention paths call this before parking linear owners so a
+    /// fail-closed generation can never become a process-lifetime transcript.
+    pub(super) fn scrub(&mut self) {
+        self.buffer.bytes.zeroize();
+        self.length = 0;
+        self.offset = 0;
+    }
+
+    fn record_write(&mut self, length: usize) -> Result<TerminalWrite, TerminalError> {
+        let remaining = self.length.saturating_sub(self.offset);
+        if length == 0 || length > remaining {
+            return Err(TerminalError::Write);
+        }
+        let previous = self.offset;
+        self.offset += length;
+        self.buffer.bytes[previous..self.offset].zeroize();
+        if self.offset == self.length {
+            self.length = 0;
+            self.offset = 0;
+            Ok(TerminalWrite::Complete)
+        } else {
+            Ok(TerminalWrite::Progress {
+                written: length,
+                remaining: self.length - self.offset,
+            })
+        }
+    }
+
+    fn remaining_bytes(&self) -> &[u8] {
+        &self.buffer.bytes[self.offset..self.length]
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_for_test(&mut self, bytes: &[u8]) -> Result<(), TerminalError> {
+        if self.is_pending() || bytes.is_empty() {
+            return Err(TerminalError::EmptyChunk);
+        }
+        if bytes.len() > self.buffer.bytes.len() {
+            return Err(TerminalError::ChunkTooLarge);
+        }
+        self.buffer.bytes[..bytes.len()].copy_from_slice(bytes);
+        self.length = bytes.len();
+        self.offset = 0;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_write_for_test<W: Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> Result<TerminalWrite, TerminalError> {
+        try_write_pending_file(writer, self)
+    }
+
+    #[cfg(test)]
+    pub(super) fn remaining_bytes_for_test(&self) -> &[u8] {
+        self.remaining_bytes()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_zeroized_for_test(&self) -> bool {
+        self.length == 0 && self.offset == 0 && self.buffer.bytes.iter().all(|byte| *byte == 0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_shape_for_test(&self) -> (usize, usize, bool) {
+        (
+            self.length,
+            self.offset,
+            self.buffer.bytes.iter().all(|byte| *byte == 0),
+        )
+    }
+}
+
+impl Default for PendingTerminalOutput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for PendingTerminalOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (&self.buffer, self.length, self.offset);
+        formatter.write_str("PendingTerminalOutput(<redacted>)")
+    }
+}
+
+impl Drop for PendingTerminalOutput {
+    fn drop(&mut self) {
+        self.scrub();
+    }
+}
+
+/// One nonblocking source observation for [`PendingTerminalOutput`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PendingTerminalRead {
+    Data,
+    EndOfStream,
+    WouldBlock,
 }
 
 /// A non-empty, move-only fragment borrowing its exact [`TerminalBuffer`].
@@ -1663,45 +1792,78 @@ fn terminal_send_flags<Fd: AsFd>(descriptor: Fd) -> Result<SendFlags, TerminalEr
     Err(TerminalError::UnsupportedPlatform)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixedRead {
+    Data { length: usize },
+    EndOfStream,
+    Interrupted,
+    WouldBlock,
+}
+
+fn read_fixed_count_once<R: Read>(
+    reader: &mut R,
+    buffer: &mut TerminalBuffer,
+    normalize_pty_eio: bool,
+) -> Result<FixedRead, TerminalError> {
+    match reader.read(&mut buffer.bytes) {
+        // Only a successfully reported prefix is terminal payload. A reader
+        // can mutate this initialized buffer before returning a short length
+        // or an error, so every unreported byte is erased.
+        Ok(0) => {
+            buffer.bytes.fill(0);
+            Ok(FixedRead::EndOfStream)
+        }
+        Ok(length) => {
+            buffer.bytes[length..].fill(0);
+            Ok(FixedRead::Data { length })
+        }
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+            buffer.bytes.fill(0);
+            Ok(FixedRead::Interrupted)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            buffer.bytes.fill(0);
+            Ok(FixedRead::WouldBlock)
+        }
+        Err(error)
+            if normalize_pty_eio
+                && error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) =>
+        {
+            buffer.bytes.fill(0);
+            Ok(FixedRead::EndOfStream)
+        }
+        Err(_) => {
+            buffer.bytes.fill(0);
+            Err(TerminalError::Read)
+        }
+    }
+}
+
+fn read_fixed_count<R: Read>(
+    reader: &mut R,
+    buffer: &mut TerminalBuffer,
+    normalize_pty_eio: bool,
+) -> Result<FixedRead, TerminalError> {
+    loop {
+        match read_fixed_count_once(reader, buffer, normalize_pty_eio)? {
+            FixedRead::Interrupted => {}
+            observation => return Ok(observation),
+        }
+    }
+}
+
 fn read_fixed<'buffer, R: Read>(
     reader: &mut R,
     buffer: &'buffer mut TerminalBuffer,
     normalize_pty_eio: bool,
 ) -> Result<TerminalRead<'buffer>, TerminalError> {
-    loop {
-        match reader.read(&mut buffer.bytes) {
-            // Only a successfully reported prefix is terminal payload. A
-            // reader can mutate this initialized buffer before returning a
-            // short length or an error, so every unreported byte is erased.
-            Ok(0) => {
-                buffer.bytes.fill(0);
-                return Ok(TerminalRead::EndOfStream);
-            }
-            Ok(length) => {
-                buffer.bytes[length..].fill(0);
-                return Ok(TerminalRead::Data(TerminalChunk::new(
-                    &mut buffer.bytes[..length],
-                )));
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                buffer.bytes.fill(0);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                buffer.bytes.fill(0);
-                return Ok(TerminalRead::WouldBlock);
-            }
-            Err(error)
-                if normalize_pty_eio
-                    && error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) =>
-            {
-                buffer.bytes.fill(0);
-                return Ok(TerminalRead::EndOfStream);
-            }
-            Err(_) => {
-                buffer.bytes.fill(0);
-                return Err(TerminalError::Read);
-            }
-        }
+    match read_fixed_count(reader, buffer, normalize_pty_eio)? {
+        FixedRead::Data { length } => Ok(TerminalRead::Data(TerminalChunk::new(
+            &mut buffer.bytes[..length],
+        ))),
+        FixedRead::EndOfStream => Ok(TerminalRead::EndOfStream),
+        FixedRead::Interrupted => unreachable!("read_fixed_count retries interruption"),
+        FixedRead::WouldBlock => Ok(TerminalRead::WouldBlock),
     }
 }
 
@@ -1718,6 +1880,59 @@ fn try_write_file<W: Write>(
             }
             Err(_) => return Err(TerminalError::Write),
         }
+    }
+}
+
+fn try_write_pending_file<W: Write>(
+    writer: &mut W,
+    pending: &mut PendingTerminalOutput,
+) -> Result<TerminalWrite, TerminalError> {
+    if !pending.is_pending() {
+        return Err(TerminalError::Write);
+    }
+    match writer.write(pending.remaining_bytes()) {
+        Ok(length) => pending.record_write(length),
+        // The coordinator output pump is deliberately one syscall per turn.
+        // Retrying either transient condition here could starve lifecycle and
+        // signal work under a sustained interruption storm.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(TerminalWrite::WouldBlock)
+        }
+        Err(_) => Err(TerminalError::Write),
+    }
+}
+
+impl PendingTerminalOutput {
+    pub(super) fn read_from(
+        &mut self,
+        endpoint: &TerminalEndpoint,
+    ) -> Result<PendingTerminalRead, TerminalError> {
+        if self.is_pending() {
+            return Err(TerminalError::Read);
+        }
+        let mut stream = &endpoint.stream;
+        match read_fixed_count_once(&mut stream, &mut self.buffer, false)? {
+            FixedRead::Data { length } => {
+                self.length = length;
+                self.offset = 0;
+                Ok(PendingTerminalRead::Data)
+            }
+            FixedRead::EndOfStream => Ok(PendingTerminalRead::EndOfStream),
+            FixedRead::Interrupted | FixedRead::WouldBlock => Ok(PendingTerminalRead::WouldBlock),
+        }
+    }
+
+    pub(super) fn try_write_to(
+        &mut self,
+        tty: &TerminalTty,
+    ) -> Result<TerminalWrite, TerminalError> {
+        let mut descriptor = &tty.descriptor;
+        try_write_pending_file(&mut descriptor, self)
     }
 }
 
@@ -2626,6 +2841,116 @@ mod tests {
         );
         drop(chunk);
         assert_eq!(&buffer.bytes[..6], &[0; 6]);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_output_survives_would_block_in_order_and_zeroizes_on_completion()
+    -> Result<(), Box<dyn Error>> {
+        struct ThreeByteCapture(Vec<u8>);
+
+        impl Write for ThreeByteCapture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let length = bytes.len().min(3);
+                self.0.extend_from_slice(&bytes[..length]);
+                Ok(length)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct AlwaysWouldBlock;
+
+        impl Write for AlwaysWouldBlock {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct AlwaysInterrupted(usize);
+
+        impl Write for AlwaysInterrupted {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut pending = PendingTerminalOutput::new();
+        pending.load_for_test(b"abcdef")?;
+        assert_eq!(format!("{pending:?}"), "PendingTerminalOutput(<redacted>)");
+
+        let mut prefix = ThreeByteCapture(Vec::new());
+        assert_eq!(
+            pending.try_write_for_test(&mut prefix)?,
+            TerminalWrite::Progress {
+                written: 3,
+                remaining: 3,
+            }
+        );
+        assert_eq!(pending.remaining_bytes_for_test(), b"def");
+        assert_eq!(
+            pending.load_for_test(b"must-not-replace-pending"),
+            Err(TerminalError::EmptyChunk)
+        );
+
+        assert_eq!(
+            pending.try_write_for_test(&mut AlwaysWouldBlock)?,
+            TerminalWrite::WouldBlock
+        );
+        assert_eq!(pending.remaining_bytes_for_test(), b"def");
+
+        let mut interrupted = AlwaysInterrupted(0);
+        assert_eq!(
+            pending.try_write_for_test(&mut interrupted)?,
+            TerminalWrite::WouldBlock
+        );
+        assert_eq!(interrupted.0, 1);
+        assert_eq!(pending.remaining_bytes_for_test(), b"def");
+
+        let mut suffix = Vec::new();
+        assert_eq!(
+            pending.try_write_for_test(&mut suffix)?,
+            TerminalWrite::Complete
+        );
+        prefix.0.extend_from_slice(&suffix);
+        assert_eq!(prefix.0, b"abcdef");
+        assert!(!pending.is_pending());
+        assert!(pending.is_zeroized_for_test());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_output_source_observes_at_most_one_interrupted_read_per_turn()
+    -> Result<(), Box<dyn Error>> {
+        struct DirtyInterrupted(usize);
+
+        impl Read for DirtyInterrupted {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.0 += 1;
+                bytes.fill(0x53);
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            }
+        }
+
+        let mut reader = DirtyInterrupted(0);
+        let mut buffer = TerminalBuffer::new();
+        assert_eq!(
+            read_fixed_count_once(&mut reader, &mut buffer, false)?,
+            FixedRead::Interrupted
+        );
+        assert_eq!(reader.0, 1);
+        assert!(buffer.bytes.iter().all(|byte| *byte == 0));
         Ok(())
     }
 

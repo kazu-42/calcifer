@@ -1265,6 +1265,8 @@ mod tests {
 
     const THREAD_ID: &str = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
     const TURN_ID: &str = "019c7714-3b77-74d1-9866-e1f484aae2ab";
+    const TEST_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+    const PROVIDER_REQUEST_TEST_IO_TIMEOUT: Duration = Duration::from_secs(20);
 
     #[test]
     fn usage_limit_signal_debug_redacts_provider_identifiers() {
@@ -1310,18 +1312,53 @@ mod tests {
         }
     }
 
+    fn provider_request_test_timing() -> MonitorTiming {
+        MonitorTiming {
+            startup_timeout: PROVIDER_REQUEST_TEST_IO_TIMEOUT,
+            request_timeout: PROVIDER_REQUEST_TEST_IO_TIMEOUT,
+            ..test_timing()
+        }
+    }
+
     fn shutdown_deadline() -> Result<Instant, MonitorTransportError> {
         checked_deadline(Duration::from_secs(1))
     }
 
     fn connected_monitor(stream: UnixStream, home: &Path) -> Result<MonitorWorker, Box<dyn Error>> {
+        connected_monitor_with_timing(stream, home, test_timing())
+    }
+
+    fn connected_monitor_with_timing(
+        stream: UnixStream,
+        home: &Path,
+        timing: MonitorTiming,
+    ) -> Result<MonitorWorker, Box<dyn Error>> {
         let (protocol, initialize) = MonitorProtocol::start(home, THREAD_ID)?;
         Ok(MonitorWorker::spawn_connected_with_timing(
-            stream,
-            protocol,
-            initialize,
-            test_timing(),
+            stream, protocol, initialize, timing,
         )?)
+    }
+
+    fn await_live_usage_transition(
+        monitor: &mut MonitorWorker,
+        transitions: &Receiver<TestUsageTransition>,
+        expected: TestUsageTransition,
+        stage: &'static str,
+    ) -> Result<(), Box<dyn Error>> {
+        match transitions.recv_timeout(TEST_BARRIER_TIMEOUT) {
+            Ok(actual) if actual == expected => Ok(()),
+            Ok(actual) => {
+                Err(format!("{stage}: expected {expected:?}, received {actual:?}").into())
+            }
+            Err(RecvTimeoutError::Timeout) => match monitor.ensure_live() {
+                Ok(()) => Err(stage.into()),
+                Err(error) => Err(format!("{stage}: exact worker failure: {error}").into()),
+            },
+            Err(RecvTimeoutError::Disconnected) => match monitor.ensure_live() {
+                Ok(()) => Err(format!("{stage}: transition observer disconnected").into()),
+                Err(error) => Err(format!("{stage}: exact worker failure: {error}").into()),
+            },
+        }
     }
 
     #[test]
@@ -1934,48 +1971,269 @@ mod tests {
         let home = TestDirectory::new()?;
         let (client, server) = UnixStream::pair()?;
         let server_home = home.path().to_path_buf();
-        let server = spawn_server(server, move |websocket| {
-            assert_eq!(read_json(websocket)?, initialize_request());
-            send_json(websocket, initialize_response(&server_home))?;
-            assert_eq!(read_json(websocket)?, json!({ "method": "initialized" }));
-            assert_eq!(read_json(websocket)?, usage_read(1));
-            send_json(
-                websocket,
-                json!({
-                    "id": "approval",
-                    "method": "item/commandExecution/requestApproval",
-                    "params": { "command": "provider secret" }
-                }),
-            )?;
-            send_json(websocket, usage_response(1, 10))?;
-            assert_eq!(
-                read_json(websocket)?,
-                usage_read(2),
-                "the observe-only monitor emitted a provider response before its next usage poll"
-            );
-            send_json(websocket, usage_response(2, 80))?;
-            wait_for_disconnect(websocket)
-        });
+        let (initial_read_sender, initial_read) = mpsc::sync_channel(1);
+        let (initial_release_sender, initial_release) = mpsc::sync_channel(1);
+        let (poll_observation_sender, poll_observation) = mpsc::sync_channel(1);
+        let (response_release_sender, response_release) = mpsc::sync_channel(1);
+        let (transition_sender, transitions) = mpsc::sync_channel(4);
+        let (acknowledgement_sender, acknowledgements) = mpsc::sync_channel(1);
+        let server = spawn_server_with_timeout(
+            server,
+            PROVIDER_REQUEST_TEST_IO_TIMEOUT,
+            move |websocket| {
+                assert_eq!(read_json(websocket)?, initialize_request());
+                send_json(websocket, initialize_response(&server_home))?;
+                assert_eq!(read_json(websocket)?, json!({ "method": "initialized" }));
+                assert_eq!(read_json(websocket)?, usage_read(1));
+                initial_read_sender
+                    .send(())
+                    .map_err(|_| "initial usage-read observation closed".to_owned())?;
+                initial_release
+                    .recv_timeout(TEST_BARRIER_TIMEOUT)
+                    .map_err(|_| "initial usage-read release timed out".to_owned())?;
+                send_json(
+                    websocket,
+                    json!({
+                        "id": "approval",
+                        "method": "item/commandExecution/requestApproval",
+                        "params": { "command": "provider secret" }
+                    }),
+                )?;
+                send_json(websocket, usage_response(1, 10))?;
+                let follow_up = match read_json(websocket) {
+                    Ok(follow_up) => follow_up,
+                    Err(_) => {
+                        let error = "the fake server did not receive the follow-up usage poll";
+                        let _ = poll_observation_sender.send(Err(error));
+                        return Err(error.to_owned());
+                    }
+                };
+                if follow_up != usage_read(2) {
+                    let _ = poll_observation_sender.send(Err(
+                        "the observe-only monitor emitted a provider response before its next usage poll",
+                    ));
+                    return Err(
+                        "the observe-only monitor emitted a provider response before its next usage poll"
+                            .to_owned(),
+                    );
+                }
+                poll_observation_sender
+                    .send(Ok(()))
+                    .map_err(|_| "follow-up usage-poll observation closed".to_owned())?;
+                response_release
+                    .recv_timeout(TEST_BARRIER_TIMEOUT)
+                    .map_err(|_| "follow-up usage response release timed out".to_owned())?;
+                send_json(websocket, usage_response(2, 80))?;
+                wait_for_disconnect_without_provider_response(websocket)
+            },
+        );
 
-        let mut monitor = connected_monitor(client, home.path())?;
-        monitor.wait_until_ready()?;
-        let deadline = checked_deadline(Duration::from_secs(1))?;
-        loop {
+        let mut monitor = match connected_monitor_with_timing(
+            client,
+            home.path(),
+            provider_request_test_timing(),
+        ) {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                drop(initial_release_sender);
+                drop(response_release_sender);
+                return match join_server(server) {
+                    Ok(()) => Err(error),
+                    Err(server_error) => Err(format!(
+                        "{error}; fake server join also reported failure: {server_error}"
+                    )
+                    .into()),
+                };
+            }
+        };
+        let assertion = (|| -> Result<(), Box<dyn Error>> {
+            initial_read
+                .recv_timeout(TEST_BARRIER_TIMEOUT)
+                .map_err(|_| "initial usage read was not observed")?;
+            monitor.observe_usage_transitions_for_test(transition_sender, acknowledgements)?;
+            initial_release_sender.send(())?;
+
+            let provider_transition = transitions.recv_timeout(TEST_BARRIER_TIMEOUT)?;
+            if provider_transition != TestUsageTransition::Invalidated {
+                return Err("the provider request changed the pending usage state".into());
+            }
+            acknowledgement_sender.send(())?;
+            let initial_transition = transitions.recv_timeout(TEST_BARRIER_TIMEOUT)?;
+            if initial_transition != TestUsageTransition::Published {
+                return Err("the initial usage response was not published".into());
+            }
+            acknowledgement_sender.send(())?;
+            monitor.wait_until_ready()?;
+
+            await_live_usage_transition(
+                &mut monitor,
+                &transitions,
+                TestUsageTransition::Invalidated,
+                "the usage monitor did not begin the follow-up poll",
+            )?;
+            if monitor.latest_usage().is_some() {
+                return Err(
+                    "the in-flight follow-up poll retained the older usage snapshot".into(),
+                );
+            }
+            acknowledgement_sender.send(())?;
+            // Queue the release before the request is written. The fake server
+            // still cannot consume it until it observes exact `usage_read(2)`,
+            // while the worker no longer spends its request deadline waiting
+            // for a test-thread round trip.
+            response_release_sender.send(())?;
+
+            match poll_observation.recv_timeout(TEST_BARRIER_TIMEOUT) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error.into()),
+                Err(RecvTimeoutError::Timeout) => match monitor.ensure_live() {
+                    Ok(()) => {
+                        return Err("the usage monitor did not emit the follow-up poll".into());
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "the usage monitor failed before the follow-up poll: {error}"
+                        )
+                        .into());
+                    }
+                },
+                Err(RecvTimeoutError::Disconnected) => match monitor.ensure_live() {
+                    Ok(()) => {
+                        return Err("the follow-up poll observer disconnected".into());
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "the usage monitor failed before the follow-up poll: {error}"
+                        )
+                        .into());
+                    }
+                },
+            }
+
+            await_live_usage_transition(
+                &mut monitor,
+                &transitions,
+                TestUsageTransition::Published,
+                "the usage monitor did not publish the follow-up response",
+            )?;
             let used = monitor
                 .latest_usage()
                 .and_then(|usage| usage.rate_limits)
                 .and_then(|limits| limits.primary)
                 .map(|window| window.used_percent);
-            if used == Some(80) {
-                break;
+            if used != Some(80) {
+                return Err("the follow-up response did not publish its exact usage".into());
             }
-            if Instant::now() >= deadline {
-                return Err("usage polling did not survive the provider request".into());
+            monitor.ensure_live()?;
+            Ok(())
+        })();
+
+        // Freeze the worker before releasing a blocked transition observer.
+        // This prevents cleanup from granting a fresh poll iteration, while a
+        // dropped acknowledgement sender wakes the observer without waiting
+        // for its own timeout.
+        monitor.request_stop();
+        drop(acknowledgement_sender);
+        drop(initial_release_sender);
+        drop(response_release_sender);
+        let shutdown = monitor.shutdown(checked_deadline(TEST_BARRIER_TIMEOUT)?);
+        let server_join = join_server(server);
+        match assertion {
+            Ok(()) => {
+                let _ = shutdown?;
+                server_join?;
+                Ok(())
             }
-            thread::sleep(Duration::from_millis(10));
+            Err(error) => match (shutdown, server_join) {
+                (Ok(_), Ok(())) => Err(error),
+                (Err(_), Ok(())) => {
+                    Err(format!("{error}; monitor shutdown also reported failure").into())
+                }
+                (Ok(_), Err(_)) => {
+                    Err(format!("{error}; fake server join also reported failure").into())
+                }
+                (Err(_), Err(_)) => Err(format!(
+                    "{error}; monitor shutdown and fake server join also reported failure"
+                )
+                .into()),
+            },
         }
-        monitor.ensure_live()?;
-        let _ = monitor.shutdown(shutdown_deadline()?)?;
+    }
+
+    #[test]
+    fn delayed_provider_response_rejection_does_not_render_its_payload()
+    -> Result<(), Box<dyn Error>> {
+        const SENTINEL: &str = "calcifer-fake-delayed-provider-secret";
+
+        let (client, server) = UnixStream::pair()?;
+        let server = spawn_server_with_timeout(
+            server,
+            PROVIDER_REQUEST_TEST_IO_TIMEOUT,
+            wait_for_disconnect_without_provider_response,
+        );
+        let deadline = checked_deadline(TEST_BARRIER_TIMEOUT)?;
+        let stream = DeadlineUnixStream::new(client, Duration::from_millis(20), Some(deadline));
+        let (mut websocket, _) =
+            client_with_config(WEBSOCKET_ENDPOINT, stream, Some(websocket_config()))
+                .map_err(map_handshake_error)?;
+        websocket.get_mut().finish_handshake();
+        websocket.send(Message::text(SENTINEL))?;
+        drop(websocket);
+
+        let rejection = server
+            .join()
+            .map_err(|_| "fake App Server panicked")?
+            .err()
+            .ok_or("a delayed provider response was unexpectedly accepted")?;
+        assert_eq!(
+            rejection,
+            "observe-only monitor emitted a delayed provider response"
+        );
+        assert!(!rejection.contains(SENTINEL));
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_before_dropping_transition_ack_joins_without_observer_timeout()
+    -> Result<(), Box<dyn Error>> {
+        let home = TestDirectory::new()?;
+        let (client, server) = UnixStream::pair()?;
+        let server_home = home.path().to_path_buf();
+        let (initial_read_sender, initial_read) = mpsc::sync_channel(1);
+        let (initial_release_sender, initial_release) = mpsc::sync_channel(1);
+        let server =
+            spawn_server_with_timeout(server, PROVIDER_REQUEST_TEST_IO_TIMEOUT, move |websocket| {
+                assert_eq!(read_json(websocket)?, initialize_request());
+                send_json(websocket, initialize_response(&server_home))?;
+                assert_eq!(read_json(websocket)?, json!({ "method": "initialized" }));
+                assert_eq!(read_json(websocket)?, usage_read(1));
+                initial_read_sender
+                    .send(())
+                    .map_err(|_| "initial usage-read observation closed".to_owned())?;
+                initial_release
+                    .recv_timeout(TEST_BARRIER_TIMEOUT)
+                    .map_err(|_| "initial usage-read release timed out".to_owned())?;
+                send_json(websocket, usage_response(1, 10))?;
+                wait_for_disconnect(websocket)
+            });
+        let monitor =
+            connected_monitor_with_timing(client, home.path(), provider_request_test_timing())?;
+        initial_read.recv_timeout(TEST_BARRIER_TIMEOUT)?;
+        let (transition_sender, transitions) = mpsc::sync_channel(1);
+        let (acknowledgement_sender, acknowledgements) = mpsc::sync_channel(1);
+        monitor.observe_usage_transitions_for_test(transition_sender, acknowledgements)?;
+        initial_release_sender.send(())?;
+        assert_eq!(
+            transitions.recv_timeout(TEST_BARRIER_TIMEOUT)?,
+            TestUsageTransition::Published
+        );
+
+        monitor.request_stop();
+        drop(acknowledgement_sender);
+        // The observer's own timeout is five seconds. A fresh, shorter
+        // deadline proves that disconnecting its acknowledgement channel
+        // wakes the STOPPING worker instead of waiting for that timeout.
+        let _ = monitor.shutdown(checked_deadline(Duration::from_secs(2))?)?;
         join_server(server)?;
         Ok(())
     }
@@ -2238,12 +2496,23 @@ mod tests {
     where
         F: FnOnce(&mut WebSocket<UnixStream>) -> ServerResult + Send + 'static,
     {
+        spawn_server_with_timeout(stream, Duration::from_secs(2), run)
+    }
+
+    fn spawn_server_with_timeout<F>(
+        stream: UnixStream,
+        io_timeout: Duration,
+        run: F,
+    ) -> JoinHandle<ServerResult>
+    where
+        F: FnOnce(&mut WebSocket<UnixStream>) -> ServerResult + Send + 'static,
+    {
         thread::spawn(move || {
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(io_timeout))
                 .map_err(|_| "server read timeout setup failed".to_owned())?;
             stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
+                .set_write_timeout(Some(io_timeout))
                 .map_err(|_| "server write timeout setup failed".to_owned())?;
             let server_config = WebSocketConfig::default()
                 .max_message_size(Some(MAX_MESSAGE_BYTES * 2))
@@ -2348,6 +2617,32 @@ mod tests {
         loop {
             match websocket.read() {
                 Ok(_) => {}
+                Err(_) => return Ok(()),
+            }
+        }
+    }
+
+    fn wait_for_disconnect_without_provider_response(
+        websocket: &mut WebSocket<UnixStream>,
+    ) -> ServerResult {
+        loop {
+            match websocket.read() {
+                Ok(Message::Ping(_) | Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => return Ok(()),
+                Ok(Message::Text(_)) => {
+                    return Err(
+                        "observe-only monitor emitted a delayed provider response".to_owned()
+                    );
+                }
+                Ok(Message::Binary(_) | Message::Frame(_)) => {
+                    return Err(
+                        "observe-only monitor emitted unexpected post-poll protocol data"
+                            .to_owned(),
+                    );
+                }
+                Err(WebSocketError::Io(error)) if io_error_is_retryable(&error) => {
+                    return Err("fake server timed out before monitor disconnect".to_owned());
+                }
                 Err(_) => return Ok(()),
             }
         }

@@ -5,6 +5,8 @@
 //! thereafter exist only inside the provider/startup/session linear owners.
 
 use std::fmt;
+#[cfg(test)]
+use std::fs::File;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::os::fd::AsFd;
@@ -16,10 +18,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::profiles::{Profile, Registry};
+#[cfg(test)]
+use crate::providers::codex::remote::ReadinessProxyError;
 
+#[cfg(test)]
+use super::channel::LifecyclePair;
 use super::channel::{ChannelError, LifecycleEndpoint, bootstrap_guardian_from_stdin};
 #[cfg(test)]
-use super::entry::RecoveryCheckpoint;
+use super::entry::{AnchorCompletion, CompletionPair, RecoveryCheckpoint};
 use super::entry::{CompletionError, GuardianCompletion, RecoveryRequestPoll};
 #[cfg(test)]
 use super::packaged_smoke::write_private_atomic_new;
@@ -44,7 +50,7 @@ use super::session::{
 #[cfg(test)]
 use super::session::{
     SessionShutdownTestTrigger, SessionStartupError, fail_next_packaged_terminal_channel_write,
-    packaged_session_startup_failure_marker,
+    packaged_readiness_transport_origin_marker, packaged_session_startup_failure_marker,
 };
 use super::startup::{
     AwaitingCoordinatorRestore, PostRestoreStartupCleanup, ProductionStartupBounds,
@@ -55,6 +61,8 @@ use super::startup::{
 #[cfg(test)]
 use super::startup::{
     PackagedRuntimeFailureStage, PackagedStartupQuiescePhase,
+    arm_packaged_startup_cleanup_second_retention,
+    concrete_startup_cleanup_failure_for_guardian_test,
     start_supervised_session_with_test_compatibility,
 };
 use super::terminal::{RecoveryTty, TerminalEndpoint, TerminalError, TerminalSnapshot};
@@ -1209,6 +1217,12 @@ impl RetainedGuardianGeneration {
         ]
     }
 
+    #[cfg(test)]
+    pub(super) fn packaged_recovery_budget_is_consumed_and_exhausted(&mut self) -> bool {
+        self.recovery_budget == RetainedRecoveryBudget::Consumed
+            && self.recovery_budget.begin_retry().is_none()
+    }
+
     /// Waits on the exact anonymous owner endpoint and performs at most one
     /// fresh bounded retry of the retained linear owner. A malformed request
     /// never authorizes recovery; its eventual peer EOF is independently an
@@ -1298,6 +1312,135 @@ impl RetainedGuardianGeneration {
     pub(super) fn park(self: Box<Self>) -> ! {
         self.publish_retained_unrecoverable_and_park()
     }
+}
+
+/// Test-only owner for the real second-retained branch. The wrapper keeps the
+/// anonymous recovery/lifecycle peers and physical PTY alive alongside the
+/// exact retained generation; none of those authorities is reconstructed from
+/// a marker, descriptor number, PID, or filesystem path.
+#[cfg(test)]
+pub(super) struct PackagedConcreteSecondRetention {
+    retained: Option<Box<RetainedGuardianGeneration>>,
+    _anchor: AnchorCompletion,
+    _coordinator_lifecycle: LifecycleEndpoint,
+    _terminal_peer: TerminalEndpoint,
+    _terminal_master_keepalive: File,
+}
+
+#[cfg(test)]
+pub(super) trait PackagedSecondRetention {
+    fn generation(&mut self) -> &mut RetainedGuardianGeneration;
+    fn park(self) -> !;
+}
+
+#[cfg(test)]
+impl PackagedSecondRetention for Box<RetainedGuardianGeneration> {
+    fn generation(&mut self) -> &mut RetainedGuardianGeneration {
+        self.as_mut()
+    }
+
+    fn park(self) -> ! {
+        RetainedGuardianGeneration::park(self)
+    }
+}
+
+#[cfg(test)]
+impl PackagedSecondRetention for PackagedConcreteSecondRetention {
+    fn generation(&mut self) -> &mut RetainedGuardianGeneration {
+        self.retained
+            .as_mut()
+            .unwrap_or_else(|| std::process::abort())
+    }
+
+    /// Enters the same fail-closed park used by the package Guardian while the
+    /// fixture's peer endpoints and physical PTY remain live locals. The
+    /// bounded parent owns the only termination and reap authority.
+    fn park(mut self) -> ! {
+        let retained = self
+            .retained
+            .take()
+            .unwrap_or_else(|| std::process::abort());
+        std::hint::black_box((
+            &self._anchor,
+            &self._coordinator_lifecycle,
+            &self._terminal_peer,
+            &self._terminal_master_keepalive,
+        ));
+        RetainedGuardianGeneration::park(retained)
+    }
+}
+
+#[cfg(test)]
+fn packaged_concrete_second_retention_bounds() -> GuardianBounds {
+    GuardianBounds {
+        phase_timeout: Duration::from_secs(1),
+        poll_interval: Duration::from_millis(20),
+        startup_timeout: Duration::from_secs(1),
+        compatibility_timeout: Duration::from_secs(1),
+        relay_start_timeout: Duration::from_secs(1),
+        containment_timeout: Duration::from_secs(1),
+        tui_grace: Duration::from_millis(10),
+        tui_forced: Duration::from_millis(10),
+        relay_shutdown_timeout: Duration::from_secs(1),
+        monitor_shutdown_timeout: Duration::from_secs(1),
+        app_grace: Duration::from_millis(10),
+        app_forced: Duration::from_millis(10),
+        app_cleanup_timeout: Duration::from_secs(1),
+        build_cleanup_timeout: Duration::from_secs(1),
+    }
+}
+
+/// Exercises the production `await_recovery -> retry_retained_owner` path
+/// with a real lifecycle channel and a concrete StartupCleanup owner. The
+/// one-shot startup seam forces exactly that retry to retain the same owner;
+/// the returned wrapper can only enter the production-shaped fail-closed park.
+#[cfg(test)]
+pub(super) fn packaged_concrete_second_retention_for_test()
+-> Result<PackagedConcreteSecondRetention, Box<dyn std::error::Error>> {
+    let (failure, terminal_peer, terminal_master_keepalive) =
+        concrete_startup_cleanup_failure_for_guardian_test()?;
+    let (mut anchor, transit) = CompletionPair::new()?.split();
+    let (coordinator_lifecycle, guardian_lifecycle) = LifecyclePair::new()?.split_for_test();
+    let bounds = packaged_concrete_second_retention_bounds();
+    let lifecycle = GuardianLifecycle::new(guardian_lifecycle, transit.into_guardian(), bounds);
+    let retained = Box::new(RetainedGuardianGeneration {
+        lifecycle: Some(lifecycle),
+        owner: Some(RetainedGuardianOwner::StartupCleanup(failure)),
+        reason: GuardianRetentionReason::CleanupUnconfirmed,
+        recovery_budget: RetainedRecoveryBudget::available(),
+    });
+
+    anchor.request_recovery(Instant::now() + Duration::from_secs(1))?;
+    if !arm_packaged_startup_cleanup_second_retention() {
+        std::mem::forget(retained);
+        return Err("the concrete second-retention seam was already armed".into());
+    }
+    let mut retained = match retained.await_recovery() {
+        GuardianRunOutcome::Retained(retained) => retained,
+        GuardianRunOutcome::Terminal(_) => {
+            return Err(
+                "the concrete recovery retry unexpectedly reached a terminal outcome".into(),
+            );
+        }
+    };
+    let expected = [
+        "guardian-recovery.retained.reason.cleanup-unconfirmed",
+        "guardian-recovery.retained.owner.startup-cleanup",
+        "guardian-recovery.retained",
+    ];
+    if retained.packaged_recovery_marker_names() != expected
+        || !retained.packaged_recovery_budget_is_consumed_and_exhausted()
+    {
+        std::mem::forget(retained);
+        return Err("the concrete recovery retry lost its owner or consumed budget".into());
+    }
+    Ok(PackagedConcreteSecondRetention {
+        retained: Some(retained),
+        _anchor: anchor,
+        _coordinator_lifecycle: coordinator_lifecycle,
+        _terminal_peer: terminal_peer,
+        _terminal_master_keepalive: terminal_master_keepalive,
+    })
 }
 
 /// Keeps the exact retained provider/terminal owner structurally reachable
@@ -1770,8 +1913,10 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
             SupervisedStartupError::Deadline => "startup-failure.deadline",
         },
     };
-    if let Some(marker) = failure.packaged_compatibility_failure_marker() {
-        write_packaged_startup_failure_marker(report_root, marker);
+    if let Some(markers) = failure.packaged_compatibility_failure_detail_markers() {
+        for marker in markers.into_iter().flatten() {
+            write_packaged_startup_failure_marker(report_root, marker);
+        }
     }
     if let Some(classification) = failure.packaged_tui_launch_failure_classification() {
         write_packaged_startup_failure_marker(report_root, classification.state_marker());
@@ -1793,16 +1938,26 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
 #[cfg(test)]
 const fn packaged_session_readiness_failure_markers(
     error: SessionStartupError,
-) -> [&'static str; 2] {
+) -> [Option<&'static str>; 3] {
+    let transport_origin = match error {
+        SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport(origin)) => {
+            Some(packaged_readiness_transport_origin_marker(origin))
+        }
+        _ => None,
+    };
     [
-        packaged_session_startup_failure_marker(error),
-        "startup-failure.session-readiness",
+        transport_origin,
+        Some(packaged_session_startup_failure_marker(error)),
+        Some("startup-failure.session-readiness"),
     ]
 }
 
 #[cfg(test)]
 fn record_packaged_session_readiness_failure(report_root: &Path, error: SessionStartupError) {
-    for marker in packaged_session_readiness_failure_markers(error) {
+    for marker in packaged_session_readiness_failure_markers(error)
+        .into_iter()
+        .flatten()
+    {
         write_packaged_startup_failure_marker(report_root, marker);
     }
 }
@@ -3435,13 +3590,13 @@ mod tests {
     use super::super::session::{
         PACKAGED_SESSION_STARTUP_FAILURE_MARKERS, SessionLifecycleProjection,
         SessionOperationError, SessionShutdownRecoveryStage, SessionStartupError,
-        TerminalPumpFailure,
+        TerminalPumpFailure, packaged_session_startup_failure_marker,
     };
     use super::super::startup::{
         PackagedStartupQuiescePhase, provider_never_started_for_completion_test,
     };
     use crate::providers::codex::monitor::SessionMonitorError;
-    use crate::providers::codex::remote::ReadinessProxyError;
+    use crate::providers::codex::remote::{ReadinessProxyError, ReadinessTransportOrigin};
 
     type QueuedCheckpointLifecycle = (
         AnchorCompletion,
@@ -3474,10 +3629,10 @@ mod tests {
     }
 
     #[test]
-    fn packaged_session_readiness_failure_writes_generic_and_one_fixed_subtype()
+    fn packaged_session_readiness_failure_writes_transport_origin_before_fixed_parents()
     -> Result<(), Box<dyn std::error::Error>> {
         let scratch = StartupFailureReportRoot::new()?;
-        let errors = [
+        let mut errors = vec![
             SessionStartupError::Monitor(SessionMonitorError::InvalidArgument),
             SessionStartupError::Monitor(SessionMonitorError::Handshake),
             SessionStartupError::Monitor(SessionMonitorError::Protocol),
@@ -3500,7 +3655,6 @@ mod tests {
             SessionStartupError::ReadinessRelay(ReadinessProxyError::UnexpectedSequence),
             SessionStartupError::ReadinessRelay(ReadinessProxyError::TargetMismatch),
             SessionStartupError::ReadinessRelay(ReadinessProxyError::Timeout),
-            SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport),
             SessionStartupError::ReadinessRelay(ReadinessProxyError::Worker),
             SessionStartupError::ReadinessRelay(ReadinessProxyError::Cleanup),
             SessionStartupError::Tui,
@@ -3518,19 +3672,46 @@ mod tests {
             SessionStartupError::TerminalPump(TerminalPumpFailure::Resume),
             SessionStartupError::Deadline,
         ];
-        assert_eq!(errors.len(), PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.len());
+        let transport_insert = errors
+            .iter()
+            .position(|error| {
+                *error == SessionStartupError::ReadinessRelay(ReadinessProxyError::Worker)
+            })
+            .ok_or("the relay worker case was omitted")?;
+        errors.splice(
+            transport_insert..transport_insert,
+            ReadinessTransportOrigin::ALL.map(|origin| {
+                SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport(origin))
+            }),
+        );
 
-        for (index, (error, subtype)) in errors
-            .into_iter()
-            .zip(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
-            .enumerate()
-        {
+        for (index, error) in errors.into_iter().enumerate() {
             let report = scratch.path().join(index.to_string());
             fs::DirBuilder::new().mode(0o700).create(&report)?;
+            let ordered = packaged_session_readiness_failure_markers(error);
+            let published = ordered.into_iter().flatten().collect::<Vec<_>>();
+            assert_eq!(published.last(), Some(&"startup-failure.session-readiness"));
             assert_eq!(
-                packaged_session_readiness_failure_markers(error),
-                [subtype, "startup-failure.session-readiness"],
-                "the generic commit marker was published before its exact subtype"
+                published.get(published.len().saturating_sub(2)),
+                Some(&packaged_session_startup_failure_marker(error)),
+                "the generic commit marker was published before its fixed subtype"
+            );
+            if let SessionStartupError::ReadinessRelay(ReadinessProxyError::Transport(origin)) =
+                error
+            {
+                assert_eq!(
+                    published.first(),
+                    Some(&super::packaged_readiness_transport_origin_marker(origin)),
+                    "the transport parent was published before its exact origin"
+                );
+                assert_eq!(published.len(), 3);
+            } else {
+                assert_eq!(published.len(), 2);
+            }
+            assert!(
+                published[..published.len() - 1]
+                    .iter()
+                    .all(|marker| PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.contains(marker))
             );
             record_packaged_session_readiness_failure(&report, error);
 
@@ -3538,7 +3719,7 @@ mod tests {
                 .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
                 .collect::<Result<Vec<_>, _>>()?;
             names.sort_unstable();
-            let mut expected = vec!["startup-failure.session-readiness", subtype];
+            let mut expected = published;
             expected.sort_unstable();
             assert_eq!(names, expected);
 

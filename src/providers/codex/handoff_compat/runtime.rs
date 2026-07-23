@@ -19,14 +19,15 @@ use super::super::remote::{
     ReadinessProbe, ReadinessProxy, ReadinessProxyError, ReadinessProxyShutdownFailure,
 };
 use super::super::{
-    AppServerProcess, CodexThreadError, CodexUsageError, child_exit_observed_without_reaping,
-    child_reap_confirmed, configure_own_process_group, force_terminate_process_tree,
-    managed_command, probe_codex_version_command, reap_exited_process_tree,
-    validate_initialize_result,
+    AppServerProcess, CodexThreadError, CodexUsageError, CodexVersionProbeFailure,
+    CodexVersionProbeTimeoutOrigin, child_exit_observed_without_reaping, child_reap_confirmed,
+    configure_own_process_group, force_terminate_process_tree, managed_command,
+    probe_codex_version_command_with_origin, reap_exited_process_tree, validate_initialize_result,
 };
 use super::{
-    CodexExecutableIdentity, CodexHandoffCapability, CodexHandoffError, CodexHandoffFailure,
-    HandoffSchemaContract, validate_handoff_schema_pair,
+    CodexExecutableIdentity, CodexHandoffCapability, CodexHandoffCause, CodexHandoffError,
+    CodexHandoffFailure, CompatibilityTimeoutOrigin, HandoffSchemaContract,
+    validate_handoff_schema_pair,
 };
 
 const SUPPORTED_VERSION: &str = "0.144.4";
@@ -56,6 +57,49 @@ const PROBE_EXECUTABLE_FILE: &str = "codex";
 #[cfg(test)]
 thread_local! {
     static VERIFICATION_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PRE_VERSION_TIMEOUT_SEAM: std::cell::Cell<Option<CompatibilityTimeoutOrigin>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct PreVersionTimeoutSeamGuard {
+    previous: Option<CompatibilityTimeoutOrigin>,
+}
+
+#[cfg(test)]
+impl Drop for PreVersionTimeoutSeamGuard {
+    fn drop(&mut self) {
+        PRE_VERSION_TIMEOUT_SEAM.with(|seam| seam.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+fn inject_pre_version_timeout(origin: CompatibilityTimeoutOrigin) -> PreVersionTimeoutSeamGuard {
+    let previous = PRE_VERSION_TIMEOUT_SEAM.with(|seam| seam.replace(Some(origin)));
+    assert!(
+        previous.is_none(),
+        "pre-version timeout seams must not be nested"
+    );
+    PreVersionTimeoutSeamGuard { previous }
+}
+
+fn check_pre_version_timeout_seam(
+    origin: CompatibilityTimeoutOrigin,
+) -> Result<(), CodexHandoffCause> {
+    #[cfg(test)]
+    if PRE_VERSION_TIMEOUT_SEAM.with(|seam| {
+        if seam.get() == Some(origin) {
+            seam.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(CodexHandoffCause::timeout(origin));
+    }
+    #[cfg(not(test))]
+    let _ = origin;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -71,10 +115,15 @@ pub(super) fn verify(
     VERIFICATION_ATTEMPTS.with(|attempts| {
         attempts.set(attempts.get().saturating_add(1));
     });
+    check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::DeadlineOverflow)?;
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or(CodexHandoffError::Timeout)?;
-    let executable = capture_executable(codex_executable, deadline)?;
+        .ok_or_else(|| CodexHandoffCause::timeout(CompatibilityTimeoutOrigin::DeadlineOverflow))?;
+    let executable = capture_executable_at_boundary(
+        codex_executable,
+        deadline,
+        CompatibilityTimeoutOrigin::SourceCapture,
+    )?;
     let proof = verify_before_remote_until(&executable, deadline)?;
     let remote = match verify_remote_tui(&proof.probe_executable, &proof, deadline) {
         Ok(remote) => remote,
@@ -180,10 +229,15 @@ fn verify_before_remote(
     codex_executable: &Path,
     timeout: Duration,
 ) -> Result<PreRemoteProof, CodexHandoffFailure> {
+    check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::DeadlineOverflow)?;
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or(CodexHandoffError::Timeout)?;
-    let executable = capture_executable(codex_executable, deadline)?;
+        .ok_or_else(|| CodexHandoffCause::timeout(CompatibilityTimeoutOrigin::DeadlineOverflow))?;
+    let executable = capture_executable_at_boundary(
+        codex_executable,
+        deadline,
+        CompatibilityTimeoutOrigin::SourceCapture,
+    )?;
     verify_before_remote_until(&executable, deadline)
 }
 
@@ -208,7 +262,7 @@ fn verify_before_remote_until(
         }),
         Err(error) => match scratch.cleanup(deadline) {
             Ok(_) => Err(error.into()),
-            Err(cleanup) => Err(CodexHandoffFailure::with_retained(
+            Err(cleanup) => Err(CodexHandoffFailure::with_retained_cause(
                 error,
                 CodexHandoffRetention::ScratchCleanup(cleanup),
             )),
@@ -220,9 +274,9 @@ fn build_pre_remote_parts(
     source_executable: &CodexExecutableIdentity,
     scratch: &ScratchRoot,
     deadline: Instant,
-) -> Result<PreRemoteParts, CodexHandoffError> {
+) -> Result<PreRemoteParts, CodexHandoffCause> {
     let (probe_binary_directory, probe_executable) =
-        stage_executable(source_executable, scratch, deadline)?;
+        stage_executable_with_origin(source_executable, scratch, deadline)?;
     let executable = &probe_executable;
     let source_home = scratch.create_directory("s")?;
     let target_home = scratch.create_directory("t")?;
@@ -258,8 +312,11 @@ fn build_pre_remote_parts(
     revalidate_executable_metadata(executable)?;
     let version_command =
         isolated_command(&executable.canonical_path, &target_home, &environment_home);
-    let version = probe_codex_version_command(version_command, &workspace, deadline, None)
-        .map_err(map_thread_error)?;
+    check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::VersionChildExit)?;
+    check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::VersionStdoutDrain)?;
+    let version =
+        probe_codex_version_command_with_origin(version_command, &workspace, deadline, None)
+            .map_err(map_version_probe_failure)?;
     target_config.revalidate(&target_home)?;
     revalidate_probe_roots(
         scratch,
@@ -269,7 +326,7 @@ fn build_pre_remote_parts(
         &environment_home,
     )?;
     if version != SUPPORTED_VERSION {
-        return Err(CodexHandoffError::Unsupported);
+        return Err(CodexHandoffError::Unsupported.into());
     }
     #[cfg(test)]
     eprintln!("handoff probe: version gate passed");
@@ -1367,11 +1424,28 @@ fn stage_executable(
     scratch: &ScratchRoot,
     deadline: Instant,
 ) -> Result<(PrivateDirectory, CodexExecutableIdentity), CodexHandoffError> {
+    stage_executable_with_origin(source, scratch, deadline).map_err(CodexHandoffCause::release)
+}
+
+fn stage_executable_with_origin(
+    source: &CodexExecutableIdentity,
+    scratch: &ScratchRoot,
+    deadline: Instant,
+) -> Result<(PrivateDirectory, CodexExecutableIdentity), CodexHandoffCause> {
+    check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::ProbeStageCopyDurability)?;
+    ensure_compatibility_deadline(
+        deadline,
+        CompatibilityTimeoutOrigin::ProbeStageCopyDurability,
+    )?;
     scratch.revalidate()?;
     let directory = scratch.create_directory("b")?;
     let (mut input, before) = open_executable(&source.canonical_path)?;
+    ensure_compatibility_deadline(
+        deadline,
+        CompatibilityTimeoutOrigin::ProbeStageCopyDurability,
+    )?;
     if before != metadata_from_identity(source) {
-        return Err(CodexHandoffError::Unsupported);
+        return Err(CodexHandoffError::Unsupported.into());
     }
     let output_descriptor = rustix::fs::openat(
         &directory.descriptor,
@@ -1389,12 +1463,17 @@ fn stage_executable(
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        if Instant::now() >= deadline {
-            return Err(CodexHandoffError::Timeout);
-        }
+        ensure_compatibility_deadline(
+            deadline,
+            CompatibilityTimeoutOrigin::ProbeStageCopyDurability,
+        )?;
         let count = input
             .read(&mut buffer)
             .map_err(|_| CodexHandoffError::Transport)?;
+        ensure_compatibility_deadline(
+            deadline,
+            CompatibilityTimeoutOrigin::ProbeStageCopyDurability,
+        )?;
         if count == 0 {
             break;
         }
@@ -1402,16 +1481,24 @@ fn stage_executable(
             .checked_add(count as u64)
             .ok_or(CodexHandoffError::Unsupported)?;
         if total > MAX_EXECUTABLE_BYTES || total > source.length {
-            return Err(CodexHandoffError::Unsupported);
+            return Err(CodexHandoffError::Unsupported.into());
         }
         output
             .write_all(&buffer[..count])
             .map_err(|_| CodexHandoffError::Transport)?;
+        ensure_compatibility_deadline(
+            deadline,
+            CompatibilityTimeoutOrigin::ProbeStageCopyDurability,
+        )?;
         hasher.update(&buffer[..count]);
     }
     output
         .sync_all()
         .map_err(|_| CodexHandoffError::Transport)?;
+    ensure_compatibility_deadline(
+        deadline,
+        CompatibilityTimeoutOrigin::ProbeStageCopyDurability,
+    )?;
     let staged_metadata = executable_metadata(
         &output
             .metadata()
@@ -1430,17 +1517,50 @@ fn stage_executable(
         || source_visible != before
         || digest != source.digest
     {
-        return Err(CodexHandoffError::Unsupported);
+        return Err(CodexHandoffError::Unsupported.into());
     }
     drop(output);
     directory.revalidate()?;
     scratch.revalidate()?;
+    ensure_compatibility_deadline(
+        deadline,
+        CompatibilityTimeoutOrigin::ProbeStageCopyDurability,
+    )?;
 
-    let staged = capture_executable(&directory.join(PROBE_EXECUTABLE_FILE), deadline)?;
+    check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::ProbeStageRecapture)?;
+    let staged = capture_executable_at_boundary(
+        &directory.join(PROBE_EXECUTABLE_FILE),
+        deadline,
+        CompatibilityTimeoutOrigin::ProbeStageRecapture,
+    )?;
     if staged.digest != source.digest || staged.length != source.length {
-        return Err(CodexHandoffError::Unsupported);
+        return Err(CodexHandoffError::Unsupported.into());
     }
     Ok((directory, staged))
+}
+
+fn capture_executable_at_boundary(
+    executable: &Path,
+    deadline: Instant,
+    origin: CompatibilityTimeoutOrigin,
+) -> Result<CodexExecutableIdentity, CodexHandoffCause> {
+    check_pre_version_timeout_seam(origin)?;
+    ensure_compatibility_deadline(deadline, origin)?;
+    let identity = capture_executable(executable, deadline)
+        .map_err(|error| CodexHandoffCause::at_timeout_boundary(error, origin))?;
+    ensure_compatibility_deadline(deadline, origin)?;
+    Ok(identity)
+}
+
+fn ensure_compatibility_deadline(
+    deadline: Instant,
+    origin: CompatibilityTimeoutOrigin,
+) -> Result<(), CodexHandoffCause> {
+    if Instant::now() >= deadline {
+        Err(CodexHandoffCause::timeout(origin))
+    } else {
+        Ok(())
+    }
 }
 
 fn capture_executable(
@@ -2256,6 +2376,23 @@ fn map_usage_error(error: CodexUsageError) -> CodexHandoffError {
         CodexUsageError::Timeout => CodexHandoffError::Timeout,
         CodexUsageError::Transport => CodexHandoffError::Transport,
         CodexUsageError::Spawn => CodexHandoffError::Spawn,
+    }
+}
+
+fn map_version_probe_failure(error: CodexVersionProbeFailure) -> CodexHandoffCause {
+    let cleanup_error = error.cleanup_error().map(map_thread_error);
+    match error.timeout_origin() {
+        Some(CodexVersionProbeTimeoutOrigin::ChildExit) => CodexHandoffCause::timeout_with_cleanup(
+            CompatibilityTimeoutOrigin::VersionChildExit,
+            cleanup_error,
+        ),
+        Some(CodexVersionProbeTimeoutOrigin::StdoutDrain) => {
+            CodexHandoffCause::timeout_with_cleanup(
+                CompatibilityTimeoutOrigin::VersionStdoutDrain,
+                cleanup_error,
+            )
+        }
+        None => map_thread_error(error.error()).into(),
     }
 }
 
@@ -3428,7 +3565,7 @@ fn map_proxy_error(error: ReadinessProxyError) -> CodexHandoffError {
         ReadinessProxyError::Bind
         | ReadinessProxyError::Accept
         | ReadinessProxyError::Connect
-        | ReadinessProxyError::Transport
+        | ReadinessProxyError::Transport(_)
         | ReadinessProxyError::Worker
         | ReadinessProxyError::Cleanup => CodexHandoffError::Transport,
     }
@@ -3704,6 +3841,97 @@ mod tests {
     }
 
     #[test]
+    fn pre_version_timeout_boundaries_preserve_only_closed_origins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for origin in CompatibilityTimeoutOrigin::ALL {
+            let cause = match ensure_compatibility_deadline(Instant::now(), origin) {
+                Err(cause) => cause,
+                Ok(()) => return Err("an expired compatibility boundary did not time out".into()),
+            };
+            let failure = CodexHandoffFailure::from(cause);
+            assert_eq!(failure.error(), CodexHandoffError::Timeout);
+            assert_eq!(failure.timeout_origin(), Some(origin));
+        }
+
+        for (probe, expected) in [
+            (
+                CodexVersionProbeTimeoutOrigin::ChildExit,
+                CompatibilityTimeoutOrigin::VersionChildExit,
+            ),
+            (
+                CodexVersionProbeTimeoutOrigin::StdoutDrain,
+                CompatibilityTimeoutOrigin::VersionStdoutDrain,
+            ),
+        ] {
+            let cause = map_version_probe_failure(CodexVersionProbeFailure::timeout(probe));
+            let failure = CodexHandoffFailure::from(cause);
+            assert_eq!(failure.error(), CodexHandoffError::Timeout);
+            assert_eq!(failure.timeout_origin(), Some(expected));
+        }
+
+        let non_timeout = CodexHandoffFailure::from(CodexHandoffCause::at_timeout_boundary(
+            CodexHandoffError::Transport,
+            CompatibilityTimeoutOrigin::SourceCapture,
+        ));
+        assert_eq!(non_timeout.error(), CodexHandoffError::Transport);
+        assert_eq!(non_timeout.timeout_origin(), None);
+
+        let later_timeout = CodexHandoffFailure::from(CodexHandoffError::Timeout);
+        assert_eq!(later_timeout.error(), CodexHandoffError::Timeout);
+        assert_eq!(later_timeout.timeout_origin(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn every_pre_version_timeout_seam_stops_before_any_provider_child_and_cleans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let executable = fixture.path().join("codex-timeout-fixture");
+        let child_started = fixture.path().join("provider-child-started");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf started > '{}'\n",
+                child_started.display()
+            ),
+        )?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+
+        for origin in CompatibilityTimeoutOrigin::ALL {
+            let seam = inject_pre_version_timeout(origin);
+            let started = Instant::now();
+            let result = verify_before_remote(&executable, Duration::from_secs(2));
+            drop(seam);
+            let failure = match result {
+                Err(failure) => failure,
+                Ok(proof) => {
+                    cleanup_test_proof(proof)?;
+                    return Err(format!("the {origin:?} timeout seam unexpectedly passed").into());
+                }
+            };
+
+            assert_eq!(failure.error(), CodexHandoffError::Timeout);
+            assert_eq!(failure.timeout_origin(), Some(origin));
+            assert_eq!(failure.cleanup_error(), None);
+            assert!(
+                !failure.has_retained_ownership(),
+                "the {origin:?} timeout retained scratch or stage cleanup authority"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the {origin:?} timeout seam exceeded its fixed test bound"
+            );
+            assert!(
+                !child_started.exists(),
+                "the {origin:?} pre-version timeout started a provider child"
+            );
+        }
+
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
     fn compatibility_target_config_disables_out_of_scope_dynamic_features()
     -> Result<(), Box<dyn std::error::Error>> {
         let scratch = ScratchRoot::create()?;
@@ -3908,6 +4136,43 @@ mod tests {
         assert_eq!(resolution.error(), CodexHandoffError::Protocol);
         assert_eq!(resolution.cleanup_error(), Some(CodexHandoffError::Timeout));
         assert_eq!(resolution.release(), CodexHandoffError::Protocol);
+        assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_timeout_origin_survives_failed_and_successful_cleanup_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = ScratchRoot::create()?;
+        let root = scratch.path().to_path_buf();
+        fs::write(root.join("retained"), b"timeout-evidence")?;
+        let cleanup = match scratch.cleanup(Instant::now()) {
+            Ok(_) => return Err("expired cleanup released the timeout owner".into()),
+            Err(cleanup) => cleanup,
+        };
+        let origin = CompatibilityTimeoutOrigin::ProbeStageCopyDurability;
+        let failure = Box::new(CodexHandoffFailure::with_retained_cause(
+            CodexHandoffCause::timeout(origin),
+            CodexHandoffRetention::ScratchCleanup(cleanup),
+        ));
+
+        let failure = match failure.resolve(Instant::now()) {
+            Ok(_) => return Err("an expired retained timeout cleanup unexpectedly resolved".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.error(), CodexHandoffError::Timeout);
+        assert_eq!(failure.timeout_origin(), Some(origin));
+        assert_eq!(failure.cleanup_error(), Some(CodexHandoffError::Timeout));
+        assert!(failure.has_retained_ownership());
+        assert_eq!(fs::read(root.join("retained"))?, b"timeout-evidence");
+
+        let resolution = failure
+            .resolve(Instant::now() + Duration::from_secs(2))
+            .map_err(|failure| format!("retained timeout cleanup did not resolve: {failure:?}"))?;
+        assert_eq!(resolution.error(), CodexHandoffError::Timeout);
+        assert_eq!(resolution.timeout_origin(), Some(origin));
+        assert_eq!(resolution.cleanup_error(), Some(CodexHandoffError::Timeout));
+        assert_eq!(resolution.release(), CodexHandoffError::Timeout);
         assert!(!root.exists());
         Ok(())
     }

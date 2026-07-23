@@ -8,7 +8,13 @@
 //! guardian consumes the protocol-minted restoration proof.
 
 use std::fmt;
+#[cfg(test)]
+use std::fs::File;
+#[cfg(test)]
+use std::io::Cursor;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::providers::codex::monitor::{
@@ -16,7 +22,7 @@ use crate::providers::codex::monitor::{
 };
 
 #[cfg(test)]
-use super::super::handoff_compat::CodexHandoffError;
+use super::super::handoff_compat::{CodexHandoffError, CompatibilityTimeoutOrigin};
 #[cfg(test)]
 use super::launcher::PackagedRemoteTuiLaunchFailureClassification;
 use super::launcher::{
@@ -26,6 +32,11 @@ use super::launcher::{
 #[cfg(test)]
 use super::process::{AppGracefulDrainFailureStage, ProcessError};
 use super::process::{ContainmentMetadata, PinnedAppGracefulDrain, ShutdownOutcome};
+#[cfg(test)]
+use super::protocol::{
+    CoordinatorCommand, FailureCode, GuardianCommandReceiver, GuardianEvent, Phase,
+    TerminalSnapshotFingerprint, send_coordinator_command,
+};
 use super::protocol::{VerifiedTerminalRestoredCommand, WorkerJoinStatus};
 #[cfg(test)]
 use super::provider::verify_authorized_test_compatibility;
@@ -53,6 +64,8 @@ use super::session::{
     SessionShutdownFailure, SessionShutdownReport, SessionStartupError, SessionStartupFailure,
     TerminalGenerationOwner, assemble_started_session,
 };
+#[cfg(test)]
+use super::terminal::startup_failure_terminal_for_test;
 use super::terminal::{
     PtyOwner, RecoveryDisarmOutcome, RecoveryDisarmProof, RecoveryDisarmUnconfirmed, RecoveryTty,
     RestoredTerminalProof, TerminalEndpoint, TerminalError, TerminalShutdown, TerminalSize,
@@ -630,6 +643,42 @@ pub(super) const PACKAGED_COMPATIBILITY_FAILURE_MARKERS: &[&str] = &[
 ];
 
 #[cfg(test)]
+pub(super) const PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS: &[&str] = &[
+    "startup-failure.compatibility.timeout-origin.deadline-overflow",
+    "startup-failure.compatibility.timeout-origin.source-capture",
+    "startup-failure.compatibility.timeout-origin.probe-stage-copy-durability",
+    "startup-failure.compatibility.timeout-origin.probe-stage-recapture",
+    "startup-failure.compatibility.timeout-origin.version-child-exit",
+    "startup-failure.compatibility.timeout-origin.version-stdout-drain",
+];
+
+#[cfg(test)]
+const fn packaged_compatibility_timeout_origin_marker(
+    origin: CompatibilityTimeoutOrigin,
+) -> &'static str {
+    match origin {
+        CompatibilityTimeoutOrigin::DeadlineOverflow => {
+            "startup-failure.compatibility.timeout-origin.deadline-overflow"
+        }
+        CompatibilityTimeoutOrigin::SourceCapture => {
+            "startup-failure.compatibility.timeout-origin.source-capture"
+        }
+        CompatibilityTimeoutOrigin::ProbeStageCopyDurability => {
+            "startup-failure.compatibility.timeout-origin.probe-stage-copy-durability"
+        }
+        CompatibilityTimeoutOrigin::ProbeStageRecapture => {
+            "startup-failure.compatibility.timeout-origin.probe-stage-recapture"
+        }
+        CompatibilityTimeoutOrigin::VersionChildExit => {
+            "startup-failure.compatibility.timeout-origin.version-child-exit"
+        }
+        CompatibilityTimeoutOrigin::VersionStdoutDrain => {
+            "startup-failure.compatibility.timeout-origin.version-stdout-drain"
+        }
+    }
+}
+
+#[cfg(test)]
 const fn packaged_compatibility_failure_marker(error: CodexHandoffError) -> &'static str {
     match error {
         CodexHandoffError::Unsupported => "startup-failure.compatibility.subtype.unsupported",
@@ -638,6 +687,22 @@ const fn packaged_compatibility_failure_marker(error: CodexHandoffError) -> &'st
         CodexHandoffError::Transport => "startup-failure.compatibility.subtype.transport",
         CodexHandoffError::Spawn => "startup-failure.compatibility.subtype.spawn",
     }
+}
+
+#[cfg(test)]
+const fn packaged_compatibility_failure_detail_markers(
+    origin: Option<CompatibilityTimeoutOrigin>,
+    error: CodexHandoffError,
+) -> [Option<&'static str>; 2] {
+    let origin = if matches!(error, CodexHandoffError::Timeout) {
+        match origin {
+            Some(origin) => Some(packaged_compatibility_timeout_origin_marker(origin)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    [origin, Some(packaged_compatibility_failure_marker(error))]
 }
 
 #[cfg(test)]
@@ -1155,14 +1220,19 @@ impl SupervisedStartupFailure {
     }
 
     #[cfg(test)]
-    pub(super) fn packaged_compatibility_failure_marker(&self) -> Option<&'static str> {
+    pub(super) fn packaged_compatibility_failure_detail_markers(
+        &self,
+    ) -> Option<[Option<&'static str>; 2]> {
         if self.error != SupervisedStartupError::Compatibility {
             return None;
         }
         match &self.owner {
             StartupFailureOwner::Partial(owner) => match &owner.build {
                 StartupBuildAuthority::CompatibilityFailure(failure) => {
-                    Some(packaged_compatibility_failure_marker(failure.error()))
+                    Some(packaged_compatibility_failure_detail_markers(
+                        failure.compatibility_timeout_origin(),
+                        failure.error(),
+                    ))
                 }
                 _ => None,
             },
@@ -2960,12 +3030,37 @@ pub(super) struct PostRestoreStartupCleanup {
     error: SupervisedStartupError,
 }
 
+#[cfg(test)]
+static FAIL_NEXT_PACKAGED_STARTUP_CLEANUP_RETRY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn arm_packaged_startup_cleanup_second_retention() -> bool {
+    FAIL_NEXT_PACKAGED_STARTUP_CLEANUP_RETRY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[cfg(test)]
+fn take_packaged_startup_cleanup_retry_failure() -> bool {
+    FAIL_NEXT_PACKAGED_STARTUP_CLEANUP_RETRY.swap(false, Ordering::AcqRel)
+}
+
 impl PostRestoreStartupCleanup {
     pub(super) fn finish(
         self,
         bounds: StartupShutdownBounds,
     ) -> Result<StartupCleanupReport, StartupCleanupFailure> {
         finish_post_restore(self.owner, self.error, bounds)
+    }
+
+    #[cfg(test)]
+    fn retain_for_concrete_guardian_test(self) -> StartupCleanupFailure {
+        let Self { owner, error } = self;
+        let owner = match owner {
+            PostRestoreOwner::Partial(owner) => StartupCleanupFailureOwner::Partial(owner),
+            PostRestoreOwner::Session(failure) => StartupCleanupFailureOwner::Session(failure),
+        };
+        StartupCleanupFailure { owner, error }
     }
 }
 
@@ -2999,6 +3094,10 @@ impl StartupCleanupFailure {
     /// guardian's bounded recovery loop consumes this seam without weakening
     /// the retained-owner invariant.
     pub(super) fn retry(self, bounds: StartupShutdownBounds) -> Result<StartupCleanupReport, Self> {
+        #[cfg(test)]
+        if take_packaged_startup_cleanup_retry_failure() {
+            return Err(self);
+        }
         let Self { owner, error } = self;
         let owner = match owner {
             StartupCleanupFailureOwner::Partial(owner) => PostRestoreOwner::Partial(owner),
@@ -3006,6 +3105,105 @@ impl StartupCleanupFailure {
         };
         finish_post_restore(owner, error, bounds)
     }
+}
+
+#[cfg(test)]
+fn concrete_guardian_startup_shutdown_bounds() -> StartupShutdownBounds {
+    StartupShutdownBounds {
+        containment_timeout: Duration::from_secs(1),
+        session: SessionShutdownBounds {
+            tui_grace: Duration::from_millis(10),
+            tui_forced: Duration::from_millis(10),
+            relay_timeout: Duration::from_secs(1),
+            monitor_timeout: Duration::from_secs(1),
+            app_grace: Duration::from_millis(10),
+            app_forced: Duration::from_millis(10),
+            app_cleanup_timeout: Duration::from_secs(1),
+            build_cleanup_timeout: Duration::from_secs(1),
+        },
+    }
+}
+
+#[cfg(test)]
+fn concrete_guardian_terminal_restored_command()
+-> Result<VerifiedTerminalRestoredCommand, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut wire = Vec::new();
+    for command in [
+        CoordinatorCommand::Start,
+        CoordinatorCommand::TerminalArmAccepted,
+        CoordinatorCommand::TerminalRestored,
+    ] {
+        send_coordinator_command(&mut wire, command, deadline)?;
+    }
+    let mut receiver = GuardianCommandReceiver::new_terminal(Cursor::new(wire));
+    receiver.record_event(GuardianEvent::LeaseCommitted)?;
+    if receiver.receive(deadline)? != CoordinatorCommand::Start {
+        return Err("the concrete cleanup fixture lost its start command".into());
+    }
+    receiver.record_event(GuardianEvent::TerminalArmed {
+        snapshot: TerminalSnapshotFingerprint::from_digest([0x74; 32]),
+    })?;
+    if receiver.receive(deadline)? != CoordinatorCommand::TerminalArmAccepted {
+        return Err("the concrete cleanup fixture lost its terminal-arm command".into());
+    }
+    receiver.record_event(GuardianEvent::Failed {
+        phase: Phase::Runtime,
+        code: FailureCode::Internal,
+    })?;
+    receiver.record_event(GuardianEvent::TerminalQuiesced)?;
+    if receiver.receive(deadline)? != CoordinatorCommand::TerminalRestored {
+        return Err("the concrete cleanup fixture lost its terminal-restored command".into());
+    }
+    Ok(receiver.take_verified_terminal_restored_command()?)
+}
+
+/// Builds a real post-restore startup-cleanup owner without starting an App,
+/// relay, monitor, or TUI child. The returned terminal peers keep the exact
+/// physical PTY and anonymous terminal channel live until the package helper
+/// is killed and reaped by its direct parent while the retained owner is parked.
+#[cfg(test)]
+pub(super) fn concrete_startup_cleanup_failure_for_guardian_test()
+-> Result<(StartupCleanupFailure, TerminalEndpoint, File), Box<dyn std::error::Error>> {
+    let (endpoint, peer, recovery, snapshot, _identity, master_keepalive) =
+        startup_failure_terminal_for_test()?;
+    let terminal = StartupTerminalAuthority::new(endpoint, recovery, snapshot);
+    terminal.validate()?;
+    let failure = partial_failure(
+        StartupBuildAuthority::Clean,
+        StartupAppAuthority::Clean(provider_never_started()),
+        StartupMonitorAuthority::None,
+        StartupRelayAuthority::None,
+        StartupTuiAuthority::Clean(None),
+        terminal,
+        SupervisedStartupError::Runtime,
+    );
+    let awaiting = match failure.quiesce(concrete_guardian_startup_shutdown_bounds()) {
+        Ok(awaiting) => awaiting,
+        Err(failure) => {
+            std::mem::forget(failure);
+            return Err("the concrete cleanup fixture could not quiesce".into());
+        }
+    };
+    let proof = match concrete_guardian_terminal_restored_command() {
+        Ok(proof) => proof,
+        Err(error) => {
+            std::mem::forget(awaiting);
+            return Err(error);
+        }
+    };
+    let cleanup = match awaiting.acknowledge_terminal_restored(proof) {
+        Ok(cleanup) => cleanup,
+        Err((awaiting, proof)) => {
+            std::mem::forget((awaiting, proof));
+            return Err("the concrete cleanup fixture rejected its restore proof".into());
+        }
+    };
+    Ok((
+        cleanup.retain_for_concrete_guardian_test(),
+        peer,
+        master_keepalive,
+    ))
 }
 
 impl fmt::Debug for StartupCleanupFailure {
@@ -4614,6 +4812,56 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), mapped.len());
+    }
+
+    #[test]
+    fn packaged_compatibility_timeout_origin_markers_are_closed_and_fixed() {
+        let mapped =
+            CompatibilityTimeoutOrigin::ALL.map(packaged_compatibility_timeout_origin_marker);
+
+        assert_eq!(
+            mapped.as_slice(),
+            PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
+        );
+        let mut unique = mapped.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), mapped.len());
+        assert!(mapped.into_iter().all(|marker| {
+            marker.is_ascii()
+                && marker.starts_with("startup-failure.compatibility.timeout-origin.")
+                && !marker.contains('/')
+                && !marker.contains(' ')
+        }));
+
+        for (origin, marker) in CompatibilityTimeoutOrigin::ALL.into_iter().zip(mapped) {
+            assert_eq!(
+                packaged_compatibility_failure_detail_markers(
+                    Some(origin),
+                    CodexHandoffError::Timeout,
+                ),
+                [
+                    Some(marker),
+                    Some("startup-failure.compatibility.subtype.timeout"),
+                ],
+                "the timeout subtype was ordered before its exact origin"
+            );
+        }
+        assert_eq!(
+            packaged_compatibility_failure_detail_markers(None, CodexHandoffError::Timeout),
+            [None, Some("startup-failure.compatibility.subtype.timeout"),]
+        );
+        assert_eq!(
+            packaged_compatibility_failure_detail_markers(
+                Some(CompatibilityTimeoutOrigin::SourceCapture),
+                CodexHandoffError::Transport,
+            ),
+            [
+                None,
+                Some("startup-failure.compatibility.subtype.transport"),
+            ],
+            "a non-timeout failure emitted a timeout origin"
+        );
     }
 
     #[test]

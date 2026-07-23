@@ -1,8 +1,8 @@
 # ADR 0003: Supervise a profile-owned Codex App Server and official remote TUI
 
-- Status: Accepted design; internal foundations #48/#50/#52 and the default-unused #54 provider implementation are present; local #55 recovery evidence is green and Ubuntu 24.04/macOS matrix acceptance is pending
+- Status: Accepted design; internal foundations #48/#50/#52 and the default-unused #54 provider implementation are present; pinned Ubuntu 24.04/macOS package acceptance was green at the merged #68 head, with post-merge hardening in progress
 - Date: 2026-07-15
-- Last updated: 2026-07-20
+- Last updated: 2026-07-22
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 - Related decisions: [ADR 0001](0001-cross-profile-conversation-handoff.md), [ADR 0002](0002-private-provider-identity-binding.md)
 
@@ -545,6 +545,15 @@ classified separately. A provider request is forwarded to the TUI, but the
 relay has no response API and emits zero bytes of its own. Unknown payloads are
 not logged or retained.
 
+The relay preserves the first transport failure in a closed, payload-free
+origin catalog while it is running. Concurrent or later failures cannot
+replace that origin, and intentional shutdown cannot create one. The public
+failure category remains `Transport`; an origin carries no socket, process,
+retry, cleanup, or lifecycle authority. Package diagnostics commit an exact
+origin marker before the stable generic transport and session-readiness
+markers, without recording paths, descriptors, process identities, payloads,
+or operating-system error text.
+
 ## Supervised exact-resume sequence
 
 ```mermaid
@@ -687,7 +696,8 @@ recovery. It must not exit and accidentally release A.
 10. Handshake, frame, fragment, semantic strings, queues, buffers, and every
     lifecycle phase are bounded.
 11. Disconnect after readiness is a transport failure until intentional
-    shutdown begins.
+    shutdown begins. The first closed transport origin is sticky and
+    diagnostic-only; intentional shutdown cannot mint or replace it.
 12. Cleanup unlinks only the recorded owner/type/device/inode pathname; a
     replacement is preserved and reported.
 13. Infrastructure and cleanup failures fail loudly and cannot be flattened

@@ -2381,8 +2381,12 @@ fn os_str_bytes(value: &OsStr) -> &[u8] {
 }
 
 fn production_coordinator_bounds() -> Result<CoordinatorBounds, ProductionEntryError> {
-    CoordinatorBounds::new(Duration::from_secs(15), Duration::from_millis(20))
-        .map_err(|_| ProductionEntryError::Environment)
+    CoordinatorBounds::new(
+        Duration::from_secs(15),
+        Duration::from_millis(20),
+        Duration::from_secs(10),
+    )
+    .map_err(|_| ProductionEntryError::Environment)
 }
 
 fn production_guardian_bounds() -> GuardianBounds {
