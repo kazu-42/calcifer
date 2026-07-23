@@ -5841,7 +5841,10 @@ fn packaged_deterministic_early_startup_failure_consumes_one_recovery_and_comple
 #[test]
 fn packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_until_owned_reap()
 -> Result<(), Box<dyn Error>> {
-    if std::env::var_os(PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV).is_some() {
+    if let Some(mode) = std::env::var_os(PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_ENV) {
+        if mode != OsStr::new("1") {
+            return Err("the concrete second-retention helper mode was invalid".into());
+        }
         return run_packaged_concrete_second_retention_helper();
     }
 
