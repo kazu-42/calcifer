@@ -34,6 +34,12 @@ pub(crate) enum Commands {
         command: AuthCommand,
     },
 
+    /// Inspect or edit inert user-level routing definitions.
+    Routing {
+        #[command(subcommand)]
+        command: RoutingCommand,
+    },
+
     /// Read structured usage and reset information for one or all profiles.
     Status {
         /// Profile to inspect; omit to inspect every registered profile.
@@ -100,6 +106,74 @@ pub(crate) enum Commands {
         #[arg(last = true, allow_hyphen_values = true)]
         provider_args: Vec<OsString>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RoutingCommand {
+    /// Inspect redacted trust-domain and disabled-pool definitions.
+    Inspect,
+
+    /// Create, rename, update, or remove a trust domain.
+    Domain {
+        #[command(subcommand)]
+        command: RoutingDomainCommand,
+    },
+
+    /// Create, rename, update, or remove a disabled routing pool.
+    Pool {
+        #[command(subcommand)]
+        command: RoutingPoolCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RoutingDomainCommand {
+    /// Create a trust domain after validating every member's current identity.
+    Create {
+        provider: ProviderArgument,
+        alias: String,
+        profiles: Vec<ProfileReference>,
+    },
+
+    /// Rename display/lookup metadata without changing durable membership.
+    Rename {
+        domain: DefinitionReference,
+        new_alias: String,
+    },
+
+    /// Replace all members after validating their current identities.
+    SetProfiles {
+        domain: DefinitionReference,
+        profiles: Vec<ProfileReference>,
+    },
+
+    /// Remove an unreferenced trust domain without touching profiles.
+    Remove { domain: DefinitionReference },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RoutingPoolCommand {
+    /// Create a disabled ordered pool after validating every member.
+    Create {
+        domain: DefinitionReference,
+        alias: String,
+        profiles: Vec<ProfileReference>,
+    },
+
+    /// Rename display/lookup metadata without changing durable membership.
+    Rename {
+        pool: DefinitionReference,
+        new_alias: String,
+    },
+
+    /// Replace ordered members while keeping the pool disabled.
+    SetProfiles {
+        pool: DefinitionReference,
+        profiles: Vec<ProfileReference>,
+    },
+
+    /// Remove a disabled pool without touching profiles.
+    Remove { pool: DefinitionReference },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,6 +272,31 @@ pub(crate) enum ProviderArgument {
 pub(crate) struct ProfileReference {
     pub(crate) provider: ProviderArgument,
     pub(crate) alias: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DefinitionReference {
+    pub(crate) provider: Option<ProviderArgument>,
+    pub(crate) value: String,
+}
+
+impl FromStr for DefinitionReference {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value) {
+            return Ok(Self {
+                provider: None,
+                value: value.to_owned(),
+            });
+        }
+        let reference = ProfileReference::from_str(value)
+            .map_err(|_| "definition must use a canonical UUID or codex@alias syntax")?;
+        Ok(Self {
+            provider: Some(reference.provider),
+            value: reference.alias,
+        })
+    }
 }
 
 impl FromStr for ProfileReference {

@@ -4,7 +4,12 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::profiles::{Provider, validate_alias};
+use crate::profiles::{Profile, Provider, validate_alias};
+
+pub(crate) mod storage;
+pub(crate) mod validation;
+
+pub(crate) use storage::RoutingError;
 
 const SCHEMA_VERSION: u8 = 1;
 const MAX_SERIALIZED_BYTES: usize = 512 * 1024;
@@ -67,6 +72,120 @@ struct PoolDefinition {
     trust_domain_id: String,
     activation: Activation,
     profile_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct Inspection {
+    revision: u64,
+    trust_domains: Vec<TrustDomainInspection>,
+    pools: Vec<PoolInspection>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustDomainInspection {
+    id: String,
+    alias: String,
+    provider: Provider,
+    members: Vec<MemberInspection>,
+}
+
+#[derive(Debug, Serialize)]
+struct PoolInspection {
+    id: String,
+    alias: String,
+    trust_domain_id: String,
+    activation: Activation,
+    members: Vec<MemberInspection>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemberInspection {
+    profile_id: String,
+    profile: Option<String>,
+}
+
+impl Inspection {
+    pub(crate) fn new(definitions: &Definitions, profiles: &[Profile]) -> Self {
+        let member = |profile_id: &String| MemberInspection {
+            profile_id: profile_id.clone(),
+            profile: profiles
+                .iter()
+                .find(|profile| profile.id == *profile_id)
+                .map(Profile::reference),
+        };
+        Self {
+            revision: definitions.revision,
+            trust_domains: definitions
+                .trust_domains
+                .iter()
+                .map(|domain| TrustDomainInspection {
+                    id: domain.id.clone(),
+                    alias: domain.alias.clone(),
+                    provider: domain.provider,
+                    members: domain.profile_ids.iter().map(member).collect(),
+                })
+                .collect(),
+            pools: definitions
+                .pools
+                .iter()
+                .map(|pool| PoolInspection {
+                    id: pool.id.clone(),
+                    alias: pool.alias.clone(),
+                    trust_domain_id: pool.trust_domain_id.clone(),
+                    activation: pool.activation,
+                    members: pool.profile_ids.iter().map(member).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn to_human(&self) -> String {
+        let mut lines = vec![format!("Routing registry revision {}", self.revision)];
+        if self.trust_domains.is_empty() {
+            lines.push("Trust domains: none".to_owned());
+        } else {
+            lines.push("Trust domains:".to_owned());
+            for domain in &self.trust_domains {
+                lines.push(format!(
+                    "- {}@{} ({})",
+                    domain.provider.as_str(),
+                    domain.alias,
+                    domain.id
+                ));
+                lines.push(format!("  members: {}", human_members(&domain.members)));
+            }
+        }
+        if self.pools.is_empty() {
+            lines.push("Pools: none".to_owned());
+        } else {
+            lines.push("Pools:".to_owned());
+            for pool in &self.pools {
+                lines.push(format!(
+                    "- {} ({}, trust domain {}, disabled)",
+                    pool.alias, pool.id, pool.trust_domain_id
+                ));
+                lines.push(format!("  members: {}", human_members(&pool.members)));
+            }
+        }
+        lines.push("Automatic routing is disabled; these definitions cannot launch or select a provider profile.".to_owned());
+        lines.join("\n")
+    }
+}
+
+fn human_members(members: &[MemberInspection]) -> String {
+    if members.is_empty() {
+        return "none".to_owned();
+    }
+    members
+        .iter()
+        .map(|member| {
+            member.profile.as_ref().map_or_else(
+                || format!("missing profile ({})", member.profile_id),
+                |profile| format!("{profile} ({})", member.profile_id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -157,6 +276,71 @@ impl Definitions {
 
     pub(crate) const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(crate) fn resolve_domain_id(
+        &self,
+        provider: Option<Provider>,
+        value: &str,
+    ) -> Result<String, DefinitionError> {
+        if let Some(provider) = provider {
+            validate_definition_alias(value)?;
+            return self
+                .trust_domains
+                .iter()
+                .find(|domain| domain.provider == provider && domain.alias == value)
+                .map(|domain| domain.id.clone())
+                .ok_or(DefinitionError::NotFound);
+        }
+        validate_uuid(value)?;
+        self.trust_domains
+            .iter()
+            .find(|domain| domain.id == value)
+            .map(|domain| domain.id.clone())
+            .ok_or(DefinitionError::NotFound)
+    }
+
+    pub(crate) fn resolve_pool_id(
+        &self,
+        provider: Option<Provider>,
+        value: &str,
+    ) -> Result<String, DefinitionError> {
+        if let Some(provider) = provider {
+            validate_definition_alias(value)?;
+            return self
+                .pools
+                .iter()
+                .find(|pool| {
+                    pool.alias == value
+                        && self
+                            .domain_provider(&pool.trust_domain_id)
+                            .is_ok_and(|pool_provider| pool_provider == provider)
+                })
+                .map(|pool| pool.id.clone())
+                .ok_or(DefinitionError::NotFound);
+        }
+        validate_uuid(value)?;
+        self.pools
+            .iter()
+            .find(|pool| pool.id == value)
+            .map(|pool| pool.id.clone())
+            .ok_or(DefinitionError::NotFound)
+    }
+
+    pub(crate) fn domain_provider_for_id(
+        &self,
+        domain_id: &str,
+    ) -> Result<Provider, DefinitionError> {
+        self.domain_provider(domain_id)
+    }
+
+    pub(crate) fn pool_provider_for_id(&self, pool_id: &str) -> Result<Provider, DefinitionError> {
+        let pool = self
+            .pools
+            .iter()
+            .find(|pool| pool.id == pool_id)
+            .ok_or(DefinitionError::NotFound)?;
+        self.domain_provider(&pool.trust_domain_id)
     }
 
     pub(crate) fn apply(
@@ -1552,6 +1736,59 @@ mod tests {
         assert_eq!(error.code(), "routing_definitions_invalid");
         assert!(!error.safe_message().contains("private@example.invalid"));
         assert!(!error.to_string().contains("provider_account"));
+        Ok(())
+    }
+
+    #[test]
+    fn inspection_is_stable_redacted_and_marks_missing_profiles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut definitions = Definitions::default();
+        create_domain(
+            &mut definitions,
+            0,
+            vec![PROFILE_A.to_owned(), PROFILE_B.to_owned()],
+        )?;
+        create_pool(
+            &mut definitions,
+            1,
+            vec![PROFILE_B.to_owned(), PROFILE_A.to_owned()],
+        )?;
+        let profiles = vec![crate::profiles::Profile {
+            id: PROFILE_A.to_owned(),
+            alias: "work".to_owned(),
+            provider: Provider::Codex,
+            created_at: 42,
+        }];
+
+        let inspection = Inspection::new(&definitions, &profiles);
+        let json = serde_json::to_value(&inspection)?;
+        assert_eq!(json["revision"], 2);
+        assert_eq!(json["trust_domains"][0]["provider"], "codex");
+        assert_eq!(
+            json["trust_domains"][0]["members"][0],
+            json!({"profile_id": PROFILE_A, "profile": "codex@work"})
+        );
+        assert_eq!(
+            json["trust_domains"][0]["members"][1],
+            json!({"profile_id": PROFILE_B, "profile": null})
+        );
+        assert_eq!(json["pools"][0]["activation"], "disabled");
+
+        let rendered = serde_json::to_string(&inspection)?;
+        for forbidden in [
+            "fingerprint",
+            "account_id",
+            "workspace_id",
+            "access_token",
+            "reset_credit",
+            "created_at",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        let human = inspection.to_human();
+        assert!(human.contains("codex@work"));
+        assert!(human.contains("missing profile"));
+        assert!(human.contains("Automatic routing is disabled"));
         Ok(())
     }
 }

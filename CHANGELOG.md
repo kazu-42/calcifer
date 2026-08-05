@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Private Unix user-level `routing.json` trust-domain and ordered-pool
+  definitions with immutable profile IDs, fixed disabled activation, bounded
+  atomic revision updates, stable redacted human/JSON inspection, and explicit
+  domain/pool create, rename, membership replacement, and removal commands.
+- Whole-domain and whole-pool current-identity validation that holds profile
+  leases in immutable-ID order through routing commit and stops on missing,
+  busy, unverified, drifted, key-inconsistent, cross-boundary, or duplicate
+  effective identities. No selector or provider launch consumes these records.
 - Internal Linux/macOS no-gap target reservation and one-shot guardian
   provider-lease transfer, with consume-by-value ACK state transitions for the
   future supervised cross-profile handoff. Public commands and persisted
@@ -20,6 +28,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Security
 
+- Routing state reuses the managed-profile NOFOLLOW, ownership, mode,
+  single-link, and macOS ACL checks; writes use a private same-directory
+  temporary, file fsync, atomic rename, and parent-directory fsync. Repository
+  routing keys are rejected and repository-local routing files never become
+  storage or selection authority. Platforms without verified private routing
+  ACL support fail closed.
 - The transfer primitive is restricted to a future supervisor-provided,
   already-authenticated private guardian stream. Within that stream, lease
   descriptors are accepted only after strict frame, inode, owner, type, mode,

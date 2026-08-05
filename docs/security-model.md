@@ -670,7 +670,7 @@ cannot constrain arbitrary egress from a malicious or compromised executable.
 
 ## Failover requirements
 
-A profile pool is user-created, provider-specific, and bound to one trust domain. Automatic failover is opt-in. The only switching signal is fresh, authoritative, version-supported exhaustion state.
+A profile pool is user-created, provider-specific, and bound to one trust domain. The implemented private user-level registry stores only immutable local profile IDs, local aliases, provider, revision, membership, and the fixed `disabled` activation. Every membership change revalidates the whole affected domain or pool under sorted profile leases and fails before commit on missing/unverified/drifted/duplicate identity or provider/trust-domain mismatch. Inspection exposes no private identity or provider account material. Repository-local `routing`, `routing_pools`, and `trust_domains` configuration is rejected by launch preflight, and repository files are never an input to the routing store. Automatic failover remains unavailable; the only future switching signal is fresh, authoritative, version-supported exhaustion state. See [ADR 0004](adr/0004-private-routing-registry.md).
 
 The selector must distinguish:
 
