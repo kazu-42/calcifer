@@ -54,8 +54,9 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 
 ## Phase 4: explicit failover pools
 
-- [ ] User-level, provider-specific, same-trust-domain pool configuration
-- [ ] Default-off behavior and explicit per-invocation pin
+- [x] User-level, provider-specific, same-trust-domain definitions with immutable profile IDs and live whole-pool identity validation
+- [x] Persist every pool as default-disabled; selection and launch remain unavailable
+- [ ] Explicit per-invocation pool selection
 - [ ] Bounded one-pass selection with cooldown
 - [ ] Identity and fresh usage revalidation inside the candidate profile lease
 - [ ] Visible local profile, provider, trust-domain, and selection-reason notice before launch

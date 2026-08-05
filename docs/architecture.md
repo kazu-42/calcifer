@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, and an internal Linux/macOS no-gap target-reservation primitive are implemented. A default-unused pinned App Server/typed-monitor/official-TUI supervisor implementation is present. Deterministic recovery and official-package normal/recovery scenarios are green from the 2026-07-20 Issue #54 candidate source on Apple silicon; Ubuntu 24.04/macOS matrix acceptance is pending. Public supervised run/resume, the production cross-profile handoff transaction, active-session failover policy, and automatic failover remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, a private default-disabled trust-domain/pool registry, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, and an internal Linux/macOS no-gap target-reservation primitive are implemented. The routing registry cannot select or launch a profile. A default-unused pinned App Server/typed-monitor/official-TUI supervisor implementation is present. Deterministic recovery and official-package normal/recovery scenarios are green from the 2026-07-20 Issue #54 candidate source on Apple silicon; Ubuntu 24.04/macOS matrix acceptance is pending. Public supervised run/resume, the production cross-profile handoff transaction, active-session failover policy, and automatic failover remain future work.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -40,6 +40,7 @@ A repository-local file must never be able to select an account or failover pool
 | CLI parser | Parse explicit commands and the `--` provider-argument boundary | Accept implicit external subcommands or an arbitrary executable |
 | Registry | Store non-secret opaque profile metadata | Store raw tokens in diagnostics or logs |
 | Private identity store | Detect equivalent Codex account/workspace scopes without exposing provider identifiers | Claim that different scopes have independent quota |
+| Routing registry | Store private user-level trust domains and ordered default-disabled pools by immutable profile ID | Read repository routing policy, select a candidate, or launch a provider |
 | Conversation lineage registry | Bind one logical conversation to ordered profile-local thread generations | Treat a credential profile ID as the conversation ID |
 | Provider adapter | Build an isolated environment and classify supported structured signals | Reimplement undocumented OAuth flows or scrape TUI text |
 | Profile lease | Serialize profile mutation, usage probes, and child lifetime | Rely on PID files as the lock authority |
@@ -137,6 +138,43 @@ Different profiles may run concurrently. The same profile has at most one offici
 The public registry proves only local profile provenance. Separately, each new supported Codex profile has a private `.calcifer-identity` marker bound to an installation-local `identity.key`. Calcifer derives a versioned HMAC-SHA-256 fingerprint over length-delimited provider, supported auth kind, adapter version, and effective `tokens.account_id`; the raw account/workspace scope remains only in provider-owned `auth.json`. Registration rejects an equal verified fingerprint under another alias. Distinct fingerprints establish only different effective routing scopes, not independent quota.
 
 Profiles created before this binding remain valid for explicit `run`, `resume`, and status. `calcifer auth verify codex@<alias>` acquires the profile lease, performs the exact `0.144.4` initialize/home/version gate without an account request, parses the same bounded auth projection, and serializes its uniqueness check and marker publication under the registry lock. It never opens a login flow or rewrites credentials. A future selector must use the lease-retaining revalidation API: missing markers, key loss/replacement, unsupported adapters/auth modes, malformed auth, and fingerprint drift stop the whole selection attempt. See [ADR 0002](adr/0002-private-provider-identity-binding.md).
+
+## Implemented private routing definitions
+
+`routing.json` and `routing.lock` live only under Calcifer's validated private
+user data root. Schema v1 bounds document bytes, definition counts, members per
+definition, and total membership edges. Trust-domain membership is a canonical
+set of immutable profile UUIDs. Pool membership is an ordered, duplicate-free
+subset of exactly one trust domain, and the only serialized activation value is
+`disabled`. Aliases are mutable display/lookup metadata and never durable
+membership authority.
+
+Membership changes use a two-authority transaction. Calcifer first reads one
+routing revision and resolves the requested aliases to profile UUIDs. It then
+acquires and retains every referenced profile lease in sorted UUID order,
+refetches the current registry row under that lease, version-gates and
+rederives the current private provider identity, and compares only opaque
+in-memory equality capabilities. Any missing, busy, unverified, drifted,
+key-inconsistent, unsupported, cross-provider, cross-domain, or duplicate
+effective identity aborts the entire change. While all proofs remain alive,
+the routing writer locks `routing.lock` and commits only if the original
+revision is still current. A concurrent routing edit therefore wins wholly or
+returns a revision conflict; it cannot be overwritten.
+
+Metadata rename/removal does not probe credentials. This keeps cleanup
+available when a profile has disappeared or drifted. Conversely, successful
+configuration validation is not a lasting identity assertion: later profile
+mutation can make an existing definition invalid, so any future selector must
+repeat lease-retaining validation at use time.
+
+The writer creates an owner-private same-directory temporary, writes and
+fsyncs the complete bounded JSON document, verifies the node, atomically
+renames it, and fsyncs the parent directory. Failure before rename preserves
+the old revision. Failure after rename returns `routing_commit_uncertain` and
+requires inspection instead of a blind retry. Readers and locks reject unsafe
+type, symlink, hard-link, ownership, mode, or macOS ACL state through the same
+storage primitives used by managed profiles. Platforms without verified
+private ACL creation fail closed. See [ADR 0004](adr/0004-private-routing-registry.md).
 
 ## Implemented same-profile resume
 
@@ -546,7 +584,7 @@ The primitive in this slice acquires only the target A+B pair. Issue #33 is
 responsible for placing it after the handoff and conversation-transition locks
 and for retaining every required owner across the non-idempotent handoff.
 
-The current `run` command does not restart or re-submit a command after the child begins execution. The planned supervisor treats credential profiles and conversation lineage as separate aggregates. It continues the same user-visible conversation after failover by creating a target-profile Codex thread from the validated source rollout, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion. The supervisor connection remains event-only and never races the official TUI to answer approvals or other server-initiated requests; no new turn is admitted without an attached TUI. The full decision and recovery model is in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
+The current `run` command does not restart or re-submit a command after the child begins execution. Existing pool definitions remain inert and default-disabled. The planned supervisor treats credential profiles and conversation lineage as separate aggregates. It continues the same user-visible conversation after failover by creating a target-profile Codex thread from the validated source rollout, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion. The supervisor connection remains event-only and never races the official TUI to answer approvals or other server-initiated requests; no new turn is admitted without an attached TUI. The full decision and recovery model is in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
 
 ## Filesystem and credential mutations
 
@@ -784,6 +822,6 @@ completed implementations for:
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
 - OS credential-store support for Claude setup tokens;
-- trust-domain configuration and failover pool UX.
+- explicit selector, enablement, and failover pool execution UX (the inert trust-domain/pool definition UX is implemented).
 
 Credential-management support is a separate platform guarantee from the portable diagnostic surface. Each provider and OS combination must pass its permission, credential-store, process, and recovery tests before being marked supported.
