@@ -2716,6 +2716,71 @@ fn package_resume_observation_fault_seam_preserves_read_invalid_and_deadline_aut
     assert_eq!(success, Ok(()));
 }
 
+fn start_package_resume_real_process_deadline_after_ready_with<WaitReady, Now>(
+    wait_ready: WaitReady,
+    mut now: Now,
+) -> Result<Instant, Box<dyn Error>>
+where
+    WaitReady: FnOnce(Instant) -> Result<(), Box<dyn Error>>,
+    Now: FnMut() -> Instant,
+{
+    let startup_deadline = now()
+        .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+        .ok_or("resume real-process startup deadline overflowed")?;
+    wait_ready(startup_deadline)?;
+    now()
+        .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+        .ok_or_else(|| "resume real-process operation deadline overflowed".into())
+}
+
+#[test]
+fn package_resume_real_process_deadline_starts_after_the_ready_boundary()
+-> Result<(), Box<dyn Error>> {
+    let origin = Instant::now();
+    let ready_at = origin
+        .checked_add(Duration::from_secs(9))
+        .ok_or("resume real-process ready time overflowed")?;
+    let now_calls = std::cell::Cell::new(0_u8);
+    let deadline = start_package_resume_real_process_deadline_after_ready_with(
+        |startup_deadline| {
+            assert_eq!(
+                startup_deadline,
+                origin
+                    .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+                    .ok_or("resume real-process startup deadline overflowed")?
+            );
+            Ok(())
+        },
+        || {
+            let call = now_calls.get();
+            now_calls.set(call.saturating_add(1));
+            if call == 0 { origin } else { ready_at }
+        },
+    )?;
+    assert_eq!(
+        deadline,
+        ready_at
+            .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+            .ok_or("resume real-process operation deadline overflowed")?
+    );
+    assert_eq!(now_calls.get(), 2);
+
+    let failed_wait_now_calls = std::cell::Cell::new(0_u8);
+    let error = require_rejected_test_result(
+        start_package_resume_real_process_deadline_after_ready_with(
+            |_| Err("fixed ready failure".into()),
+            || {
+                failed_wait_now_calls.set(failed_wait_now_calls.get().saturating_add(1));
+                origin
+            },
+        ),
+        "a failed ready boundary started a resume-operation deadline",
+    )?;
+    assert_eq!(error.to_string(), "fixed ready failure");
+    assert_eq!(failed_wait_now_calls.get(), 1);
+    Ok(())
+}
+
 struct PackageResumeRealProcessChild {
     child: Option<Child>,
 }
@@ -2842,10 +2907,16 @@ fn package_resume_real_process_preserves_stale_cont_resize_and_publication_order
     let process_group = pid.as_raw_nonzero().get();
     let mut exercise_phase = Some("resume-real-process.ready");
     let exercise = (|| -> Result<(), Box<dyn Error>> {
-        let deadline = Instant::now()
-            .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
-            .ok_or("resume real-process deadline overflowed")?;
-        wait_for_private_marker(&report.join("resume-test.ready"), b"ready\n", deadline)?;
+        let deadline = start_package_resume_real_process_deadline_after_ready_with(
+            |startup_deadline| {
+                wait_for_private_marker(
+                    &report.join("resume-test.ready"),
+                    b"ready\n",
+                    startup_deadline,
+                )
+            },
+            Instant::now,
+        )?;
 
         // This CONT is deliberately delivered while the exact child is still
         // running. It must not remain latched across the later self-stop.
