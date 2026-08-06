@@ -632,6 +632,7 @@ const PACKAGE_RESUME_REAL_PROCESS_HELPER_TEST: &str = concat!(
     "package_resume_real_process_preserves_stale_cont_resize_and_publication_order"
 );
 const PACKAGE_RESUME_REAL_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+const PACKAGE_RESUME_REAL_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES: [(RecoveryCheckpoint, &str); 7] = [
     (RecoveryCheckpoint::StartupQueued, "startup-queued-v1"),
@@ -2716,6 +2717,123 @@ fn package_resume_observation_fault_seam_preserves_read_invalid_and_deadline_aut
     assert_eq!(success, Ok(()));
 }
 
+fn wait_for_package_resume_real_process_size_with<Observe, Now, Wait>(
+    expected: TerminalSize,
+    deadline: Instant,
+    mut observe: Observe,
+    mut now: Now,
+    mut wait: Wait,
+) -> Result<(), Box<dyn Error>>
+where
+    Observe: FnMut() -> Result<TerminalSize, Box<dyn Error>>,
+    Now: FnMut() -> Instant,
+    Wait: FnMut(Duration),
+{
+    loop {
+        if now() >= deadline {
+            return Err("resume real-process terminal size exceeded its deadline".into());
+        }
+        let observed = observe()?;
+        let observed_at = now();
+        if observed_at >= deadline {
+            return Err("resume real-process terminal size exceeded its deadline".into());
+        }
+        if observed == expected {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(observed_at);
+        wait(remaining.min(PACKAGE_RESUME_REAL_PROCESS_POLL_INTERVAL));
+    }
+}
+
+#[test]
+fn package_resume_real_process_size_wait_is_bounded_and_retries_only_mismatch()
+-> Result<(), Box<dyn Error>> {
+    let origin = Instant::now();
+    let deadline = origin
+        .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+        .ok_or("resume real-process size deadline overflowed")?;
+    let expected = PACKAGE_SUPERVISOR_RESUMED_SIZE;
+    let observations = std::cell::Cell::new(0_u8);
+    let waits = std::cell::Cell::new(0_u8);
+    wait_for_package_resume_real_process_size_with(
+        expected,
+        deadline,
+        || {
+            let observation = observations.get();
+            observations.set(observation.saturating_add(1));
+            Ok(if observation == 0 {
+                PACKAGE_SUPERVISOR_INITIAL_SIZE
+            } else {
+                expected
+            })
+        },
+        || origin,
+        |duration| {
+            assert_eq!(duration, PACKAGE_RESUME_REAL_PROCESS_POLL_INTERVAL);
+            waits.set(waits.get().saturating_add(1));
+        },
+    )?;
+    assert_eq!(observations.get(), 2);
+    assert_eq!(waits.get(), 1);
+
+    let failed_read_waits = std::cell::Cell::new(0_u8);
+    let error = require_rejected_test_result(
+        wait_for_package_resume_real_process_size_with(
+            expected,
+            deadline,
+            || Err("fixed size read failure".into()),
+            || origin,
+            |_| failed_read_waits.set(failed_read_waits.get().saturating_add(1)),
+        ),
+        "a terminal-size read failure was retried",
+    )?;
+    assert_eq!(error.to_string(), "fixed size read failure");
+    assert_eq!(failed_read_waits.get(), 0);
+
+    let expired_observations = std::cell::Cell::new(0_u8);
+    let error = require_rejected_test_result(
+        wait_for_package_resume_real_process_size_with(
+            expected,
+            deadline,
+            || {
+                expired_observations.set(expired_observations.get().saturating_add(1));
+                Ok(expected)
+            },
+            || deadline,
+            |_| {},
+        ),
+        "an expired terminal-size wait performed an observation",
+    )?;
+    assert_eq!(
+        error.to_string(),
+        "resume real-process terminal size exceeded its deadline"
+    );
+    assert_eq!(expired_observations.get(), 0);
+
+    let crossing_now_calls = std::cell::Cell::new(0_u8);
+    let error = require_rejected_test_result(
+        wait_for_package_resume_real_process_size_with(
+            expected,
+            deadline,
+            || Ok(expected),
+            || {
+                let call = crossing_now_calls.get();
+                crossing_now_calls.set(call.saturating_add(1));
+                if call == 0 { origin } else { deadline }
+            },
+            |_| {},
+        ),
+        "a terminal-size observation crossing its deadline was accepted",
+    )?;
+    assert_eq!(
+        error.to_string(),
+        "resume real-process terminal size exceeded its deadline"
+    );
+    assert_eq!(crossing_now_calls.get(), 2);
+    Ok(())
+}
+
 struct PackageResumeRealProcessChild {
     child: Option<Child>,
 }
@@ -2795,20 +2913,24 @@ fn run_package_resume_real_process_helper() -> Result<(), Box<dyn Error>> {
 
     claim_controlling_terminal_from_stdin()?;
     write_private_atomic_new(&report.join("resume-test.ready"), b"ready\n")?;
-    wait_for_private_marker(
-        &report.join("resume-test.stop"),
-        b"stop\n",
-        Instant::now()
-            .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
-            .ok_or("resume real-process helper deadline overflowed")?,
-    )?;
+    let deadline = Instant::now()
+        .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+        .ok_or("resume real-process helper deadline overflowed")?;
+    wait_for_private_marker(&report.join("resume-test.stop"), b"stop\n", deadline)?;
     rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)?;
 
     verify_controlling_terminal_from_stdin()?;
-    let size = rustix::termios::tcgetwinsize(io::stdin())?;
-    if size.ws_row != 43 || size.ws_col != 125 {
-        return Err("resume real-process helper observed the wrong resumed size".into());
-    }
+    let stdin = io::stdin();
+    // Linux may schedule the continued child before the PTY master's window
+    // update is visible through the slave. Keep the proof inside the original
+    // absolute helper deadline instead of assuming one immediate read.
+    wait_for_package_resume_real_process_size_with(
+        PACKAGE_SUPERVISOR_RESUMED_SIZE,
+        deadline,
+        || Ok(rustix::termios::tcgetwinsize(&stdin)?.into()),
+        Instant::now,
+        thread::sleep,
+    )?;
     write_private_atomic_new(&report.join("resume.live"), b"43 125\n")
 }
 
