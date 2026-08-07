@@ -91,7 +91,8 @@ The planned Codex adapter gives each profile its own managed home and launches C
 
 ```text
 managed root/
-  conversations.json  <- private same-profile thread bindings and workspace heads
+  conversations.json  <- lazy-v2 lineage, workspace heads, and one transition
+  conversations.v1.pre-v2.json <- explicit rollback copy after first v2 mutation
   conversations.lock
   profiles/
     codex/
@@ -196,7 +197,40 @@ Capture failure never degrades implicitly into an ordinary provider launch. The 
 
 Codex 0.144.4's rollout scanner has an internal 10,000-file cap, but the v2 `thread/list` response does not expose its `reached_scan_cap` flag. Calcifer therefore snapshots each of `sessions` and `archived_sessions` before and after the App Server call, requires each root to contain strictly fewer than 10,000 regular files, and compares canonical relative path, type, owner-safe identity, length, and nanosecond mtime. A symlink, special or writable node, unreadable traversal, cap hit, or pre/post mismatch makes the inventory incomplete. Missing and empty roots normalize identically. `useStateDbOnly` is not used because a rollout can legitimately exist before the state database has indexed or repaired it.
 
-The separate schema-v1 `conversations.json` contains opaque local IDs, versions, timestamps, path-free rollout change fingerprints, lifecycle state, pending launch baselines or metadata-only untracked ownership, and workspace-head references. It never contains profile aliases, provider account IDs, rollout paths, previews, prompts, responses, tool arguments, terminal output, or credentials. A whole-document update uses a private same-directory temporary file, file fsync, atomic rename, and parent-directory fsync under `conversations.lock`. A post-rename directory-sync failure is read back and reported as `conversation_commit_uncertain`; it never authorizes relaunching the provider.
+The conversation registry reads both schema v1 and schema v2. Ordinary
+same-profile reads, exact resumes, captures, and lifecycle refreshes leave a v1
+document at v1. The first successful handoff mutation, and no earlier read,
+first publishes the complete owner-private
+`conversations.v1.pre-v2.json` recovery copy and then atomically publishes v2
+with that copy's exact revision and SHA-256 digest.
+If an earlier failed publication left an older recovery copy while v1 continued
+to change, the next attempt replaces and syncs the copy with the exact current
+v1 revision before v2 can become visible. A missing, linked, malformed, or
+digest-mismatched copy makes every later v2 read fail closed.
+
+Schema v2 keeps the v1 opaque local IDs, versions, timestamps, bounded
+path-free inventory fingerprints, lifecycle state, pending launch ownership,
+and workspace-head references. It adds ordered generations, one exact active
+tail, local trust-domain UUIDs, bounded root-relative rollout locators and
+device/inode/length/mode/owner/link/time/SHA-256 fingerprints, plus at most one
+durable transition. The transition advances without provider I/O through
+`prepared`, `source_stop_requested`, `source_stopped`, `fork_requested`,
+`fork_observed`, and `committed_unattached`. Duplicate or skipped generations,
+a head that does not name the active tail, a skipped transition phase, or a
+second active transition fails closed. A prepared or committed-but-unattached
+transition blocks ordinary head resolution until recovery advances or attaches
+the exact target.
+
+Neither schema contains profile aliases, provider account/workspace IDs,
+previews, transcripts, prompts, responses, tool payloads, terminal output,
+credentials, or arbitrary absolute rollout paths. A whole-document update uses
+a private same-directory temporary file, file fsync, atomic rename, and
+parent-directory fsync under `conversations.lock`. A post-rename
+directory-sync failure is read back and reported as
+`conversation_commit_uncertain`; it never authorizes repeating a stop, fork,
+provider launch, or attachment. Once v2 is visible, older schema-v1 binaries
+fail closed. Downgrade recovery requires a forward-compatible binary or the
+explicit pre-migration copy; Calcifer never rewrites a live v2 lineage to v1.
 
 Bare `calcifer resume` reads and releases the workspace-head lock, acquires the immutable source profile by UUID, and revalidates the same binding under the profile lease before executing `codex resume <exact-uuid>`. If a guardian crash left a pending launch, the command first reacquires both profile locks and reconciles its before/after inventory; one candidate becomes `interrupted` or `unknown_crash`, while ambiguity stops. Bare and explicit exact resume look up an already-bound immutable `{profile_id, thread_id, canonical_cwd}` directly even when pending or needs-selection state hides the mutable workspace head. A clean pre-launch rollout observation cannot erase its persisted interrupted or unknown-crash marker; only lifecycle readback after the provider completes may clear that uncertainty. Retryable authentication, spawn, timeout, transport, or provider availability failures retain the pending launch without destroying the previous ready head; malformed protocol, unsupported schema/version, missing/archive, immutable profile/cwd ownership conflicts, or deleted-baseline results atomically clear the pending launch and require explicit selection. Restored state is the persisted conversation transcript; a dead process, stream, in-flight tool call, prompt, command, approval, or tool action is not restarted or replayed.
 

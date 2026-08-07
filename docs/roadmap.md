@@ -68,8 +68,8 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 ## Phase 4.5: required conversation handoff
 
 - [x] Decide that successful automatic failover continues the same user-visible conversation; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
-- [ ] Model one logical conversation as a lineage of profile-local provider threads
-- [ ] Bind every lineage generation to profile, canonical cwd, trust domain, thread ID, and exact rollout path
+- [x] Model one logical conversation as an ordered schema-v2 lineage of profile-local provider threads, with one active generation and one crash-durable handoff transition
+- [ ] Bind every lineage generation to profile, canonical cwd, trust domain, thread ID, and a validated root-relative rollout locator
 - [x] Version-gate Codex's experimental `thread/fork.path` field and remote TUI contract with `codex app-server generate-json-schema --experimental --out <dir>` drift checks plus a synthetic runtime smoke test
 - [x] Extract a bounded, observe-only readiness relay with separate synthetic-fork and exact-resume policies; keep it internal and opaque after readiness (issue #48 and [ADR 0003](adr/0003-supervised-codex-session.md))
 - [x] Prove the default-unused coordinator/guardian authority, bounded lifecycle channel, guardian-direct fake process groups, exact reap, worker join, private runtime cleanup, descriptor non-inheritance, and retained-A crash behavior (issue #50)

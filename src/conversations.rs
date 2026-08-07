@@ -1,8 +1,8 @@
 //! Crash-safe bindings between Calcifer workspaces and provider-owned threads.
 //!
 //! This registry deliberately contains only local opaque identifiers and
-//! bounded metadata. Provider payloads, prompts, previews, rollout paths, and
-//! credentials never enter this document.
+//! bounded metadata. Provider payloads, prompts, previews, arbitrary absolute
+//! rollout paths, and credentials never enter this document.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -12,15 +12,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::profiles::{Provider, Registry};
 
-const SCHEMA_VERSION: u8 = 1;
+const SCHEMA_VERSION_V1: u8 = 1;
+const SCHEMA_VERSION_V2: u8 = 2;
 const REGISTRY_FILE: &str = "conversations.json";
+#[cfg_attr(not(test), allow(dead_code))] // Consumed by transactional handoff in issue #34.
+const PRE_MIGRATION_BACKUP_FILE: &str = "conversations.v1.pre-v2.json";
 const LOCK_FILE: &str = "conversations.lock";
 const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INVENTORY_THREADS: usize = 1_600;
+const MAX_LINEAGE_GENERATIONS: usize = 256;
+const MAX_ROLLOUT_RELATIVE_BYTES: usize = 512;
+const MAX_ROLLOUT_COMPONENTS: usize = 8;
+const MAX_ROLLOUT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -108,6 +116,102 @@ pub(crate) struct HeadBinding {
     pub(crate) lifecycle: ConversationLifecycle,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RolloutRoot {
+    Sessions,
+    ArchivedSessions,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RolloutLocator {
+    pub(crate) root: RolloutRoot,
+    pub(crate) relative_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RolloutFingerprint {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) length: u64,
+    pub(crate) mode: u32,
+    pub(crate) owner: u32,
+    pub(crate) link_count: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: i64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanoseconds: i64,
+    pub(crate) sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GenerationRollout {
+    pub(crate) locator: RolloutLocator,
+    pub(crate) fingerprint: RolloutFingerprint,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HandoffPhase {
+    Prepared,
+    SourceStopRequested,
+    SourceStopped,
+    ForkRequested,
+    ForkObserved,
+    CommittedUnattached,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))] // Consumed by transactional handoff in issue #34.
+pub(crate) struct HandoffPreparation {
+    pub(crate) expected_source: HeadBinding,
+    pub(crate) target_profile_id: String,
+    pub(crate) trust_domain_id: String,
+    pub(crate) source_rollout: GenerationRollout,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))] // Consumed by transactional handoff in issue #34.
+pub(crate) struct HandoffTarget {
+    pub(crate) thread_id: String,
+    pub(crate) canonical_cwd: String,
+    pub(crate) codex_version: String,
+    pub(crate) rollout: GenerationRollout,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ObservedHandoffTarget {
+    pub(crate) thread_id: String,
+    pub(crate) canonical_cwd: String,
+    pub(crate) codex_version: String,
+    pub(crate) adapter_version: String,
+    pub(crate) rollout: GenerationRollout,
+    pub(crate) observed_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HandoffTransition {
+    pub(crate) transition_id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) source_generation: u32,
+    pub(crate) target_generation: u32,
+    pub(crate) source_profile_id: String,
+    pub(crate) target_profile_id: String,
+    pub(crate) canonical_cwd: String,
+    pub(crate) trust_domain_id: String,
+    pub(crate) source_rollout: GenerationRollout,
+    pub(crate) phase: HandoffPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed_target: Option<ObservedHandoffTarget>,
+    pub(crate) prepared_at: i64,
+    pub(crate) updated_at: i64,
+}
+
 pub(crate) enum LaunchResolution {
     Bind(BindingInput),
     NoThread,
@@ -122,16 +226,30 @@ struct ConversationDocument {
     conversations: Vec<Conversation>,
     workspace_heads: Vec<WorkspaceHead>,
     pending_launches: Vec<PendingLaunch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pre_migration_backup: Option<PreMigrationBackup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_transition: Option<HandoffTransition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreMigrationBackup {
+    schema_version: u8,
+    revision: u64,
+    sha256: String,
 }
 
 impl Default for ConversationDocument {
     fn default() -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: SCHEMA_VERSION_V1,
             revision: 0,
             conversations: Vec::new(),
             workspace_heads: Vec::new(),
             pending_launches: Vec::new(),
+            pre_migration_backup: None,
+            active_transition: None,
         }
     }
 }
@@ -156,6 +274,10 @@ struct ConversationGeneration {
     codex_version: String,
     adapter_version: String,
     bound_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trust_domain_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollout: Option<GenerationRollout>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -181,6 +303,7 @@ enum WriteFault {
     BeforeFileSync,
     BeforeRename,
     AfterRename,
+    DirectorySync,
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +354,7 @@ impl ConversationRegistry {
         };
 
         let overlapping = self.transact(|document| {
+            ensure_workspace_not_transitioning(document, &canonical_cwd)?;
             let overlapping = document.pending_launches.iter().any(|existing| {
                 existing.canonical_cwd == canonical_cwd && existing.launch_id != launch_id
             });
@@ -376,6 +500,7 @@ impl ConversationRegistry {
     pub(crate) fn adopt(&self, binding: BindingInput) -> Result<HeadBinding, ConversationError> {
         validate_binding_input(&binding)?;
         self.transact(|document| {
+            ensure_workspace_not_transitioning(document, &binding.canonical_cwd)?;
             if document
                 .pending_launches
                 .iter()
@@ -467,6 +592,7 @@ impl ConversationRegistry {
     ) -> Result<(), ConversationError> {
         let canonical_cwd = canonical_path_string(canonical_cwd)?;
         self.transact(|document| {
+            ensure_workspace_not_transitioning(document, &canonical_cwd)?;
             mark_head_needs_selection(document, &canonical_cwd);
             Ok(())
         })
@@ -504,6 +630,7 @@ impl ConversationRegistry {
             started_at: unix_timestamp()?,
         };
         self.transact(|document| {
+            ensure_workspace_not_transitioning(document, &canonical_cwd)?;
             if document
                 .pending_launches
                 .iter()
@@ -514,6 +641,362 @@ impl ConversationRegistry {
             mark_head_needs_selection(document, &canonical_cwd);
             document.pending_launches.push(pending);
             Ok(launch_id)
+        })
+    }
+
+    /// Starts the only durable cross-profile transition in the registry.
+    ///
+    /// The caller supplies already-validated, provider-free metadata. No
+    /// provider process or filesystem rollout is opened while the short
+    /// conversation lock is held.
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
+    pub(crate) fn prepare_handoff(
+        &self,
+        preparation: HandoffPreparation,
+    ) -> Result<HandoffTransition, ConversationError> {
+        validate_uuid(
+            &preparation.expected_source.conversation_id,
+            "conversation id",
+        )?;
+        validate_uuid(&preparation.expected_source.profile_id, "source profile id")?;
+        validate_uuid(&preparation.expected_source.thread_id, "source thread id")?;
+        validate_stored_path(&preparation.expected_source.canonical_cwd)?;
+        validate_codex_version(&preparation.expected_source.codex_version)?;
+        validate_uuid(&preparation.target_profile_id, "target profile id")?;
+        validate_uuid(&preparation.trust_domain_id, "trust domain id")?;
+        validate_rollout(&preparation.source_rollout)?;
+        if preparation.expected_source.profile_id == preparation.target_profile_id {
+            return Err(ConversationError::RegistryInvalid(
+                "handoff target must use a different profile".to_owned(),
+            ));
+        }
+
+        self.transact_v2(|document| {
+            if document.active_transition.is_some() {
+                return Err(ConversationError::TransitionBusy);
+            }
+            if document
+                .pending_launches
+                .iter()
+                .any(|pending| pending.canonical_cwd == preparation.expected_source.canonical_cwd)
+            {
+                return Err(ConversationError::Ambiguous);
+            }
+            let current =
+                resolve_head_document(document, &preparation.expected_source.canonical_cwd)?;
+            if current != preparation.expected_source {
+                return Err(ConversationError::Ambiguous);
+            }
+
+            let conversation = document
+                .conversations
+                .iter_mut()
+                .find(|conversation| {
+                    conversation.conversation_id == preparation.expected_source.conversation_id
+                })
+                .ok_or(ConversationError::NotFound)?;
+            if conversation.active_generation != preparation.expected_source.generation {
+                return Err(ConversationError::Ambiguous);
+            }
+            let source = conversation
+                .generations
+                .iter_mut()
+                .find(|generation| generation.generation == conversation.active_generation)
+                .ok_or_else(|| {
+                    ConversationError::RegistryInvalid(
+                        "active handoff source generation is missing".to_owned(),
+                    )
+                })?;
+            if source.profile_id != preparation.expected_source.profile_id
+                || source.thread_id != preparation.expected_source.thread_id
+                || source.canonical_cwd != preparation.expected_source.canonical_cwd
+            {
+                return Err(ConversationError::Ambiguous);
+            }
+            match (&source.trust_domain_id, &source.rollout) {
+                (None, None) => {
+                    source.trust_domain_id = Some(preparation.trust_domain_id.clone());
+                    source.rollout = Some(preparation.source_rollout.clone());
+                }
+                (Some(trust_domain_id), Some(rollout))
+                    if trust_domain_id == &preparation.trust_domain_id
+                        && rollout == &preparation.source_rollout => {}
+                _ => {
+                    return Err(ConversationError::RegistryInvalid(
+                        "handoff source metadata conflicts with its lineage".to_owned(),
+                    ));
+                }
+            }
+
+            let target_generation = source.generation.checked_add(1).ok_or_else(|| {
+                ConversationError::RegistryInvalid("generation overflow".to_owned())
+            })?;
+            let now = unix_timestamp()?;
+            let transition = HandoffTransition {
+                transition_id: Uuid::new_v4().to_string(),
+                conversation_id: conversation.conversation_id.clone(),
+                source_generation: source.generation,
+                target_generation,
+                source_profile_id: source.profile_id.clone(),
+                target_profile_id: preparation.target_profile_id,
+                canonical_cwd: source.canonical_cwd.clone(),
+                trust_domain_id: preparation.trust_domain_id,
+                source_rollout: preparation.source_rollout,
+                phase: HandoffPhase::Prepared,
+                observed_target: None,
+                prepared_at: now,
+                updated_at: now,
+            };
+            document.active_transition = Some(transition.clone());
+            Ok(transition)
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34 recovery.
+    pub(crate) fn current_handoff(&self) -> Result<Option<HandoffTransition>, ConversationError> {
+        self.read(|document| Ok(document.active_transition.clone()))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
+    pub(crate) fn mark_source_stop_requested(
+        &self,
+        transition_id: &str,
+    ) -> Result<HandoffTransition, ConversationError> {
+        self.advance_handoff_phase(
+            transition_id,
+            HandoffPhase::Prepared,
+            HandoffPhase::SourceStopRequested,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
+    pub(crate) fn mark_source_stopped(
+        &self,
+        transition_id: &str,
+    ) -> Result<HandoffTransition, ConversationError> {
+        self.advance_handoff_phase(
+            transition_id,
+            HandoffPhase::SourceStopRequested,
+            HandoffPhase::SourceStopped,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
+    pub(crate) fn mark_fork_requested(
+        &self,
+        transition_id: &str,
+    ) -> Result<HandoffTransition, ConversationError> {
+        self.advance_handoff_phase(
+            transition_id,
+            HandoffPhase::SourceStopped,
+            HandoffPhase::ForkRequested,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
+    pub(crate) fn observe_handoff_target(
+        &self,
+        transition_id: &str,
+        target: HandoffTarget,
+    ) -> Result<HandoffTransition, ConversationError> {
+        validate_uuid(transition_id, "transition id")?;
+        validate_uuid(&target.thread_id, "target thread id")?;
+        validate_stored_path(&target.canonical_cwd)?;
+        validate_codex_version(&target.codex_version)?;
+        validate_rollout(&target.rollout)?;
+        self.transact_v2(|document| {
+            let transition_snapshot = document
+                .active_transition
+                .as_ref()
+                .filter(|transition| transition.transition_id == transition_id)
+                .cloned()
+                .ok_or(ConversationError::NotFound)?;
+            if transition_snapshot.phase != HandoffPhase::ForkRequested {
+                return Err(ConversationError::TransitionPhaseInvalid);
+            }
+            if target.canonical_cwd != transition_snapshot.canonical_cwd
+                || same_rollout_file(&target.rollout, &transition_snapshot.source_rollout)
+            {
+                return Err(ConversationError::RegistryInvalid(
+                    "observed handoff target conflicts with the source".to_owned(),
+                ));
+            }
+            let source_thread = document
+                .conversations
+                .iter()
+                .find(|conversation| {
+                    conversation.conversation_id == transition_snapshot.conversation_id
+                })
+                .and_then(|conversation| {
+                    conversation.generations.iter().find(|generation| {
+                        generation.generation == transition_snapshot.source_generation
+                    })
+                })
+                .map(|generation| generation.thread_id.as_str())
+                .ok_or_else(|| {
+                    ConversationError::RegistryInvalid(
+                        "handoff source generation is missing".to_owned(),
+                    )
+                })?;
+            if target.thread_id == source_thread
+                || document.conversations.iter().any(|conversation| {
+                    conversation
+                        .generations
+                        .iter()
+                        .any(|generation| generation.thread_id == target.thread_id)
+                })
+            {
+                return Err(ConversationError::RegistryInvalid(
+                    "observed handoff target thread is not new".to_owned(),
+                ));
+            }
+            let now = unix_timestamp()?;
+            let transition = document
+                .active_transition
+                .as_mut()
+                .ok_or(ConversationError::NotFound)?;
+            transition.observed_target = Some(ObservedHandoffTarget {
+                thread_id: target.thread_id,
+                canonical_cwd: target.canonical_cwd,
+                codex_version: target.codex_version,
+                adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                rollout: target.rollout,
+                observed_at: now,
+            });
+            transition.phase = HandoffPhase::ForkObserved;
+            transition.updated_at = now;
+            Ok(transition.clone())
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
+    pub(crate) fn commit_handoff(
+        &self,
+        transition_id: &str,
+    ) -> Result<HeadBinding, ConversationError> {
+        validate_uuid(transition_id, "transition id")?;
+        self.transact_v2(|document| {
+            let transition = document
+                .active_transition
+                .as_ref()
+                .filter(|transition| transition.transition_id == transition_id)
+                .cloned()
+                .ok_or(ConversationError::NotFound)?;
+            if transition.phase != HandoffPhase::ForkObserved {
+                return Err(ConversationError::TransitionPhaseInvalid);
+            }
+            let target = transition.observed_target.clone().ok_or_else(|| {
+                ConversationError::RegistryInvalid("observed handoff target is missing".to_owned())
+            })?;
+            if document.conversations.iter().any(|conversation| {
+                conversation
+                    .generations
+                    .iter()
+                    .any(|generation| generation.thread_id == target.thread_id)
+            }) {
+                return Err(ConversationError::RegistryInvalid(
+                    "handoff target thread is already bound".to_owned(),
+                ));
+            }
+
+            let conversation = document
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.conversation_id == transition.conversation_id)
+                .ok_or(ConversationError::NotFound)?;
+            if conversation.active_generation != transition.source_generation
+                || conversation.generations.len() >= MAX_LINEAGE_GENERATIONS
+            {
+                return Err(ConversationError::TransitionPhaseInvalid);
+            }
+            conversation.generations.push(ConversationGeneration {
+                generation: transition.target_generation,
+                profile_id: transition.target_profile_id.clone(),
+                thread_id: target.thread_id.clone(),
+                canonical_cwd: target.canonical_cwd.clone(),
+                codex_version: target.codex_version.clone(),
+                adapter_version: target.adapter_version,
+                bound_at: target.observed_at,
+                trust_domain_id: Some(transition.trust_domain_id.clone()),
+                rollout: Some(target.rollout),
+            });
+            conversation.active_generation = transition.target_generation;
+            conversation.last_safe_lifecycle = ConversationLifecycle::Interrupted;
+
+            let head = document
+                .workspace_heads
+                .iter_mut()
+                .find(|head| {
+                    head.provider == conversation.provider
+                        && head.canonical_cwd == transition.canonical_cwd
+                })
+                .ok_or_else(|| {
+                    ConversationError::RegistryInvalid(
+                        "handoff workspace head is missing".to_owned(),
+                    )
+                })?;
+            if head.state != HeadState::Ready
+                || head.conversation_id.as_deref() != Some(transition.conversation_id.as_str())
+                || head.generation != Some(transition.source_generation)
+            {
+                return Err(ConversationError::TransitionPhaseInvalid);
+            }
+            head.generation = Some(transition.target_generation);
+
+            let now = unix_timestamp()?;
+            let current = document
+                .active_transition
+                .as_mut()
+                .ok_or(ConversationError::NotFound)?;
+            current.phase = HandoffPhase::CommittedUnattached;
+            current.updated_at = now;
+
+            Ok(HeadBinding {
+                conversation_id: transition.conversation_id,
+                generation: transition.target_generation,
+                profile_id: transition.target_profile_id,
+                thread_id: target.thread_id,
+                canonical_cwd: target.canonical_cwd,
+                codex_version: target.codex_version,
+                lifecycle: ConversationLifecycle::Interrupted,
+            })
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
+    pub(crate) fn finish_handoff_attachment(
+        &self,
+        transition_id: &str,
+    ) -> Result<HeadBinding, ConversationError> {
+        validate_uuid(transition_id, "transition id")?;
+        self.transact_v2(|document| {
+            let transition = document
+                .active_transition
+                .as_ref()
+                .filter(|transition| transition.transition_id == transition_id)
+                .ok_or(ConversationError::NotFound)?;
+            if transition.phase != HandoffPhase::CommittedUnattached {
+                return Err(ConversationError::TransitionPhaseInvalid);
+            }
+            let canonical_cwd = transition.canonical_cwd.clone();
+            document.active_transition = None;
+            resolve_head_document(document, &canonical_cwd)
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
+    fn advance_handoff_phase(
+        &self,
+        transition_id: &str,
+        expected: HandoffPhase,
+        next: HandoffPhase,
+    ) -> Result<HandoffTransition, ConversationError> {
+        validate_uuid(transition_id, "transition id")?;
+        self.transact_v2(|document| {
+            let transition = exact_transition_mut(document, transition_id, expected)?;
+            transition.phase = next;
+            transition.updated_at = unix_timestamp()?;
+            Ok(transition.clone())
         })
     }
 
@@ -548,6 +1031,46 @@ impl ConversationRegistry {
         Ok(result)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // Called only by staged handoff APIs.
+    fn transact_v2<T>(
+        &self,
+        operation: impl FnOnce(&mut ConversationDocument) -> Result<T, ConversationError>,
+    ) -> Result<T, ConversationError> {
+        verify_private_directory(&self.root)?;
+        let lock = open_lock(&self.root.join(LOCK_FILE))?;
+        FileExt::lock_exclusive(&lock)?;
+        let original = self.load()?;
+        let mut document = original.clone();
+        let migrated = document.schema_version == SCHEMA_VERSION_V1;
+        if migrated {
+            let backup_bytes = serialize_v1_document(&original)?;
+            document.schema_version = SCHEMA_VERSION_V2;
+            document.pre_migration_backup = Some(PreMigrationBackup {
+                schema_version: SCHEMA_VERSION_V1,
+                revision: original.revision,
+                sha256: sha256_hex(&backup_bytes),
+            });
+        }
+        let result = operation(&mut document)?;
+        document.revision = document
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| ConversationError::RegistryInvalid("revision overflow".to_owned()))?;
+        validate_document(&document)?;
+        if migrated {
+            self.save_pre_migration_backup(
+                &original,
+                document.pre_migration_backup.as_ref().ok_or_else(|| {
+                    ConversationError::RegistryInvalid(
+                        "v2 pre-migration backup metadata is missing".to_owned(),
+                    )
+                })?,
+            )?;
+        }
+        self.save(&document)?;
+        Ok(result)
+    }
+
     fn load(&self) -> Result<ConversationDocument, ConversationError> {
         let path = self.root.join(REGISTRY_FILE);
         match fs::symlink_metadata(&path) {
@@ -567,16 +1090,132 @@ impl ConversationRegistry {
             ));
         }
         let document: ConversationDocument = serde_json::from_slice(&bytes).map_err(|_| {
-            ConversationError::RegistryInvalid("registry is not valid schema v1 JSON".to_owned())
+            ConversationError::RegistryInvalid(
+                "registry is not valid conversation schema JSON".to_owned(),
+            )
         })?;
-        if document.schema_version != SCHEMA_VERSION {
+        if !matches!(
+            document.schema_version,
+            SCHEMA_VERSION_V1 | SCHEMA_VERSION_V2
+        ) {
             return Err(ConversationError::RegistryInvalid(format!(
                 "unsupported conversation registry schema {}",
                 document.schema_version
             )));
         }
         validate_document(&document)?;
+        if let Some(metadata) = &document.pre_migration_backup {
+            self.verify_pre_migration_backup(metadata)?;
+        }
         Ok(document)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Called only by staged handoff APIs.
+    fn save_pre_migration_backup(
+        &self,
+        document: &ConversationDocument,
+        metadata: &PreMigrationBackup,
+    ) -> Result<(), ConversationError> {
+        let bytes = serialize_v1_document(document)?;
+        if metadata.schema_version != SCHEMA_VERSION_V1
+            || metadata.revision != document.revision
+            || metadata.sha256 != sha256_hex(&bytes)
+        {
+            return Err(ConversationError::RegistryInvalid(
+                "pre-migration backup metadata does not match schema v1".to_owned(),
+            ));
+        }
+
+        let destination = self.root.join(PRE_MIGRATION_BACKUP_FILE);
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                verify_private_regular_file(&destination)?;
+                let mut existing = Vec::new();
+                File::open(&destination)?
+                    .take((MAX_REGISTRY_BYTES + 1) as u64)
+                    .read_to_end(&mut existing)?;
+                if existing.len() > MAX_REGISTRY_BYTES {
+                    return Err(ConversationError::RegistryInvalid(
+                        "pre-migration backup exceeds its size limit".to_owned(),
+                    ));
+                }
+                let existing_document: ConversationDocument = serde_json::from_slice(&existing)
+                    .map_err(|_| {
+                        ConversationError::RegistryInvalid(
+                            "pre-migration backup is invalid".to_owned(),
+                        )
+                    })?;
+                validate_v1_document(&existing_document)?;
+                if existing_document == *document && sha256_hex(&existing) == metadata.sha256 {
+                    return sync_directory(&self.root)
+                        .map_err(|_| ConversationError::CommitUncertain);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let temporary_name = format!(".{PRE_MIGRATION_BACKUP_FILE}.{}.tmp", Uuid::new_v4());
+        let temporary = self.root.join(&temporary_name);
+        let publication = (|| {
+            let mut options = private_open_options();
+            let mut file = options.write(true).create_new(true).open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            verify_private_regular_file(&temporary)?;
+            drop(file);
+            fs::rename(&temporary, &destination)?;
+            Ok::<(), ConversationError>(())
+        })();
+        if let Err(error) = publication {
+            if fs::symlink_metadata(&temporary).is_ok() {
+                let _ =
+                    remove_exact_temporary(&temporary, PRE_MIGRATION_BACKUP_FILE, &temporary_name);
+            }
+            return Err(error);
+        }
+        if sync_directory(&self.root).is_err() {
+            return Err(ConversationError::CommitUncertain);
+        }
+        Ok(())
+    }
+
+    fn verify_pre_migration_backup(
+        &self,
+        metadata: &PreMigrationBackup,
+    ) -> Result<(), ConversationError> {
+        let path = self.root.join(PRE_MIGRATION_BACKUP_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => verify_private_regular_file(&path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ConversationError::RegistryInvalid(
+                    "schema v2 pre-migration backup is missing".to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let mut bytes = Vec::new();
+        File::open(&path)?
+            .take((MAX_REGISTRY_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_REGISTRY_BYTES || sha256_hex(&bytes) != metadata.sha256 {
+            return Err(ConversationError::RegistryInvalid(
+                "schema v2 pre-migration backup does not match its digest".to_owned(),
+            ));
+        }
+        let backup: ConversationDocument = serde_json::from_slice(&bytes).map_err(|_| {
+            ConversationError::RegistryInvalid(
+                "schema v2 pre-migration backup is invalid".to_owned(),
+            )
+        })?;
+        validate_v1_document(&backup)?;
+        if metadata.schema_version != backup.schema_version || metadata.revision != backup.revision
+        {
+            return Err(ConversationError::RegistryInvalid(
+                "schema v2 pre-migration backup revision is invalid".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn save(&self, document: &ConversationDocument) -> Result<(), ConversationError> {
@@ -592,38 +1231,46 @@ impl ConversationRegistry {
         let temporary_name = format!(".{REGISTRY_FILE}.{}.tmp", Uuid::new_v4());
         let temporary = self.root.join(&temporary_name);
         let destination = self.root.join(REGISTRY_FILE);
-        let mut options = private_open_options();
-        let mut file = options.write(true).create_new(true).open(&temporary)?;
-        file.write_all(&bytes)?;
+        let publication = (|| {
+            let mut options = private_open_options();
+            let mut file = options.write(true).create_new(true).open(&temporary)?;
+            file.write_all(&bytes)?;
 
-        #[cfg(test)]
-        if self.fault == Some(WriteFault::BeforeFileSync) {
+            #[cfg(test)]
+            if self.fault == Some(WriteFault::BeforeFileSync) {
+                return Err(ConversationError::Io(io::Error::other(
+                    "injected failure before file sync",
+                )));
+            }
+
+            file.sync_all()?;
+            verify_private_regular_file(&temporary)?;
             drop(file);
-            remove_exact_temporary(&temporary, &temporary_name)?;
-            return Err(ConversationError::Io(io::Error::other(
-                "injected failure before file sync",
-            )));
-        }
 
-        file.sync_all()?;
-        verify_private_regular_file(&temporary)?;
-        drop(file);
+            #[cfg(test)]
+            if self.fault == Some(WriteFault::BeforeRename) {
+                return Err(ConversationError::Io(io::Error::other(
+                    "injected failure before rename",
+                )));
+            }
 
-        #[cfg(test)]
-        if self.fault == Some(WriteFault::BeforeRename) {
-            remove_exact_temporary(&temporary, &temporary_name)?;
-            return Err(ConversationError::Io(io::Error::other(
-                "injected failure before rename",
-            )));
-        }
-
-        if let Err(error) = fs::rename(&temporary, &destination) {
-            let _ = remove_exact_temporary(&temporary, &temporary_name);
-            return Err(error.into());
+            fs::rename(&temporary, &destination)?;
+            Ok::<(), ConversationError>(())
+        })();
+        if let Err(error) = publication {
+            if fs::symlink_metadata(&temporary).is_ok() {
+                let _ = remove_exact_temporary(&temporary, REGISTRY_FILE, &temporary_name);
+            }
+            return Err(error);
         }
 
         #[cfg(test)]
         if self.fault == Some(WriteFault::AfterRename) {
+            return Err(self.confirm_uncertain_commit(document.revision));
+        }
+
+        #[cfg(test)]
+        if self.fault == Some(WriteFault::DirectorySync) {
             return Err(self.confirm_uncertain_commit(document.revision));
         }
 
@@ -659,11 +1306,29 @@ impl ConversationRegistry {
     }
 }
 
+fn serialize_v1_document(document: &ConversationDocument) -> Result<Vec<u8>, ConversationError> {
+    validate_v1_document(document)?;
+    let bytes = serde_json::to_vec_pretty(document).map_err(|_| {
+        ConversationError::RegistryInvalid("registry serialization failed".to_owned())
+    })?;
+    if bytes.len() > MAX_REGISTRY_BYTES {
+        return Err(ConversationError::RegistryInvalid(
+            "registry exceeds its size limit".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn bind_document(
     document: &mut ConversationDocument,
     binding: BindingInput,
 ) -> Result<HeadBinding, ConversationError> {
     validate_binding_input(&binding)?;
+    ensure_workspace_not_transitioning(document, &binding.canonical_cwd)?;
 
     if document.conversations.iter().any(|conversation| {
         conversation.generations.iter().any(|generation| {
@@ -682,8 +1347,15 @@ fn bind_document(
     let (conversation_id, generation) = if let Some(conversation) = existing {
         let generation = conversation
             .generations
-            .first()
+            .iter()
+            .find(|generation| {
+                generation.profile_id == binding.profile_id
+                    && generation.thread_id == binding.thread_id
+            })
             .ok_or_else(|| ConversationError::RegistryInvalid("missing generation".to_owned()))?;
+        if generation.generation != conversation.active_generation {
+            return Err(ConversationError::Ambiguous);
+        }
         if generation.canonical_cwd != binding.canonical_cwd {
             return Err(ConversationError::CwdMismatch);
         }
@@ -699,6 +1371,8 @@ fn bind_document(
             codex_version: binding.codex_version.clone(),
             adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
             bound_at: unix_timestamp()?,
+            trust_domain_id: None,
+            rollout: None,
         };
         document.conversations.push(Conversation {
             conversation_id: conversation_id.clone(),
@@ -736,6 +1410,13 @@ fn resolve_head_document(
     document: &ConversationDocument,
     canonical_cwd: &str,
 ) -> Result<HeadBinding, ConversationError> {
+    if document
+        .active_transition
+        .as_ref()
+        .is_some_and(|transition| transition.canonical_cwd == canonical_cwd)
+    {
+        return Err(ConversationError::TransitionBusy);
+    }
     if document
         .pending_launches
         .iter()
@@ -811,6 +1492,37 @@ fn find_pending_mut<'a>(
         .ok_or(ConversationError::NotFound)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Called only by staged handoff APIs.
+fn exact_transition_mut<'a>(
+    document: &'a mut ConversationDocument,
+    transition_id: &str,
+    expected: HandoffPhase,
+) -> Result<&'a mut HandoffTransition, ConversationError> {
+    let transition = document
+        .active_transition
+        .as_mut()
+        .filter(|transition| transition.transition_id == transition_id)
+        .ok_or(ConversationError::NotFound)?;
+    if transition.phase != expected {
+        return Err(ConversationError::TransitionPhaseInvalid);
+    }
+    Ok(transition)
+}
+
+fn ensure_workspace_not_transitioning(
+    document: &ConversationDocument,
+    canonical_cwd: &str,
+) -> Result<(), ConversationError> {
+    if document
+        .active_transition
+        .as_ref()
+        .is_some_and(|transition| transition.canonical_cwd == canonical_cwd)
+    {
+        return Err(ConversationError::TransitionBusy);
+    }
+    Ok(())
+}
+
 fn validate_binding_input(binding: &BindingInput) -> Result<(), ConversationError> {
     validate_uuid(&binding.profile_id, "profile id")?;
     validate_uuid(&binding.thread_id, "thread id")?;
@@ -831,20 +1543,78 @@ fn validate_binding_input(binding: &BindingInput) -> Result<(), ConversationErro
 }
 
 fn validate_document(document: &ConversationDocument) -> Result<(), ConversationError> {
-    if document.schema_version != SCHEMA_VERSION {
+    if !matches!(
+        document.schema_version,
+        SCHEMA_VERSION_V1 | SCHEMA_VERSION_V2
+    ) {
         return Err(ConversationError::RegistryInvalid(
             "unsupported conversation registry schema".to_owned(),
         ));
     }
 
+    if document.schema_version == SCHEMA_VERSION_V1 {
+        return validate_v1_document(document);
+    }
+
+    validate_v2_document(document)
+}
+
+fn validate_v1_document(document: &ConversationDocument) -> Result<(), ConversationError> {
+    if document.schema_version != SCHEMA_VERSION_V1
+        || document.pre_migration_backup.is_some()
+        || document.active_transition.is_some()
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "schema v1 contains v2 state".to_owned(),
+        ));
+    }
+
+    validate_document_contents(document, true)
+}
+
+fn validate_v2_document(document: &ConversationDocument) -> Result<(), ConversationError> {
+    if document.schema_version != SCHEMA_VERSION_V2 {
+        return Err(ConversationError::RegistryInvalid(
+            "schema v2 version is invalid".to_owned(),
+        ));
+    }
+
+    let backup = document.pre_migration_backup.as_ref().ok_or_else(|| {
+        ConversationError::RegistryInvalid(
+            "schema v2 pre-migration backup metadata is missing".to_owned(),
+        )
+    })?;
+    if backup.schema_version != SCHEMA_VERSION_V1
+        || backup.revision > document.revision
+        || backup.sha256.len() != 64
+        || !backup
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "schema v2 pre-migration backup metadata is invalid".to_owned(),
+        ));
+    }
+
+    validate_document_contents(document, false)?;
+    validate_active_transition(document)
+}
+
+fn validate_document_contents(
+    document: &ConversationDocument,
+    schema_v1: bool,
+) -> Result<(), ConversationError> {
     for (conversation_index, conversation) in document.conversations.iter().enumerate() {
         validate_uuid(&conversation.conversation_id, "conversation id")?;
         if conversation.provider != Provider::Codex
-            || conversation.generations.len() != 1
-            || conversation.active_generation != 0
+            || conversation.generations.is_empty()
+            || conversation.generations.len() > MAX_LINEAGE_GENERATIONS
+            || (schema_v1
+                && (conversation.generations.len() != 1 || conversation.active_generation != 0))
         {
             return Err(ConversationError::RegistryInvalid(format!(
-                "conversation {conversation_index} violates schema v1 lineage"
+                "conversation {conversation_index} violates lineage bounds"
             )));
         }
         if !matches!(
@@ -857,28 +1627,91 @@ fn validate_document(document: &ConversationDocument) -> Result<(), Conversation
                 "conversation {conversation_index} has an unusable lifecycle"
             )));
         }
-        let generation = &conversation.generations[0];
-        if generation.generation != 0 {
+        if conversation
+            .generations
+            .last()
+            .map(|generation| generation.generation)
+            != Some(conversation.active_generation)
+        {
             return Err(ConversationError::RegistryInvalid(
-                "schema v1 generation must be zero".to_owned(),
+                "active generation is not the ordered lineage tail".to_owned(),
             ));
         }
-        validate_uuid(&generation.profile_id, "profile id")?;
-        validate_uuid(&generation.thread_id, "thread id")?;
-        validate_stored_path(&generation.canonical_cwd)?;
-        validate_codex_version(&generation.codex_version)?;
-        validate_adapter_version(&generation.adapter_version)?;
-        if generation.bound_at < 0 {
-            return Err(ConversationError::RegistryInvalid(
-                "binding timestamp is invalid".to_owned(),
-            ));
+        let lineage_trust_domain = conversation
+            .generations
+            .iter()
+            .find_map(|generation| generation.trust_domain_id.as_deref());
+        for (generation_index, generation) in conversation.generations.iter().enumerate() {
+            if generation.generation != u32::try_from(generation_index).unwrap_or(u32::MAX) {
+                return Err(ConversationError::RegistryInvalid(
+                    "lineage generations are duplicated or skipped".to_owned(),
+                ));
+            }
+            validate_uuid(&generation.profile_id, "profile id")?;
+            validate_uuid(&generation.thread_id, "thread id")?;
+            validate_stored_path(&generation.canonical_cwd)?;
+            validate_codex_version(&generation.codex_version)?;
+            validate_adapter_version(&generation.adapter_version)?;
+            if generation.bound_at < 0 {
+                return Err(ConversationError::RegistryInvalid(
+                    "binding timestamp is invalid".to_owned(),
+                ));
+            }
+            if generation.canonical_cwd != conversation.generations[0].canonical_cwd {
+                return Err(ConversationError::RegistryInvalid(
+                    "lineage generations disagree on canonical cwd".to_owned(),
+                ));
+            }
+            match (&generation.trust_domain_id, &generation.rollout) {
+                (None, None) => {}
+                (Some(trust_domain_id), Some(rollout)) if !schema_v1 => {
+                    validate_uuid(trust_domain_id, "trust domain id")?;
+                    validate_rollout(rollout)?;
+                    if lineage_trust_domain != Some(trust_domain_id.as_str()) {
+                        return Err(ConversationError::RegistryInvalid(
+                            "lineage generations cross trust domains".to_owned(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ConversationError::RegistryInvalid(
+                        "generation handoff metadata is incomplete".to_owned(),
+                    ));
+                }
+            }
+            if !schema_v1
+                && conversation.generations.len() > 1
+                && (generation.trust_domain_id.is_none() || generation.rollout.is_none())
+            {
+                return Err(ConversationError::RegistryInvalid(
+                    "multi-generation lineage lacks handoff metadata".to_owned(),
+                ));
+            }
+            if schema_v1 && (generation.trust_domain_id.is_some() || generation.rollout.is_some()) {
+                return Err(ConversationError::RegistryInvalid(
+                    "schema v1 contains generation handoff metadata".to_owned(),
+                ));
+            }
         }
         for previous in document.conversations.iter().take(conversation_index) {
-            if previous.conversation_id == conversation.conversation_id
-                || previous.generations.iter().any(|previous_generation| {
-                    previous_generation.profile_id == generation.profile_id
-                        && previous_generation.thread_id == generation.thread_id
-                })
+            if previous.conversation_id == conversation.conversation_id {
+                return Err(ConversationError::RegistryInvalid(
+                    "registry contains a duplicate conversation binding".to_owned(),
+                ));
+            }
+        }
+        for generation in &conversation.generations {
+            if document
+                .conversations
+                .iter()
+                .take(conversation_index)
+                .flat_map(|previous| &previous.generations)
+                .any(|previous| previous.thread_id == generation.thread_id)
+                || conversation
+                    .generations
+                    .iter()
+                    .take(generation.generation as usize)
+                    .any(|previous| previous.thread_id == generation.thread_id)
             {
                 return Err(ConversationError::RegistryInvalid(
                     "registry contains a duplicate conversation binding".to_owned(),
@@ -930,6 +1763,7 @@ fn validate_document(document: &ConversationDocument) -> Result<(), Conversation
                     })?;
                 if conversation.provider != head.provider
                     || generation.canonical_cwd != head.canonical_cwd
+                    || generation.generation != conversation.active_generation
                 {
                     return Err(ConversationError::RegistryInvalid(
                         "head does not match its immutable generation".to_owned(),
@@ -989,6 +1823,216 @@ fn validate_document(document: &ConversationDocument) -> Result<(), Conversation
                 "registry contains overlapping pending launches".to_owned(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_active_transition(document: &ConversationDocument) -> Result<(), ConversationError> {
+    let Some(transition) = &document.active_transition else {
+        return Ok(());
+    };
+    validate_uuid(&transition.transition_id, "transition id")?;
+    validate_uuid(&transition.conversation_id, "conversation id")?;
+    validate_uuid(&transition.source_profile_id, "source profile id")?;
+    validate_uuid(&transition.target_profile_id, "target profile id")?;
+    validate_uuid(&transition.trust_domain_id, "trust domain id")?;
+    validate_stored_path(&transition.canonical_cwd)?;
+    validate_rollout(&transition.source_rollout)?;
+    if transition.source_profile_id == transition.target_profile_id
+        || transition.target_generation
+            != transition.source_generation.checked_add(1).ok_or_else(|| {
+                ConversationError::RegistryInvalid("generation overflow".to_owned())
+            })?
+        || transition.prepared_at < 0
+        || transition.updated_at < transition.prepared_at
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "handoff transition metadata is invalid".to_owned(),
+        ));
+    }
+
+    let conversation = document
+        .conversations
+        .iter()
+        .find(|conversation| conversation.conversation_id == transition.conversation_id)
+        .ok_or_else(|| {
+            ConversationError::RegistryInvalid(
+                "handoff transition conversation is missing".to_owned(),
+            )
+        })?;
+    let source = conversation
+        .generations
+        .iter()
+        .find(|generation| generation.generation == transition.source_generation)
+        .ok_or_else(|| {
+            ConversationError::RegistryInvalid("handoff source generation is missing".to_owned())
+        })?;
+    if source.profile_id != transition.source_profile_id
+        || source.canonical_cwd != transition.canonical_cwd
+        || source.trust_domain_id.as_deref() != Some(transition.trust_domain_id.as_str())
+        || source.rollout.as_ref() != Some(&transition.source_rollout)
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "handoff source does not match its lineage".to_owned(),
+        ));
+    }
+
+    let observed_required = matches!(
+        transition.phase,
+        HandoffPhase::ForkObserved | HandoffPhase::CommittedUnattached
+    );
+    if transition.observed_target.is_some() != observed_required {
+        return Err(ConversationError::RegistryInvalid(
+            "handoff target observation does not match its phase".to_owned(),
+        ));
+    }
+    if let Some(target) = &transition.observed_target {
+        validate_observed_target(target)?;
+        if target.canonical_cwd != transition.canonical_cwd
+            || target.thread_id == source.thread_id
+            || same_rollout_file(&target.rollout, &transition.source_rollout)
+            || target.observed_at < transition.prepared_at
+            || target.observed_at > transition.updated_at
+        {
+            return Err(ConversationError::RegistryInvalid(
+                "observed handoff target conflicts with the source".to_owned(),
+            ));
+        }
+    }
+
+    let committed = transition.phase == HandoffPhase::CommittedUnattached;
+    let expected_active = if committed {
+        transition.target_generation
+    } else {
+        transition.source_generation
+    };
+    if conversation.active_generation != expected_active {
+        return Err(ConversationError::RegistryInvalid(
+            "handoff transition does not match the active generation".to_owned(),
+        ));
+    }
+    if committed {
+        let target = transition.observed_target.as_ref().ok_or_else(|| {
+            ConversationError::RegistryInvalid("committed handoff target is missing".to_owned())
+        })?;
+        let generation = conversation
+            .generations
+            .iter()
+            .find(|generation| generation.generation == transition.target_generation)
+            .ok_or_else(|| {
+                ConversationError::RegistryInvalid(
+                    "committed handoff generation is missing".to_owned(),
+                )
+            })?;
+        if generation.profile_id != transition.target_profile_id
+            || generation.thread_id != target.thread_id
+            || generation.canonical_cwd != target.canonical_cwd
+            || generation.codex_version != target.codex_version
+            || generation.adapter_version != target.adapter_version
+            || generation.trust_domain_id.as_deref() != Some(transition.trust_domain_id.as_str())
+            || generation.rollout.as_ref() != Some(&target.rollout)
+        {
+            return Err(ConversationError::RegistryInvalid(
+                "committed handoff target does not match its lineage".to_owned(),
+            ));
+        }
+    } else if conversation
+        .generations
+        .iter()
+        .any(|generation| generation.generation == transition.target_generation)
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "uncommitted handoff already has a target generation".to_owned(),
+        ));
+    }
+    let head = document
+        .workspace_heads
+        .iter()
+        .find(|head| {
+            head.provider == conversation.provider && head.canonical_cwd == transition.canonical_cwd
+        })
+        .ok_or_else(|| {
+            ConversationError::RegistryInvalid("handoff workspace head is missing".to_owned())
+        })?;
+    if head.state != HeadState::Ready
+        || head.conversation_id.as_deref() != Some(transition.conversation_id.as_str())
+        || head.generation != Some(expected_active)
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "handoff workspace head does not match its phase".to_owned(),
+        ));
+    }
+    if document
+        .pending_launches
+        .iter()
+        .any(|pending| pending.canonical_cwd == transition.canonical_cwd)
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "handoff overlaps a pending launch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rollout(rollout: &GenerationRollout) -> Result<(), ConversationError> {
+    let relative = Path::new(&rollout.locator.relative_path);
+    let components = relative.components().collect::<Vec<_>>();
+    let lexical_components = rollout.locator.relative_path.split('/').collect::<Vec<_>>();
+    if rollout.locator.relative_path.is_empty()
+        || rollout.locator.relative_path.len() > MAX_ROLLOUT_RELATIVE_BYTES
+        || relative.is_absolute()
+        || components.len() > MAX_ROLLOUT_COMPONENTS
+        || lexical_components.len() != components.len()
+        || lexical_components.iter().any(|component| {
+            component.is_empty()
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "rollout locator is not a bounded root-relative path".to_owned(),
+        ));
+    }
+    let fingerprint = &rollout.fingerprint;
+    if fingerprint.inode == 0
+        || fingerprint.length > MAX_ROLLOUT_BYTES
+        || fingerprint.link_count != 1
+        || fingerprint.modified_seconds < 0
+        || fingerprint.changed_seconds < 0
+        || !(0..1_000_000_000).contains(&fingerprint.modified_nanoseconds)
+        || !(0..1_000_000_000).contains(&fingerprint.changed_nanoseconds)
+        || fingerprint.sha256.len() != 64
+        || !fingerprint
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "rollout fingerprint is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn same_rollout_file(left: &GenerationRollout, right: &GenerationRollout) -> bool {
+    left.fingerprint.device == right.fingerprint.device
+        && left.fingerprint.inode == right.fingerprint.inode
+}
+
+fn validate_observed_target(target: &ObservedHandoffTarget) -> Result<(), ConversationError> {
+    validate_uuid(&target.thread_id, "target thread id")?;
+    validate_stored_path(&target.canonical_cwd)?;
+    validate_codex_version(&target.codex_version)?;
+    validate_adapter_version(&target.adapter_version)?;
+    validate_rollout(&target.rollout)?;
+    if target.observed_at < 0 {
+        return Err(ConversationError::RegistryInvalid(
+            "target observation timestamp is invalid".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1162,9 +2206,13 @@ fn verify_private_regular_file(_path: &Path) -> Result<(), ConversationError> {
     Err(ConversationError::SessionSchemaUnsupported)
 }
 
-fn remove_exact_temporary(path: &Path, expected_name: &str) -> Result<(), ConversationError> {
+fn remove_exact_temporary(
+    path: &Path,
+    base_name: &str,
+    expected_name: &str,
+) -> Result<(), ConversationError> {
     if path.file_name().and_then(|name| name.to_str()) != Some(expected_name)
-        || !expected_name.starts_with(&format!(".{REGISTRY_FILE}."))
+        || !expected_name.starts_with(&format!(".{base_name}."))
         || !expected_name.ends_with(".tmp")
     {
         return Err(ConversationError::RegistryInvalid(
@@ -1196,6 +2244,9 @@ pub(crate) enum ConversationError {
     Archived,
     RegistryInvalid(String),
     CommitUncertain,
+    TransitionBusy,
+    #[cfg_attr(not(test), allow(dead_code))] // Emitted by staged handoff APIs.
+    TransitionPhaseInvalid,
     CodexVersionUnsupported,
     SessionSchemaUnsupported,
     ThreadProtocolInvalid,
@@ -1214,6 +2265,8 @@ impl ConversationError {
             Self::Archived => "conversation_archived",
             Self::RegistryInvalid(_) => "conversation_registry_invalid",
             Self::CommitUncertain => "conversation_commit_uncertain",
+            Self::TransitionBusy => "conversation_handoff_in_progress",
+            Self::TransitionPhaseInvalid => "conversation_handoff_phase_invalid",
             Self::CodexVersionUnsupported => "codex_session_schema_unsupported",
             Self::SessionSchemaUnsupported => "codex_session_schema_unsupported",
             Self::ThreadProtocolInvalid => "codex_thread_protocol_invalid",
@@ -1248,6 +2301,12 @@ impl ConversationError {
             }
             Self::CommitUncertain => {
                 "The conversation update became visible, but durability could not be confirmed. Inspect the registry before retrying."
+            }
+            Self::TransitionBusy => {
+                "A conversation handoff is already in progress and must be reconciled first."
+            }
+            Self::TransitionPhaseInvalid => {
+                "The conversation handoff phase changed and must be reconciled before retrying."
             }
             Self::CodexVersionUnsupported => {
                 "The installed Codex version is not supported for automatic resume."
@@ -1284,6 +2343,8 @@ mod tests {
 
     use super::*;
 
+    type JsonCorruption = fn(&mut serde_json::Value);
+
     fn test_root(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
             "calcifer-conversations-{name}-{}-{}",
@@ -1304,6 +2365,109 @@ mod tests {
                 .unwrap_or_default(),
             codex_version: "0.144.4".to_owned(),
             lifecycle: ConversationLifecycle::Clean,
+        }
+    }
+
+    fn test_rollout(relative_path: &str, seed: u64) -> GenerationRollout {
+        GenerationRollout {
+            locator: RolloutLocator {
+                root: RolloutRoot::Sessions,
+                relative_path: relative_path.to_owned(),
+            },
+            fingerprint: RolloutFingerprint {
+                device: 1,
+                inode: seed + 1,
+                length: seed,
+                mode: 0o100600,
+                owner: rustix::process::getuid().as_raw(),
+                link_count: 1,
+                modified_seconds: 1_786_086_000,
+                modified_nanoseconds: 123,
+                changed_seconds: 1_786_086_000,
+                changed_nanoseconds: 456,
+                sha256: format!("{seed:064x}"),
+            },
+        }
+    }
+
+    fn handoff_preparation(
+        source: &HeadBinding,
+        target_profile: Uuid,
+        trust_domain: Uuid,
+        seed: u64,
+    ) -> HandoffPreparation {
+        HandoffPreparation {
+            expected_source: source.clone(),
+            target_profile_id: target_profile.to_string(),
+            trust_domain_id: trust_domain.to_string(),
+            source_rollout: test_rollout(&format!("2026/08/07/rollout-source-{seed}.jsonl"), seed),
+        }
+    }
+
+    fn handoff_target(cwd: &Path, thread: Uuid, seed: u64) -> HandoffTarget {
+        HandoffTarget {
+            thread_id: thread.to_string(),
+            canonical_cwd: fs::canonicalize(cwd)
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned))
+                .unwrap_or_default(),
+            codex_version: "0.144.4".to_owned(),
+            rollout: test_rollout(&format!("2026/08/07/rollout-target-{seed}.jsonl"), seed),
+        }
+    }
+
+    fn apply_handoff_step(
+        registry: &ConversationRegistry,
+        step: usize,
+        preparation: &HandoffPreparation,
+        target: &HandoffTarget,
+        transition_id: &mut Option<String>,
+    ) -> Result<(), ConversationError> {
+        match step {
+            0 => registry
+                .prepare_handoff(preparation.clone())
+                .map(|transition| {
+                    *transition_id = Some(transition.transition_id);
+                }),
+            1 => registry
+                .mark_source_stop_requested(
+                    transition_id
+                        .as_deref()
+                        .ok_or(ConversationError::NotFound)?,
+                )
+                .map(|_| ()),
+            2 => registry
+                .mark_source_stopped(
+                    transition_id
+                        .as_deref()
+                        .ok_or(ConversationError::NotFound)?,
+                )
+                .map(|_| ()),
+            3 => registry
+                .mark_fork_requested(
+                    transition_id
+                        .as_deref()
+                        .ok_or(ConversationError::NotFound)?,
+                )
+                .map(|_| ()),
+            4 => registry
+                .observe_handoff_target(
+                    transition_id
+                        .as_deref()
+                        .ok_or(ConversationError::NotFound)?,
+                    target.clone(),
+                )
+                .map(|_| ()),
+            5 => registry
+                .commit_handoff(
+                    transition_id
+                        .as_deref()
+                        .ok_or(ConversationError::NotFound)?,
+                )
+                .map(|_| ()),
+            _ => Err(ConversationError::RegistryInvalid(
+                "unknown test handoff step".to_owned(),
+            )),
         }
     }
 
@@ -1699,6 +2863,7 @@ mod tests {
             WriteFault::BeforeFileSync,
             WriteFault::BeforeRename,
             WriteFault::AfterRename,
+            WriteFault::DirectorySync,
         ] {
             let root = test_root("atomic-fault")?;
             let workspace = root.join("workspace");
@@ -1719,7 +2884,7 @@ mod tests {
                     );
                     assert_eq!(visible, old);
                 }
-                WriteFault::AfterRename => {
+                WriteFault::AfterRename | WriteFault::DirectorySync => {
                     assert_eq!(
                         result.err().map(|error| error.code()),
                         Some("conversation_commit_uncertain")
@@ -1778,7 +2943,7 @@ mod tests {
     fn corrupt_newer_or_linked_registry_never_selects() -> Result<(), Box<dyn std::error::Error>> {
         for contents in [
             b"not-json".as_slice(),
-            br#"{"schema_version":2,"revision":0,"conversations":[],"workspace_heads":[],"pending_launches":[]}"#,
+            br#"{"schema_version":3,"revision":0,"conversations":[],"workspace_heads":[],"pending_launches":[]}"#,
         ] {
             let root = test_root("invalid")?;
             let path = root.join(REGISTRY_FILE);
@@ -1823,6 +2988,762 @@ mod tests {
             registry.load().err().map(|error| error.code()),
             Some("conversation_registry_invalid")
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn first_handoff_mutation_migrates_v1_losslessly_and_preserves_recovery_copy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("lazy-v2-migration")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source_profile = Uuid::new_v4();
+        let source_thread = Uuid::new_v4();
+        let source = registry.adopt(binding(&workspace, source_profile, source_thread))?;
+        let original_bytes = fs::read(root.join(REGISTRY_FILE))?;
+
+        assert_eq!(registry.resolve_head(&workspace)?, source);
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, original_bytes);
+        assert!(!root.join(PRE_MIGRATION_BACKUP_FILE).exists());
+
+        let transition = registry.prepare_handoff(HandoffPreparation {
+            expected_source: source.clone(),
+            target_profile_id: Uuid::new_v4().to_string(),
+            trust_domain_id: Uuid::new_v4().to_string(),
+            source_rollout: test_rollout("2026/08/07/rollout-source.jsonl", 11),
+        })?;
+
+        assert_eq!(transition.phase, HandoffPhase::Prepared);
+        assert_eq!(transition.source_generation, source.generation);
+        assert_eq!(transition.target_generation, source.generation + 1);
+        let migrated = registry.load()?;
+        assert_eq!(migrated.schema_version, SCHEMA_VERSION_V2);
+        assert_eq!(migrated.conversations.len(), 1);
+        assert_eq!(
+            migrated.conversations[0].conversation_id,
+            source.conversation_id
+        );
+        assert_eq!(
+            migrated.conversations[0].generations[0].thread_id,
+            source.thread_id
+        );
+
+        let backup: ConversationDocument =
+            serde_json::from_slice(&fs::read(root.join(PRE_MIGRATION_BACKUP_FILE))?)?;
+        assert_eq!(backup.schema_version, SCHEMA_VERSION_V1);
+        assert_eq!(
+            backup.conversations[0].conversation_id,
+            source.conversation_id
+        );
+        assert_eq!(
+            backup.conversations[0].generations[0].thread_id,
+            source.thread_id
+        );
+        assert_eq!(
+            fs::read(root.join(PRE_MIGRATION_BACKUP_FILE))?,
+            original_bytes
+        );
+
+        let mut projected_v1 = migrated;
+        projected_v1.schema_version = SCHEMA_VERSION_V1;
+        projected_v1.revision = backup.revision;
+        projected_v1.pre_migration_backup = None;
+        projected_v1.active_transition = None;
+        projected_v1.conversations[0].generations[0].trust_domain_id = None;
+        projected_v1.conversations[0].generations[0].rollout = None;
+        assert_eq!(projected_v1, backup);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_same_profile_resume_mutations_keep_schema_v1()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("same-profile-stays-v1")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let profile = Uuid::new_v4();
+        let thread = Uuid::new_v4();
+        let exact = binding(&workspace, profile, thread);
+        let expected = registry.adopt(exact.clone())?;
+
+        assert_eq!(registry.resolve_head(&workspace)?, expected);
+        registry.refresh_adopted(&expected, exact)?;
+        let document = registry.load()?;
+
+        assert_eq!(document.schema_version, SCHEMA_VERSION_V1);
+        assert!(document.active_transition.is_none());
+        assert!(!root.join(PRE_MIGRATION_BACKUP_FILE).exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_v2_publication_refreshes_a_stale_pre_migration_backup_before_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("refresh-v1-backup")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let exact = binding(&workspace, Uuid::new_v4(), Uuid::new_v4());
+        let source = registry.adopt(exact.clone())?;
+        let preparation = handoff_preparation(&source, Uuid::new_v4(), Uuid::new_v4(), 11);
+
+        assert_eq!(
+            registry
+                .with_fault(WriteFault::BeforeFileSync)
+                .prepare_handoff(preparation.clone())
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_registry_invalid")
+        );
+        let stale_backup: ConversationDocument =
+            serde_json::from_slice(&fs::read(root.join(PRE_MIGRATION_BACKUP_FILE))?)?;
+        assert_eq!(registry.load()?.schema_version, SCHEMA_VERSION_V1);
+
+        registry.refresh_adopted(&source, exact)?;
+        let v1_before_retry = registry.load()?;
+        assert!(v1_before_retry.revision > stale_backup.revision);
+        registry.prepare_handoff(preparation)?;
+
+        let refreshed_backup: ConversationDocument =
+            serde_json::from_slice(&fs::read(root.join(PRE_MIGRATION_BACKUP_FILE))?)?;
+        assert_eq!(refreshed_backup, v1_before_retry);
+        assert_eq!(
+            fs::metadata(root.join(PRE_MIGRATION_BACKUP_FILE))?.mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(root.join(PRE_MIGRATION_BACKUP_FILE))?.nlink(),
+            1
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_pre_migration_backup_blocks_v2_without_rewriting_any_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("unsafe-v1-backup")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let v1_bytes = fs::read(root.join(REGISTRY_FILE))?;
+        let outside = root.join("outside-sentinel");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        options.open(&outside)?.write_all(b"outside sentinel")?;
+        std::os::unix::fs::symlink(&outside, root.join(PRE_MIGRATION_BACKUP_FILE))?;
+
+        assert_eq!(
+            registry
+                .prepare_handoff(handoff_preparation(
+                    &source,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    12,
+                ))
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_registry_invalid")
+        );
+        assert_eq!(fs::read(root.join(REGISTRY_FILE))?, v1_bytes);
+        assert_eq!(fs::read(&outside)?, b"outside sentinel");
+        assert!(
+            fs::symlink_metadata(root.join(PRE_MIGRATION_BACKUP_FILE))?
+                .file_type()
+                .is_symlink()
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_or_unbounded_rollout_metadata_never_triggers_v2_migration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("invalid-rollout-metadata")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let v1_bytes = fs::read(root.join(REGISTRY_FILE))?;
+        let base = handoff_preparation(&source, Uuid::new_v4(), Uuid::new_v4(), 13);
+        let mut invalid = Vec::new();
+
+        let mut absolute = base.clone();
+        absolute.source_rollout.locator.relative_path = "/tmp/rollout.jsonl".to_owned();
+        invalid.push(absolute);
+
+        let mut traversal = base.clone();
+        traversal.source_rollout.locator.relative_path =
+            "2026/08/07/../../outside.jsonl".to_owned();
+        invalid.push(traversal);
+
+        let mut noncanonical = base.clone();
+        noncanonical.source_rollout.locator.relative_path = "2026//08/07/rollout.jsonl".to_owned();
+        invalid.push(noncanonical);
+
+        let mut oversized_path = base.clone();
+        oversized_path.source_rollout.locator.relative_path =
+            format!("{}.jsonl", "x".repeat(MAX_ROLLOUT_RELATIVE_BYTES));
+        invalid.push(oversized_path);
+
+        let mut oversized_file = base.clone();
+        oversized_file.source_rollout.fingerprint.length = MAX_ROLLOUT_BYTES + 1;
+        invalid.push(oversized_file);
+
+        let mut linked_file = base.clone();
+        linked_file.source_rollout.fingerprint.link_count = 2;
+        invalid.push(linked_file);
+
+        let mut invalid_digest = base;
+        invalid_digest.source_rollout.fingerprint.sha256 = "A".repeat(64);
+        invalid.push(invalid_digest);
+
+        for preparation in invalid {
+            assert_eq!(
+                registry
+                    .prepare_handoff(preparation)
+                    .err()
+                    .map(|error| error.code()),
+                Some("conversation_registry_invalid")
+            );
+            assert_eq!(fs::read(root.join(REGISTRY_FILE))?, v1_bytes);
+            assert!(!root.join(PRE_MIGRATION_BACKUP_FILE).exists());
+        }
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn target_rollout_must_have_a_distinct_file_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = test_root("distinct-target-rollout")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let preparation = handoff_preparation(&source, Uuid::new_v4(), Uuid::new_v4(), 14);
+        let source_identity = preparation.source_rollout.fingerprint.clone();
+        let transition = registry.prepare_handoff(preparation)?;
+        registry.mark_source_stop_requested(&transition.transition_id)?;
+        registry.mark_source_stopped(&transition.transition_id)?;
+        registry.mark_fork_requested(&transition.transition_id)?;
+        let mut target = handoff_target(&workspace, Uuid::new_v4(), 15);
+        target.rollout.fingerprint.device = source_identity.device;
+        target.rollout.fingerprint.inode = source_identity.inode;
+
+        assert_eq!(
+            registry
+                .observe_handoff_target(&transition.transition_id, target)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_registry_invalid")
+        );
+        assert_eq!(
+            registry
+                .current_handoff()?
+                .map(|transition| transition.phase),
+            Some(HandoffPhase::ForkRequested)
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn v2_fails_closed_when_the_hash_bound_v1_backup_is_missing_or_tampered()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("v2-backup-integrity")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        registry.prepare_handoff(handoff_preparation(
+            &source,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            16,
+        ))?;
+        let backup_path = root.join(PRE_MIGRATION_BACKUP_FILE);
+        let backup_bytes = fs::read(&backup_path)?;
+
+        fs::write(&backup_path, b"tampered")?;
+        assert_eq!(
+            registry.load().err().map(|error| error.code()),
+            Some("conversation_registry_invalid")
+        );
+        fs::write(&backup_path, &backup_bytes)?;
+        fs::remove_file(&backup_path)?;
+        assert_eq!(
+            registry.load().err().map(|error| error.code()),
+            Some("conversation_registry_invalid")
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_handoff_generations_resolve_only_the_attached_active_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("ordered-generations")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let trust_domain = Uuid::new_v4();
+
+        let first = registry.prepare_handoff(handoff_preparation(
+            &source,
+            Uuid::new_v4(),
+            trust_domain,
+            21,
+        ))?;
+        assert_eq!(
+            registry
+                .resolve_head(&workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_in_progress")
+        );
+        assert_eq!(
+            registry
+                .prepare_handoff(handoff_preparation(
+                    &source,
+                    Uuid::new_v4(),
+                    trust_domain,
+                    22,
+                ))
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_in_progress")
+        );
+
+        assert_eq!(
+            registry
+                .mark_source_stop_requested(&first.transition_id)?
+                .phase,
+            HandoffPhase::SourceStopRequested
+        );
+        assert_eq!(
+            registry.mark_source_stopped(&first.transition_id)?.phase,
+            HandoffPhase::SourceStopped
+        );
+        assert_eq!(
+            registry.mark_fork_requested(&first.transition_id)?.phase,
+            HandoffPhase::ForkRequested
+        );
+        let first_target_thread = Uuid::new_v4();
+        let first_target_observation = handoff_target(&workspace, first_target_thread, 31);
+        assert_eq!(
+            registry
+                .observe_handoff_target(&first.transition_id, first_target_observation.clone(),)?
+                .phase,
+            HandoffPhase::ForkObserved
+        );
+        let first_target = registry.commit_handoff(&first.transition_id)?;
+        assert_eq!(first_target.generation, 1);
+        assert_eq!(first_target.thread_id, first_target_thread.to_string());
+        assert_eq!(
+            registry
+                .current_handoff()?
+                .map(|transition| transition.phase),
+            Some(HandoffPhase::CommittedUnattached)
+        );
+        assert_eq!(
+            registry
+                .resolve_head(&workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_in_progress"),
+            "a committed generation must remain unavailable until official TUI attachment"
+        );
+        assert_eq!(
+            registry.finish_handoff_attachment(&first.transition_id)?,
+            first_target
+        );
+        assert_eq!(registry.resolve_head(&workspace)?, first_target);
+
+        let mut second_preparation =
+            handoff_preparation(&first_target, Uuid::new_v4(), trust_domain, 41);
+        second_preparation.source_rollout = first_target_observation.rollout;
+        let second = registry.prepare_handoff(second_preparation)?;
+        registry.mark_source_stop_requested(&second.transition_id)?;
+        registry.mark_source_stopped(&second.transition_id)?;
+        registry.mark_fork_requested(&second.transition_id)?;
+        let second_target_thread = Uuid::new_v4();
+        registry.observe_handoff_target(
+            &second.transition_id,
+            handoff_target(&workspace, second_target_thread, 51),
+        )?;
+        let second_target = registry.commit_handoff(&second.transition_id)?;
+        registry.finish_handoff_attachment(&second.transition_id)?;
+
+        assert_eq!(second_target.conversation_id, source.conversation_id);
+        assert_eq!(second_target.generation, 2);
+        assert_eq!(registry.resolve_head(&workspace)?, second_target);
+        let document = registry.load()?;
+        assert_eq!(document.conversations[0].generations.len(), 3);
+        assert_eq!(document.conversations[0].active_generation, 2);
+        assert_eq!(
+            document.conversations[0]
+                .generations
+                .iter()
+                .map(|generation| generation.generation)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn active_handoff_blocks_its_workspace_but_not_unrelated_conversation_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("scoped-transition-blocking")?;
+        let source_workspace = root.join("source-workspace");
+        let unrelated_workspace = root.join("unrelated-workspace");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&source_workspace)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&unrelated_workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source_profile = Uuid::new_v4();
+        let source_thread = Uuid::new_v4();
+        let source = registry.adopt(binding(&source_workspace, source_profile, source_thread))?;
+        registry.prepare_handoff(handoff_preparation(
+            &source,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            55,
+        ))?;
+        let revision_before = registry.load()?.revision;
+
+        assert_eq!(
+            registry
+                .adopt(binding(&source_workspace, source_profile, source_thread,))
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_in_progress")
+        );
+        let unrelated = registry.adopt(binding(
+            &unrelated_workspace,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        ))?;
+
+        assert_eq!(registry.resolve_head(&unrelated_workspace)?, unrelated);
+        assert_eq!(
+            registry
+                .resolve_head(&source_workspace)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_in_progress")
+        );
+        assert_eq!(registry.load()?.revision, revision_before + 1);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_phase_skips_and_duplicate_advances_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("phase-order")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let transition = registry.prepare_handoff(handoff_preparation(
+            &source,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            61,
+        ))?;
+
+        assert_eq!(
+            registry
+                .mark_source_stopped(&transition.transition_id)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_phase_invalid")
+        );
+        registry.mark_source_stop_requested(&transition.transition_id)?;
+        assert_eq!(
+            registry
+                .mark_source_stop_requested(&transition.transition_id)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_phase_invalid")
+        );
+        assert_eq!(
+            registry
+                .current_handoff()?
+                .map(|transition| transition.phase),
+            Some(HandoffPhase::SourceStopRequested)
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_lineage_order_heads_and_transition_shape_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("malformed-v2")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let preparation = handoff_preparation(&source, Uuid::new_v4(), Uuid::new_v4(), 71);
+        let transition = registry.prepare_handoff(preparation)?;
+
+        let prepared_bytes = fs::read(root.join(REGISTRY_FILE))?;
+        let mut multiple: serde_json::Value = serde_json::from_slice(&prepared_bytes)?;
+        multiple["active_transitions"] = serde_json::json!([
+            multiple["active_transition"].clone(),
+            multiple["active_transition"].clone()
+        ]);
+        fs::write(
+            root.join(REGISTRY_FILE),
+            serde_json::to_vec_pretty(&multiple)?,
+        )?;
+        assert_eq!(
+            registry.load().err().map(|error| error.code()),
+            Some("conversation_registry_invalid"),
+            "an array-shaped multiple-transition document must not be accepted"
+        );
+        fs::write(root.join(REGISTRY_FILE), &prepared_bytes)?;
+
+        registry.mark_source_stop_requested(&transition.transition_id)?;
+        registry.mark_source_stopped(&transition.transition_id)?;
+        registry.mark_fork_requested(&transition.transition_id)?;
+        registry.observe_handoff_target(
+            &transition.transition_id,
+            handoff_target(&workspace, Uuid::new_v4(), 81),
+        )?;
+        registry.commit_handoff(&transition.transition_id)?;
+        registry.finish_handoff_attachment(&transition.transition_id)?;
+        let valid_bytes = fs::read(root.join(REGISTRY_FILE))?;
+
+        let corruptions: [(&str, JsonCorruption); 5] = [
+            ("duplicate", |document: &mut serde_json::Value| {
+                document["conversations"][0]["generations"][1]["generation"] = serde_json::json!(0);
+            }),
+            ("skipped", |document: &mut serde_json::Value| {
+                document["conversations"][0]["generations"][1]["generation"] = serde_json::json!(2);
+            }),
+            ("mismatched head", |document: &mut serde_json::Value| {
+                document["workspace_heads"][0]["generation"] = serde_json::json!(0);
+            }),
+            (
+                "cross-domain generation",
+                |document: &mut serde_json::Value| {
+                    document["conversations"][0]["generations"][1]["trust_domain_id"] =
+                        serde_json::json!("00000000-0000-4000-8000-000000000001");
+                },
+            ),
+            (
+                "missing rollout metadata",
+                |document: &mut serde_json::Value| {
+                    document["conversations"][0]["generations"][1]["rollout"] =
+                        serde_json::Value::Null;
+                },
+            ),
+        ];
+        for (label, mutate) in corruptions {
+            let mut document: serde_json::Value = serde_json::from_slice(&valid_bytes)?;
+            mutate(&mut document);
+            fs::write(
+                root.join(REGISTRY_FILE),
+                serde_json::to_vec_pretty(&document)?,
+            )?;
+            assert_eq!(
+                registry.load().err().map(|error| error.code()),
+                Some("conversation_registry_invalid"),
+                "{label} lineage corruption was accepted"
+            );
+        }
+
+        fs::write(root.join(REGISTRY_FILE), valid_bytes)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn every_handoff_phase_write_is_atomic_across_injected_faults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for step in 0..6 {
+            for fault in [
+                WriteFault::BeforeFileSync,
+                WriteFault::BeforeRename,
+                WriteFault::AfterRename,
+                WriteFault::DirectorySync,
+            ] {
+                let root = test_root("handoff-phase-fault")?;
+                let workspace = root.join("workspace");
+                fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+                let registry = ConversationRegistry::at(root.clone());
+                let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+                let preparation =
+                    handoff_preparation(&source, Uuid::new_v4(), Uuid::new_v4(), 100 + step as u64);
+                let target = handoff_target(&workspace, Uuid::new_v4(), 200 + step as u64);
+                let mut transition_id = None;
+                for completed in 0..step {
+                    apply_handoff_step(
+                        &registry,
+                        completed,
+                        &preparation,
+                        &target,
+                        &mut transition_id,
+                    )?;
+                }
+                let old_bytes = fs::read(root.join(REGISTRY_FILE))?;
+
+                let result = apply_handoff_step(
+                    &registry.with_fault(fault),
+                    step,
+                    &preparation,
+                    &target,
+                    &mut transition_id,
+                );
+                let visible_bytes = fs::read(root.join(REGISTRY_FILE))?;
+                match fault {
+                    WriteFault::BeforeFileSync | WriteFault::BeforeRename => {
+                        assert_eq!(
+                            result.err().map(|error| error.code()),
+                            Some("conversation_registry_invalid")
+                        );
+                        assert_eq!(visible_bytes, old_bytes);
+                    }
+                    WriteFault::AfterRename | WriteFault::DirectorySync => {
+                        assert_eq!(
+                            result.err().map(|error| error.code()),
+                            Some("conversation_commit_uncertain")
+                        );
+                        assert_ne!(visible_bytes, old_bytes);
+                    }
+                }
+                let visible: ConversationDocument = serde_json::from_slice(&visible_bytes)?;
+                validate_document(&visible)?;
+                let stale_temps = fs::read_dir(&root)?
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                    .count();
+                assert_eq!(stale_temps, 0);
+                fs::remove_dir_all(root)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_phase_transactions_publish_one_complete_successor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("concurrent-handoff")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let transition = registry.prepare_handoff(handoff_preparation(
+            &source,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            301,
+        ))?;
+        let revision_before = registry.load()?.revision;
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let worker_registry = registry.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            let transition_id = transition.transition_id.clone();
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                worker_registry.mark_source_stop_requested(&transition_id)
+            }));
+        }
+        barrier.wait();
+        let mut codes = workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("handoff worker panicked"))
+                    .map(|result| result.map(|_| "ok").unwrap_or_else(|error| error.code()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        codes.sort_unstable();
+        assert_eq!(codes, vec!["conversation_handoff_phase_invalid", "ok"]);
+        let document = registry.load()?;
+        assert_eq!(document.revision, revision_before + 1);
+        assert_eq!(
+            document
+                .active_transition
+                .as_ref()
+                .map(|transition| transition.phase),
+            Some(HandoffPhase::SourceStopRequested)
+        );
+        validate_document(&document)?;
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn v2_journal_persists_only_local_bounded_metadata_and_rejects_downgrade()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("v2-redaction-downgrade")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        registry.prepare_handoff(handoff_preparation(
+            &source,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            401,
+        ))?;
+
+        let serialized = fs::read_to_string(root.join(REGISTRY_FILE))?;
+        assert!(serialized.contains("\"relative_path\""));
+        assert!(!serialized.contains("/sessions/rollout-"));
+        for forbidden in [
+            "\"alias\"",
+            "\"token\"",
+            "\"provider_account_id\"",
+            "\"provider_workspace_id\"",
+            "\"transcript\"",
+            "\"prompt\"",
+            "\"response\"",
+            "\"tool_payload\"",
+            "\"rollout_path\"",
+        ] {
+            assert!(!serialized.contains(forbidden), "persisted {forbidden}");
+        }
+        let v2 = registry.load()?;
+        assert_eq!(v2.schema_version, SCHEMA_VERSION_V2);
+        assert_eq!(
+            validate_v1_document(&v2).err().map(|error| error.code()),
+            Some("conversation_registry_invalid")
+        );
+        let backup: ConversationDocument =
+            serde_json::from_slice(&fs::read(root.join(PRE_MIGRATION_BACKUP_FILE))?)?;
+        validate_v1_document(&backup)?;
+
         fs::remove_dir_all(root)?;
         Ok(())
     }
