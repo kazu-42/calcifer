@@ -1,6 +1,6 @@
 # ADR 0001: Treat conversation lineage as independent from credential profiles
 
-- Status: Accepted for the failover design; private compatibility gate, Linux/macOS no-gap target reservation, and pinned same-profile supervisor implemented internally; public cross-profile handoff pending
+- Status: Accepted for the failover design; private compatibility gate, schema-v2 lineage, Linux/macOS validated rollout capability/no-gap target reservation, and pinned same-profile supervisor implemented internally; public cross-profile handoff pending
 - Date: 2026-07-15
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 
@@ -202,6 +202,32 @@ Provider-owned rollout and SQLite formats are not a documented import API. Copyi
 ### Start a fresh thread after failover
 
 This loses the interaction continuity the product is meant to provide. A fresh thread is only an explicit recovery option when the version-gated handoff is unavailable; it is never the silent success path.
+
+## Validated rollout capability
+
+The production Linux/macOS rollout boundary is implemented as a linear,
+default-unused capability. Its only crate-visible minting function takes a
+current registered profile and the Codex adapter's validated root-thread read;
+there is no constructor from a CLI, configuration, repository, or caller path.
+Minting reopens the profile home, active sessions root, every locator component,
+and final rollout with descriptor-relative `O_NOFOLLOW`, then retains those
+directory/file descriptors. The sealed state records only the immutable local
+profile/thread IDs, canonical cwd, CLI version, a bounded sessions-root-relative
+locator, and device/inode/length/mode/UID/GID/link/mtime/ctime/SHA-256.
+
+The capability becomes a one-shot import state only after an immediate
+descriptor/path/hash readback. After the provider import, consuming that state
+requires the same readback again before it can yield source-stability proof.
+Deletion, rename/replacement, content mutation, traversal, archive roots,
+symlinked ancestors/finals, hard links, special files, wrong owner, writable
+modes, oversize files, and session ID/thread/cwd/version/source mismatches fail
+closed. A separate fork-result projection requires a source-distinct canonical
+thread ID, exact `forkedFromId`, matching canonical cwd and CLI version, and a
+safe source-distinct rollout inside the registered target profile's active
+sessions root. This projection does not modify the ordinary same-profile
+root-thread validator or exact-resume behavior. Process shutdown, the fork RPC,
+settings transfer, transition commit/reconciliation, and TUI attachment remain
+the transactional work in issue #34.
 
 ## Compatibility gate
 

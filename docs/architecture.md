@@ -42,6 +42,7 @@ A repository-local file must never be able to select an account or failover pool
 | Private identity store | Detect equivalent Codex account/workspace scopes without exposing provider identifiers | Claim that different scopes have independent quota |
 | Routing registry | Store private user-level trust domains and ordered default-disabled pools by immutable profile ID | Read repository routing policy, select a candidate, or launch a provider |
 | Conversation lineage registry | Bind one logical conversation to ordered profile-local thread generations | Treat a credential profile ID as the conversation ID |
+| Rollout handoff capability | Seal one registered profile/thread rollout behind retained directory/file descriptors, a root-relative locator, and a bounded content fingerprint | Accept a CLI, config, repository, or caller-supplied import path |
 | Provider adapter | Build an isolated environment and classify supported structured signals | Reimplement undocumented OAuth flows or scrape TUI text |
 | Profile lease | Serialize profile mutation, usage probes, and child lifetime | Rely on PID files as the lock authority |
 | Conversation lease | Serialize lineage transitions and rollout imports across profiles | Allow two generations to write one rollout |
@@ -584,6 +585,21 @@ resolve pinned profile or explicit pool
 
 A pool is traversed at most once per invocation.
 ```
+
+The implemented Linux/macOS rollout capability gives the future transaction a
+separate path-provenance boundary. It can be minted only from an exact current
+registry profile plus the existing validated root-thread projection; callers
+cannot construct it from a path. The capability retains the private managed
+home and sessions directory descriptors, the open source file, a bounded
+sessions-root-relative locator, and a device/inode/mode/owner/link/time/SHA-256
+fingerprint. It walks every component with descriptor-relative `O_NOFOLLOW`,
+validates source session metadata, and reopens and rehashes both the retained
+descriptor and current managed path before and after its one-shot import phase.
+A separate fork-result projection requires a new canonical target thread ID,
+the exact source `forkedFromId`, matching canonical cwd and CLI version, a
+single-link safe rollout below the registered target home, and an inode distinct
+from the source. This module remains unused until the transaction below is
+wired; current run/resume behavior and its root-thread validator are unchanged.
 
 The implemented target-reservation primitive gives the future supervisor an
 ephemeral, no-gap ownership transition on Linux and macOS:

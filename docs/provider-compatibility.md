@@ -188,6 +188,18 @@ The connection that creates or resumes a thread is subscribed to thread events. 
 
 The path must come only from Calcifer-owned lineage metadata, remain canonically contained in a registered source profile's sessions root, pass type/hard-link/symlink/owner/mode checks, and be read only after the source TUI/App Server are stopped and reaped while Calcifer retains the source lease. Source and target profiles must share an explicitly configured trust domain. The installed Codex version and `codex app-server generate-json-schema --experimental --out <dir>` output must match a tested adapter because the default generated schema omits these unstable fields. CI must also perform a synthetic fork-by-path protocol smoke test; schema presence alone does not prove runtime acceptance or materialization semantics.
 
+The production Linux/macOS path-provenance primitive is now implemented but
+default-unused. It accepts a current registered profile and an already validated
+root-thread projection, never an arbitrary path. Its linear import phase retains
+the managed home, sessions root, and source file descriptors; performs a
+normal-component-only `O_NOFOLLOW` walk; binds device, inode, length, mode,
+UID/GID, link count, nanosecond times, and SHA-256; validates the source session
+ID/thread/cwd/version/source metadata; and revalidates both descriptor and path
+before and after provider import. The corresponding fork-result projection is
+separate from ordinary inventory/read validation and requires a new UUID, exact
+`forkedFromId`, matching cwd/version, target-home containment, a safe active
+target rollout, and source-distinct file identity.
+
 `ThreadForkParams.threadId` remains a required string even for a path-based fork. Calcifer sends `threadId: ""` together with a non-empty validated `path`; Codex then ignores the empty lookup ID and imports by path.
 
 Calcifer now has a private Unix compatibility gate for exactly Codex `0.144.4`.
@@ -454,11 +466,11 @@ No command currently switches a user's profile or imports a user's rollout.
 The gate receives no Calcifer profile, conversation registry, credential, or
 user rollout, and incompatibility therefore cannot mutate those states.
 The internal Linux/macOS no-gap target-reservation and guardian lease-transfer
-primitive is implemented. The separate lazy schema-v2 conversation lineage and
-provider-free transition journal are also implemented but unused. Supervisor
-wiring, authoritative exhaustion selection, validated user-rollout
-capabilities, target-fork integration, and cross-profile transition crash
-recovery remain prerequisites before automatic handoff is enabled.
+primitive is implemented. The separate lazy schema-v2 conversation lineage,
+provider-free transition journal, and validated user-rollout/fork projection
+are also implemented but unused. Supervisor wiring, authoritative exhaustion
+selection, target-fork execution, and cross-profile transition crash recovery
+remain prerequisites before automatic handoff is enabled.
 
 Relevant upstream sources:
 
