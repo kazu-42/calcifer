@@ -60,11 +60,16 @@ without `LOCK_UN` and returns an A-only coordinator state. The guardian's ACK
 operation likewise consumes its provisional state and returns a B-only state.
 No PID establishes lock authority.
 
-This primitive is ephemeral and internal. It changes no public command,
-registry or conversation schema, transition journal, or provider protocol, and
-is deliberately unused until the cross-profile transaction in issue #33. That
-integration must acquire locks in this order: retained source lifetime lease,
-handoff coordinator, conversation transition, target A, then target B.
+The compatibility primitive itself is ephemeral and internal. It changes no
+public command, registry, transition journal, or provider protocol. The
+separate conversation schema-v2 foundation now persists an ordered lineage and
+one provider-free transition through `prepared`, `source_stop_requested`,
+`source_stopped`, `fork_requested`, `fork_observed`, and
+`committed_unattached`. It stores only local IDs, bounded fingerprints, and
+managed-root-relative rollout locators. It remains unused by provider I/O until
+the cross-profile transaction in issue #34. That integration must acquire
+locks in this order: retained source lifetime lease, handoff coordinator,
+conversation transition, target A, then target B.
 
 For the first supported Codex handoff implementation, Calcifer will prefer a **fork-by-path handoff**:
 
@@ -77,7 +82,7 @@ For the first supported Codex handoff implementation, Calcifer will prefer a **f
 7. Negotiate an explicitly supported Codex version/schema with `experimentalApi: true`.
 8. Call `thread/fork` with required `threadId: ""`, the non-empty validated source rollout `path`, canonical working directory, and source thread's effective model/sandbox/approval settings. Codex ignores the empty lookup ID when `path` is non-empty; authentication and provider routing remain target-profile-owned.
 9. Verify that the response has a new thread ID, the expected `forkedFromId`, and a new regular rollout under the target profile; also verify that the source rollout content and identity are unchanged.
-10. Atomically record the returned target thread ID, target rollout path, profile ID, generation, and interruption state.
+10. Atomically record the returned target thread ID, validated root-relative target rollout locator and fingerprint, profile ID, generation, and interruption state.
 11. Attach the official TUI with `codex resume --remote <local-socket> <target-thread-id>` and require that rejoin to succeed before accepting input.
 12. Keep the supervisor connection event-only: it may observe notifications and query usage but never answers approval or other server-initiated requests. The attached official TUI is their sole responder, and a new turn is not allowed while it is absent.
 13. Release the source-profile and transition leases only after the target generation is committed and attached; retain the target-profile lifetime lease.

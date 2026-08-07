@@ -108,7 +108,13 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Managed profile roots and homes are private to the current user; secret files are private at creation time. Provider-owned nested rollout directories/files from older installations may retain non-writable `0755`/`0644` modes behind that private home boundary.
 - Tokens and reset-credit IDs are never accepted as ordinary command-line flags because process listings and shell history can expose them.
 - Raw arguments, child environments, credential files, account email, and stable provider IDs are not logged.
-- Conversation metadata stores only Calcifer/profile/thread UUIDs, canonical cwd, tested adapter versions, bounded inventory timestamps, path-free file identity/size/mtime/ctime fingerprints, and lifecycle state. It excludes aliases, rollout paths, App Server previews, transcript bodies, prompts, responses, approvals, tool arguments, terminal streams, credentials, and provider identity.
+- Conversation metadata stores only Calcifer/profile/thread/trust-domain UUIDs,
+  canonical cwd, tested adapter versions, bounded inventory timestamps,
+  path-free inventory fingerprints, schema-v2 managed-root-relative rollout
+  locators and bounded rollout fingerprints, lifecycle state, and handoff
+  phases. It excludes aliases, arbitrary absolute rollout paths, App Server
+  previews, transcript bodies, prompts, responses, approvals, tool arguments,
+  terminal streams, credentials, and provider identity.
 - The internal terminal kernel moves bytes only through one fixed 8 KiB buffer
   per active direction, retains no transcript or payload queue, zeroes reported
   and otherwise unreported bytes before reuse, and emits only fixed redacted
@@ -345,6 +351,16 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Codex 0.144.4 hides its 10,000-file rollout scan cap from the v2 App Server response. Calcifer proves a conservative upper bound by snapshotting active and archived roots separately before and after listing, requiring each root to remain below the cap, and mapping every wire path to the stable snapshot. Nested nodes must remain owned, real, non-symlink, and non-writable by group/other; files must have one hard link. The enclosing managed home remains owner-private.
 - Bare resume releases its initial conversation lock before waiting for a profile lease, then revalidates the unchanged UUID binding under that lease. Registry mutation order is coordinator lease, provider lease, then a short conversation lock; no conversation lock spans App Server or interactive provider I/O.
 - A conversation document update uses create-only private same-directory temporary files, file fsync, rename, and directory fsync. Post-rename sync uncertainty is read back and reported without retrying a provider launch. Newer schemas and unsafe owner/type/mode/hard-link state are never rewritten.
+- Conversation schema v2 is lazy: ordinary same-profile reads and mutations do
+  not migrate v1. Before the first handoff mutation publishes v2, Calcifer
+  durably publishes an owner-private, single-link v1 recovery copy and binds
+  its exact revision and SHA-256 digest into v2. A missing or mismatched copy
+  stops v2 reads. V2 accepts
+  only ordered generations with one active tail and one active transition,
+  stores rollout locations only as bounded managed-root-relative components,
+  and blocks ordinary resume throughout every crash-sensitive handoff phase.
+  Older v1 binaries reject v2; recovery uses a forward binary or the explicit
+  pre-migration copy, never an automatic v2-to-v1 rewrite.
 - Profile removal is local-only and requires an explicit TTY `yes` or `--yes`;
   JSON requires `--yes`. Before confirmation, non-TTY invocations perform no
   managed-state read, recovery, or mutation. Removal never starts a provider or
