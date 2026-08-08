@@ -468,6 +468,18 @@ SID, path, OS error, provider output, or credential material. It is observation
 only: it does not authorize a retry or numeric-ID cleanup and does not weaken
 guardian retention, cleanup ordering, or the exit-86 boundary.
 
+Remote-TUI startup readiness likewise keeps the production
+`TuiReadiness` category while package diagnostics distinguish readiness receive,
+first child liveness, descriptor isolation, and final child liveness. All six
+`TuiReadinessError` values, all closed `ProcessError` variants at each liveness
+stage, and all thirteen process-group descriptor-scan errors have fixed,
+payload-free markers. The retained failure exposes only that marker to the
+test/package projection; its child, PTY, readiness channel, session guard, and
+containment methods remain private. The package scanner accepts only the exact
+catalog with a private `classified\n` node and rejects aliases, prefixes,
+extensions, links, wrong modes, oversized files, and payload-bearing files.
+Successful official-TUI startup writes none of these failure markers.
+
 This compatibility gate and the internal handoff transaction/reconciliation
 kernel described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
 are implemented. No command currently switches a user's profile or imports a

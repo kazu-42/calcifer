@@ -61,6 +61,10 @@ const FIXTURE_VERIFIED_BYTE: u8 = b'V';
 const TUI_SHUTDOWN_DRAIN_MAX_FRAGMENTS_PER_POLL: usize = 16;
 #[cfg(test)]
 const PACKAGED_TUI_LAUNCHER_ENV: &str = "CALCIFER_PACKAGE_TUI_LAUNCHER";
+#[cfg(test)]
+pub(super) const PACKAGED_TUI_READINESS_FAULT_ENV: &str = "CALCIFER_PACKAGE_TUI_READINESS_FAULT";
+#[cfg(test)]
+pub(super) const PACKAGED_TUI_READINESS_INVALID_FAULT_V1: &str = "receive-invalid-v1";
 
 /// Fixed, non-sensitive launcher failure. Command paths, provider output,
 /// environment values, readiness bytes, and terminal payloads are omitted.
@@ -621,14 +625,14 @@ impl PendingRemoteTui {
             Err(error) => {
                 return Err(Box::new(RemoteTuiReadinessFailure {
                     pending: self,
-                    error: error.into(),
+                    diagnostic: RemoteTuiReadinessDiagnostic::Receive(error),
                 }));
             }
         };
         if let Err(error) = self.child.confirm_running_after_readiness(deadline) {
             return Err(Box::new(RemoteTuiReadinessFailure {
                 pending: self,
-                error: RemoteTuiLauncherError::Process(error),
+                diagnostic: RemoteTuiReadinessDiagnostic::FirstChildLiveness(error),
             }));
         }
         let descriptor_scan = (|| {
@@ -650,14 +654,14 @@ impl PendingRemoteTui {
             Err(error) => {
                 return Err(Box::new(RemoteTuiReadinessFailure {
                     pending: self,
-                    error: RemoteTuiLauncherError::DescriptorIsolation(error),
+                    diagnostic: RemoteTuiReadinessDiagnostic::DescriptorIsolation(error),
                 }));
             }
         };
         if let Err(error) = self.child.confirm_running_after_readiness(deadline) {
             return Err(Box::new(RemoteTuiReadinessFailure {
                 pending: self,
-                error: RemoteTuiLauncherError::Process(error),
+                diagnostic: RemoteTuiReadinessDiagnostic::FinalChildLiveness(error),
             }));
         }
         Ok(ReadyRemoteTui {
@@ -677,7 +681,7 @@ impl PendingRemoteTui {
     ) -> Box<RemoteTuiReadinessFailure> {
         Box::new(RemoteTuiReadinessFailure {
             pending: self,
-            error: RemoteTuiLauncherError::DescriptorIsolation(error),
+            diagnostic: RemoteTuiReadinessDiagnostic::DescriptorIsolation(error),
         })
     }
 }
@@ -842,13 +846,317 @@ impl fmt::Debug for PendingRemoteTui {
     }
 }
 
+/// Closed diagnostic projection of the exact readiness barrier that failed.
+///
+/// The variant owns no authority. It remains embedded beside the retained
+/// pending child so package diagnostics can preserve stage identity without
+/// exposing a PID, descriptor, path, provider payload, or cleanup capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteTuiReadinessDiagnostic {
+    Receive(TuiReadinessError),
+    FirstChildLiveness(ProcessError),
+    DescriptorIsolation(calcifer_unix_child_fd::ProcessGroupDescriptorScanError),
+    FinalChildLiveness(ProcessError),
+}
+
+impl RemoteTuiReadinessDiagnostic {
+    const fn launcher_error(self) -> RemoteTuiLauncherError {
+        match self {
+            Self::Receive(error) => RemoteTuiLauncherError::Readiness(error),
+            Self::FirstChildLiveness(error) | Self::FinalChildLiveness(error) => {
+                RemoteTuiLauncherError::Process(error)
+            }
+            Self::DescriptorIsolation(error) => RemoteTuiLauncherError::DescriptorIsolation(error),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) const PACKAGED_TUI_READINESS_FAILURE_MARKERS: &[&str] = &[
+    "startup-failure.tui-readiness.subtype.receive.channel",
+    "startup-failure.tui-readiness.subtype.receive.descriptor",
+    "startup-failure.tui-readiness.subtype.receive.inherited",
+    "startup-failure.tui-readiness.subtype.receive.invalid",
+    "startup-failure.tui-readiness.subtype.receive.timeout",
+    "startup-failure.tui-readiness.subtype.receive.deadline",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.spawn",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.process-group-readback",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.process-group-mismatch",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.session-readback",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.session-mismatch",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.session-startup-timeout",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.spawn-cleanup-timeout",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.spawn-containment-unconfirmed",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.readiness-unavailable",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.parent-liveness-unavailable",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.readiness-timeout",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.readiness-io",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.invalid-readiness",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.early-exit",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.signal",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.forwarded-signal-mismatch",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.suspend-timeout",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.wait",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.wait-timeout",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.tui-output-drain",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.app-graceful-drain-unconfirmed",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.role-mismatch",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.retry-after-resolution",
+    "startup-failure.tui-readiness.subtype.first-child-liveness.process.deadline",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.invalid-argument",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.process-limit",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.member-limit",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.descriptor-limit",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.forbidden-identity-limit",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.deadline",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.permission-denied",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.process-user-mismatch",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.process-changed",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.descriptor-changed",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.forbidden-descriptor",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.unsupported-descriptor",
+    "startup-failure.tui-readiness.subtype.descriptor-isolation.observation-failed",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.spawn",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.process-group-readback",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.process-group-mismatch",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.session-readback",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.session-mismatch",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.session-startup-timeout",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.spawn-cleanup-timeout",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.spawn-containment-unconfirmed",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.readiness-unavailable",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.parent-liveness-unavailable",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.readiness-timeout",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.readiness-io",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.invalid-readiness",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.early-exit",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.signal",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.forwarded-signal-mismatch",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.suspend-timeout",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.wait",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.wait-timeout",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.tui-output-drain",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.app-graceful-drain-unconfirmed",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.role-mismatch",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.retry-after-resolution",
+    "startup-failure.tui-readiness.subtype.final-child-liveness.process.deadline",
+];
+
+#[cfg(test)]
+macro_rules! packaged_tui_readiness_process_marker {
+    ($error:expr, $stage:literal) => {
+        match $error {
+            ProcessError::Spawn { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.spawn"
+            ),
+            ProcessError::ProcessGroupReadback { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.process-group-readback"
+            ),
+            ProcessError::ProcessGroupMismatch { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.process-group-mismatch"
+            ),
+            ProcessError::SessionReadback { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.session-readback"
+            ),
+            ProcessError::SessionMismatch { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.session-mismatch"
+            ),
+            ProcessError::SessionStartupTimeout { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.session-startup-timeout"
+            ),
+            ProcessError::SpawnCleanupTimeout { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.spawn-cleanup-timeout"
+            ),
+            ProcessError::SpawnContainmentUnconfirmed { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.spawn-containment-unconfirmed"
+            ),
+            ProcessError::ReadinessUnavailable { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.readiness-unavailable"
+            ),
+            ProcessError::ParentLivenessUnavailable { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.parent-liveness-unavailable"
+            ),
+            ProcessError::ReadinessTimeout { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.readiness-timeout"
+            ),
+            ProcessError::ReadinessIo { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.readiness-io"
+            ),
+            ProcessError::InvalidReadiness { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.invalid-readiness"
+            ),
+            ProcessError::EarlyExit { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.early-exit"
+            ),
+            ProcessError::Signal { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.signal"
+            ),
+            ProcessError::ForwardedSignalMismatch { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.forwarded-signal-mismatch"
+            ),
+            ProcessError::SuspendTimeout { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.suspend-timeout"
+            ),
+            ProcessError::Wait { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.wait"
+            ),
+            ProcessError::WaitTimeout { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.wait-timeout"
+            ),
+            ProcessError::TuiOutputDrain { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.tui-output-drain"
+            ),
+            ProcessError::AppGracefulDrainUnconfirmed { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.app-graceful-drain-unconfirmed"
+            ),
+            ProcessError::RoleMismatch { .. } => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.role-mismatch"
+            ),
+            ProcessError::RetryAfterResolution => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.retry-after-resolution"
+            ),
+            ProcessError::Deadline => concat!(
+                "startup-failure.tui-readiness.subtype.",
+                $stage,
+                ".process.deadline"
+            ),
+        }
+    };
+}
+
+#[cfg(test)]
+const fn packaged_tui_readiness_failure_marker(
+    diagnostic: RemoteTuiReadinessDiagnostic,
+) -> &'static str {
+    use calcifer_unix_child_fd::ProcessGroupDescriptorScanError as DescriptorError;
+
+    match diagnostic {
+        RemoteTuiReadinessDiagnostic::Receive(TuiReadinessError::Channel) => {
+            "startup-failure.tui-readiness.subtype.receive.channel"
+        }
+        RemoteTuiReadinessDiagnostic::Receive(TuiReadinessError::Descriptor) => {
+            "startup-failure.tui-readiness.subtype.receive.descriptor"
+        }
+        RemoteTuiReadinessDiagnostic::Receive(TuiReadinessError::Inherited) => {
+            "startup-failure.tui-readiness.subtype.receive.inherited"
+        }
+        RemoteTuiReadinessDiagnostic::Receive(TuiReadinessError::Invalid) => {
+            "startup-failure.tui-readiness.subtype.receive.invalid"
+        }
+        RemoteTuiReadinessDiagnostic::Receive(TuiReadinessError::Timeout) => {
+            "startup-failure.tui-readiness.subtype.receive.timeout"
+        }
+        RemoteTuiReadinessDiagnostic::Receive(TuiReadinessError::Deadline) => {
+            "startup-failure.tui-readiness.subtype.receive.deadline"
+        }
+        RemoteTuiReadinessDiagnostic::FirstChildLiveness(error) => {
+            packaged_tui_readiness_process_marker!(error, "first-child-liveness")
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::InvalidArgument) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.invalid-argument"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::ProcessLimit) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.process-limit"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::MemberLimit) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.member-limit"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::DescriptorLimit) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.descriptor-limit"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(
+            DescriptorError::ForbiddenIdentityLimit,
+        ) => "startup-failure.tui-readiness.subtype.descriptor-isolation.forbidden-identity-limit",
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::Deadline) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.deadline"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::PermissionDenied) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.permission-denied"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::ProcessUserMismatch) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.process-user-mismatch"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::ProcessChanged) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.process-changed"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::DescriptorChanged) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.descriptor-changed"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::ForbiddenDescriptor) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.forbidden-descriptor"
+        }
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(
+            DescriptorError::UnsupportedDescriptor,
+        ) => "startup-failure.tui-readiness.subtype.descriptor-isolation.unsupported-descriptor",
+        RemoteTuiReadinessDiagnostic::DescriptorIsolation(DescriptorError::ObservationFailed) => {
+            "startup-failure.tui-readiness.subtype.descriptor-isolation.observation-failed"
+        }
+        RemoteTuiReadinessDiagnostic::FinalChildLiveness(error) => {
+            packaged_tui_readiness_process_marker!(error, "final-child-liveness")
+        }
+    }
+}
+
 #[must_use = "readiness failure retains the supervised child and PTY"]
 pub(super) struct RemoteTuiReadinessFailure {
     pending: PendingRemoteTui,
-    error: RemoteTuiLauncherError,
+    diagnostic: RemoteTuiReadinessDiagnostic,
 }
 
 impl RemoteTuiReadinessFailure {
+    /// Returns a fixed, payload-free package diagnostic. The retained child,
+    /// PTY, readiness channel, and cleanup methods remain private.
+    #[cfg(test)]
+    pub(super) const fn packaged_failure_marker(&self) -> &'static str {
+        packaged_tui_readiness_failure_marker(self.diagnostic)
+    }
+
     /// Starts bounded containment while keeping the session guard, PTY, and
     /// readiness channel attached to any unreaped direct-child authority.
     #[expect(
@@ -860,7 +1168,11 @@ impl RemoteTuiReadinessFailure {
         graceful_deadline: Duration,
         forced_deadline: Duration,
     ) -> Result<RemoteTuiReadinessResolution, Box<RemoteTuiReadinessContainmentFailure>> {
-        let Self { pending, error } = *self;
+        let Self {
+            pending,
+            diagnostic,
+        } = *self;
+        let error = diagnostic.launcher_error();
         let PendingRemoteTui {
             child,
             master,
@@ -889,7 +1201,7 @@ impl fmt::Debug for RemoteTuiReadinessFailure {
         let _ = &self.pending;
         formatter
             .debug_struct("RemoteTuiReadinessFailure")
-            .field("error", &self.error)
+            .field("error", &self.diagnostic.launcher_error())
             .field("retains_child", &true)
             .finish_non_exhaustive()
     }
@@ -1306,6 +1618,19 @@ pub(super) fn run_exec_launcher() -> Result<ExitCode, RemoteTuiLauncherError> {
     }
 
     let spec = ExecSpec::from_environment()?;
+    #[cfg(test)]
+    match env::var_os(PACKAGED_TUI_READINESS_FAULT_ENV).as_deref() {
+        None => {}
+        Some(value) if value == OsStr::new(PACKAGED_TUI_READINESS_INVALID_FAULT_V1) => {
+            // Keep the already-verified session leader live long enough for
+            // its parent to publish the exact PID=PGID=SID observation. The
+            // fault then begins strictly at the readiness receive boundary.
+            thread::sleep(Duration::from_millis(200));
+            drop(readiness);
+            return Ok(ExitCode::from(23));
+        }
+        Some(_) => return Err(RemoteTuiLauncherError::InvalidCommand),
+    }
     let mut command = spec.into_target_command();
     scrub_launcher_environment(&mut command);
     readiness.publish_before_exec()?;
@@ -1391,7 +1716,10 @@ fn prepare_launcher_command(
         }
     }
     #[cfg(test)]
-    command.env_remove(PACKAGED_TUI_LAUNCHER_ENV);
+    {
+        command.env_remove(PACKAGED_TUI_LAUNCHER_ENV);
+        command.env_remove(PACKAGED_TUI_READINESS_FAULT_ENV);
+    }
     command
         .env(LAUNCH_CONTRACT_ENV, LAUNCH_CONTRACT_V1)
         .env(TARGET_PROGRAM_ENV, spec.program)
@@ -1638,7 +1966,9 @@ fn is_launcher_environment(name: &OsStr) -> bool {
     .any(|candidate| name == OsStr::new(candidate));
     #[cfg(test)]
     {
-        production_private || name == OsStr::new(PACKAGED_TUI_LAUNCHER_ENV)
+        production_private
+            || name == OsStr::new(PACKAGED_TUI_LAUNCHER_ENV)
+            || name == OsStr::new(PACKAGED_TUI_READINESS_FAULT_ENV)
     }
     #[cfg(not(test))]
     production_private
@@ -2232,6 +2562,140 @@ mod tests {
             )),
             "startup-failure.tui-launch.subtype.process-tui-output-drain"
         );
+    }
+
+    #[test]
+    fn packaged_readiness_failure_catalog_projects_every_closed_stage_and_error() {
+        use super::super::process::AppGracefulDrainFailureStage;
+        use super::super::protocol::{ChildDisposition, StopAction};
+        use calcifer_unix_child_fd::ProcessGroupDescriptorScanError as DescriptorError;
+
+        let process_errors = [
+            ProcessError::Spawn {
+                role: ChildRole::Tui,
+            },
+            ProcessError::ProcessGroupReadback {
+                role: ChildRole::Tui,
+            },
+            ProcessError::ProcessGroupMismatch {
+                role: ChildRole::Tui,
+            },
+            ProcessError::SessionReadback {
+                role: ChildRole::Tui,
+            },
+            ProcessError::SessionMismatch {
+                role: ChildRole::Tui,
+            },
+            ProcessError::SessionStartupTimeout {
+                role: ChildRole::Tui,
+            },
+            ProcessError::SpawnCleanupTimeout {
+                role: ChildRole::Tui,
+            },
+            ProcessError::SpawnContainmentUnconfirmed {
+                role: ChildRole::Tui,
+            },
+            ProcessError::ReadinessUnavailable {
+                role: ChildRole::Tui,
+            },
+            ProcessError::ParentLivenessUnavailable {
+                role: ChildRole::Tui,
+            },
+            ProcessError::ReadinessTimeout {
+                role: ChildRole::Tui,
+            },
+            ProcessError::ReadinessIo {
+                role: ChildRole::Tui,
+            },
+            ProcessError::InvalidReadiness {
+                role: ChildRole::Tui,
+            },
+            ProcessError::EarlyExit {
+                role: ChildRole::Tui,
+                disposition: ChildDisposition::NotStarted,
+            },
+            ProcessError::Signal {
+                role: ChildRole::Tui,
+                action: StopAction::None,
+            },
+            ProcessError::ForwardedSignalMismatch {
+                role: ChildRole::Tui,
+            },
+            ProcessError::SuspendTimeout {
+                role: ChildRole::Tui,
+            },
+            ProcessError::Wait {
+                role: ChildRole::Tui,
+            },
+            ProcessError::WaitTimeout {
+                role: ChildRole::Tui,
+            },
+            ProcessError::TuiOutputDrain {
+                role: ChildRole::Tui,
+            },
+            ProcessError::AppGracefulDrainUnconfirmed {
+                role: ChildRole::Tui,
+                stage: AppGracefulDrainFailureStage::PriorInvalid,
+            },
+            ProcessError::RoleMismatch {
+                expected: ChildRole::Tui,
+                actual: ChildRole::AppServer,
+            },
+            ProcessError::RetryAfterResolution,
+            ProcessError::Deadline,
+        ];
+        let descriptor_errors = [
+            DescriptorError::InvalidArgument,
+            DescriptorError::ProcessLimit,
+            DescriptorError::MemberLimit,
+            DescriptorError::DescriptorLimit,
+            DescriptorError::ForbiddenIdentityLimit,
+            DescriptorError::Deadline,
+            DescriptorError::PermissionDenied,
+            DescriptorError::ProcessUserMismatch,
+            DescriptorError::ProcessChanged,
+            DescriptorError::DescriptorChanged,
+            DescriptorError::ForbiddenDescriptor,
+            DescriptorError::UnsupportedDescriptor,
+            DescriptorError::ObservationFailed,
+        ];
+        let mut projected = [
+            TuiReadinessError::Channel,
+            TuiReadinessError::Descriptor,
+            TuiReadinessError::Inherited,
+            TuiReadinessError::Invalid,
+            TuiReadinessError::Timeout,
+            TuiReadinessError::Deadline,
+        ]
+        .map(|error| {
+            packaged_tui_readiness_failure_marker(RemoteTuiReadinessDiagnostic::Receive(error))
+        })
+        .to_vec();
+        projected.extend(process_errors.map(|error| {
+            packaged_tui_readiness_failure_marker(RemoteTuiReadinessDiagnostic::FirstChildLiveness(
+                error,
+            ))
+        }));
+        projected.extend(descriptor_errors.map(|error| {
+            packaged_tui_readiness_failure_marker(
+                RemoteTuiReadinessDiagnostic::DescriptorIsolation(error),
+            )
+        }));
+        projected.extend(process_errors.map(|error| {
+            packaged_tui_readiness_failure_marker(RemoteTuiReadinessDiagnostic::FinalChildLiveness(
+                error,
+            ))
+        }));
+
+        assert_eq!(projected, PACKAGED_TUI_READINESS_FAILURE_MARKERS);
+        let unique: std::collections::BTreeSet<_> = projected.iter().copied().collect();
+        assert_eq!(unique.len(), projected.len());
+        assert!(projected.iter().all(|marker| {
+            marker.is_ascii()
+                && marker.starts_with("startup-failure.tui-readiness.subtype.")
+                && !marker.contains('/')
+                && !marker.contains(' ')
+        }));
     }
 
     #[test]

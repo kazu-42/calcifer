@@ -50,6 +50,7 @@ use super::guardian::{
     PackagedSecondRetention, ProductionGuardianConfig, packaged_concrete_second_retention_for_test,
     run_production_guardian_with_test_seams, write_packaged_startup_failure_marker,
 };
+use super::launcher::PACKAGED_TUI_READINESS_FAILURE_MARKERS;
 use super::process::{ManagedGroupChild, shutdown_app_server_child};
 use super::protocol::{
     ChildDisposition, ChildRole, CleanupStatus, GuardianExitDisposition, SessionStatus, StopAction,
@@ -4561,6 +4562,110 @@ fn package_failure_report_scanner_bridges_only_the_closed_app_socket_catalog()
 }
 
 #[test]
+fn package_failure_report_scanner_bridges_every_closed_tui_readiness_subtype()
+-> Result<(), Box<dyn Error>> {
+    let catalog: BTreeSet<_> = PACKAGED_TUI_READINESS_FAILURE_MARKERS
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(catalog.len(), PACKAGED_TUI_READINESS_FAILURE_MARKERS.len());
+    assert!(catalog.iter().all(|marker| {
+        marker.is_ascii()
+            && marker.starts_with("startup-failure.tui-readiness.subtype.")
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
+
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    write_private_new(
+        &report.join("startup-failure.tui-readiness"),
+        b"classified\n",
+    )?;
+    for marker in PACKAGED_TUI_READINESS_FAILURE_MARKERS.iter().copied() {
+        let path = report.join(marker);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some(marker)
+        );
+        fs::remove_file(path)?;
+    }
+    scratch.cleanup()
+}
+
+#[test]
+fn package_tui_readiness_subtype_scanner_rejects_untrusted_names_nodes_and_payloads()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    write_private_new(
+        &report.join("startup-failure.tui-readiness"),
+        b"classified\n",
+    )?;
+    let marker = "startup-failure.tui-readiness.subtype.receive.invalid";
+    let marker_path = report.join(marker);
+
+    for rejected in [
+        "startup-failure.tui-readiness.subtype.receive",
+        "startup-failure.tui-readiness.subtype.user-controlled",
+        "startup-failure.tui-readiness.subtype.receive.invalid.extended",
+    ] {
+        let path = report.join(rejected);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some("startup-failure.tui-readiness"),
+            "a prefix-only, unknown, or extended readiness subtype was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    for payload in [
+        b"private\n".as_slice(),
+        b"classified\nprivate-provider-payload\n".as_slice(),
+    ] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some("startup-failure.tui-readiness"),
+            "a payload-bearing or oversized readiness subtype was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("tui-readiness-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some("startup-failure.tui-readiness"),
+        "a symlinked readiness subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some("startup-failure.tui-readiness"),
+        "a hardlinked readiness subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some("startup-failure.tui-readiness"),
+        "a wrong-mode readiness subtype was trusted"
+    );
+    fs::remove_file(marker_path)?;
+    scratch.cleanup()
+}
+
+#[test]
 fn package_failure_report_scanner_bridges_only_the_closed_session_startup_catalog()
 -> Result<(), Box<dyn Error>> {
     use std::collections::BTreeSet;
@@ -6342,6 +6447,85 @@ fn package_final_error_prefers_the_fixed_app_socket_subtype_written_with_its_gen
     assert!(!format!("{final_error:?}").contains("private-provider-detail"));
     assert!(final_error.source().is_none());
     scratch.cleanup()
+}
+
+#[test]
+fn packaged_deterministic_tui_readiness_failure_keeps_exact_primary_and_secondary_evidence()
+-> Result<(), Box<dyn Error>> {
+    let _process_guard = package_process_test_guard();
+    let suite_budget = reserve_package_deterministic_generation()?;
+    let scratch = PackageScratch::create()?;
+    let root = scratch.root.clone();
+    let report = root.join("supervisor-report");
+    let backend = PackageSessionBackend::spawn()?;
+    let mut harness = OfficialTuiPackageHarness::spawn_deterministic_tui_readiness_failure(
+        scratch,
+        backend,
+        suite_budget,
+    )?;
+    let subtype = "startup-failure.tui-readiness.subtype.receive.invalid";
+
+    let exercise = harness.exercise();
+    assert!(
+        exercise.is_err(),
+        "the readiness fault unexpectedly became active"
+    );
+    assert_eq!(harness.latest_fixed_failure_detail(), Some(subtype));
+    assert!(fixed_package_failure_marker_is_valid(&report, subtype));
+    assert!(fixed_package_failure_marker_is_valid(
+        &report,
+        "startup-failure.tui-readiness"
+    ));
+
+    let cleanup_outcome = harness.cleanup_after_exercise(true);
+    let cleanup_error = cleanup_outcome
+        .result
+        .as_ref()
+        .err()
+        .ok_or("zero inference unexpectedly satisfied the exactly-one invariant")?;
+    assert!(
+        cleanup_error
+            .to_string()
+            .contains("did not observe exactly one responses call"),
+        "the cleanup failure did not preserve zero-inference evidence: {cleanup_error}"
+    );
+    assert_eq!(
+        harness.latest_fixed_cleanup_failure_detail(),
+        Some("package-cleanup.inference-evidence")
+    );
+    assert_eq!(
+        harness.latest_fixed_failure_detail(),
+        Some(subtype),
+        "cleanup replaced the immutable readiness cause"
+    );
+    let evidence = match cleanup_outcome.scratch {
+        PackageScratchDisposition::Preserved(evidence) => evidence,
+        PackageScratchDisposition::Deleted => {
+            return Err("failed readiness generation deleted its owned evidence".into());
+        }
+        PackageScratchDisposition::Unavailable => {
+            return Err("failed readiness generation lost its evidence owner".into());
+        }
+    };
+    assert_eq!(evidence.root(), root);
+    assert!(root.join("owner.marker").is_file());
+    assert!(report.join(subtype).is_file());
+    assert!(report.join("startup-failure.tui-readiness").is_file());
+    assert!(
+        harness.coordinator.is_none()
+            && harness.completion.is_none()
+            && harness.backend.is_none()
+            && harness.master.is_none()
+            && harness.output_cancel.is_none()
+            && harness.output_worker.is_none()
+            && harness.output_finished,
+        "readiness cleanup retained a live process, channel, PTY, or worker owner"
+    );
+
+    drop(harness);
+    evidence.cleanup()?;
+    assert!(!root.exists());
+    Ok(())
 }
 
 /// Runs the checksum-pinned official TUI through the actual production
@@ -10000,6 +10184,7 @@ fn package_operation_failure_can_finalize_during_cleanup(marker: &'static str) -
         || PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.contains(&marker)
         || PACKAGED_COMPATIBILITY_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_APP_SOCKET_FAILURE_MARKERS.contains(&marker)
+        || PACKAGED_TUI_READINESS_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.contains(&marker)
         || PACKAGE_JOB_CONTROL_FAILURE_MARKERS.contains(&marker)
         || PACKAGE_OFFICIAL_TUI_GROUP_FAILURE_MARKERS.contains(&marker)
@@ -11523,6 +11708,26 @@ impl OfficialTuiPackageHarness {
         )
     }
 
+    fn spawn_deterministic_tui_readiness_failure(
+        scratch: PackageScratch,
+        backend: PackageSessionBackend,
+        suite_budget: PackageDeterministicSuiteLease,
+    ) -> Result<Self, Box<dyn Error>> {
+        let executable = install_packaged_codex_provider_fixture(&scratch)?;
+        let launcher = install_packaged_tui_readiness_failure_launcher_fixture(&scratch)?;
+        Self::spawn_configured(
+            executable,
+            scratch,
+            backend,
+            None,
+            PackageProviderSuiteBudget::Deterministic {
+                _lease: suite_budget,
+            },
+            PackageInferenceExpectation::ExactlyOne,
+            PackageStartupTestSeams::deterministic(launcher, None),
+        )
+    }
+
     fn spawn_configured(
         executable: PathBuf,
         scratch: PackageScratch,
@@ -12458,6 +12663,12 @@ impl OfficialTuiPackageHarness {
         self.generation_cleanup_mut()?.reported_groups_absent = true;
         verify_package_build_namespaces_empty(&root)?;
         self.generation_cleanup_mut()?.runtime_empty = true;
+        if PACKAGED_TUI_READINESS_FAILURE_MARKERS
+            .iter()
+            .any(|marker| report.join(marker).exists())
+        {
+            return Err("successful official-TUI startup published a readiness failure".into());
+        }
         Ok(())
     }
 
@@ -12718,6 +12929,7 @@ impl OfficialTuiPackageHarness {
             .copied()
             .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
+            .chain(PACKAGED_TUI_READINESS_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_JOB_CONTROL_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_OFFICIAL_TUI_GROUP_FAILURE_MARKERS.iter().copied())
@@ -15488,6 +15700,7 @@ fn fixed_package_startup_failure_marker(name: &str) -> Option<&'static str> {
         .copied()
         .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
+        .chain(PACKAGED_TUI_READINESS_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_STARTUP_FAILURE_MARKERS.iter().copied())
         .find(|marker| *marker == name)
@@ -15639,6 +15852,15 @@ fn fixed_package_startup_failure_from_report(
         PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
         failure => return failure,
     };
+    let tui_readiness = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_TUI_READINESS_FAILURE_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
     let session_readiness = match scan_fixed_package_startup_failure_marker_catalog(
         report,
         PACKAGED_SESSION_STARTUP_FAILURE_MARKERS,
@@ -15654,6 +15876,7 @@ fn fixed_package_startup_failure_from_report(
     let detail = match generic.marker() {
         "startup-failure.compatibility" => compatibility_origin.or(compatibility),
         "startup-failure.app-socket" => app_socket,
+        "startup-failure.tui-readiness" => tui_readiness,
         "startup-failure.session-readiness" => session_readiness,
         _ => None,
     };
@@ -21159,6 +21382,34 @@ if [ "$#" -ne 0 ]; then
     exit 64
 fi
 exec {helper} --exact {test} --nocapture --test-threads=1
+"#,
+    );
+    let path = scratch.root.join(PACKAGE_LIBTEST_LAUNCHER_WRAPPER);
+    write_private_executable_new(&path, script.as_bytes())?;
+    Ok(fs::canonicalize(path)?)
+}
+
+fn install_packaged_tui_readiness_failure_launcher_fixture(
+    scratch: &PackageScratch,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let helper = fs::canonicalize(std::env::current_exe()?)?;
+    let helper_metadata = fs::symlink_metadata(&helper)?;
+    if !helper.is_absolute()
+        || !helper_metadata.file_type().is_file()
+        || helper_metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err("libtest readiness launcher helper executable was unsafe".into());
+    }
+    let helper = shell_quote_package_libtest(helper.as_os_str())?;
+    let test = shell_quote_package_libtest(OsStr::new(PACKAGE_LIBTEST_LAUNCHER_HELPER_TEST))?;
+    let fault_name = super::launcher::PACKAGED_TUI_READINESS_FAULT_ENV;
+    let fault_value = super::launcher::PACKAGED_TUI_READINESS_INVALID_FAULT_V1;
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$#" -ne 0 ]; then
+    exit 64
+fi
+{fault_name}={fault_value} exec {helper} --exact {test} --nocapture --test-threads=1
 "#,
     );
     let path = scratch.root.join(PACKAGE_LIBTEST_LAUNCHER_WRAPPER);

@@ -331,6 +331,21 @@ subtype is published before the existing generic job-identity marker. Neither
 marker grants retry, signal, wait, deletion, cleanup, or numeric-process
 authority; every failure retains the existing fail-closed guardian path.
 
+The earlier remote-TUI readiness barrier now has an independent closed
+package-only diagnostic catalog. It records whether failure occurred while
+receiving the one-shot token/exec EOF, at the first post-readiness child
+liveness proof, during forbidden-descriptor inventory and process-group
+isolation, or at the final child liveness proof. Every readiness-channel,
+process, and descriptor-scan enum variant maps to one fixed redacted subtype;
+the two liveness stages use distinct markers for the same process error. The
+subtype is written before `startup-failure.tui-readiness`, so the generic marker
+continues to act as the completed-detail-publication boundary. These markers
+carry no child, PID, descriptor, retry, signal, wait, deletion, or cleanup
+authority. A deterministic package test exits the already-verified launcher
+before readiness publication and proves that the exact subtype survives
+Guardian projection while the existing exactly-one inference rule still emits
+secondary `package-cleanup.inference-evidence` and preserves owned evidence.
+
 The coordinator/guardian exec boundary keeps three channel classes physically
 separate:
 
