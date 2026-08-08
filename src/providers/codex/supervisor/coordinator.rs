@@ -183,6 +183,17 @@ impl DescriptorIsolationObservationFailure {
             ),
         }
     }
+
+    const fn retryable_target_observation(self) -> bool {
+        self.retryable_target_change
+            || (matches!(
+                self.stage,
+                DescriptorIsolationObservationStage::TargetProcessGroup
+            ) && matches!(
+                self.error,
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline
+            ))
+    }
 }
 
 #[cfg(test)]
@@ -241,28 +252,38 @@ fn lifecycle_descriptor_readable(
     }
 }
 
+fn descriptor_isolation_attempt_deadline(
+    observed: Instant,
+    outer_deadline: Instant,
+    poll_interval: Duration,
+) -> Result<Instant, CoordinatorDriveError> {
+    observed
+        .checked_add(poll_interval)
+        .map(|candidate| candidate.min(outer_deadline))
+        .ok_or(CoordinatorDriveError::Deadline)
+}
+
 fn retry_descriptor_isolation_observation<State, T>(
     deadline: Instant,
     poll_interval: Duration,
     state: &mut State,
     mut attempt: impl FnMut(
         &mut State,
+        Instant,
     ) -> (
         Result<T, DescriptorIsolationObservationFailure>,
         Result<(), CoordinatorDriveError>,
     ),
-    mut lifecycle_ready: impl FnMut(&mut State, Instant) -> Result<bool, CoordinatorDriveError>,
+    mut progress_ready: impl FnMut(&mut State, Instant) -> Result<bool, CoordinatorDriveError>,
+    mut final_lifecycle_ready: impl FnMut(&mut State, Instant) -> Result<bool, CoordinatorDriveError>,
 ) -> Result<DescriptorIsolationRetryOutcome<T>, CoordinatorDriveError> {
     loop {
         let now = Instant::now();
         if now >= deadline {
-            // A descriptor scan is allowed to consume the complete isolation
-            // budget, but it must not mask a lifecycle frame which the
-            // guardian already committed before that fence. This is one
-            // zero-wait observation only: it can decode buffered progress in
-            // the outer bootstrap loop, but it can never authorize another
-            // descriptor scan after expiry.
-            if lifecycle_ready(state, now)? {
+            // At the outer fence only lifecycle receives one zero-time poll.
+            // Output servicing is deliberately excluded here so an expired
+            // descriptor proof keeps its exact failure origin.
+            if final_lifecycle_ready(state, now)? {
                 return Ok(DescriptorIsolationRetryOutcome::LifecycleReadable);
             }
             return Err(CoordinatorDriveError::DescriptorIsolation(
@@ -270,14 +291,20 @@ fn retry_descriptor_isolation_observation<State, T>(
             ));
         }
 
-        let (observation, guardian_liveness) = attempt(state);
+        // A process-group scan is read-only but may walk every process and FD
+        // visible to the current user. It therefore receives one coordinator
+        // turn, never the complete bootstrap phase. A local scan Deadline is
+        // retryable until the absolute isolation fence; no incomplete scan
+        // can mint a proof.
+        let attempt_deadline = descriptor_isolation_attempt_deadline(now, deadline, poll_interval)?;
+        let (observation, guardian_liveness) = attempt(state, attempt_deadline);
         guardian_liveness?;
         match observation {
             Ok(proof) => return Ok(DescriptorIsolationRetryOutcome::Verified(proof)),
-            Err(failure) if failure.retryable_target_change => {
+            Err(failure) if failure.retryable_target_observation() => {
                 let now = Instant::now();
                 if now >= deadline {
-                    if lifecycle_ready(state, now)? {
+                    if final_lifecycle_ready(state, now)? {
                         return Ok(DescriptorIsolationRetryOutcome::LifecycleReadable);
                     }
                     #[cfg(test)]
@@ -290,19 +317,9 @@ fn retry_descriptor_isolation_observation<State, T>(
                     .checked_add(poll_interval)
                     .map(|candidate| candidate.min(deadline))
                     .ok_or(CoordinatorDriveError::Deadline)?;
-                if lifecycle_ready(state, poll_deadline)? {
+                if progress_ready(state, poll_deadline)? {
                     return Ok(DescriptorIsolationRetryOutcome::LifecycleReadable);
                 }
-            }
-            Err(failure)
-                if failure.error
-                    == calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline =>
-            {
-                let now = Instant::now();
-                if lifecycle_ready(state, now)? {
-                    return Ok(DescriptorIsolationRetryOutcome::LifecycleReadable);
-                }
-                return Err(final_descriptor_isolation_error(failure));
             }
             Err(failure) => return Err(final_descriptor_isolation_error(failure)),
         }
@@ -1586,13 +1603,17 @@ impl ProductionCoordinator {
             deadline,
             poll_interval,
             self,
-            |coordinator| {
+            |coordinator, attempt_deadline| {
                 let observation = coordinator
-                    .observe_reported_child_descriptor_isolation(process_group, deadline);
+                    .observe_reported_child_descriptor_isolation(process_group, attempt_deadline);
                 let guardian_liveness = coordinator.ensure_guardian_live();
                 (observation, guardian_liveness)
             },
-            |coordinator, poll_deadline| coordinator.lifecycle_readable(poll_deadline),
+            |coordinator, poll_deadline| {
+                coordinator.pump_output_before(deadline)?;
+                coordinator.lifecycle_readable(poll_deadline)
+            },
+            |coordinator, final_poll| coordinator.lifecycle_readable(final_poll),
         )?;
         match outcome {
             DescriptorIsolationRetryOutcome::Verified(proof) => {
@@ -2547,7 +2568,7 @@ mod tests {
                 Instant::now() + TEST_TIMEOUT,
                 Duration::from_millis(1),
                 &mut state,
-                |(attempts, liveness_checks)| {
+                |(attempts, liveness_checks), _attempt_deadline| {
                     *attempts += 1;
                     *liveness_checks += 1;
                     let observation = if *attempts == 1 {
@@ -2557,6 +2578,7 @@ mod tests {
                     };
                     (observation, Ok(()))
                 },
+                |_, _| Ok(false),
                 |_, _| Ok(false),
             )?;
             let DescriptorIsolationRetryOutcome::Verified(proof) = outcome else {
@@ -2570,6 +2592,57 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_isolation_scan_attempt_is_bounded_to_one_coordinator_turn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let observed = Instant::now();
+        let outer_deadline = observed + Duration::from_secs(1);
+        let poll_interval = Duration::from_millis(20);
+
+        assert_eq!(
+            descriptor_isolation_attempt_deadline(observed, outer_deadline, poll_interval)?,
+            observed + poll_interval
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_isolation_turn_deadline_services_progress_before_rescan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let outer_deadline = Instant::now() + TEST_TIMEOUT;
+        let mut state = (0_usize, 0_usize, 0_usize);
+
+        let outcome = retry_descriptor_isolation_observation(
+            outer_deadline,
+            Duration::from_millis(5),
+            &mut state,
+            |(attempts, _, _), attempt_deadline| {
+                *attempts += 1;
+                assert!(attempt_deadline < outer_deadline);
+                let observation = if *attempts == 1 {
+                    Err(DescriptorIsolationObservationFailure::target(
+                        calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline,
+                    ))
+                } else {
+                    Ok(0x84_u8)
+                };
+                (observation, Ok(()))
+            },
+            |(_, progress_checks, _), _| {
+                *progress_checks += 1;
+                Ok(false)
+            },
+            |(_, _, final_checks), _| {
+                *final_checks += 1;
+                Ok(false)
+            },
+        )?;
+
+        assert_eq!(outcome, DescriptorIsolationRetryOutcome::Verified(0x84));
+        assert_eq!(state, (2, 1, 0));
+        Ok(())
+    }
+
+    #[test]
     fn descriptor_isolation_churn_yields_to_authoritative_startup_failure_before_deadline()
     -> Result<(), Box<dyn std::error::Error>> {
         let deadline = Instant::now() + TEST_TIMEOUT;
@@ -2579,7 +2652,7 @@ mod tests {
             deadline,
             Duration::from_millis(1),
             &mut (),
-            |_| {
+            |_, _attempt_deadline| {
                 attempts += 1;
                 (
                     Err(DescriptorIsolationObservationFailure::target(
@@ -2592,6 +2665,7 @@ mod tests {
                 progress_checks += 1;
                 Ok(true)
             },
+            |_, _| Ok(false),
         )?;
         assert_eq!(outcome, DescriptorIsolationRetryOutcome::LifecycleReadable);
         assert_eq!(attempts, 1);
@@ -2612,13 +2686,14 @@ mod tests {
             ),
         ] {
             let mut attempts = 0_usize;
-            let mut readiness_checks = 0_usize;
+            let mut progress_checks = 0_usize;
+            let mut final_checks = 0_usize;
             let deadline = Instant::now() + Duration::from_millis(1);
             let outcome = retry_descriptor_isolation_observation::<_, ()>(
                 deadline,
                 Duration::from_millis(1),
                 &mut (),
-                |_| {
+                |_, _attempt_deadline| {
                     attempts += 1;
                     if failure.retryable_target_change {
                         std::thread::sleep(Duration::from_millis(2));
@@ -2626,14 +2701,18 @@ mod tests {
                     (Err(failure), Ok(()))
                 },
                 |_, _| {
-                    readiness_checks += 1;
+                    progress_checks += 1;
+                    Ok(true)
+                },
+                |_, _| {
+                    final_checks += 1;
                     Ok(true)
                 },
             )?;
 
             assert_eq!(outcome, DescriptorIsolationRetryOutcome::LifecycleReadable);
             assert_eq!(attempts, 1);
-            assert_eq!(readiness_checks, 1);
+            assert_eq!(progress_checks + final_checks, 1);
         }
         Ok(())
     }
@@ -2647,10 +2726,11 @@ mod tests {
             Instant::now(),
             Duration::from_millis(1),
             &mut (),
-            |_| {
+            |_, _attempt_deadline| {
                 attempts += 1;
                 (Ok(()), Ok(()))
             },
+            |_, _| Ok(false),
             |_, _| {
                 readiness_checks += 1;
                 Ok(true)
@@ -2688,7 +2768,7 @@ mod tests {
                 Instant::now() + Duration::from_millis(20),
                 Duration::from_millis(1),
                 &mut state,
-                |(attempts, liveness_checks)| {
+                |(attempts, liveness_checks), _attempt_deadline| {
                     *attempts += 1;
                     *liveness_checks += 1;
                     (
@@ -2696,6 +2776,7 @@ mod tests {
                         Ok(()),
                     )
                 },
+                |_, _| Ok(false),
                 |_, _| Ok(false),
             );
             let error = match result {
@@ -2729,7 +2810,6 @@ mod tests {
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::MemberLimit,
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorLimit,
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenIdentityLimit,
-            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline,
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::PermissionDenied,
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessUserMismatch,
             calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor,
@@ -2748,10 +2828,11 @@ mod tests {
                 Instant::now() + TEST_TIMEOUT,
                 Duration::from_millis(1),
                 &mut attempts,
-                |attempts| {
+                |attempts, _attempt_deadline| {
                     *attempts += 1;
                     (Err(failure), Ok(()))
                 },
+                |_, _| Ok(false),
                 |_, _| Ok(false),
             );
             let error = match result {
@@ -2773,7 +2854,7 @@ mod tests {
             Instant::now() + TEST_TIMEOUT,
             Duration::from_millis(1),
             &mut attempts,
-            |attempts| {
+            |attempts, _attempt_deadline| {
                 *attempts += 1;
                 (
                     Err(DescriptorIsolationObservationFailure::target(
@@ -2782,6 +2863,7 @@ mod tests {
                     Err(CoordinatorDriveError::Guardian),
                 )
             },
+            |_, _| Ok(false),
             |_, _| Ok(false),
         );
         assert_eq!(result, Err(CoordinatorDriveError::Guardian));
