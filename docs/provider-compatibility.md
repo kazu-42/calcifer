@@ -460,6 +460,14 @@ unsupported and fails closed. A new Codex release requires a new reviewed
 projection, pinned package, and complete runtime smoke; editing the
 supported-version label alone cannot mint the capability.
 
+Official-TUI job-identity validation preserves its fail-closed public category
+while recording a closed package-only subtype for invalid PID, process-group
+query failure, process-group mismatch, session query failure, or session
+mismatch. The subtype precedes the generic marker and contains no PID, PGID,
+SID, path, OS error, provider output, or credential material. It is observation
+only: it does not authorize a retry or numeric-ID cleanup and does not weaken
+guardian retention, cleanup ordering, or the exit-86 boundary.
+
 This compatibility gate and the internal handoff transaction/reconciliation
 kernel described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
 are implemented. No command currently switches a user's profile or imports a
