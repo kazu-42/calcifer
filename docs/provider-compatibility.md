@@ -460,17 +460,21 @@ unsupported and fails closed. A new Codex release requires a new reviewed
 projection, pinned package, and complete runtime smoke; editing the
 supported-version label alone cannot mint the capability.
 
-This compatibility gate is implemented, but the production handoff transaction
-described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) is not.
-No command currently switches a user's profile or imports a user's rollout.
+This compatibility gate and the internal handoff transaction/reconciliation
+kernel described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
+are implemented. No command currently switches a user's profile or imports a
+user's rollout.
 The gate receives no Calcifer profile, conversation registry, credential, or
 user rollout, and incompatibility therefore cannot mutate those states.
 The internal Linux/macOS no-gap target-reservation and guardian lease-transfer
 primitive is implemented. The separate lazy schema-v2 conversation lineage,
-provider-free transition journal, and validated user-rollout/fork projection
-are also implemented but unused. Supervisor wiring, authoritative exhaustion
-selection, target-fork execution, and cross-profile transition crash recovery
-remain prerequisites before automatic handoff is enabled.
+provider-free transition journal, validated user-rollout/fork projection, and
+one-boundary crash recovery driver are also implemented but default-unused.
+The driver persists stop and fork intent before external effects, validates
+same-domain source provenance, adopts exactly one matching post-crash target,
+permits zero candidates one durable retry, and never offers a replay action.
+Public supervisor wiring, authoritative exhaustion selection, and target-fork
+activation remain prerequisites before automatic handoff is enabled.
 
 Relevant upstream sources:
 

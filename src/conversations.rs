@@ -23,6 +23,8 @@ const REGISTRY_FILE: &str = "conversations.json";
 #[cfg_attr(not(test), allow(dead_code))] // Consumed by transactional handoff in issue #34.
 const PRE_MIGRATION_BACKUP_FILE: &str = "conversations.v1.pre-v2.json";
 const LOCK_FILE: &str = "conversations.lock";
+#[cfg(unix)]
+const HANDOFF_COORDINATOR_LOCK_FILE: &str = "conversation-handoff.lock";
 const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INVENTORY_THREADS: usize = 1_600;
 const MAX_LINEAGE_GENERATIONS: usize = 256;
@@ -164,12 +166,25 @@ pub(crate) enum HandoffPhase {
     CommittedUnattached,
 }
 
+/// Closed, provider-free reason retained across crash recovery.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HandoffReason {
+    ConfirmedUsageExhaustion,
+    ExplicitRecovery,
+    /// Schema-v2 transition written before reason persistence existed.
+    /// Recovery may display and reconcile it, but it cannot infer exhaustion.
+    #[default]
+    UnknownLegacy,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))] // Consumed by transactional handoff in issue #34.
 pub(crate) struct HandoffPreparation {
     pub(crate) expected_source: HeadBinding,
     pub(crate) target_profile_id: String,
     pub(crate) trust_domain_id: String,
+    pub(crate) reason: HandoffReason,
     pub(crate) source_rollout: GenerationRollout,
 }
 
@@ -204,8 +219,16 @@ pub(crate) struct HandoffTransition {
     pub(crate) target_profile_id: String,
     pub(crate) canonical_cwd: String,
     pub(crate) trust_domain_id: String,
+    #[serde(default)]
+    pub(crate) reason: HandoffReason,
     pub(crate) source_rollout: GenerationRollout,
     pub(crate) phase: HandoffPhase,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) target_baseline_thread_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub(crate) fork_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fork_requested_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) observed_target: Option<ObservedHandoffTarget>,
     pub(crate) prepared_at: i64,
@@ -313,12 +336,45 @@ pub(crate) struct ConversationRegistry {
     fault: Option<WriteFault>,
 }
 
+/// Process-lifetime serialization for one crash-sensitive handoff.
+///
+/// This is deliberately distinct from the short registry transaction lock:
+/// provider shutdown, fork, and attachment may take seconds, while unrelated
+/// conversation registry updates must remain available. The descriptor is
+/// close-on-exec and never grants provider, signal, wait, or cleanup authority.
+#[cfg(unix)]
+#[must_use = "dropping the handoff coordinator lease releases global handoff serialization"]
+pub(crate) struct HandoffCoordinatorLease {
+    _lock: File,
+}
+
 impl ConversationRegistry {
     pub(crate) fn from_profiles(registry: &Registry) -> Self {
         Self {
             root: registry.managed_root().to_owned(),
             #[cfg(test)]
             fault: None,
+        }
+    }
+
+    /// Acquires the global handoff coordinator without waiting.
+    ///
+    /// Recovery invokes the same operation. A live transaction therefore
+    /// wins deterministically; callers never block while retaining a source
+    /// or target profile lease.
+    #[cfg(unix)]
+    pub(crate) fn try_lock_handoff_coordinator(
+        &self,
+    ) -> Result<HandoffCoordinatorLease, ConversationError> {
+        verify_private_directory(&self.root)?;
+        let path = self.root.join(HANDOFF_COORDINATOR_LOCK_FILE);
+        let lock = open_private_handoff_lock(&path)?;
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => Ok(HandoffCoordinatorLease { _lock: lock }),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(ConversationError::TransitionBusy)
+            }
+            Err(error) => Err(ConversationError::Io(error)),
         }
     }
 
@@ -665,6 +721,11 @@ impl ConversationRegistry {
         validate_uuid(&preparation.target_profile_id, "target profile id")?;
         validate_uuid(&preparation.trust_domain_id, "trust domain id")?;
         validate_rollout(&preparation.source_rollout)?;
+        if preparation.reason == HandoffReason::UnknownLegacy {
+            return Err(ConversationError::RegistryInvalid(
+                "a new handoff requires an explicit reason".to_owned(),
+            ));
+        }
         if preparation.expected_source.profile_id == preparation.target_profile_id {
             return Err(ConversationError::RegistryInvalid(
                 "handoff target must use a different profile".to_owned(),
@@ -741,8 +802,12 @@ impl ConversationRegistry {
                 target_profile_id: preparation.target_profile_id,
                 canonical_cwd: source.canonical_cwd.clone(),
                 trust_domain_id: preparation.trust_domain_id,
+                reason: preparation.reason,
                 source_rollout: preparation.source_rollout,
                 phase: HandoffPhase::Prepared,
+                target_baseline_thread_ids: Vec::new(),
+                fork_attempts: 0,
+                fork_requested_at: None,
                 observed_target: None,
                 prepared_at: now,
                 updated_at: now,
@@ -782,15 +847,58 @@ impl ConversationRegistry {
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
-    pub(crate) fn mark_fork_requested(
+    pub(crate) fn record_fork_intent(
+        &self,
+        transition_id: &str,
+        target_baseline_thread_ids: Vec<String>,
+    ) -> Result<HandoffTransition, ConversationError> {
+        validate_uuid(transition_id, "transition id")?;
+        validate_thread_baseline(&target_baseline_thread_ids)?;
+        self.transact_v2(|document| {
+            let transition =
+                exact_transition_mut(document, transition_id, HandoffPhase::SourceStopped)?;
+            if transition.fork_attempts != 0
+                || transition.fork_requested_at.is_some()
+                || !transition.target_baseline_thread_ids.is_empty()
+            {
+                return Err(ConversationError::TransitionPhaseInvalid);
+            }
+            let now = unix_timestamp()?;
+            transition.phase = HandoffPhase::ForkRequested;
+            transition.target_baseline_thread_ids = target_baseline_thread_ids;
+            transition.fork_attempts = 1;
+            transition.fork_requested_at = Some(now);
+            transition.updated_at = now;
+            Ok(transition.clone())
+        })
+    }
+
+    /// Persists the only retry authorization before a second fork request.
+    ///
+    /// A crash after this write but before the request leaves attempt two
+    /// consumed. Recovery may reconcile candidates but must never mint a third
+    /// request from an ambiguous absence.
+    #[cfg_attr(not(test), allow(dead_code))] // Consumed by issue #34 recovery.
+    pub(crate) fn record_bounded_fork_retry(
         &self,
         transition_id: &str,
     ) -> Result<HandoffTransition, ConversationError> {
-        self.advance_handoff_phase(
-            transition_id,
-            HandoffPhase::SourceStopped,
-            HandoffPhase::ForkRequested,
-        )
+        validate_uuid(transition_id, "transition id")?;
+        self.transact_v2(|document| {
+            let transition =
+                exact_transition_mut(document, transition_id, HandoffPhase::ForkRequested)?;
+            if transition.fork_attempts != 1
+                || transition.fork_requested_at.is_none()
+                || transition.observed_target.is_some()
+            {
+                return Err(ConversationError::TransitionPhaseInvalid);
+            }
+            let now = unix_timestamp()?;
+            transition.fork_attempts = 2;
+            transition.fork_requested_at = Some(now);
+            transition.updated_at = now;
+            Ok(transition.clone())
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
@@ -1293,7 +1401,7 @@ impl ConversationRegistry {
     }
 
     #[cfg(test)]
-    fn at(root: PathBuf) -> Self {
+    pub(crate) fn at(root: PathBuf) -> Self {
         Self { root, fault: None }
     }
 
@@ -1850,6 +1958,35 @@ fn validate_active_transition(document: &ConversationDocument) -> Result<(), Con
             "handoff transition metadata is invalid".to_owned(),
         ));
     }
+    validate_thread_baseline(&transition.target_baseline_thread_ids)?;
+    let fork_started = matches!(
+        transition.phase,
+        HandoffPhase::ForkRequested
+            | HandoffPhase::ForkObserved
+            | HandoffPhase::CommittedUnattached
+    );
+    if fork_started {
+        let fork_requested_at = transition.fork_requested_at.ok_or_else(|| {
+            ConversationError::RegistryInvalid(
+                "handoff fork intent has no request timestamp".to_owned(),
+            )
+        })?;
+        if !(1..=2).contains(&transition.fork_attempts)
+            || fork_requested_at < transition.prepared_at
+            || fork_requested_at > transition.updated_at
+        {
+            return Err(ConversationError::RegistryInvalid(
+                "handoff fork intent metadata is invalid".to_owned(),
+            ));
+        }
+    } else if transition.fork_attempts != 0
+        || transition.fork_requested_at.is_some()
+        || !transition.target_baseline_thread_ids.is_empty()
+    {
+        return Err(ConversationError::RegistryInvalid(
+            "pre-fork handoff contains fork intent metadata".to_owned(),
+        ));
+    }
 
     let conversation = document
         .conversations
@@ -1892,6 +2029,9 @@ fn validate_active_transition(document: &ConversationDocument) -> Result<(), Con
             || target.thread_id == source.thread_id
             || same_rollout_file(&target.rollout, &transition.source_rollout)
             || target.observed_at < transition.prepared_at
+            || transition
+                .fork_requested_at
+                .is_some_and(|requested_at| target.observed_at < requested_at)
             || target.observed_at > transition.updated_at
         {
             return Err(ConversationError::RegistryInvalid(
@@ -2037,6 +2177,27 @@ fn validate_observed_target(target: &ObservedHandoffTarget) -> Result<(), Conver
     Ok(())
 }
 
+fn validate_thread_baseline(thread_ids: &[String]) -> Result<(), ConversationError> {
+    if thread_ids.len() > MAX_INVENTORY_THREADS {
+        return Err(ConversationError::RegistryInvalid(
+            "target baseline exceeds its thread limit".to_owned(),
+        ));
+    }
+    for (index, thread_id) in thread_ids.iter().enumerate() {
+        validate_uuid(thread_id, "target baseline thread id")?;
+        if index > 0 && thread_ids[index - 1].as_str() >= thread_id.as_str() {
+            return Err(ConversationError::RegistryInvalid(
+                "target baseline thread ids are not canonical and unique".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+const fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 fn normalize_inventory(inventory: &mut [InventoryThread]) -> Result<(), ConversationError> {
     if inventory.len() > MAX_INVENTORY_THREADS {
         return Err(ConversationError::RegistryInvalid(
@@ -2158,6 +2319,44 @@ fn open_lock(path: &Path) -> Result<File, ConversationError> {
     let file = options.read(true).write(true).create(true).open(path)?;
     verify_private_regular_file(path)?;
     Ok(file)
+}
+
+#[cfg(unix)]
+fn open_private_handoff_lock(path: &Path) -> Result<File, ConversationError> {
+    use std::os::unix::fs::MetadataExt;
+
+    use rustix::fs::{Mode, OFlags};
+    use rustix::io::{FdFlags, fcntl_getfd};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map(File::from)
+    .map_err(io::Error::from)?;
+    let opened = descriptor.metadata()?;
+    let visible = fs::symlink_metadata(path)?;
+    let safe = opened.file_type().is_file()
+        && !visible.file_type().is_symlink()
+        && visible.file_type().is_file()
+        && opened.uid() == rustix::process::getuid().as_raw()
+        && visible.uid() == opened.uid()
+        && opened.mode() & 0o077 == 0
+        && visible.mode() == opened.mode()
+        && opened.nlink() == 1
+        && visible.nlink() == 1
+        && visible.dev() == opened.dev()
+        && visible.ino() == opened.ino()
+        && fcntl_getfd(&descriptor)
+            .map_err(io::Error::from)?
+            .contains(FdFlags::CLOEXEC);
+    if !safe {
+        return Err(ConversationError::RegistryInvalid(
+            "managed handoff coordinator lock is unsafe".to_owned(),
+        ));
+    }
+    Ok(descriptor)
 }
 
 #[cfg(unix)]
@@ -2338,7 +2537,7 @@ impl From<io::Error> for ConversationError {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -2400,6 +2599,7 @@ mod tests {
             expected_source: source.clone(),
             target_profile_id: target_profile.to_string(),
             trust_domain_id: trust_domain.to_string(),
+            reason: HandoffReason::ConfirmedUsageExhaustion,
             source_rollout: test_rollout(&format!("2026/08/07/rollout-source-{seed}.jsonl"), seed),
         }
     }
@@ -2444,10 +2644,11 @@ mod tests {
                 )
                 .map(|_| ()),
             3 => registry
-                .mark_fork_requested(
+                .record_fork_intent(
                     transition_id
                         .as_deref()
                         .ok_or(ConversationError::NotFound)?,
+                    Vec::new(),
                 )
                 .map(|_| ()),
             4 => registry
@@ -3012,6 +3213,7 @@ mod tests {
             expected_source: source.clone(),
             target_profile_id: Uuid::new_v4().to_string(),
             trust_domain_id: Uuid::new_v4().to_string(),
+            reason: HandoffReason::ConfirmedUsageExhaustion,
             source_rollout: test_rollout("2026/08/07/rollout-source.jsonl", 11),
         })?;
 
@@ -3237,7 +3439,7 @@ mod tests {
         let transition = registry.prepare_handoff(preparation)?;
         registry.mark_source_stop_requested(&transition.transition_id)?;
         registry.mark_source_stopped(&transition.transition_id)?;
-        registry.mark_fork_requested(&transition.transition_id)?;
+        registry.record_fork_intent(&transition.transition_id, Vec::new())?;
         let mut target = handoff_target(&workspace, Uuid::new_v4(), 15);
         target.rollout.fingerprint.device = source_identity.device;
         target.rollout.fingerprint.inode = source_identity.inode;
@@ -3340,7 +3542,9 @@ mod tests {
             HandoffPhase::SourceStopped
         );
         assert_eq!(
-            registry.mark_fork_requested(&first.transition_id)?.phase,
+            registry
+                .record_fork_intent(&first.transition_id, Vec::new())?
+                .phase,
             HandoffPhase::ForkRequested
         );
         let first_target_thread = Uuid::new_v4();
@@ -3380,7 +3584,7 @@ mod tests {
         let second = registry.prepare_handoff(second_preparation)?;
         registry.mark_source_stop_requested(&second.transition_id)?;
         registry.mark_source_stopped(&second.transition_id)?;
-        registry.mark_fork_requested(&second.transition_id)?;
+        registry.record_fork_intent(&second.transition_id, Vec::new())?;
         let second_target_thread = Uuid::new_v4();
         registry.observe_handoff_target(
             &second.transition_id,
@@ -3501,6 +3705,153 @@ mod tests {
     }
 
     #[test]
+    fn fork_intent_persists_a_canonical_baseline_and_allows_only_one_bounded_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("fork-intent-retry")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        let transition = registry.prepare_handoff(handoff_preparation(
+            &source,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            67,
+        ))?;
+        registry.mark_source_stop_requested(&transition.transition_id)?;
+        registry.mark_source_stopped(&transition.transition_id)?;
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        let mut baseline = vec![second, first];
+        baseline.sort_unstable();
+
+        let requested = registry.record_fork_intent(&transition.transition_id, baseline.clone())?;
+        assert_eq!(requested.phase, HandoffPhase::ForkRequested);
+        assert_eq!(requested.target_baseline_thread_ids, baseline);
+        assert_eq!(requested.fork_attempts, 1);
+        assert!(requested.fork_requested_at.is_some());
+        assert_eq!(registry.current_handoff()?, Some(requested.clone()));
+
+        let retried = registry.record_bounded_fork_retry(&transition.transition_id)?;
+        assert_eq!(retried.fork_attempts, 2);
+        assert!(retried.fork_requested_at >= requested.fork_requested_at);
+        assert_eq!(retried.target_baseline_thread_ids, baseline);
+        assert_eq!(
+            registry
+                .record_bounded_fork_retry(&transition.transition_id)
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_phase_invalid")
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fork_intent_rejects_noncanonical_or_duplicate_target_baselines()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for baseline in [
+            vec![Uuid::new_v4().to_string(), "not-a-thread".to_owned()],
+            {
+                let duplicate = Uuid::new_v4().to_string();
+                vec![duplicate.clone(), duplicate]
+            },
+        ] {
+            let root = test_root("fork-intent-invalid-baseline")?;
+            let workspace = root.join("workspace");
+            fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+            let registry = ConversationRegistry::at(root.clone());
+            let source = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+            let transition = registry.prepare_handoff(handoff_preparation(
+                &source,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                68,
+            ))?;
+            registry.mark_source_stop_requested(&transition.transition_id)?;
+            registry.mark_source_stopped(&transition.transition_id)?;
+
+            assert_eq!(
+                registry
+                    .record_fork_intent(&transition.transition_id, baseline)
+                    .err()
+                    .map(|error| error.code()),
+                Some("conversation_registry_invalid")
+            );
+            assert_eq!(
+                registry.current_handoff()?.map(|handoff| handoff.phase),
+                Some(HandoffPhase::SourceStopped)
+            );
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_coordinator_lease_is_exclusive_nonblocking_and_separate_from_registry_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("handoff-coordinator-lease")?;
+        let workspace = root.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let registry = ConversationRegistry::at(root.clone());
+        let first = registry.try_lock_handoff_coordinator()?;
+
+        assert_eq!(
+            registry
+                .try_lock_handoff_coordinator()
+                .err()
+                .map(|error| error.code()),
+            Some("conversation_handoff_in_progress")
+        );
+
+        let binding = registry.adopt(binding(&workspace, Uuid::new_v4(), Uuid::new_v4()))?;
+        assert_eq!(registry.resolve_head(&workspace)?, binding);
+
+        drop(first);
+        let second = registry.try_lock_handoff_coordinator()?;
+        drop(second);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_coordinator_lease_rejects_unsafe_visible_lock_nodes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for kind in ["symlink", "hardlink", "permissive"] {
+            let root = test_root("unsafe-handoff-coordinator-lease")?;
+            let registry = ConversationRegistry::at(root.clone());
+            let lock = root.join(HANDOFF_COORDINATOR_LOCK_FILE);
+            let other = root.join("other.lock");
+            let mut options = OpenOptions::new();
+            options.mode(0o600).write(true).create_new(true);
+            options.open(&other)?;
+            match kind {
+                "symlink" => std::os::unix::fs::symlink(&other, &lock)?,
+                "hardlink" => fs::hard_link(&other, &lock)?,
+                "permissive" => {
+                    fs::copy(&other, &lock)?;
+                    let mut permissions = fs::metadata(&lock)?.permissions();
+                    permissions.set_mode(0o666);
+                    fs::set_permissions(&lock, permissions)?;
+                }
+                _ => unreachable!(),
+            }
+
+            assert_eq!(
+                registry
+                    .try_lock_handoff_coordinator()
+                    .err()
+                    .map(|error| error.code()),
+                Some("conversation_registry_invalid"),
+                "unsafe {kind} handoff lock was accepted"
+            );
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn malformed_lineage_order_heads_and_transition_shape_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = test_root("malformed-v2")?;
@@ -3530,7 +3881,7 @@ mod tests {
 
         registry.mark_source_stop_requested(&transition.transition_id)?;
         registry.mark_source_stopped(&transition.transition_id)?;
-        registry.mark_fork_requested(&transition.transition_id)?;
+        registry.record_fork_intent(&transition.transition_id, Vec::new())?;
         registry.observe_handoff_target(
             &transition.transition_id,
             handoff_target(&workspace, Uuid::new_v4(), 81),

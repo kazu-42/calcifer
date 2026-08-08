@@ -702,12 +702,15 @@ A successful switch continues the same logical conversation. Credential profile 
 
 The target App Server imports that history through a version-gated provider API and must return the expected lineage plus a distinct rollout contained under the target profile before activation. The separate handoff-only fork projection requires a new canonical thread ID, exact `forkedFromId`, matching canonical cwd and CLI version, target-profile containment, safe target metadata, and a source-distinct inode; it does not relax the ordinary same-profile root-thread projection. Calcifer verifies that the source rollout content is unchanged and never copies credentials into a shared runtime home. The prepared transition is synced before the non-idempotent fork request, so crash recovery adopts only one uniquely matching target fork and otherwise fails closed. Source ownership is released only after the target generation is committed and attached.
 
-The rollout capability and target-reservation/guardian lease-transfer
-primitives described above are implemented, but no production command calls
-them yet. Issue #34 must integrate them beneath the handoff coordinator and
-conversation-transition locks, own the guardian lifecycle through ambiguous
-ACK outcomes, and preserve the global lock order before automatic switching can
-be enabled.
+The rollout capability, target-reservation/guardian lease-transfer primitives,
+and serialized transaction/reconciliation kernel described above are
+implemented, but no production command calls them yet. The transaction driver
+holds the separate handoff coordinator across one selected external boundary,
+uses only short conversation-registry transactions, persists stop/fork intent
+before effects, and resumes from the durable phase. Target guardian lifecycle
+and ambiguous ACK ownership remain inside the supervised runtime adapter; the
+selector must supply that adapter without changing the global lease order
+before automatic switching can be enabled.
 
 The supervisor may subscribe to thread events for usage monitoring, but it never answers approvals or any other server-initiated request. Only the attached official TUI may respond, and no new turn is admitted while that TUI is absent. Source effective execution settings are fixed at fork time; target authentication and provider routing cannot be replaced by a remote-client override.
 
@@ -720,9 +723,9 @@ profile retains an exclusive single-writer lease and reports busy/unknown
 rather than starting another App Server that could refresh the same credential
 file. The internal #54 supervisor owns a typed monitor beside its provider
 session, but no public command consumes that observation yet. Public active
-monitoring and automatic failover require the remaining selector, pool,
-transition-journal, and cross-profile recovery transaction before they can be
-enabled.
+monitoring and automatic failover require the remaining observation cache,
+selector, enabled-pool policy, and supervised transaction adapter before they
+can be enabled.
 
 The typed monitor retains Codex thread and turn UUIDs only for bounded in-memory
 target matching and one-shot routing. Those UUIDs are provider identifiers, so

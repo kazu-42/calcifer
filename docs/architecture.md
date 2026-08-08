@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, a private default-disabled trust-domain/pool registry, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, and an internal Linux/macOS no-gap target-reservation primitive are implemented. The routing registry cannot select or launch a profile. A default-unused pinned App Server/typed-monitor/official-TUI supervisor implementation is present. Deterministic recovery and official-package normal/recovery scenarios are green from the 2026-07-20 Issue #54 candidate source on Apple silicon; Ubuntu 24.04/macOS matrix acceptance is pending. Public supervised run/resume, the production cross-profile handoff transaction, active-session failover policy, and automatic failover remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, a private default-disabled trust-domain/pool registry, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target reservation, and a serialized cross-profile transaction/reconciliation kernel are implemented. The routing registry cannot select or launch a profile. A default-unused pinned App Server/typed-monitor/official-TUI supervisor implementation is present. No public supervised command or automatic selector activates these pieces yet.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -562,8 +562,9 @@ readiness contract, macOS guardian-loss constraint, and public release gates
 are specified in [ADR 0003](adr/0003-supervised-codex-session.md).
 Its fake-child process and readiness-gated PTY foundations are implemented and
 the pinned same-profile App Server/monitor/TUI integration is implemented and
-default-unused. The following pool, journal, handoff, and public-UX transaction
-remains planned.
+default-unused. The lineage journal and one-boundary handoff/recovery driver are
+implemented internally; pool selection, its supervised runtime adapter, and
+the public UX remain planned.
 
 ```text
 resolve pinned profile or explicit pool
@@ -586,7 +587,7 @@ resolve pinned profile or explicit pool
 A pool is traversed at most once per invocation.
 ```
 
-The implemented Linux/macOS rollout capability gives the future transaction a
+The implemented Linux/macOS rollout capability gives the internal transaction a
 separate path-provenance boundary. It can be minted only from an exact current
 registry profile plus the existing validated root-thread projection; callers
 cannot construct it from a path. The capability retains the private managed
@@ -595,11 +596,13 @@ sessions-root-relative locator, and a device/inode/mode/owner/link/time/SHA-256
 fingerprint. It walks every component with descriptor-relative `O_NOFOLLOW`,
 validates source session metadata, and reopens and rehashes both the retained
 descriptor and current managed path before and after its one-shot import phase.
-A separate fork-result projection requires a new canonical target thread ID,
+A separate direct-result and post-crash inventory projection requires a new canonical target thread ID,
 the exact source `forkedFromId`, matching canonical cwd and CLI version, a
-single-link safe rollout below the registered target home, and an inode distinct
-from the source. This module remains unused until the transaction below is
-wired; current run/resume behavior and its root-thread validator are unchanged.
+single-link safe rollout below the registered target home, an exact target
+session-meta parent, a bounded durable fork window for recovery, and an inode
+distinct from the source. The transaction remains default-unused until the
+selector supplies its supervised runtime adapter; current run/resume behavior
+and its root-thread validator are unchanged.
 
 The implemented target-reservation primitive gives the future supervisor an
 ephemeral, no-gap ownership transition on Linux and macOS:

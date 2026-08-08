@@ -19,6 +19,8 @@ use serde_json::{Value, json};
     any(target_os = "linux", target_os = "macos")
 ))]
 mod handoff_compat;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod handoff_transaction;
 mod json;
 #[cfg(all(
     feature = "internal-supervisor-fixture",
@@ -36,11 +38,12 @@ mod rollout_handoff;
 mod supervisor;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(unused_imports)] // Public integration first consumes this sealed surface in issue #34.
+#[allow(unused_imports)]
+// Public selector activation first consumes this sealed surface in issue #36.
 pub(crate) use rollout_handoff::{
     CodexHandoffFingerprint, CodexRolloutHandoff, CodexRolloutHandoffError, CodexRolloutImport,
     CodexRolloutLocator, ValidatedForkRollout, VerifiedSourceRollout, mint_profile_rollout_handoff,
-    validate_handoff_fork_result,
+    validate_handoff_fork_result, validate_handoff_inventory_candidate,
 };
 
 #[cfg(all(
