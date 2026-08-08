@@ -541,12 +541,15 @@ pub(super) fn publish_entry_foreground_observation(
     } else {
         "entry.foreground-safe"
     };
-    write_marker(name, b"observed\n").map_err(|_| ())?;
+    // Publish the aggregate marker last. Package tests use it as the
+    // synchronization point before reading the operation-specific evidence,
+    // so every detail must already be durable when that marker becomes
+    // visible.
     write_marker(operation, b"observed\n").map_err(|_| ())?;
     if let Some(rollback) = rollback {
         write_marker(rollback, b"observed\n").map_err(|_| ())?;
     }
-    Ok(())
+    write_marker(name, b"observed\n").map_err(|_| ())
 }
 
 fn write_process_marker(name: &str, pid: i32) -> Result<(), FixtureError> {
