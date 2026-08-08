@@ -1,6 +1,6 @@
 # ADR 0001: Treat conversation lineage as independent from credential profiles
 
-- Status: Accepted for the failover design; private compatibility gate, schema-v2 lineage, Linux/macOS validated rollout capability/no-gap target reservation, and pinned same-profile supervisor implemented internally; public cross-profile handoff pending
+- Status: Accepted for the failover design; private compatibility gate, schema-v2 lineage, Linux/macOS validated rollout capability/no-gap target reservation, pinned same-profile supervisor, and serialized cross-profile transaction/reconciliation kernel implemented internally; public selector and supervised activation pending
 - Date: 2026-07-15
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 
@@ -66,8 +66,8 @@ separate conversation schema-v2 foundation now persists an ordered lineage and
 one provider-free transition through `prepared`, `source_stop_requested`,
 `source_stopped`, `fork_requested`, `fork_observed`, and
 `committed_unattached`. It stores only local IDs, bounded fingerprints, and
-managed-root-relative rollout locators. It remains unused by provider I/O until
-the cross-profile transaction in issue #34. That integration must acquire
+managed-root-relative rollout locators. The cross-profile transaction kernel
+now consumes this journal. Its supervised runtime adapter must acquire
 locks in this order: retained source lifetime lease, handoff coordinator,
 conversation transition, target A, then target B.
 
@@ -226,8 +226,9 @@ thread ID, exact `forkedFromId`, matching canonical cwd and CLI version, and a
 safe source-distinct rollout inside the registered target profile's active
 sessions root. This projection does not modify the ordinary same-profile
 root-thread validator or exact-resume behavior. Process shutdown, the fork RPC,
-settings transfer, transition commit/reconciliation, and TUI attachment remain
-the transactional work in issue #34.
+settings transfer, and TUI attachment remain owned by the supervised runtime
+adapter consumed by the transaction driver; transition commit and crash
+reconciliation are implemented in the kernel.
 
 ## Compatibility gate
 
@@ -301,7 +302,6 @@ The baseline source contracts are:
 - A Calcifer logical conversation ID remains stable while the provider thread ID changes at each handoff.
 - The lineage registry and conversation lease become first-class state alongside credential profiles.
 - The supervised path must use App Server plus remote TUI; the current direct `run` and same-profile `resume` commands remain available and unchanged.
-- Production handoff stays disabled until the synthetic compatibility gate and
-  default-unused pinned supervisor are wired into a reviewed cross-profile
-  transaction with transition recovery, pool policy, authoritative exhaustion
-  selection, leases, and adversarial user-state path/lock tests.
+- Production handoff stays disabled until the default-unused pinned supervisor
+  is wired into the reviewed cross-profile transaction kernel with pool policy,
+  authoritative exhaustion selection, and target-reservation ownership.

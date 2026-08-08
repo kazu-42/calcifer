@@ -22,11 +22,15 @@ use super::{
     CodexThreadRead, MAX_JSONL_LINE_BYTES, MAX_ROLLOUT_BYTES, read_bounded_line,
     validate_session_meta_value,
 };
+use crate::conversations::{
+    GenerationRollout, HandoffTarget, RolloutFingerprint, RolloutLocator, RolloutRoot,
+};
 use crate::profiles::{Profile, Provider, Registry};
 
 const ACTIVE_ROLLOUT_ROOT: &str = "sessions";
 const MAX_LOCATOR_COMPONENTS: usize = 128;
 const MAX_LOCATOR_BYTES: usize = 16 * 1024;
+const MAX_FORK_CLOCK_SKEW_SECONDS: i64 = 5;
 
 /// A redacted failure at the rollout capability boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +150,10 @@ impl CodexRolloutHandoff {
         &self.thread_id
     }
 
+    pub(crate) fn codex_version(&self) -> &str {
+        &self.codex_version
+    }
+
     pub(crate) fn canonical_cwd(&self) -> &Path {
         &self.canonical_cwd
     }
@@ -156,6 +164,12 @@ impl CodexRolloutHandoff {
 
     pub(crate) fn fingerprint(&self) -> &CodexHandoffFingerprint {
         &self.fingerprint
+    }
+
+    /// Projects the sealed source into the bounded provider-free journal
+    /// shape without exposing its absolute path.
+    pub(crate) fn journal_rollout(&self) -> Result<GenerationRollout, CodexRolloutHandoffError> {
+        project_journal_rollout(&self.locator, &self.fingerprint)
     }
 
     /// Revalidates immediately before exposing the sealed path to provider I/O.
@@ -266,6 +280,10 @@ impl VerifiedSourceRollout {
     pub(crate) fn fingerprint(&self) -> &CodexHandoffFingerprint {
         &self.fingerprint
     }
+
+    pub(crate) fn journal_rollout(&self) -> Result<GenerationRollout, CodexRolloutHandoffError> {
+        project_journal_rollout(&self.locator, &self.fingerprint)
+    }
 }
 
 /// Strict handoff-only projection for a newly materialized target rollout.
@@ -298,6 +316,62 @@ impl ValidatedForkRollout {
     pub(crate) fn fingerprint(&self) -> &CodexHandoffFingerprint {
         &self.fingerprint
     }
+
+    /// Consumes a validated fork into the exact provider-free target that the
+    /// journal may adopt. The source supplies the version invariant already
+    /// checked in the provider response.
+    pub(crate) fn into_handoff_target(
+        self,
+        source: &VerifiedSourceRollout,
+    ) -> Result<HandoffTarget, CodexRolloutHandoffError> {
+        if self.profile_id == source.profile_id
+            || self.thread_id == source.thread_id
+            || self.canonical_cwd != source.canonical_cwd
+            || self.fingerprint.same_file(&source.fingerprint)
+        {
+            return Err(CodexRolloutHandoffError::UnsafeTarget);
+        }
+        Ok(HandoffTarget {
+            thread_id: self.thread_id,
+            canonical_cwd: self
+                .canonical_cwd
+                .to_str()
+                .ok_or(CodexRolloutHandoffError::UnsafeTarget)?
+                .to_owned(),
+            codex_version: source.codex_version.clone(),
+            rollout: project_journal_rollout(&self.locator, &self.fingerprint)?,
+        })
+    }
+}
+
+fn project_journal_rollout(
+    locator: &CodexRolloutLocator,
+    fingerprint: &CodexHandoffFingerprint,
+) -> Result<GenerationRollout, CodexRolloutHandoffError> {
+    let relative_path = locator
+        .relative_path
+        .to_str()
+        .ok_or(CodexRolloutHandoffError::Thread)?
+        .to_owned();
+    Ok(GenerationRollout {
+        locator: RolloutLocator {
+            root: RolloutRoot::Sessions,
+            relative_path,
+        },
+        fingerprint: RolloutFingerprint {
+            device: fingerprint.device,
+            inode: fingerprint.inode,
+            length: fingerprint.length,
+            mode: fingerprint.mode,
+            owner: fingerprint.uid,
+            link_count: fingerprint.links,
+            modified_seconds: fingerprint.modified_seconds,
+            modified_nanoseconds: fingerprint.modified_nanoseconds,
+            changed_seconds: fingerprint.changed_seconds,
+            changed_nanoseconds: fingerprint.changed_nanoseconds,
+            sha256: fingerprint.sha256(),
+        },
+    })
 }
 
 /// Mints source authority from registered profile lineage, never from a path.
@@ -478,7 +552,112 @@ pub(crate) fn validate_handoff_fork_result(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or(CodexRolloutHandoffError::ForkResponse)?;
-    let (locator, fingerprint) = validate_target_rollout(&home, &target_path)?;
+    let (locator, fingerprint) = validate_target_rollout(
+        &home,
+        &target_path,
+        target_thread_id,
+        &source.thread_id,
+        &response_cwd,
+        &source.codex_version,
+    )?;
+    if fingerprint.same_file(&source.fingerprint) {
+        return Err(CodexRolloutHandoffError::UnsafeTarget);
+    }
+    Ok(ValidatedForkRollout {
+        profile_id: current.id,
+        thread_id: target_thread_id.to_owned(),
+        canonical_cwd: response_cwd,
+        locator,
+        fingerprint,
+    })
+}
+
+/// Validates one post-crash `thread/list` entry against the durable fork
+/// window and the same source/target lineage rules as the direct response.
+/// Baseline filtering happens before this call; any returned value is safe to
+/// project as a matching reconciliation candidate.
+pub(crate) fn validate_handoff_inventory_candidate(
+    registry: &Registry,
+    target_profile: &Profile,
+    source: &VerifiedSourceRollout,
+    candidate: &Value,
+    fork_requested_at: i64,
+    observed_at: i64,
+) -> Result<ValidatedForkRollout, CodexRolloutHandoffError> {
+    if fork_requested_at < 0 || observed_at < fork_requested_at {
+        return Err(CodexRolloutHandoffError::ForkResponse);
+    }
+    let earliest = fork_requested_at
+        .checked_sub(MAX_FORK_CLOCK_SKEW_SECONDS)
+        .ok_or(CodexRolloutHandoffError::ForkResponse)?;
+    let latest = observed_at
+        .checked_add(MAX_FORK_CLOCK_SKEW_SECONDS)
+        .ok_or(CodexRolloutHandoffError::ForkResponse)?;
+    let candidate = candidate
+        .as_object()
+        .ok_or(CodexRolloutHandoffError::ForkResponse)?;
+    let target_thread_id = candidate
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or(CodexRolloutHandoffError::ForkResponse)?;
+    super::validate_canonical_uuid(target_thread_id)
+        .map_err(|_| CodexRolloutHandoffError::ForkResponse)?;
+    let updated_at = candidate
+        .get("updatedAt")
+        .and_then(Value::as_i64)
+        .filter(|timestamp| (*timestamp >= earliest) && (*timestamp <= latest))
+        .ok_or(CodexRolloutHandoffError::ForkResponse)?;
+    let recency_at = match candidate.get("recencyAt") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .filter(|timestamp| (*timestamp >= earliest) && (*timestamp <= latest))
+                .ok_or(CodexRolloutHandoffError::ForkResponse)?,
+        ),
+    };
+    let _ = (updated_at, recency_at);
+    if target_thread_id == source.thread_id
+        || candidate.get("parentThreadId").and_then(Value::as_str)
+            != Some(source.thread_id.as_str())
+        || candidate.get("ephemeral").and_then(Value::as_bool) != Some(false)
+        || candidate.get("cliVersion").and_then(Value::as_str)
+            != Some(source.codex_version.as_str())
+        || candidate.get("source").and_then(Value::as_str) != Some("cli")
+    {
+        return Err(CodexRolloutHandoffError::ForkResponse);
+    }
+    let response_cwd = canonical_response_cwd(candidate.get("cwd"))?;
+    if response_cwd != source.canonical_cwd {
+        return Err(CodexRolloutHandoffError::ForkResponse);
+    }
+    let target_path = candidate
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or(CodexRolloutHandoffError::ForkResponse)?;
+
+    if target_profile.provider != Provider::Codex || target_profile.id == source.profile_id {
+        return Err(CodexRolloutHandoffError::Profile);
+    }
+    let current = registry
+        .find_by_id(target_profile.provider, &target_profile.id)
+        .map_err(|_| CodexRolloutHandoffError::Profile)?;
+    if current != *target_profile {
+        return Err(CodexRolloutHandoffError::Profile);
+    }
+    let home = registry
+        .profile_home(&current)
+        .map_err(|_| CodexRolloutHandoffError::Profile)?;
+    let (locator, fingerprint) = validate_target_rollout(
+        &home,
+        &target_path,
+        target_thread_id,
+        &source.thread_id,
+        &response_cwd,
+        &source.codex_version,
+    )?;
     if fingerprint.same_file(&source.fingerprint) {
         return Err(CodexRolloutHandoffError::UnsafeTarget);
     }
@@ -494,6 +673,10 @@ pub(crate) fn validate_handoff_fork_result(
 fn validate_target_rollout(
     managed_home: &Path,
     path: &Path,
+    target_thread_id: &str,
+    source_thread_id: &str,
+    expected_cwd: &Path,
+    expected_version: &str,
 ) -> Result<(CodexRolloutLocator, CodexHandoffFingerprint), CodexRolloutHandoffError> {
     let canonical_home =
         fs::canonicalize(managed_home).map_err(|_| CodexRolloutHandoffError::UnsafeTarget)?;
@@ -527,6 +710,13 @@ fn validate_target_rollout(
         locator.relative_path(),
         CodexRolloutHandoffError::UnsafeTarget,
     )?;
+    validate_target_session(
+        &mut file,
+        target_thread_id,
+        source_thread_id,
+        expected_cwd,
+        expected_version,
+    )?;
     let fingerprint = fingerprint_file(&mut file, CodexRolloutHandoffError::UnsafeTarget)?;
     let mut reopened = open_relative_rollout(
         &sessions,
@@ -537,6 +727,50 @@ fn validate_target_rollout(
         return Err(CodexRolloutHandoffError::UnsafeTarget);
     }
     Ok((locator, fingerprint))
+}
+
+fn validate_target_session(
+    file: &mut File,
+    target_thread_id: &str,
+    source_thread_id: &str,
+    expected_cwd: &Path,
+    expected_version: &str,
+) -> Result<(), CodexRolloutHandoffError> {
+    let error = CodexRolloutHandoffError::UnsafeTarget;
+    file.seek(SeekFrom::Start(0)).map_err(|_| error)?;
+    let mut reader = BufReader::new(file);
+    let first = read_bounded_line(&mut reader)
+        .map_err(|_| error)?
+        .ok_or(error)?;
+    if first.len() > MAX_JSONL_LINE_BYTES {
+        return Err(error);
+    }
+    let value = super::json::decode_unique_json(first.as_bytes()).map_err(|_| error)?;
+    let object = value.as_object().ok_or(error)?;
+    if object.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Err(error);
+    }
+    let payload = object
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or(error)?;
+    let rollout_cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or(error)?;
+    let canonical_cwd = fs::canonicalize(&rollout_cwd).map_err(|_| error)?;
+    if payload.get("id").and_then(Value::as_str) != Some(target_thread_id)
+        || payload.get("session_id").and_then(Value::as_str) != Some(target_thread_id)
+        || payload.get("parent_thread_id").and_then(Value::as_str) != Some(source_thread_id)
+        || payload.get("cli_version").and_then(Value::as_str) != Some(expected_version)
+        || payload.get("source").and_then(Value::as_str) != Some("cli")
+        || canonical_cwd != expected_cwd
+        || canonical_cwd != rollout_cwd
+    {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn canonical_response_cwd(value: Option<&Value>) -> Result<PathBuf, CodexRolloutHandoffError> {
@@ -889,9 +1123,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::conversations::{
+        BindingInput, ConversationLifecycle, ConversationRegistry, HandoffReason,
+    };
     use crate::providers::codex::{
         CodexIdentityAdapter, CodexThreadLifecycle, WireThread, validate_thread_projection,
     };
+    use crate::routing::{DefinitionMutation, Definitions};
 
     struct TestFixture {
         root: PathBuf,
@@ -1073,6 +1311,25 @@ mod tests {
         })
     }
 
+    fn inventory_candidate(
+        source: &VerifiedSourceRollout,
+        target_thread_id: &str,
+        target_rollout: &Path,
+        updated_at: i64,
+    ) -> Value {
+        json!({
+            "id": target_thread_id,
+            "parentThreadId": source.thread_id(),
+            "ephemeral": false,
+            "updatedAt": updated_at,
+            "recencyAt": updated_at,
+            "cwd": source.canonical_cwd(),
+            "cliVersion": "0.144.4",
+            "source": "cli",
+            "path": target_rollout,
+        })
+    }
+
     fn write_target_rollout(
         fixture: &TestFixture,
         thread_id: &str,
@@ -1101,6 +1358,13 @@ mod tests {
         assert_eq!(capability.locator().root(), "sessions");
         assert!(!capability.locator().relative_path().is_absolute());
         assert_eq!(capability.fingerprint().sha256().len(), 64);
+        let journal = capability.journal_rollout()?;
+        assert_eq!(journal.locator.root, RolloutRoot::Sessions);
+        assert!(!journal.locator.relative_path.starts_with('/'));
+        assert_eq!(
+            journal.fingerprint.sha256,
+            capability.fingerprint().sha256()
+        );
 
         let import = capability.begin_import()?;
         assert_eq!(import.source_path(), fixture.source_rollout);
@@ -1110,6 +1374,56 @@ mod tests {
         assert_eq!(verified.canonical_cwd(), fixture.workspace);
         assert_eq!(verified.locator().root(), "sessions");
         assert_eq!(verified.fingerprint().sha256().len(), 64);
+        assert_eq!(verified.journal_rollout()?, journal);
+        Ok(())
+    }
+
+    #[test]
+    fn concrete_handoff_preparation_binds_capability_policy_and_active_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new("transaction-preparation")?;
+        let source = fixture.mint()?;
+        let conversations = ConversationRegistry::from_profiles(&fixture.registry);
+        let expected_source = conversations.adopt(BindingInput {
+            profile_id: fixture.source_profile.id.clone(),
+            thread_id: fixture.source_read.metadata.thread_id.clone(),
+            canonical_cwd: fixture.workspace.to_string_lossy().into_owned(),
+            codex_version: "0.144.4".to_owned(),
+            lifecycle: ConversationLifecycle::Interrupted,
+        })?;
+        let trust_domain_id = uuid::Uuid::new_v4().to_string();
+        let mut definitions = Definitions::default();
+        definitions.apply(
+            0,
+            DefinitionMutation::CreateDomain {
+                id: trust_domain_id.clone(),
+                alias: "handoff-domain".to_owned(),
+                provider: Provider::Codex,
+                profile_ids: vec![
+                    fixture.source_profile.id.clone(),
+                    fixture.target_profile.id.clone(),
+                ],
+            },
+        )?;
+
+        let transition = crate::providers::codex::handoff_transaction::prepare_codex_handoff(
+            &conversations,
+            &definitions,
+            expected_source.clone(),
+            &fixture.target_profile,
+            &trust_domain_id,
+            HandoffReason::ConfirmedUsageExhaustion,
+            &source,
+        )?;
+        assert_eq!(transition.conversation_id, expected_source.conversation_id);
+        assert_eq!(transition.source_profile_id, fixture.source_profile.id);
+        assert_eq!(transition.target_profile_id, fixture.target_profile.id);
+        assert_eq!(transition.trust_domain_id, trust_domain_id);
+        assert_eq!(transition.source_rollout, source.journal_rollout()?);
+        assert_eq!(
+            transition.phase,
+            crate::conversations::HandoffPhase::Prepared
+        );
         Ok(())
     }
 
@@ -1333,6 +1647,76 @@ mod tests {
         assert!(!target.locator().relative_path().is_absolute());
         assert_eq!(target.fingerprint().sha256().len(), 64);
         assert_ne!(target.fingerprint().inode, source.fingerprint().inode);
+        let adopted = target.into_handoff_target(&source)?;
+        assert_eq!(adopted.thread_id, target_thread_id);
+        assert_eq!(adopted.canonical_cwd, fixture.workspace.to_string_lossy());
+        assert_eq!(adopted.codex_version, "0.144.4");
+        assert_eq!(adopted.rollout.locator.root, RolloutRoot::Sessions);
+        assert_ne!(adopted.rollout, source.journal_rollout()?);
+        Ok(())
+    }
+
+    #[test]
+    fn crash_inventory_candidate_requires_exact_lineage_and_durable_fork_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new("reconcile-target")?;
+        let source = fixture.verified_source()?;
+        let target_thread_id = uuid::Uuid::new_v4().to_string();
+        let target_rollout = write_target_rollout(&fixture, &target_thread_id)?;
+        let requested_at = 1_800_000_000;
+        let observed_at = requested_at + 10;
+        let candidate =
+            inventory_candidate(&source, &target_thread_id, &target_rollout, requested_at);
+
+        let validated = validate_handoff_inventory_candidate(
+            &fixture.registry,
+            &fixture.target_profile,
+            &source,
+            &candidate,
+            requested_at,
+            observed_at,
+        )?;
+        assert_eq!(validated.thread_id(), target_thread_id);
+        let transaction_candidate =
+            crate::providers::codex::handoff_transaction::ForkCandidate::from_validated_rollout(
+                target_thread_id.clone(),
+                validated,
+                &source,
+            );
+        assert_eq!(
+            transaction_candidate
+                .matching_target_for_test()
+                .map(|target| target.thread_id.as_str()),
+            Some(target_thread_id.as_str())
+        );
+
+        let mut stale = candidate.clone();
+        stale["updatedAt"] = json!(requested_at - MAX_FORK_CLOCK_SKEW_SECONDS - 1);
+        assert_eq!(
+            validate_handoff_inventory_candidate(
+                &fixture.registry,
+                &fixture.target_profile,
+                &source,
+                &stale,
+                requested_at,
+                observed_at,
+            ),
+            Err(CodexRolloutHandoffError::ForkResponse)
+        );
+
+        let mut wrong_parent = candidate;
+        wrong_parent["parentThreadId"] = json!(uuid::Uuid::new_v4().to_string());
+        assert_eq!(
+            validate_handoff_inventory_candidate(
+                &fixture.registry,
+                &fixture.target_profile,
+                &source,
+                &wrong_parent,
+                requested_at,
+                observed_at,
+            ),
+            Err(CodexRolloutHandoffError::ForkResponse)
+        );
         Ok(())
     }
 
@@ -1354,6 +1738,28 @@ mod tests {
                 &same_id
             ),
             Err(CodexRolloutHandoffError::ForkResponse)
+        );
+
+        let wrong_rollout_thread = uuid::Uuid::new_v4().to_string();
+        let wrong_rollout_parent = uuid::Uuid::new_v4().to_string();
+        let wrong_lineage_rollout = write_rollout(
+            &fixture.target_home()?,
+            &fixture.workspace,
+            &wrong_rollout_thread,
+            &wrong_rollout_thread,
+            Some(&wrong_rollout_parent),
+        )?;
+        let wrong_lineage_result =
+            target_result(&source, &wrong_rollout_thread, &wrong_lineage_rollout);
+        assert_eq!(
+            validate_handoff_fork_result(
+                &fixture.registry,
+                &fixture.target_profile,
+                &source,
+                &wrong_lineage_result,
+            ),
+            Err(CodexRolloutHandoffError::UnsafeTarget),
+            "the provider response cannot substitute for target rollout lineage"
         );
 
         let mut wrong_parent = target_result(&source, &target_thread_id, &target_rollout);

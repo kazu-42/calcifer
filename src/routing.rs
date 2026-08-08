@@ -27,6 +27,24 @@ pub(crate) struct Definitions {
     pools: Vec<PoolDefinition>,
 }
 
+/// Proof that two distinct profiles are members of one provider trust domain.
+///
+/// The proof contains no aliases, credentials, or provider-owned state. It is
+/// intentionally minted from the validated routing snapshot immediately
+/// before a durable handoff is prepared.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))] // Activated by cross-profile selection in issue #36.
+pub(crate) struct HandoffAuthorization {
+    trust_domain_id: String,
+}
+
+impl HandoffAuthorization {
+    #[cfg_attr(not(test), allow(dead_code))] // Activated by cross-profile selection in issue #36.
+    pub(crate) fn trust_domain_id(&self) -> &str {
+        &self.trust_domain_id
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DefinitionsDocument {
@@ -332,6 +350,40 @@ impl Definitions {
         domain_id: &str,
     ) -> Result<Provider, DefinitionError> {
         self.domain_provider(domain_id)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Activated by cross-profile selection in issue #36.
+    pub(crate) fn authorize_handoff(
+        &self,
+        trust_domain_id: &str,
+        source_profile_id: &str,
+        target_profile_id: &str,
+        provider: Provider,
+    ) -> Result<HandoffAuthorization, DefinitionError> {
+        validate_uuid(trust_domain_id)?;
+        validate_uuid(source_profile_id)?;
+        validate_uuid(target_profile_id)?;
+        let domain = self
+            .trust_domains
+            .iter()
+            .find(|domain| domain.id == trust_domain_id)
+            .ok_or(DefinitionError::NotFound)?;
+        if source_profile_id == target_profile_id
+            || domain.provider != provider
+            || domain
+                .profile_ids
+                .binary_search_by(|candidate| candidate.as_str().cmp(source_profile_id))
+                .is_err()
+            || domain
+                .profile_ids
+                .binary_search_by(|candidate| candidate.as_str().cmp(target_profile_id))
+                .is_err()
+        {
+            return Err(DefinitionError::InvalidMembership);
+        }
+        Ok(HandoffAuthorization {
+            trust_domain_id: domain.id.clone(),
+        })
     }
 
     pub(crate) fn pool_provider_for_id(&self, pool_id: &str) -> Result<Provider, DefinitionError> {
@@ -902,6 +954,32 @@ mod tests {
             .ok_or("a stale expected revision must fail")?;
         assert_eq!(error.code(), "routing_definition_revision_conflict");
         assert_eq!(definitions.revision(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_authorization_requires_two_distinct_members_of_one_provider_domain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definitions = Definitions::from_json(&encoded(&schema_document())?)?;
+
+        let authorization =
+            definitions.authorize_handoff(DOMAIN_ID, PROFILE_A, PROFILE_B, Provider::Codex)?;
+        assert_eq!(authorization.trust_domain_id(), DOMAIN_ID);
+
+        for (source, target) in [(PROFILE_A, PROFILE_A), (PROFILE_A, PROFILE_C)] {
+            assert_eq!(
+                definitions
+                    .authorize_handoff(DOMAIN_ID, source, target, Provider::Codex)
+                    .err(),
+                Some(DefinitionError::InvalidMembership)
+            );
+        }
+        assert_eq!(
+            definitions
+                .authorize_handoff(POOL_ID, PROFILE_A, PROFILE_B, Provider::Codex)
+                .err(),
+            Some(DefinitionError::NotFound)
+        );
         Ok(())
     }
 
