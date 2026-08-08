@@ -3375,7 +3375,27 @@ fn package_official_tui_group_failures_are_closed_fixed_and_payload_free() {
     ];
     let mut markers = vec![
         PackageOfficialTuiGroupFailure::Leader.marker(),
-        PackageOfficialTuiGroupFailure::JobIdentity.marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::InvalidPid,
+        )
+        .marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::ProcessGroupQuery,
+        )
+        .marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::ProcessGroupMismatch,
+        )
+        .marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::SessionQuery,
+        )
+        .marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+        )
+        .marker(),
+        "exercise.tui-group-validation-failed.job-identity",
         PackageOfficialTuiGroupFailure::Empty.marker(),
         PackageOfficialTuiGroupFailure::Snapshot.marker(),
         PackageOfficialTuiGroupFailure::NotStablyLiveNoObservation.marker(),
@@ -3401,6 +3421,93 @@ fn package_official_tui_group_failures_are_closed_fixed_and_payload_free() {
     markers.sort_unstable();
     markers.dedup();
     assert_eq!(markers.len(), marker_count);
+}
+
+#[test]
+fn package_official_tui_job_identity_observer_classifies_every_closed_boundary() {
+    use PackageOfficialTuiJobIdentityFailure::{
+        InvalidPid, ProcessGroupMismatch, ProcessGroupQuery, SessionMismatch, SessionQuery,
+    };
+
+    let tui = PackageChildMarker {
+        pid: 101,
+        pgid: 101,
+    };
+    let cases = [
+        (
+            PackageChildMarker { pid: 0, pgid: 0 },
+            Err(InvalidPid),
+            Ok(101),
+            Ok(101),
+        ),
+        (
+            PackageChildMarker { pid: -1, pgid: -1 },
+            Err(InvalidPid),
+            Ok(101),
+            Ok(101),
+        ),
+        (tui, Err(ProcessGroupQuery), Err(()), Ok(101)),
+        (tui, Err(ProcessGroupMismatch), Ok(202), Ok(101)),
+        (tui, Err(SessionQuery), Ok(101), Err(())),
+        (tui, Err(SessionMismatch), Ok(101), Ok(202)),
+        (tui, Ok(()), Ok(101), Ok(101)),
+    ];
+
+    for (marker, expected, process_group, session) in cases {
+        let mut process_group_calls = 0;
+        let mut session_calls = 0;
+        let actual = validate_official_tui_job_identity_with_observer(
+            marker,
+            |_| {
+                process_group_calls += 1;
+                process_group
+            },
+            |_| {
+                session_calls += 1;
+                session
+            },
+        )
+        .map_err(|failure| match failure {
+            PackageOfficialTuiGroupFailure::JobIdentity(detail) => detail,
+            other => panic!("unexpected official-TUI identity failure: {other:?}"),
+        });
+
+        assert_eq!(actual, expected);
+        if marker.pid <= 0 {
+            assert_eq!((process_group_calls, session_calls), (0, 0));
+        } else if process_group.is_err() || process_group != Ok(marker.pgid) {
+            assert_eq!((process_group_calls, session_calls), (1, 0));
+        } else {
+            assert_eq!((process_group_calls, session_calls), (1, 1));
+        }
+    }
+}
+
+#[test]
+fn package_official_tui_job_identity_publishes_exact_detail_before_generic_marker()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let failure = PackageOfficialTuiGroupFailure::JobIdentity(
+        PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+    );
+
+    record_package_official_tui_group_failure(&report, failure);
+
+    assert!(fixed_package_failure_marker_is_valid(
+        &report,
+        "exercise.tui-group-validation-failed.job-identity.session-mismatch"
+    ));
+    assert!(fixed_package_failure_marker_is_valid(
+        &report,
+        "exercise.tui-group-validation-failed.job-identity"
+    ));
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some("exercise.tui-group-validation-failed.job-identity.session-mismatch")
+    );
+    scratch.cleanup()
 }
 
 #[test]
@@ -3504,14 +3611,21 @@ fn package_official_tui_descriptor_scan_stops_retry_when_job_identity_is_lost() 
             if liveness_checks == 1 {
                 Ok(())
             } else {
-                Err(PackageOfficialTuiGroupFailure::JobIdentity)
+                Err(PackageOfficialTuiGroupFailure::JobIdentity(
+                    PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+                ))
             }
         },
         |_| waits += 1,
         || origin,
     );
 
-    assert_eq!(result, Err(PackageOfficialTuiGroupFailure::JobIdentity));
+    assert_eq!(
+        result,
+        Err(PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+        ))
+    );
     assert_eq!(observation_calls, 1);
     assert_eq!(liveness_checks, 2);
     assert_eq!(waits, 0);
@@ -3564,14 +3678,21 @@ fn package_official_tui_descriptor_scan_rejects_identity_loss_after_success() {
             if liveness_checks == 1 {
                 Ok(())
             } else {
-                Err(PackageOfficialTuiGroupFailure::JobIdentity)
+                Err(PackageOfficialTuiGroupFailure::JobIdentity(
+                    PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+                ))
             }
         },
         |_| panic!("a successful scan must not enter the retry wait"),
         || origin,
     );
 
-    assert_eq!(result, Err(PackageOfficialTuiGroupFailure::JobIdentity));
+    assert_eq!(
+        result,
+        Err(PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+        ))
+    );
     assert_eq!(observation_calls, 1);
     assert_eq!(liveness_checks, 2);
 }
@@ -3812,6 +3933,95 @@ fn package_failure_report_scanner_bridges_only_the_closed_official_tui_group_cat
         None,
         "the scanner must not return a prefix match or a raw report filename"
     );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_official_tui_job_identity_scanner_rejects_hostile_nodes() -> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let marker = "exercise.tui-group-validation-failed.job-identity.session-query";
+    let marker_path = report.join(marker);
+
+    for rejected in [
+        "exercise.tui-group-validation-failed.job-identity",
+        "exercise.tui-group-validation-failed.job-identity.user-controlled",
+        "exercise.tui-group-validation-failed.job-identity.session-query.extended",
+    ] {
+        let path = report.join(rejected);
+        write_private_new(&path, b"private\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a prefix-only, unknown, extended, or payload-bearing subtype was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    for payload in [
+        b"private\n".as_slice(),
+        b"classified\nprivate-provider-payload\n".as_slice(),
+    ] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a payload-bearing or oversized subtype was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("job-identity-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a symlinked subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a hardlinked subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a wrong-mode subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let fifo_status = Command::new("/usr/bin/mkfifo").arg(&marker_path).status()?;
+    if !fifo_status.success() {
+        return Err("could not create the job-identity subtype FIFO fixture".into());
+    }
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a FIFO subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let socket_source = scratch.root.join("job-identity-subtype.socket");
+    let socket_listener = UnixListener::bind(&socket_source)?;
+    fs::set_permissions(&socket_source, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&socket_source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a socket subtype was trusted"
+    );
+    drop(socket_listener);
+    fs::remove_file(marker_path)?;
     scratch.cleanup()
 }
 
@@ -11983,7 +12193,7 @@ impl OfficialTuiPackageHarness {
             exercise_deadline(PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)?,
         )?;
         if let Err(failure) = validate_official_tui_group(tui, exercise_deadline(IO_TIMEOUT)?) {
-            record_package_diagnostic_marker(&report, failure.marker());
+            record_package_official_tui_group_failure(&report, failure);
             return Err(Box::new(failure));
         }
         record_package_exercise_phase(&report, PackageExercisePhase::ChildrenValidated);
@@ -11998,7 +12208,7 @@ impl OfficialTuiPackageHarness {
         record_package_exercise_phase(&report, PackageExercisePhase::RawModeObserved);
         if let Err(failure) = validate_live_official_tui_group(tui, exercise_deadline(IO_TIMEOUT)?)
         {
-            record_package_diagnostic_marker(&report, failure.marker());
+            record_package_official_tui_group_failure(&report, failure);
             return Err(Box::new(failure));
         }
         record_package_exercise_phase(&report, PackageExercisePhase::PostGateTuiLive);
@@ -16119,6 +16329,11 @@ struct PackageChildMarker {
 
 const PACKAGE_OFFICIAL_TUI_GROUP_FAILURE_MARKERS: &[&str] = &[
     "exercise.tui-group-validation-failed.leader",
+    "exercise.tui-group-validation-failed.job-identity.invalid-pid",
+    "exercise.tui-group-validation-failed.job-identity.process-group-query",
+    "exercise.tui-group-validation-failed.job-identity.process-group-mismatch",
+    "exercise.tui-group-validation-failed.job-identity.session-query",
+    "exercise.tui-group-validation-failed.job-identity.session-mismatch",
     "exercise.tui-group-validation-failed.job-identity",
     "exercise.tui-group-validation-failed.empty",
     "exercise.tui-group-validation-failed.snapshot",
@@ -16148,9 +16363,36 @@ const PACKAGE_OFFICIAL_TUI_GROUP_FAILURE_MARKERS: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageOfficialTuiJobIdentityFailure {
+    InvalidPid,
+    ProcessGroupQuery,
+    ProcessGroupMismatch,
+    SessionQuery,
+    SessionMismatch,
+}
+
+impl PackageOfficialTuiJobIdentityFailure {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::InvalidPid => "exercise.tui-group-validation-failed.job-identity.invalid-pid",
+            Self::ProcessGroupQuery => {
+                "exercise.tui-group-validation-failed.job-identity.process-group-query"
+            }
+            Self::ProcessGroupMismatch => {
+                "exercise.tui-group-validation-failed.job-identity.process-group-mismatch"
+            }
+            Self::SessionQuery => "exercise.tui-group-validation-failed.job-identity.session-query",
+            Self::SessionMismatch => {
+                "exercise.tui-group-validation-failed.job-identity.session-mismatch"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackageOfficialTuiGroupFailure {
     Leader,
-    JobIdentity,
+    JobIdentity(PackageOfficialTuiJobIdentityFailure),
     Descriptor(calcifer_unix_child_fd::ProcessGroupDescriptorScanError),
     Empty,
     Snapshot,
@@ -16165,7 +16407,7 @@ impl PackageOfficialTuiGroupFailure {
 
         match self {
             Self::Leader => "exercise.tui-group-validation-failed.leader",
-            Self::JobIdentity => "exercise.tui-group-validation-failed.job-identity",
+            Self::JobIdentity(detail) => detail.marker(),
             Self::Empty => "exercise.tui-group-validation-failed.empty",
             Self::Snapshot => "exercise.tui-group-validation-failed.snapshot",
             Self::NotStablyLiveNoObservation => {
@@ -16238,6 +16480,19 @@ impl PackageOfficialTuiGroupFailure {
                 "exercise.tui-group-validation-failed.descriptor.observation-failed"
             }
         }
+    }
+}
+
+fn record_package_official_tui_group_failure(
+    report: &Path,
+    failure: PackageOfficialTuiGroupFailure,
+) {
+    record_package_diagnostic_marker(report, failure.marker());
+    if matches!(failure, PackageOfficialTuiGroupFailure::JobIdentity(_)) {
+        record_package_diagnostic_marker(
+            report,
+            "exercise.tui-group-validation-failed.job-identity",
+        );
     }
 }
 
@@ -16617,21 +16872,53 @@ fn validate_official_tui_group(
 fn validate_official_tui_job_identity(
     tui: PackageChildMarker,
 ) -> Result<(), PackageOfficialTuiGroupFailure> {
+    validate_official_tui_job_identity_with_observer(
+        tui,
+        |pid| {
+            rustix::process::getpgid(Some(pid))
+                .map(rustix::process::Pid::as_raw_pid)
+                .map_err(|_| ())
+        },
+        |pid| {
+            rustix::process::getsid(Some(pid))
+                .map(rustix::process::Pid::as_raw_pid)
+                .map_err(|_| ())
+        },
+    )
+}
+
+fn validate_official_tui_job_identity_with_observer<ObserveProcessGroup, ObserveSession>(
+    tui: PackageChildMarker,
+    mut observe_process_group: ObserveProcessGroup,
+    mut observe_session: ObserveSession,
+) -> Result<(), PackageOfficialTuiGroupFailure>
+where
+    ObserveProcessGroup: FnMut(rustix::process::Pid) -> Result<i32, ()>,
+    ObserveSession: FnMut(rustix::process::Pid) -> Result<i32, ()>,
+{
+    use PackageOfficialTuiJobIdentityFailure::{
+        InvalidPid, ProcessGroupMismatch, ProcessGroupQuery, SessionMismatch, SessionQuery,
+    };
+
     if tui.pid != tui.pgid {
         return Err(PackageOfficialTuiGroupFailure::Leader);
     }
+    if tui.pid <= 0 {
+        return Err(PackageOfficialTuiGroupFailure::JobIdentity(InvalidPid));
+    }
     let pid = rustix::process::Pid::from_raw(tui.pid)
-        .ok_or(PackageOfficialTuiGroupFailure::JobIdentity)?;
-    if rustix::process::getpgid(Some(pid))
-        .map_err(|_| PackageOfficialTuiGroupFailure::JobIdentity)?
-        .as_raw_pid()
-        != tui.pgid
-        || rustix::process::getsid(Some(pid))
-            .map_err(|_| PackageOfficialTuiGroupFailure::JobIdentity)?
-            .as_raw_pid()
-            != tui.pid
-    {
-        return Err(PackageOfficialTuiGroupFailure::JobIdentity);
+        .ok_or(PackageOfficialTuiGroupFailure::JobIdentity(InvalidPid))?;
+    let process_group = observe_process_group(pid)
+        .map_err(|()| PackageOfficialTuiGroupFailure::JobIdentity(ProcessGroupQuery))?;
+    if process_group != tui.pgid {
+        return Err(PackageOfficialTuiGroupFailure::JobIdentity(
+            ProcessGroupMismatch,
+        ));
+    }
+    let session = observe_session(pid)
+        .map_err(|()| PackageOfficialTuiGroupFailure::JobIdentity(SessionQuery))?;
+    if session != tui.pid {
+        return Err(PackageOfficialTuiGroupFailure::JobIdentity(SessionMismatch));
     }
     Ok(())
 }

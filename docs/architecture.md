@@ -310,6 +310,14 @@ not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE`
 dispatcher/parser or persistent shell-anchor role, and these scenarios make no
 parser coverage claim.
 
+Before descriptor inventory, the package harness validates the reported
+official-TUI leader through a sealed kernel-observer boundary. Invalid PID,
+process-group query failure, process-group mismatch, session query failure, and
+session mismatch project to five distinct fixed payload-free markers. The exact
+subtype is published before the existing generic job-identity marker. Neither
+marker grants retry, signal, wait, deletion, cleanup, or numeric-process
+authority; every failure retains the existing fail-closed guardian path.
+
 The coordinator/guardian exec boundary keeps three channel classes physically
 separate:
 
