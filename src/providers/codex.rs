@@ -35,6 +35,8 @@ mod remote;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod rollout_handoff;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod selection_runtime;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod supervisor;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

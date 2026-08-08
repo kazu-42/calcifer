@@ -35,9 +35,10 @@ dispatcher/parser or persistent shell-anchor role, and these scenarios make no
 parser coverage claim. Package tests use no real credential, token, account ID,
 or provider identifier. The deterministic provider fixture described below is
 credential-free and loopback-only. No public supervised command calls this path,
-and it persists no terminal transcript. Automatic failover, public supervised
-run/resume, and the production cross-profile conversation handoff transaction
-remain unimplemented;
+and it persists no terminal transcript. The guarded selector and its
+lease-retaining candidate runtime are internal and default-unused; automatic
+failover, public supervised run/resume, and production cross-profile handoff
+wiring remain unavailable;
 [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines handoff
 semantics and [ADR 0003](adr/0003-supervised-codex-session.md) defines the
 staged supervisor.

@@ -49,8 +49,17 @@ impl RoutingUpdateReport {
         } else {
             "No change to"
         };
+        let safety = match self.action {
+            "pool_enable" => {
+                "This pool may now enter guarded selection; explicit profile pins still bypass it."
+            }
+            "pool_disable" => {
+                "This pool cannot enter guarded selection; its durable membership is unchanged."
+            }
+            _ => "Automatic routing remains unchanged.",
+        };
         format!(
-            "{result} routing definition {} at revision {}.\nAutomatic routing remains disabled.",
+            "{result} routing definition {} at revision {}.\n{safety}",
             self.definition_id, self.revision
         )
     }
@@ -214,6 +223,45 @@ pub(crate) fn remove_pool(
         let id = definitions.resolve_pool_id(provider, reference)?;
         Ok((id.clone(), DefinitionMutation::RemovePool { id }))
     })
+}
+
+pub(crate) fn set_pool_activation(
+    provider: Option<Provider>,
+    reference: &str,
+    enabled: bool,
+) -> Result<RoutingUpdateReport, AppError> {
+    let registry = Registry::discover()?;
+    let store = Store::from_profiles(&registry);
+    let snapshot = store.read()?;
+    let id = snapshot
+        .resolve_pool_id(provider, reference)
+        .map_err(RoutingError::from)?;
+    let mutation = DefinitionMutation::SetPoolActivation {
+        id: id.clone(),
+        enabled,
+    };
+    let action = if enabled {
+        "pool_enable"
+    } else {
+        "pool_disable"
+    };
+
+    if !enabled {
+        let outcome = store.commit(snapshot.revision(), mutation)?;
+        return Ok(update_report(action, id, outcome));
+    }
+
+    preflight(&snapshot, &mutation)?;
+    let executable = resolve_codex()?;
+    let neutral = registry.neutral_working_directory()?;
+    let source = LiveMembershipSource::new(
+        &registry,
+        Some(executable.as_path()),
+        Some(neutral.as_path()),
+        registry.list()?,
+    );
+    let outcome = mutate_snapshot(&store, &source, &snapshot, mutation)?;
+    Ok(update_report(action, id, outcome))
 }
 
 fn metadata_update(

@@ -1,8 +1,8 @@
 # ADR 0004: Private default-disabled routing registry
 
-- Status: accepted and implemented on Unix; selection remains unavailable
+- Status: accepted and implemented on Unix; explicit activation and the internal guarded selector are implemented, while public selection remains unavailable
 - Date: 2026-08-06
-- Related: [Issue 31](https://github.com/kazu-42/calcifer/issues/31), [ADR 0001](0001-cross-profile-conversation-handoff.md), [ADR 0002](0002-private-provider-identity-binding.md)
+- Related: [Issue 31](https://github.com/kazu-42/calcifer/issues/31), [Issue 36](https://github.com/kazu-42/calcifer/issues/36), [ADR 0001](0001-cross-profile-conversation-handoff.md), [ADR 0002](0002-private-provider-identity-binding.md)
 
 ## Context
 
@@ -31,7 +31,7 @@ The document contains a monotonic revision and two bounded collections:
    can belong to at most one trust domain.
 2. A pool has its own immutable canonical UUID, mutable local alias, one trust
    domain UUID, an ordered list of two or more distinct member UUIDs, and the
-   only accepted activation value, `disabled`.
+   closed activation enum, `disabled | enabled`. Creation is always disabled.
 3. Pool members must be a subset of their trust domain. Definition IDs share
    one namespace. Provider-derived aliases are unique within their definition
    kind.
@@ -47,7 +47,10 @@ maintenance CLI.
 ## Identity validation transaction
 
 Creating a non-empty trust domain, replacing trust-domain members, creating a
-pool, or replacing pool members validates the complete affected membership.
+pool, replacing pool members, or enabling a pool validates the complete
+affected membership. An enabled pool freezes membership and removal until it
+is explicitly disabled. Disabling never requires live provider state, so it
+remains available as the rollback path.
 Calcifer:
 
 1. reads one routing snapshot and resolves requested profile aliases from one
@@ -73,11 +76,11 @@ but not the routing lock, so it cannot race a validated member between proof
 and commit. Multi-profile callers never acquire the profile-registry mutation
 lock while retaining several profile leases.
 
-Domain/pool rename and removal do not require a provider executable or current
-identity. This is deliberate recovery behavior: invalid or missing membership
-must not prevent metadata cleanup. Successful configuration validation is not
-persisted as a boolean and never authorizes future use. A future selector must
-repeat current identity and policy validation under the same leases.
+Domain/pool rename and disabled-pool removal do not require a provider
+executable or current identity. This is deliberate recovery behavior: invalid
+or missing membership must not prevent metadata cleanup. Activation is policy,
+not a persisted identity proof. The selector repeats current identity and
+fresh usage validation while retaining the target reservation.
 
 ## Persistence and failure semantics
 
@@ -100,13 +103,16 @@ already running as the same OS user.
 
 ## Public surface and redaction
 
-The public commands can inspect, create, rename, replace membership, and remove
-definitions. There is no enable, selector, supervisor, failover, or provider
-launch path in this slice. Every pool remains disabled.
+The public commands can inspect, create, rename, replace membership, explicitly
+enable/disable, and remove definitions. Enabling a pool performs whole-pool
+identity validation but does not select, supervise, fail over, or launch a
+provider. Profile-pinned run/resume bypass every pool. The one-pass selector
+and Codex candidate runtime are internal capabilities for the later public
+supervisor integration.
 
 Human and JSON inspection DTOs can contain only schema/action metadata,
 routing revision, definition UUIDs and aliases, provider, immutable member
-UUIDs, current local profile references when present, and disabled activation.
+UUIDs, current local profile references when present, and explicit activation.
 They have no field for raw or fingerprinted provider identity, account,
 workspace, organization, email, token, credential, usage, or reset-credit
 data. Errors collapse storage and identity details to stable redacted codes.
@@ -118,10 +124,10 @@ the user-level registry and cannot activate, select, or launch a profile.
 
 ## Rollback
 
-All pools are optional and disabled. Removing pools and then their trust
-domains through the maintenance commands returns operation to explicit profile
-pinning without changing profiles, credentials, conversations, or provider
-state. If an operator must recover from a commit-uncertain result, first run
+All pools are optional and default-disabled. Disabling an enabled pool, then
+optionally removing it and its trust domain, returns operation to explicit
+profile pinning without changing profiles, credentials, conversations, or
+provider state. If an operator must recover from a commit-uncertain result, first run
 `calcifer routing inspect`; do not blindly repeat a create with a new UUID.
 
 ## Rejected alternatives
@@ -139,6 +145,6 @@ state. If an operator must recover from a commit-uncertain result, first run
   and whole-pool inconsistency.
 - **Expose fingerprints for diagnostics:** creates a stable correlation and
   disclosure surface without improving safe operator action.
-- **Ship a selector with the schema:** would make storage acceptance
-  accidentally authorize provider launch before monitoring, handoff, recovery,
-  and user-visible selection proofs exist.
+- **Make schema presence or pool creation activate selection:** would let a
+  storage write accidentally authorize provider launch. Activation is a
+  separate explicit mutation, and public invocation wiring remains separate.

@@ -143,9 +143,11 @@ fn membership_validation(
         | DefinitionMutation::ReplaceDomainMembers { id, .. } => Some((true, id.as_str())),
         DefinitionMutation::CreatePool { id, .. }
         | DefinitionMutation::ReplacePoolMembers { id, .. } => Some((false, id.as_str())),
+        DefinitionMutation::SetPoolActivation { id, enabled: true } => Some((false, id.as_str())),
         DefinitionMutation::RenameDomain { .. }
         | DefinitionMutation::RemoveDomain { .. }
         | DefinitionMutation::RenamePool { .. }
+        | DefinitionMutation::SetPoolActivation { enabled: false, .. }
         | DefinitionMutation::RemovePool { .. } => None,
     };
     let Some((is_domain, target_id)) = target else {

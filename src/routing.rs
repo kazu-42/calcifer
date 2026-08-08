@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::profiles::{Profile, Provider, validate_alias};
 
+pub(crate) mod selection;
 pub(crate) mod storage;
 pub(crate) mod validation;
 
@@ -42,6 +43,47 @@ impl HandoffAuthorization {
     #[cfg_attr(not(test), allow(dead_code))] // Activated by cross-profile selection in issue #36.
     pub(crate) fn trust_domain_id(&self) -> &str {
         &self.trust_domain_id
+    }
+}
+
+/// Immutable execution snapshot for one explicitly enabled provider pool.
+///
+/// The snapshot contains only Calcifer-local identifiers and ordered
+/// membership. Provider account identity and credentials stay behind the
+/// profile reservations used by the selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EnabledPool {
+    id: String,
+    alias: String,
+    trust_domain_id: String,
+    trust_domain_alias: String,
+    provider: Provider,
+    profile_ids: Vec<String>,
+}
+
+impl EnabledPool {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub(crate) fn trust_domain_id(&self) -> &str {
+        &self.trust_domain_id
+    }
+
+    pub(crate) fn trust_domain_alias(&self) -> &str {
+        &self.trust_domain_alias
+    }
+
+    pub(crate) const fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    pub(crate) fn profile_ids(&self) -> &[String] {
+        &self.profile_ids
     }
 }
 
@@ -179,13 +221,26 @@ impl Inspection {
             lines.push("Pools:".to_owned());
             for pool in &self.pools {
                 lines.push(format!(
-                    "- {} ({}, trust domain {}, disabled)",
-                    pool.alias, pool.id, pool.trust_domain_id
+                    "- {} ({}, trust domain {}, {})",
+                    pool.alias,
+                    pool.id,
+                    pool.trust_domain_id,
+                    pool.activation.label()
                 ));
                 lines.push(format!("  members: {}", human_members(&pool.members)));
             }
         }
-        lines.push("Automatic routing is disabled; these definitions cannot launch or select a provider profile.".to_owned());
+        if self
+            .pools
+            .iter()
+            .all(|pool| pool.activation == Activation::Disabled)
+        {
+            lines.push(
+                "Automatic routing is disabled; no pool can select a provider profile.".to_owned(),
+            );
+        } else {
+            lines.push("Only explicitly enabled pools may enter guarded selection; an explicit profile pin bypasses every pool.".to_owned());
+        }
         lines.join("\n")
     }
 }
@@ -210,6 +265,16 @@ fn human_members(members: &[MemberInspection]) -> String {
 #[serde(rename_all = "snake_case")]
 enum Activation {
     Disabled,
+    Enabled,
+}
+
+impl Activation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -244,6 +309,10 @@ pub(crate) enum DefinitionMutation {
     ReplacePoolMembers {
         id: String,
         profile_ids: Vec<String>,
+    },
+    SetPoolActivation {
+        id: String,
+        enabled: bool,
     },
     RemovePool {
         id: String,
@@ -393,6 +462,45 @@ impl Definitions {
             .find(|pool| pool.id == pool_id)
             .ok_or(DefinitionError::NotFound)?;
         self.domain_provider(&pool.trust_domain_id)
+    }
+
+    pub(crate) fn enabled_pool_for_source(
+        &self,
+        pool_id: &str,
+        source_profile_id: &str,
+        provider: Provider,
+    ) -> Result<EnabledPool, DefinitionError> {
+        validate_uuid(pool_id)?;
+        validate_uuid(source_profile_id)?;
+        let pool = self
+            .pools
+            .iter()
+            .find(|pool| pool.id == pool_id)
+            .ok_or(DefinitionError::NotFound)?;
+        if pool.activation != Activation::Enabled {
+            return Err(DefinitionError::PoolDisabled);
+        }
+        let domain = self
+            .trust_domains
+            .iter()
+            .find(|domain| domain.id == pool.trust_domain_id)
+            .ok_or(DefinitionError::InvalidMembership)?;
+        if domain.provider != provider
+            || !pool
+                .profile_ids
+                .iter()
+                .any(|profile_id| profile_id == source_profile_id)
+        {
+            return Err(DefinitionError::InvalidMembership);
+        }
+        Ok(EnabledPool {
+            id: pool.id.clone(),
+            alias: pool.alias.clone(),
+            trust_domain_id: pool.trust_domain_id.clone(),
+            trust_domain_alias: domain.alias.clone(),
+            provider,
+            profile_ids: pool.profile_ids.clone(),
+        })
     }
 
     pub(crate) fn apply(
@@ -571,10 +679,31 @@ impl Definitions {
                     .iter_mut()
                     .find(|pool| pool.id == id)
                     .ok_or(DefinitionError::NotFound)?;
+                if pool.activation == Activation::Enabled {
+                    return Err(DefinitionError::PoolEnabled);
+                }
                 if pool.profile_ids == profile_ids {
                     return Ok(false);
                 }
                 pool.profile_ids = profile_ids;
+                Ok(true)
+            }
+            DefinitionMutation::SetPoolActivation { id, enabled } => {
+                validate_uuid(&id)?;
+                let pool = self
+                    .pools
+                    .iter_mut()
+                    .find(|pool| pool.id == id)
+                    .ok_or(DefinitionError::NotFound)?;
+                let activation = if enabled {
+                    Activation::Enabled
+                } else {
+                    Activation::Disabled
+                };
+                if pool.activation == activation {
+                    return Ok(false);
+                }
+                pool.activation = activation;
                 Ok(true)
             }
             DefinitionMutation::RemovePool { id } => {
@@ -584,6 +713,9 @@ impl Definitions {
                     .iter()
                     .position(|pool| pool.id == id)
                     .ok_or(DefinitionError::NotFound)?;
+                if self.pools[index].activation == Activation::Enabled {
+                    return Err(DefinitionError::PoolEnabled);
+                }
                 self.pools.remove(index);
                 Ok(true)
             }
@@ -649,9 +781,6 @@ impl Definitions {
             }
             validate_definition_alias(&pool.alias)?;
             validate_uuid(&pool.trust_domain_id)?;
-            if pool.activation != Activation::Disabled {
-                return Err(DefinitionError::InvalidSchema);
-            }
             if pool.profile_ids.len() > MAX_POOL_PROFILE_IDS {
                 return Err(DefinitionError::LimitExceeded);
             }
@@ -770,6 +899,8 @@ pub(crate) enum DefinitionError {
     AlreadyExists,
     NotFound,
     DomainInUse,
+    PoolDisabled,
+    PoolEnabled,
     LimitExceeded,
     RevisionConflict,
     RevisionOverflow,
@@ -787,6 +918,8 @@ impl DefinitionError {
             Self::AlreadyExists => "routing_definition_already_exists",
             Self::NotFound => "routing_definition_not_found",
             Self::DomainInUse => "routing_definition_domain_in_use",
+            Self::PoolDisabled => "routing_pool_disabled",
+            Self::PoolEnabled => "routing_pool_enabled",
             Self::LimitExceeded => "routing_definition_limit_exceeded",
             Self::RevisionConflict => "routing_definition_revision_conflict",
             Self::RevisionOverflow => "routing_definition_revision_overflow",
@@ -808,6 +941,8 @@ impl DefinitionError {
             Self::AlreadyExists => "A routing definition already exists.",
             Self::NotFound => "A routing definition was not found.",
             Self::DomainInUse => "A routing trust domain is still referenced by a pool.",
+            Self::PoolDisabled => "The routing pool is disabled.",
+            Self::PoolEnabled => "Disable the routing pool before changing its membership.",
             Self::LimitExceeded => "The routing definitions exceed a supported bound.",
             Self::RevisionConflict => "The routing definitions changed before this update.",
             Self::RevisionOverflow => "The routing definition revision cannot advance.",
@@ -901,17 +1036,80 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_round_trips_only_disabled_pool_definitions()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn schema_v1_round_trips_explicit_pool_activation() -> Result<(), Box<dyn std::error::Error>> {
         let definitions = Definitions::from_json(&encoded(&schema_document())?)?;
-        let encoded: Value = serde_json::from_slice(&definitions.to_json()?)?;
+        let round_trip: Value = serde_json::from_slice(&definitions.to_json()?)?;
 
         assert_eq!(definitions.revision(), 7);
         assert_eq!(definitions.trust_domains[0].provider, Provider::Codex);
         assert_eq!(definitions.pools[0].profile_ids, [PROFILE_B, PROFILE_A]);
-        assert_eq!(encoded["pools"][0]["activation"], "disabled");
-        assert!(encoded["pools"][0].get("provider").is_none());
-        assert!(encoded["pools"][0].get("enabled").is_none());
+        assert_eq!(round_trip["pools"][0]["activation"], "disabled");
+        assert!(round_trip["pools"][0].get("provider").is_none());
+        assert!(round_trip["pools"][0].get("enabled").is_none());
+
+        let mut enabled = schema_document();
+        enabled["pools"][0]["activation"] = json!("enabled");
+        let enabled = Definitions::from_json(&encoded(&enabled)?)?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&enabled.to_json()?)?["pools"][0]["activation"],
+            "enabled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pools_are_default_off_and_activation_freezes_execution_membership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut definitions = Definitions::from_json(&encoded(&schema_document())?)?;
+        assert_eq!(
+            definitions
+                .enabled_pool_for_source(POOL_ID, PROFILE_A, Provider::Codex)
+                .err(),
+            Some(DefinitionError::PoolDisabled)
+        );
+
+        let enabled = definitions.apply(
+            7,
+            DefinitionMutation::SetPoolActivation {
+                id: POOL_ID.to_owned(),
+                enabled: true,
+            },
+        )?;
+        assert!(enabled.changed());
+        let pool = definitions.enabled_pool_for_source(POOL_ID, PROFILE_A, Provider::Codex)?;
+        assert_eq!(pool.id(), POOL_ID);
+        assert_eq!(pool.trust_domain_id(), DOMAIN_ID);
+        assert_eq!(pool.provider(), Provider::Codex);
+        assert_eq!(pool.profile_ids(), [PROFILE_B, PROFILE_A]);
+
+        for mutation in [
+            DefinitionMutation::ReplacePoolMembers {
+                id: POOL_ID.to_owned(),
+                profile_ids: vec![PROFILE_A.to_owned(), PROFILE_B.to_owned()],
+            },
+            DefinitionMutation::RemovePool {
+                id: POOL_ID.to_owned(),
+            },
+        ] {
+            assert_eq!(
+                definitions.apply(8, mutation).err(),
+                Some(DefinitionError::PoolEnabled)
+            );
+            assert_eq!(definitions.revision(), 8);
+        }
+
+        assert!(
+            definitions
+                .apply(
+                    8,
+                    DefinitionMutation::SetPoolActivation {
+                        id: POOL_ID.to_owned(),
+                        enabled: false,
+                    },
+                )?
+                .changed()
+        );
+        assert_eq!(definitions.revision(), 9);
         Ok(())
     }
 
@@ -1029,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_rejects_every_alternative_to_required_disabled_activation()
+    fn schema_rejects_non_enum_and_legacy_pool_activation_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut documents = Vec::new();
 
@@ -1043,10 +1241,6 @@ mod tests {
         let mut boolean = schema_document();
         boolean["pools"][0]["activation"] = json!(false);
         documents.push(boolean);
-
-        let mut enabled = schema_document();
-        enabled["pools"][0]["activation"] = json!("enabled");
-        documents.push(enabled);
 
         let mut legacy_boolean = schema_document();
         legacy_boolean["pools"][0]

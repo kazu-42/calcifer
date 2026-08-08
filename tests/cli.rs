@@ -794,6 +794,61 @@ fn routing_cli_validates_live_members_and_preserves_ids_across_alias_rename()
         ])
     );
     assert_eq!(document["routing"]["pools"][0]["activation"], "disabled");
+
+    let enable = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["--json", "routing", "pool", "enable", "codex@fallback"])
+        .output()?;
+    assert!(
+        enable.status.success(),
+        "{}",
+        String::from_utf8(enable.stderr)?
+    );
+    let enabled: serde_json::Value = serde_json::from_slice(&enable.stdout)?;
+    assert_eq!(enabled["action"], "pool_enable");
+    assert_eq!(enabled["revision"], 3);
+    assert_eq!(enabled["changed"], true);
+
+    let frozen = calcifer()
+        .env("CALCIFER_HOME", &root)
+        .args([
+            "--json",
+            "routing",
+            "pool",
+            "set-profiles",
+            "codex@fallback",
+            "codex@office",
+            "codex@personal",
+        ])
+        .output()?;
+    assert!(!frozen.status.success());
+    let frozen_error: serde_json::Value = serde_json::from_slice(&frozen.stderr)?;
+    assert_eq!(frozen_error["error"]["code"], "routing_pool_enabled");
+
+    let disable = calcifer()
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "routing", "pool", "disable", "codex@fallback"])
+        .output()?;
+    assert!(
+        disable.status.success(),
+        "{}",
+        String::from_utf8(disable.stderr)?
+    );
+    let disabled: serde_json::Value = serde_json::from_slice(&disable.stdout)?;
+    assert_eq!(disabled["action"], "pool_disable");
+    assert_eq!(disabled["revision"], 4);
+
+    let inspect_disabled = calcifer()
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "routing", "inspect"])
+        .output()?;
+    let disabled_document: serde_json::Value = serde_json::from_slice(&inspect_disabled.stdout)?;
+    assert_eq!(
+        disabled_document["routing"]["pools"][0]["activation"],
+        "disabled"
+    );
     for forbidden in [
         "fingerprint",
         "account_id",

@@ -482,6 +482,14 @@ fn run_routing_command(command: RoutingCommand, json: bool) -> ExitCode {
                         member_values(profiles),
                     )
                 }
+                RoutingPoolCommand::Enable { pool } => {
+                    let (provider, reference) = definition_value(pool);
+                    commands::routing::set_pool_activation(provider, &reference, true)
+                }
+                RoutingPoolCommand::Disable { pool } => {
+                    let (provider, reference) = definition_value(pool);
+                    commands::routing::set_pool_activation(provider, &reference, false)
+                }
                 RoutingPoolCommand::Remove { pool } => {
                     let (provider, reference) = definition_value(pool);
                     commands::routing::remove_pool(provider, &reference)
@@ -735,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_cli_exposes_only_definition_and_inspection_operations() {
+    fn routing_cli_exposes_explicit_pool_activation_without_a_selection_command() {
         assert!(Cli::try_parse_from(["calcifer", "routing", "inspect"]).is_ok());
         assert!(
             Cli::try_parse_from([
@@ -762,6 +770,14 @@ mod tests {
                 "codex@work",
             ])
             .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["calcifer", "routing", "pool", "enable", "codex@fallback",])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["calcifer", "routing", "pool", "disable", "codex@fallback",])
+                .is_ok()
         );
         for forbidden in ["enable", "select", "launch", "activate"] {
             assert!(
