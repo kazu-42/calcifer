@@ -691,10 +691,10 @@ A profile pool is user-created, provider-specific, and bound to one trust domain
 The selector must distinguish:
 
 ```text
-available | exhausted | unknown
+available | exhausted | stale | unsupported | unknown
 ```
 
-The observation records its provider, profile ID, source, observation time, optional reset time, detected provider version, adapter version, tested-version set, and compatibility state. On-demand Codex status accepts only the tested `0.144.4` initialize/home and typed usage contract. Every incompatible or unverified contract and every error that cannot be proven to mean exhaustion becomes `unknown` and stops selection.
+The observation records its provider, local profile ID, fixed source, observation/expiry time, optional provider reset time, detected provider version, adapter version, tested-version set, and compatibility state. On-demand Codex status accepts only the tested `0.144.4` initialize/home and typed usage contract. Expired evidence is `stale`, an explicitly unsupported version or method is `unsupported`, and malformed/incompatible schema, every unverified contract, or any other error that cannot be proven to mean exhaustion is `unknown`; all three stop selection.
 
 The selector keeps an attempted-profile set, traverses a pool no more than once, and observes a cooldown. Cached state may prefilter candidates, but identity and fresh authoritative usage are revalidated after acquiring the profile lease. It never changes the credentials of a running process and never replays a started command.
 
@@ -716,22 +716,25 @@ The supervisor may subscribe to thread events for usage monitoring, but it never
 
 If the provider version, experimental schema, path provenance, target identity, or transition state is ambiguous, the handoff stops with the source rollout intact. A fresh thread may be offered as an explicit recovery choice, but it is not reported as a successful automatic resume.
 
-The displayed remaining percentage is derived from a rounded provider value. `0% remaining` alone is not exhaustion. Current status requires a recognized structured `rateLimitReachedType` to report `exhausted`; all missing, malformed, stale, auth, network, and unsupported states are `unknown` for future switching logic.
+The displayed remaining percentage is derived from a rounded provider value. `0% remaining` alone is not exhaustion. Current status requires a fresh recognized structured `rateLimitReachedType` to report `exhausted`; missing, malformed, auth, and network states are `unknown`, while expired and incompatible evidence is explicitly `stale` or `unsupported`. None can drive switching.
 
-Current on-demand status is intentionally limited to idle profiles. An active
-profile retains an exclusive single-writer lease and reports busy/unknown
-rather than starting another App Server that could refresh the same credential
-file. The internal #54 supervisor owns a typed monitor beside its provider
-session, but no public command consumes that observation yet. Public active
-monitoring and automatic failover require the remaining observation cache,
-selector, enabled-pool policy, and supervised transaction adapter before they
-can be enabled.
+On-demand provider reads remain limited to idle profiles. An active profile
+retains an exclusive single-writer lease; the internal supervisor may project
+the latest fully validated read from that already-live, profile-owned App
+Server into the disposable cache, but status never starts another credential
+writer. Cache expiry, capped backoff, and bounded idle-refresh planning are
+implemented. Public automatic failover still requires the guarded selector and
+explicit pool execution path; cached state may only prefilter and never replaces
+fresh target revalidation under the selected profile lease.
 
 The typed monitor retains Codex thread and turn UUIDs only for bounded in-memory
 target matching and one-shot routing. Those UUIDs are provider identifiers, so
 transport, action, and session signal `Debug` surfaces use fixed payload-free
 representations; the values never enter display text, error chains, lifecycle
-evidence, logs, or persisted usage snapshots.
+evidence, logs, or persisted usage snapshots. The cache audit contains only a
+monotonic local revision, local profile ID, fixed source/event/state enums, and
+timestamp; it cannot encode credentials, provider account/workspace IDs,
+reset-credit IDs, aliases, or transcript content.
 
 Immediately before launch, Calcifer reports the local profile alias, provider, trust domain, and selection reason. It does not display email or stable provider account, workspace, or organization identifiers, and repository-local configuration cannot suppress this notice.
 

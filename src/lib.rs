@@ -9,6 +9,7 @@ mod project_config;
 mod provider_identity;
 mod providers;
 mod routing;
+mod usage_observations;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
