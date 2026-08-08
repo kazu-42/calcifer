@@ -254,7 +254,13 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   so Calcifer performs no restore, emits no restored proof, and retains its
   lease/evidence. The production-shaped persistent anchor remains the
   controlling-terminal session leader while each coordinator generation owns
-  the foreground process group. It accepts only one exact eight-byte terminal
+  the foreground process group. Each foreground selection requires the exact
+  terminal descriptor and expected current group before mutation plus exact
+  descriptor/selected-group readback afterward. A post-write failure becomes
+  an ordinary error only after an exact rollback readback; descriptor change,
+  a third foreground generation, or any unproved rollback retains the anchor
+  state and performs no authority-clobbering follow-up write. It accepts only
+  one exact eight-byte terminal
   record followed by EOF. The guardian can publish the provider-release-only
   `CFCMP\x01\r\n` record
   only by consuming a move-only `ProviderNeverStarted` or direct-App graceful-
