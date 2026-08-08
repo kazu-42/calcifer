@@ -164,6 +164,7 @@ enum DescriptorIsolationObservationStage {
 struct DescriptorIsolationObservationFailure {
     stage: DescriptorIsolationObservationStage,
     error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError,
+    macos_reason: Option<calcifer_unix_child_fd::MacosDescriptorObservationReason>,
     retryable_target_change: bool,
 }
 
@@ -175,14 +176,33 @@ impl DescriptorIsolationObservationFailure {
         Self {
             stage,
             error,
+            macos_reason: None,
             retryable_target_change: false,
         }
     }
 
+    #[cfg(test)]
     const fn target(error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError) -> Self {
         Self {
             stage: DescriptorIsolationObservationStage::TargetProcessGroup,
             error,
+            macos_reason: None,
+            retryable_target_change: matches!(
+                error,
+                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged
+                    | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+            ),
+        }
+    }
+
+    const fn target_diagnostic(
+        diagnostic: calcifer_unix_child_fd::ProcessGroupDescriptorScanDiagnostic,
+    ) -> Self {
+        let error = diagnostic.classification();
+        Self {
+            stage: DescriptorIsolationObservationStage::TargetProcessGroup,
+            error,
+            macos_reason: diagnostic.macos_reason(),
             retryable_target_change: matches!(
                 error,
                 calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged
@@ -205,9 +225,23 @@ impl DescriptorIsolationObservationFailure {
 
 #[cfg(test)]
 fn record_descriptor_isolation_observation_failure(failure: DescriptorIsolationObservationFailure) {
+    eprintln!("{}", descriptor_isolation_observation_diagnostic(failure));
+}
+
+#[cfg(test)]
+fn descriptor_isolation_observation_diagnostic(
+    failure: DescriptorIsolationObservationFailure,
+) -> String {
     let stage = failure.stage;
-    let error = failure.error;
-    eprintln!("descriptor-isolation-observation-failure:stage={stage:?}, error={error:?}");
+    if let Some(reason) = failure.macos_reason {
+        format!(
+            "descriptor-isolation-observation-failure:stage={stage:?}, subtype={}",
+            reason.label()
+        )
+    } else {
+        let error = failure.error;
+        format!("descriptor-isolation-observation-failure:stage={stage:?}, error={error:?}")
+    }
 }
 
 fn final_descriptor_isolation_error(
@@ -1683,12 +1717,12 @@ impl ProductionCoordinator {
                     error,
                 )
             })?;
-        calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
+        calcifer_unix_child_fd::diagnose_process_group_forbidden_descriptors_absent_before(
             process_group,
             &forbidden,
             deadline,
         )
-        .map_err(DescriptorIsolationObservationFailure::target)
+        .map_err(DescriptorIsolationObservationFailure::target_diagnostic)
     }
 
     fn run_active(&mut self) -> Result<ActiveOutcome, CoordinatorDriveError> {
@@ -2560,6 +2594,43 @@ mod tests {
             ],
             "the broader retention reason was published before the exact coordinator error"
         );
+    }
+
+    #[test]
+    fn macos_descriptor_observation_diagnostics_preserve_stage_and_only_fixed_subtype() {
+        use calcifer_unix_child_fd::MacosDescriptorObservationReason as Reason;
+
+        let reasons = Reason::ALL;
+        let synthetic_private_data = [
+            "synthetic-private-profile@example.invalid",
+            "/private/synthetic/path",
+            "pid=4242",
+            "fd=17",
+            "device=99",
+            "inode=100",
+            "token=secret",
+        ];
+        for reason in reasons {
+            let rendered = descriptor_isolation_observation_diagnostic(
+                DescriptorIsolationObservationFailure {
+                    stage: DescriptorIsolationObservationStage::TargetProcessGroup,
+                    error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError::UnsupportedDescriptor,
+                    macos_reason: Some(reason),
+                    retryable_target_change: false,
+                },
+            );
+            assert_eq!(
+                rendered,
+                format!(
+                    "descriptor-isolation-observation-failure:stage=TargetProcessGroup, subtype={}",
+                    reason.label()
+                )
+            );
+            assert!(!rendered.contains("UnsupportedDescriptor"));
+            for private in synthetic_private_data {
+                assert!(!rendered.contains(private));
+            }
+        }
     }
 
     #[test]
@@ -5152,7 +5223,7 @@ mod tests {
         let mut last_transient_error = None;
         loop {
             let stable =
-                match calcifer_unix_child_fd::verify_process_group_forbidden_descriptors_absent_before(
+                match calcifer_unix_child_fd::diagnose_process_group_forbidden_descriptors_absent_before(
                     raw_pid,
                     &empty_forbidden,
                     deadline,
@@ -5162,17 +5233,26 @@ mod tests {
                         true
                     }
                     Ok(_) => false,
-                    Err(
-                        error @ (calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
-                        | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged),
-                    ) => {
+                    Err(diagnostic)
+                        if matches!(
+                            diagnostic.classification(),
+                            calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+                                | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged
+                        ) => {
+                        let error = diagnostic.classification();
                         last_transient_error = Some(error);
                         false
                     }
-                    Err(error) => {
-                        return Err(
-                            format!("matrix process group scan failed: {error:?}").into()
-                        );
+                    Err(diagnostic) => {
+                        if let Some(reason) = diagnostic.macos_reason() {
+                            return Err(format!(
+                                "matrix process group scan failed: stage=TargetProcessGroup, subtype={}",
+                                reason.label()
+                            )
+                            .into());
+                        }
+                        let error = diagnostic.classification();
+                        return Err(format!("matrix process group scan failed: {error:?}").into());
                     }
                 };
             if stable {

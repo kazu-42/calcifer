@@ -346,6 +346,13 @@ before readiness publication and proves that the exact subtype survives
 Guardian projection while the existing exactly-one inference rule still emits
 secondary `package-cleanup.inference-evidence` and preserves owned evidence.
 
+macOS cross-process descriptor inspection preserves `UnsupportedDescriptor`
+as its public failure classification. The internal coordinator diagnostic can
+retain one closed payload-free reason for unsupported kind, unavailable
+vnode/socket/pipe identity, or unavailable identity for a forbidden kind. It
+is observation only: unknown data is never reclassified as safe or forbidden,
+and the subtype cannot authorize a rescan or advance the startup gate.
+
 The coordinator/guardian exec boundary keeps three channel classes physically
 separate:
 
