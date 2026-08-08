@@ -155,6 +155,13 @@ def _canonical_path(raw_path: str, *, label: str) -> pathlib.Path:
     return path
 
 
+def _validate_privileged_mode(
+    mode: int, *, allow_privileged_bits: bool, label: str
+) -> None:
+    if not allow_privileged_bits and mode & (stat.S_ISUID | stat.S_ISGID):
+        raise ValueError(f"{label} had a privileged execution bit")
+
+
 def _inspect_artifact(
     raw_path: str,
     *,
@@ -175,8 +182,11 @@ def _inspect_artifact(
         raise ValueError(f"{label} was not owned by an allowed uid")
     if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise ValueError(f"{label} was group/world writable")
-    if not allow_privileged_bits and metadata.st_mode & (stat.S_ISUID | stat.S_ISGID):
-        raise ValueError(f"{label} had a privileged execution bit")
+    _validate_privileged_mode(
+        metadata.st_mode,
+        allow_privileged_bits=allow_privileged_bits,
+        label=label,
+    )
     if require_executable and not metadata.st_mode & stat.S_IXUSR:
         raise ValueError(f"{label} was not owner-executable")
     if metadata.st_size <= 0:

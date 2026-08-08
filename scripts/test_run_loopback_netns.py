@@ -88,39 +88,60 @@ class ArtifactValidationTests(unittest.TestCase):
                 require_executable=True,
             )
 
-    def test_privileged_bits_require_an_explicit_trusted_tool_policy(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            binary = self._executable(pathlib.Path(temporary), "fixture")
-            metadata = binary.lstat()
-            fields = list(metadata)
-            fields[stat.ST_MODE] |= stat.S_ISUID
-            privileged_metadata = os.stat_result(fields)
-
-            # Some macOS filesystems and sandboxes clear set-user-ID when an
-            # unprivileged process changes a fixture's mode. Project the exact
-            # kernel metadata instead of making this validator contract depend
-            # on whether the development filesystem preserves that bit.
-            with mock.patch.object(
-                pathlib.Path,
-                "lstat",
-                autospec=True,
-                return_value=privileged_metadata,
-            ):
-                with self.assertRaisesRegex(ValueError, "privileged execution bit"):
-                    run_loopback_netns._inspect_artifact(
-                        str(binary),
-                        allowed_uids={os.getuid()},
+    def test_privileged_mode_policy_requires_an_explicit_trusted_tool_policy(
+        self,
+    ) -> None:
+        for privileged_mode in (
+            stat.S_IFREG | 0o4700,
+            stat.S_IFREG | 0o2700,
+        ):
+            with self.subTest(mode=oct(privileged_mode)):
+                with self.assertRaisesRegex(
+                    ValueError, "privileged execution bit"
+                ):
+                    run_loopback_netns._validate_privileged_mode(
+                        privileged_mode,
+                        allow_privileged_bits=False,
                         label="fixture",
-                        require_executable=True,
                     )
 
+                run_loopback_netns._validate_privileged_mode(
+                    privileged_mode,
+                    allow_privileged_bits=True,
+                    label="fixture",
+                )
+
+    def test_privileged_bit_filesystem_integration_when_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = self._executable(pathlib.Path(temporary), "fixture")
+            try:
+                binary.chmod(0o4700)
+            except PermissionError as error:
+                self.skipTest(
+                    "filesystem or sandbox denied a privileged-bit fixture: "
+                    f"{error.__class__.__name__}"
+                )
+            observed_mode = binary.lstat().st_mode
+            if not observed_mode & stat.S_ISUID:
+                self.skipTest(
+                    "filesystem or sandbox stripped the requested set-user-ID bit"
+                )
+
+            with self.assertRaisesRegex(ValueError, "privileged execution bit"):
                 run_loopback_netns._inspect_artifact(
                     str(binary),
                     allowed_uids={os.getuid()},
                     label="fixture",
                     require_executable=True,
-                    allow_privileged_bits=True,
                 )
+
+            run_loopback_netns._inspect_artifact(
+                str(binary),
+                allowed_uids={os.getuid()},
+                label="fixture",
+                require_executable=True,
+                allow_privileged_bits=True,
+            )
 
     def test_only_the_fixed_sudo_tool_gets_the_privileged_bit_exception(self) -> None:
         with mock.patch.object(run_loopback_netns, "_inspect_artifact") as inspect:
