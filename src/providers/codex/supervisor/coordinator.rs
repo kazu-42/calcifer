@@ -33,6 +33,13 @@ use super::signals::{
 };
 use super::terminal::{RestoredTerminalProof, TerminalSize};
 
+// Descriptor scans walk kernel process and FD metadata and can exceed the
+// coordinator's short lifecycle-poll cadence on a loaded host. Keep their
+// read-only slice long enough to complete a stable observation, but far below
+// both production output-stall and phase deadlines so terminal output is
+// serviced regularly during target startup churn.
+const DESCRIPTOR_ISOLATION_SCAN_SLICE: Duration = Duration::from_millis(250);
+
 /// Per-operation limits. A session may live indefinitely, but no lifecycle
 /// read/write, pending output fragment, control handshake, or exact child wait
 /// inherits an unbounded deadline. The output-stall bound is deliberately
@@ -255,10 +262,9 @@ fn lifecycle_descriptor_readable(
 fn descriptor_isolation_attempt_deadline(
     observed: Instant,
     outer_deadline: Instant,
-    poll_interval: Duration,
 ) -> Result<Instant, CoordinatorDriveError> {
     observed
-        .checked_add(poll_interval)
+        .checked_add(DESCRIPTOR_ISOLATION_SCAN_SLICE)
         .map(|candidate| candidate.min(outer_deadline))
         .ok_or(CoordinatorDriveError::Deadline)
 }
@@ -292,11 +298,11 @@ fn retry_descriptor_isolation_observation<State, T>(
         }
 
         // A process-group scan is read-only but may walk every process and FD
-        // visible to the current user. It therefore receives one coordinator
-        // turn, never the complete bootstrap phase. A local scan Deadline is
-        // retryable until the absolute isolation fence; no incomplete scan
-        // can mint a proof.
-        let attempt_deadline = descriptor_isolation_attempt_deadline(now, deadline, poll_interval)?;
+        // visible to the current user. It therefore receives one bounded
+        // observation slice, never the complete bootstrap phase. A local scan
+        // Deadline is retryable until the absolute isolation fence; no
+        // incomplete scan can mint a proof.
+        let attempt_deadline = descriptor_isolation_attempt_deadline(now, deadline)?;
         let (observation, guardian_liveness) = attempt(state, attempt_deadline);
         guardian_liveness?;
         match observation {
@@ -2592,21 +2598,25 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_isolation_scan_attempt_is_bounded_to_one_coordinator_turn()
+    fn descriptor_isolation_scan_attempt_is_bounded_to_one_fairness_slice()
     -> Result<(), Box<dyn std::error::Error>> {
         let observed = Instant::now();
         let outer_deadline = observed + Duration::from_secs(1);
-        let poll_interval = Duration::from_millis(20);
 
         assert_eq!(
-            descriptor_isolation_attempt_deadline(observed, outer_deadline, poll_interval)?,
-            observed + poll_interval
+            descriptor_isolation_attempt_deadline(observed, outer_deadline)?,
+            observed + DESCRIPTOR_ISOLATION_SCAN_SLICE
+        );
+        let shorter_outer = observed + Duration::from_millis(100);
+        assert_eq!(
+            descriptor_isolation_attempt_deadline(observed, shorter_outer)?,
+            shorter_outer
         );
         Ok(())
     }
 
     #[test]
-    fn descriptor_isolation_turn_deadline_services_progress_before_rescan()
+    fn descriptor_isolation_slice_deadline_services_progress_before_rescan()
     -> Result<(), Box<dyn std::error::Error>> {
         let outer_deadline = Instant::now() + TEST_TIMEOUT;
         let mut state = (0_usize, 0_usize, 0_usize);
