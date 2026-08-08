@@ -53,6 +53,8 @@ const HISTORY_SENTINEL: &str = "calcifer handoff compatibility sentinel";
 const MAX_TUI_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const PROBE_EXECUTABLE_FILE: &str = "codex";
+const SCRATCH_EXECUTABILITY_PROBE_FILE: &str = ".calcifer-exec-probe";
+const SCRATCH_EXECUTABILITY_PROBE_BYTES: &[u8] = b"#!/bin/sh\nexit 0\n";
 
 #[cfg(test)]
 thread_local! {
@@ -143,7 +145,7 @@ pub(super) fn verify(
         match PinnedExecutableStage::from_verified(&proof.probe_executable, deadline) {
             Ok(stage) => stage,
             Err(failure) => {
-                return Err(cleanup_failed_proof(proof, failure.into(), deadline));
+                return Err(cleanup_failed_proof(proof, failure, deadline));
             }
         };
     if let Err(error) = pinned_executable.revalidate(deadline) {
@@ -245,7 +247,7 @@ fn verify_before_remote_until(
     source_executable: &CodexExecutableIdentity,
     deadline: Instant,
 ) -> Result<PreRemoteProof, CodexHandoffFailure> {
-    let scratch = ScratchRoot::create()?;
+    let scratch = ScratchRoot::create_until(deadline)?;
     match build_pre_remote_parts(source_executable, &scratch, deadline) {
         Ok(parts) => Ok(PreRemoteProof {
             scratch,
@@ -641,6 +643,7 @@ pub(crate) struct PinnedStageCreateFailure {
 }
 
 enum PinnedStageConstructionOwnership {
+    #[cfg(test)]
     ScratchCreate(Box<ScratchRootCreateFailure>),
     Scratch(Box<ScratchRoot>),
     Complete(Box<PinnedExecutableStage>),
@@ -649,6 +652,7 @@ enum PinnedStageConstructionOwnership {
 impl fmt::Debug for PinnedStageConstructionOwnership {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(test)]
             Self::ScratchCreate(failure) => {
                 let _ = failure;
                 formatter.write_str("PinnedStageConstructionOwnership::ScratchCreate(<redacted>)")
@@ -716,6 +720,7 @@ pub(super) fn resolve_handoff_retention(
                 return Ok(());
             };
             match ownership {
+                #[cfg(test)]
                 PinnedStageConstructionOwnership::ScratchCreate(failure) => {
                     resolve_handoff_retention(
                         CodexHandoffRetention::ScratchCreate(failure),
@@ -805,6 +810,7 @@ fn resolve_scratch_root(
 }
 
 impl PinnedStageCreateFailure {
+    #[cfg(test)]
     fn not_created(error: PinnedStageError) -> Self {
         Self {
             error,
@@ -812,6 +818,7 @@ impl PinnedStageCreateFailure {
         }
     }
 
+    #[cfg(test)]
     fn from_scratch_create(failure: ScratchRootCreateFailure) -> Self {
         Self {
             error: map_stage_error(failure.error()),
@@ -843,6 +850,7 @@ impl PinnedStageCreateFailure {
     #[cfg(test)]
     pub(crate) fn retained_path(&self) -> Option<&Path> {
         match self.ownership.as_ref()? {
+            #[cfg(test)]
             PinnedStageConstructionOwnership::ScratchCreate(failure) => failure.retained_path(),
             PinnedStageConstructionOwnership::Scratch(scratch) => Some(scratch.path()),
             PinnedStageConstructionOwnership::Complete(stage) => Some(stage.scratch.path()),
@@ -1003,13 +1011,15 @@ impl PinnedExecutableStage {
     fn from_verified(
         source: &CodexExecutableIdentity,
         deadline: Instant,
-    ) -> Result<Self, PinnedStageCreateFailure> {
+    ) -> Result<Self, CodexHandoffFailure> {
         revalidate_executable_until(source, Some(deadline))
             .map_err(map_stage_error)
-            .map_err(PinnedStageCreateFailure::not_created)?;
-        let scratch =
-            ScratchRoot::create().map_err(PinnedStageCreateFailure::from_scratch_create)?;
-        Self::stage(source, scratch, deadline)
+            .map_err(map_pinned_stage_error)?;
+        let scratch = ScratchRoot::create_until_with_origin(
+            deadline,
+            CompatibilityTimeoutOrigin::FinalScratchSelection,
+        )?;
+        Self::stage(source, scratch, deadline).map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -1340,7 +1350,9 @@ fn map_stage_error(error: CodexHandoffError) -> PinnedStageError {
         CodexHandoffError::Unsupported | CodexHandoffError::Spawn => {
             PinnedStageError::ExecutableChanged
         }
-        CodexHandoffError::Protocol | CodexHandoffError::Transport => PinnedStageError::Storage,
+        CodexHandoffError::UnsupportedNoexecScratch
+        | CodexHandoffError::Protocol
+        | CodexHandoffError::Transport => PinnedStageError::Storage,
     }
 }
 
@@ -2762,6 +2774,170 @@ impl FileFingerprint {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScratchParentPolicy {
+    PrimarySystemTemporary,
+    #[cfg(any(target_os = "linux", test))]
+    PrivateUserRuntime,
+    SecondarySystemTemporary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScratchParentCandidate {
+    path: PathBuf,
+    policy: ScratchParentPolicy,
+}
+
+impl ScratchParentCandidate {
+    fn primary_system_temporary() -> Self {
+        Self {
+            path: PathBuf::from("/tmp"),
+            policy: ScratchParentPolicy::PrimarySystemTemporary,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_user_runtime() -> Self {
+        Self {
+            path: PathBuf::from(format!("/run/user/{}", rustix::process::geteuid().as_raw())),
+            policy: ScratchParentPolicy::PrivateUserRuntime,
+        }
+    }
+
+    fn secondary_system_temporary() -> Self {
+        Self {
+            path: PathBuf::from("/var/tmp"),
+            policy: ScratchParentPolicy::SecondarySystemTemporary,
+        }
+    }
+
+    #[cfg(test)]
+    fn private_for_test(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            policy: ScratchParentPolicy::PrivateUserRuntime,
+        }
+    }
+}
+
+fn production_scratch_candidates() -> Vec<ScratchParentCandidate> {
+    let mut candidates = vec![ScratchParentCandidate::primary_system_temporary()];
+    #[cfg(target_os = "linux")]
+    candidates.push(ScratchParentCandidate::private_user_runtime());
+    candidates.push(ScratchParentCandidate::secondary_system_temporary());
+    candidates
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScratchParentValidationFailure {
+    Unavailable,
+    Unsafe,
+    Infrastructure(CodexHandoffError),
+}
+
+impl fmt::Display for ScratchParentValidationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("scratch parent is unavailable"),
+            Self::Unsafe => formatter.write_str("scratch parent is unsafe"),
+            Self::Infrastructure(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ScratchParentValidationFailure {}
+
+fn validate_scratch_parent(
+    candidate: &ScratchParentCandidate,
+) -> Result<PathBuf, ScratchParentValidationFailure> {
+    if !candidate.path.is_absolute()
+        || candidate
+            .path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(ScratchParentValidationFailure::Unsafe);
+    }
+    let canonical = fs::canonicalize(&candidate.path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
+            ScratchParentValidationFailure::Unavailable
+        }
+        _ => ScratchParentValidationFailure::Infrastructure(CodexHandoffError::Transport),
+    })?;
+    let alias_is_reviewed = match candidate.policy {
+        ScratchParentPolicy::PrimarySystemTemporary => {
+            canonical == Path::new("/tmp") || canonical == Path::new("/private/tmp")
+        }
+        ScratchParentPolicy::SecondarySystemTemporary => {
+            canonical == Path::new("/var/tmp") || canonical == Path::new("/private/var/tmp")
+        }
+        #[cfg(any(target_os = "linux", test))]
+        ScratchParentPolicy::PrivateUserRuntime => canonical == candidate.path,
+    };
+    if !alias_is_reviewed {
+        return Err(ScratchParentValidationFailure::Unsafe);
+    }
+
+    // Re-read every resolved component, including the filesystem root. A
+    // canonical string is not enough if an ancestor is replaced between
+    // canonicalization and descriptor open. Only root/current-user-owned
+    // directories may contribute authority; writable shared ancestors must
+    // carry sticky deletion protection.
+    let mut ancestor = PathBuf::from("/");
+    validate_resolved_scratch_ancestor(&ancestor)?;
+    for component in canonical.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => ancestor.push(name),
+            _ => return Err(ScratchParentValidationFailure::Unsafe),
+        }
+        validate_resolved_scratch_ancestor(&ancestor)?;
+    }
+
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| {
+        ScratchParentValidationFailure::Infrastructure(CodexHandoffError::Transport)
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(ScratchParentValidationFailure::Unsafe);
+    }
+    let permission_bits = metadata.mode() & 0o7777;
+    match candidate.policy {
+        ScratchParentPolicy::PrimarySystemTemporary
+        | ScratchParentPolicy::SecondarySystemTemporary => {
+            if metadata.uid() != 0 || permission_bits != 0o1777 {
+                return Err(ScratchParentValidationFailure::Unsafe);
+            }
+        }
+        #[cfg(any(target_os = "linux", test))]
+        ScratchParentPolicy::PrivateUserRuntime => {
+            if metadata.uid() != rustix::process::geteuid().as_raw() || permission_bits != 0o700 {
+                return Err(ScratchParentValidationFailure::Unsafe);
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+fn validate_resolved_scratch_ancestor(
+    ancestor: &Path,
+) -> Result<(), ScratchParentValidationFailure> {
+    let metadata = fs::symlink_metadata(ancestor).map_err(|_| {
+        ScratchParentValidationFailure::Infrastructure(CodexHandoffError::Transport)
+    })?;
+    let permissions = metadata.mode() & 0o7777;
+    let owner_is_trusted =
+        metadata.uid() == 0 || metadata.uid() == rustix::process::geteuid().as_raw();
+    let replaceable_without_sticky = permissions & 0o022 != 0 && permissions & 0o1000 == 0;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || !owner_is_trusted
+        || replaceable_without_sticky
+    {
+        return Err(ScratchParentValidationFailure::Unsafe);
+    }
+    Ok(())
+}
+
 struct ScratchRoot {
     path: PathBuf,
     identity: ScratchIdentity,
@@ -2942,9 +3118,186 @@ impl fmt::Debug for ScratchRootCreateFailure {
 
 impl std::error::Error for ScratchRootCreateFailure {}
 
+fn verify_scratch_executability(
+    root: &ScratchRoot,
+    deadline: Instant,
+) -> Result<bool, CodexHandoffError> {
+    ensure_before_deadline(deadline)?;
+    root.revalidate()?;
+    let descriptor = rustix::fs::openat(
+        &root.descriptor,
+        SCRATCH_EXECUTABILITY_PROBE_FILE,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o700),
+    )
+    .map_err(|_| CodexHandoffError::Transport)?;
+    let mut output = File::from(descriptor);
+    output
+        .write_all(SCRATCH_EXECUTABILITY_PROBE_BYTES)
+        .map_err(|_| CodexHandoffError::Transport)?;
+    output
+        .sync_all()
+        .map_err(|_| CodexHandoffError::Transport)?;
+    drop(output);
+    root.sync_all()?;
+
+    let probe_path = root.path.join(SCRATCH_EXECUTABILITY_PROBE_FILE);
+    let identity = capture_executable(&probe_path, deadline)?;
+    revalidate_executable_until(&identity, Some(deadline))?;
+    let mut command = Command::new(&identity.canonical_path);
+    command.env_clear();
+    configure_own_process_group(&mut command);
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .current_dir(root.path())
+        .spawn();
+    let executed = match child {
+        Ok(child) => {
+            let mut child = ChildGuard {
+                child,
+                reaped: false,
+            };
+            loop {
+                ensure_before_deadline(deadline)?;
+                match child
+                    .child
+                    .try_wait()
+                    .map_err(|_| CodexHandoffError::Transport)?
+                {
+                    Some(status) => {
+                        child.reaped = true;
+                        break status.success();
+                    }
+                    None => thread::sleep(POLL_INTERVAL),
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => false,
+        Err(_) => return Err(CodexHandoffError::Spawn),
+    };
+
+    // The fixed probe is identity-checked on both sides of execution. The
+    // containing root is mode 0700 and descriptor-pinned, so no repository or
+    // environment path can replace the executed bytes.
+    revalidate_executable_until(&identity, Some(deadline))?;
+    root.revalidate()?;
+    rustix::fs::unlinkat(
+        &root.descriptor,
+        SCRATCH_EXECUTABILITY_PROBE_FILE,
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(|_| CodexHandoffError::Transport)?;
+    root.sync_all()?;
+    Ok(executed)
+}
+
 impl ScratchRoot {
-    fn create() -> Result<Self, ScratchRootCreateFailure> {
-        Self::create_below(Path::new("/tmp"), false, false)
+    fn create_until(deadline: Instant) -> Result<Self, CodexHandoffFailure> {
+        Self::create_until_with_origin(deadline, CompatibilityTimeoutOrigin::ScratchSelection)
+    }
+
+    fn create_until_with_origin(
+        deadline: Instant,
+        origin: CompatibilityTimeoutOrigin,
+    ) -> Result<Self, CodexHandoffFailure> {
+        check_pre_version_timeout_seam(origin)?;
+        ensure_compatibility_deadline(deadline, origin)?;
+        Self::create_from_candidates_until(
+            &production_scratch_candidates(),
+            deadline,
+            verify_scratch_executability,
+        )
+        .map_err(|failure| failure.at_timeout_boundary(origin))
+    }
+
+    #[cfg(test)]
+    fn create() -> Result<Self, CodexHandoffFailure> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or(CodexHandoffError::Timeout)?;
+        Self::create_until(deadline)
+    }
+
+    fn create_from_candidates_until<F>(
+        candidates: &[ScratchParentCandidate],
+        deadline: Instant,
+        probe: F,
+    ) -> Result<Self, CodexHandoffFailure>
+    where
+        F: FnMut(&ScratchRoot, Instant) -> Result<bool, CodexHandoffError>,
+    {
+        Self::create_from_candidates_until_with(
+            candidates,
+            deadline,
+            |parent| Self::create_below(parent, false, false),
+            probe,
+        )
+    }
+
+    fn create_from_candidates_until_with<C, F>(
+        candidates: &[ScratchParentCandidate],
+        deadline: Instant,
+        mut create: C,
+        mut probe: F,
+    ) -> Result<Self, CodexHandoffFailure>
+    where
+        C: FnMut(&Path) -> Result<Self, ScratchRootCreateFailure>,
+        F: FnMut(&ScratchRoot, Instant) -> Result<bool, CodexHandoffError>,
+    {
+        let mut first_infrastructure_error = None;
+        for candidate in candidates {
+            ensure_before_deadline(deadline)?;
+            let canonical_parent = match validate_scratch_parent(candidate) {
+                Ok(parent) => parent,
+                Err(
+                    ScratchParentValidationFailure::Unavailable
+                    | ScratchParentValidationFailure::Unsafe,
+                ) => continue,
+                Err(ScratchParentValidationFailure::Infrastructure(error)) => {
+                    first_infrastructure_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            let root = match create(&canonical_parent) {
+                Ok(root) => root,
+                Err(failure) if failure.retained.is_some() => return Err(failure.into()),
+                Err(failure) if failure.error() == CodexHandoffError::Transport => {
+                    first_infrastructure_error.get_or_insert(failure.error());
+                    continue;
+                }
+                Err(failure) => return Err(failure.into()),
+            };
+            let probe_result = probe(&root, deadline);
+            if matches!(probe_result, Ok(true)) {
+                return Ok(root);
+            }
+            let probe_error = probe_result.err();
+            match root.cleanup(deadline) {
+                Ok(_) => {}
+                Err(cleanup) => {
+                    let cause = probe_error
+                        .or(first_infrastructure_error)
+                        .unwrap_or(CodexHandoffError::UnsupportedNoexecScratch)
+                        .into();
+                    return Err(CodexHandoffFailure::with_retained_cause(
+                        cause,
+                        CodexHandoffRetention::ScratchCleanup(cleanup),
+                    ));
+                }
+            }
+            if let Some(error) = probe_error {
+                return Err(error.into());
+            }
+        }
+        Err(first_infrastructure_error
+            .unwrap_or(CodexHandoffError::UnsupportedNoexecScratch)
+            .into())
     }
 
     #[cfg(test)]
@@ -3841,7 +4194,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_version_timeout_boundaries_preserve_only_closed_origins()
+    fn compatibility_timeout_boundaries_preserve_only_closed_origins()
     -> Result<(), Box<dyn std::error::Error>> {
         for origin in CompatibilityTimeoutOrigin::ALL {
             let cause = match ensure_compatibility_deadline(Instant::now(), origin) {
@@ -3897,7 +4250,7 @@ mod tests {
         )?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
 
-        for origin in CompatibilityTimeoutOrigin::ALL {
+        for origin in CompatibilityTimeoutOrigin::PRE_VERSION {
             let seam = inject_pre_version_timeout(origin);
             let started = Instant::now();
             let result = verify_before_remote(&executable, Duration::from_secs(2));
@@ -4054,11 +4407,398 @@ mod tests {
     }
 
     #[test]
-    fn scratch_root_uses_the_canonical_fixed_parent() -> Result<(), Box<dyn std::error::Error>> {
-        let expected_parent = fs::canonicalize("/tmp")?;
+    fn scratch_root_uses_a_canonical_fixed_candidate_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scratch = ScratchRoot::create()?;
+        let fixed_parents = production_scratch_candidates()
+            .iter()
+            .filter_map(|candidate| validate_scratch_parent(candidate).ok())
+            .collect::<Vec<_>>();
 
-        assert_eq!(scratch.path().parent(), Some(expected_parent.as_path()));
+        assert_eq!(fs::canonicalize(&scratch.parent_path)?, scratch.parent_path);
+        assert!(fixed_parents.contains(&scratch.parent_path));
+        scratch.revalidate()?;
+        cleanup_test_scratch(scratch)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_selection_timeout_preserves_exact_pre_version_origin() {
+        let failure = match ScratchRoot::create_until(Instant::now()) {
+            Ok(scratch) => {
+                drop(scratch);
+                panic!("an expired scratch-selection deadline created filesystem authority");
+            }
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.error(), CodexHandoffError::Timeout);
+        assert_eq!(
+            failure.timeout_origin(),
+            Some(CompatibilityTimeoutOrigin::ScratchSelection)
+        );
+        assert!(!failure.has_retained_ownership());
+    }
+
+    #[test]
+    fn final_pinning_revalidation_preserves_integrity_failure_mapping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let executable = fixture.path().join("verified-codex");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n")?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+        let identity = capture_executable(&executable, Instant::now() + Duration::from_secs(2))?;
+        fs::remove_file(&executable)?;
+
+        let failure = match PinnedExecutableStage::from_verified(
+            &identity,
+            Instant::now() + Duration::from_secs(2),
+        ) {
+            Ok(stage) => {
+                drop(stage);
+                return Err("a missing verified executable minted a final stage".into());
+            }
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.error(), CodexHandoffError::Unsupported);
+        assert_eq!(failure.timeout_origin(), None);
+        assert!(!failure.has_retained_ownership());
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn final_scratch_selection_timeout_has_a_post_probe_origin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let executable = fixture.path().join("verified-codex");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n")?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+        let identity = capture_executable(&executable, Instant::now() + Duration::from_secs(2))?;
+        let seam = inject_pre_version_timeout(CompatibilityTimeoutOrigin::FinalScratchSelection);
+
+        let failure = match PinnedExecutableStage::from_verified(
+            &identity,
+            Instant::now() + Duration::from_secs(2),
+        ) {
+            Ok(stage) => {
+                drop(stage);
+                return Err("the final scratch timeout seam minted a stage".into());
+            }
+            Err(failure) => failure,
+        };
+        drop(seam);
+
+        assert_eq!(failure.error(), CodexHandoffError::Timeout);
+        assert_eq!(
+            failure.timeout_origin(),
+            Some(CompatibilityTimeoutOrigin::FinalScratchSelection)
+        );
+        assert!(!failure.has_retained_ownership());
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn executable_scratch_selection_is_ordered_and_cleans_rejected_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let first = fixture.create_directory("candidate-first")?;
+        let second = fixture.create_directory("candidate-second")?;
+        let candidates = [
+            ScratchParentCandidate::private_for_test(first.as_ref()),
+            ScratchParentCandidate::private_for_test(second.as_ref()),
+        ];
+        let mut visited = Vec::new();
+
+        let selected = ScratchRoot::create_from_candidates_until(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |root, _deadline| {
+                visited.push(root.parent_path.clone());
+                Ok(root.parent_path == second.as_ref())
+            },
+        )?;
+
+        assert_eq!(visited, vec![first.as_ref(), second.as_ref()]);
+        assert_eq!(selected.parent_path, second.as_ref());
+        assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
+        cleanup_test_scratch(selected)?;
+        drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn executable_scratch_selection_fails_closed_when_no_candidate_executes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let first = fixture.create_directory("candidate-first")?;
+        let second = fixture.create_directory("candidate-second")?;
+        let candidates = [
+            ScratchParentCandidate::private_for_test(first.as_ref()),
+            ScratchParentCandidate::private_for_test(second.as_ref()),
+        ];
+
+        let failure = match ScratchRoot::create_from_candidates_until(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |_root, _deadline| Ok(false),
+        ) {
+            Ok(selected) => {
+                cleanup_test_scratch(selected)?;
+                return Err("an unverified scratch candidate became executable authority".into());
+            }
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.error(), CodexHandoffError::UnsupportedNoexecScratch);
+        assert!(!failure.has_retained_ownership());
+        assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
+        assert_eq!(fs::read_dir(second.as_ref())?.count(), 0);
+        drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn executable_scratch_selection_does_not_hide_probe_infrastructure_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let first = fixture.create_directory("candidate-first")?;
+        let second = fixture.create_directory("candidate-second")?;
+        let candidates = [
+            ScratchParentCandidate::private_for_test(first.as_ref()),
+            ScratchParentCandidate::private_for_test(second.as_ref()),
+        ];
+        let mut attempts = 0;
+
+        let failure = match ScratchRoot::create_from_candidates_until(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |_root, _deadline| {
+                attempts += 1;
+                Err(CodexHandoffError::Transport)
+            },
+        ) {
+            Ok(selected) => {
+                cleanup_test_scratch(selected)?;
+                return Err("a probe infrastructure failure became scratch authority".into());
+            }
+            Err(failure) => failure,
+        };
+
+        assert_eq!(attempts, 1);
+        assert_eq!(failure.error(), CodexHandoffError::Transport);
+        assert!(!failure.has_retained_ownership());
+        assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
+        assert_eq!(fs::read_dir(second.as_ref())?.count(), 0);
+        drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn private_scratch_parent_rejects_symlinks_and_permissive_modes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let parent = fixture.create_directory("candidate")?;
+        let candidate = ScratchParentCandidate::private_for_test(parent.as_ref());
+        assert_eq!(validate_scratch_parent(&candidate)?, parent.as_ref());
+
+        let alias = fixture.path().join("candidate-alias");
+        symlink(parent.as_ref(), &alias)?;
+        assert_eq!(
+            validate_scratch_parent(&ScratchParentCandidate::private_for_test(&alias)),
+            Err(ScratchParentValidationFailure::Unsafe)
+        );
+
+        fs::set_permissions(parent.as_ref(), fs::Permissions::from_mode(0o770))?;
+        assert_eq!(
+            validate_scratch_parent(&candidate),
+            Err(ScratchParentValidationFailure::Unsafe)
+        );
+        fs::set_permissions(parent.as_ref(), fs::Permissions::from_mode(0o700))?;
+
+        let replaceable_ancestor = fixture.path().join("replaceable-ancestor");
+        let nested_candidate = replaceable_ancestor.join("candidate");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&replaceable_ancestor)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&nested_candidate)?;
+        fs::set_permissions(&replaceable_ancestor, fs::Permissions::from_mode(0o777))?;
+        assert_eq!(
+            validate_scratch_parent(&ScratchParentCandidate::private_for_test(&nested_candidate)),
+            Err(ScratchParentValidationFailure::Unsafe),
+            "a group/world-replaceable ancestor became executable authority"
+        );
+        fs::set_permissions(&replaceable_ancestor, fs::Permissions::from_mode(0o700))?;
+
+        fs::remove_file(alias)?;
+        drop(parent);
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_selection_preserves_unresolved_candidate_infrastructure_failure() {
+        let candidates = [ScratchParentCandidate::private_for_test(Path::new(
+            "/dev/null/calcifer-scratch",
+        ))];
+        let mut probes = 0;
+
+        let failure = match ScratchRoot::create_from_candidates_until(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |_root, _deadline| {
+                probes += 1;
+                Ok(true)
+            },
+        ) {
+            Ok(scratch) => {
+                drop(scratch);
+                panic!("an invalid device path became scratch authority");
+            }
+            Err(failure) => failure,
+        };
+
+        assert_eq!(probes, 0);
+        assert_eq!(failure.error(), CodexHandoffError::Transport);
+        assert!(!failure.has_retained_ownership());
+    }
+
+    #[test]
+    fn scratch_selection_recovers_from_root_creation_infrastructure_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let first = fixture.create_directory("candidate-first")?;
+        let second = fixture.create_directory("candidate-second")?;
+        let candidates = [
+            ScratchParentCandidate::private_for_test(first.as_ref()),
+            ScratchParentCandidate::private_for_test(second.as_ref()),
+        ];
+        let mut creates = 0;
+
+        let selected = ScratchRoot::create_from_candidates_until_with(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |parent| {
+                creates += 1;
+                if creates == 1 {
+                    Err(ScratchRootCreateFailure::not_created(
+                        CodexHandoffError::Transport,
+                    ))
+                } else {
+                    ScratchRoot::create_below(parent, false, false)
+                }
+            },
+            |_root, _deadline| Ok(true),
+        )?;
+
+        assert_eq!(creates, 2);
+        assert_eq!(selected.parent_path, second.as_ref());
+        assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
+        cleanup_test_scratch(selected)?;
+        drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_selection_reports_root_creation_infrastructure_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let first = fixture.create_directory("candidate-first")?;
+        let second = fixture.create_directory("candidate-second")?;
+        let candidates = [
+            ScratchParentCandidate::private_for_test(first.as_ref()),
+            ScratchParentCandidate::private_for_test(second.as_ref()),
+        ];
+        let mut creates = 0;
+
+        let failure = match ScratchRoot::create_from_candidates_until_with(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |_parent| {
+                creates += 1;
+                Err(ScratchRootCreateFailure::not_created(
+                    CodexHandoffError::Transport,
+                ))
+            },
+            |_root, _deadline| panic!("an uncreated root reached the executable probe"),
+        ) {
+            Ok(selected) => {
+                cleanup_test_scratch(selected)?;
+                return Err("a failed root creation became scratch authority".into());
+            }
+            Err(failure) => failure,
+        };
+
+        assert_eq!(creates, 2);
+        assert_eq!(failure.error(), CodexHandoffError::Transport);
+        assert!(!failure.has_retained_ownership());
+        assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
+        assert_eq!(fs::read_dir(second.as_ref())?.count(), 0);
+        drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn production_scratch_candidates_are_fixed_and_environment_independent() {
+        let candidates = production_scratch_candidates();
+        let paths = candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect::<Vec<_>>();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/tmp"),
+                PathBuf::from(format!("/run/user/{}", rustix::process::geteuid().as_raw())),
+                PathBuf::from("/var/tmp"),
+            ]
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]
+        );
+        assert!(paths.len() <= 3);
+        assert!(paths.iter().all(|path| path.is_absolute()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a private mount namespace plus CAP_SYS_ADMIN"]
+    fn noexec_primary_scratch_selects_credential_free_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if rustix::process::geteuid().as_raw() != 0 {
+            return Err("the noexec mount test must run as root inside a private namespace".into());
+        }
+        for arguments in [
+            ["--bind", "/tmp", "/tmp"].as_slice(),
+            ["-o", "remount,bind,noexec", "/tmp"].as_slice(),
+        ] {
+            let status = Command::new("/usr/bin/mount").args(arguments).status()?;
+            if !status.success() {
+                return Err(format!("private-namespace mount failed: {arguments:?}").into());
+            }
+        }
+
+        let primary = fs::canonicalize("/tmp")?;
+        let scratch = ScratchRoot::create_until(Instant::now() + Duration::from_secs(5))?;
+        assert_ne!(scratch.parent_path, primary);
+        assert!(
+            scratch.parent_path == Path::new("/run/user/0")
+                || scratch.parent_path == Path::new("/var/tmp"),
+            "selection escaped the fixed fallback set"
+        );
+        ensure_no_credentials(scratch.path())?;
         scratch.revalidate()?;
         cleanup_test_scratch(scratch)?;
         Ok(())

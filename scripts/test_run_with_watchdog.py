@@ -726,6 +726,17 @@ class WatchdogWorkflowTests(unittest.TestCase):
         )
         self.assertIn("make supervisor-msrv", msrv_step)
 
+        mount_step = test_job.split(
+            "      - name: Test Linux mount-boundary enforcement\n", 1
+        )[1]
+        self.assertIn(
+            "providers::codex::handoff_compat::runtime::tests::"
+            "noexec_primary_scratch_selects_credential_free_fallback",
+            mount_step,
+        )
+        self.assertEqual(mount_step.count("sudo -n unshare"), 2)
+        self.assertEqual(mount_step.count("--mount"), 2)
+
         budget = run_with_watchdog.validate_repeated_budget(
             rust_source=repository
             / "src/providers/codex/supervisor/packaged_smoke.rs",
