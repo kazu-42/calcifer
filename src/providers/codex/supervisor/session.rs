@@ -59,6 +59,7 @@ use crate::providers::codex::monitor::{
 #[cfg(test)]
 use crate::providers::codex::remote::ReadinessTransportOrigin;
 use crate::providers::codex::remote::{EffectiveThreadSettings, ReadinessProxyError};
+use crate::usage_observations::{ObservationError, ObservationSource, ObservationStore, UsageView};
 
 const TERMINAL_PUMP_RETRY: Duration = Duration::from_millis(1);
 const TERMINAL_DISCARD_MAX_FRAGMENTS: usize = 64;
@@ -4247,15 +4248,37 @@ impl<State> SessionState<ProductionSessionComponents, State> {
     /// monitor. The coordinator status surface will consume this once its
     /// account-scoped query protocol is added; retaining this typed seam keeps
     /// usage observation separate from restart/profile-selection authority.
-    #[expect(
-        dead_code,
-        reason = "staged production seam for the account usage/status protocol"
-    )]
     pub(super) fn latest_usage(&self) -> Option<CodexUsage> {
         match &self.components.monitor {
             MonitorAuthority::Live(monitor) => monitor.latest_usage(),
             MonitorAuthority::Clean => None,
         }
+    }
+
+    /// Publishes the latest snapshot from this already-live, profile-owned App
+    /// Server into the disposable observation cache. This path cannot spawn a
+    /// second provider process or acquire another credential-writing lease.
+    #[expect(
+        dead_code,
+        reason = "consumed by the guarded selection loop introduced in issue #36"
+    )]
+    pub(super) fn publish_latest_usage(
+        &self,
+        observations: &ObservationStore,
+        profile_id: &str,
+        observed_at: i64,
+    ) -> Result<Option<UsageView>, ObservationError> {
+        self.latest_usage()
+            .map(|usage| {
+                observations.observe_usage(
+                    profile_id,
+                    ObservationSource::ActiveMonitor,
+                    crate::providers::codex::CodexIdentityAdapter::supported_version(),
+                    usage,
+                    observed_at,
+                )
+            })
+            .transpose()
     }
 
     /// Takes at most one already-observed limit transition. This does not

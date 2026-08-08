@@ -47,8 +47,8 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Timestamped source, window reset metadata, spend control, and reset-credit count/expiry
 - [x] Provider failure, auth failure, timeout, missing-field, and unknown-format handling
 - [x] Human and stable JSON status commands for one or all idle profiles
-- [ ] Expose active-session monitoring through a public profile-owned supervisor or safe observation cache (the #54 typed monitor is internal and default-unused)
-- [ ] Snapshot cache, staleness state, TTL/backoff, and notification merge
+- [x] Expose the profile-owned monitor through a safe observation-cache projection (the supervised launch remains internal and default-unused)
+- [x] Bounded snapshot cache, explicit staleness, TTL/backoff, notification/read ordering, and idle refresh planning
 
 Calcifer will not ship automatic failover by scraping an unstable human string and treating parse failures as zero.
 

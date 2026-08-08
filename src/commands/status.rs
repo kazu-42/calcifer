@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jiff::Timestamp;
@@ -10,26 +12,11 @@ use crate::providers::codex::{
     CODEX_STATUS_PROTOCOL, CodexCompatibilityStatus, CodexUsage, CodexUsageError,
     RateLimitSnapshot, RateLimitWindow, SUPPORTED_CODEX_STATUS_VERSIONS, read_account_usage,
 };
+use crate::usage_observations::{
+    Availability, Freshness, ObservationError, ObservationSource, ObservationStore, UsageView,
+};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Availability {
-    Available,
-    Exhausted,
-    Unknown,
-}
-
-impl Availability {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Available => "available",
-            Self::Exhausted => "exhausted",
-            Self::Unknown => "unknown",
-        }
-    }
-}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct StatusReport {
@@ -45,10 +32,10 @@ struct ProfileStatus {
     provider: &'static str,
     availability: Availability,
     observed_at: i64,
-    source: &'static str,
-    freshness: &'static str,
+    source: String,
+    freshness: Freshness,
     codex_version: Option<String>,
-    adapter_version: &'static str,
+    adapter_version: String,
     compatibility: CompatibilityReport,
     usage: Option<CodexUsage>,
     error: Option<StatusFailure>,
@@ -72,6 +59,7 @@ struct InspectionFailure {
     status: StatusFailure,
     codex_version: Option<String>,
     compatibility: CodexCompatibilityStatus,
+    provider_error: Option<CodexUsageError>,
 }
 
 impl InspectionFailure {
@@ -80,6 +68,7 @@ impl InspectionFailure {
             status,
             codex_version: None,
             compatibility: CodexCompatibilityStatus::Unverified,
+            provider_error: None,
         }
     }
 }
@@ -95,10 +84,49 @@ impl StatusReport {
                 .filter(|profile| profile.provider == Provider::Codex)
                 .collect(),
         };
+        if profiles.is_empty() {
+            return Ok(Self {
+                schema_version: 1,
+                command: "status",
+                ok: true,
+                profiles: Vec::new(),
+            });
+        }
+        let observations = ObservationStore::from_profiles(&registry);
         let executable = resolve_codex();
+        let refresh_ids = match alias {
+            Some(_) => profiles
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<BTreeSet<_>>(),
+            None => observations
+                .due_idle_refresh(
+                    &profiles
+                        .iter()
+                        .map(|profile| profile.id.clone())
+                        .collect::<Vec<_>>(),
+                    &BTreeSet::new(),
+                    current_timestamp()?,
+                )
+                .map_err(cache_error)?
+                .into_iter()
+                .collect(),
+        };
         let statuses = profiles
             .into_iter()
-            .map(|profile| inspect_profile(&registry, &profile, alias, executable.as_deref()))
+            .map(|profile| {
+                if refresh_ids.contains(&profile.id) {
+                    inspect_profile(
+                        &registry,
+                        &observations,
+                        &profile,
+                        alias,
+                        executable.as_deref(),
+                    )
+                } else {
+                    cached_profile_status(&observations, &profile, current_timestamp()?)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let ok = statuses.iter().all(|profile| profile.error.is_none());
         Ok(Self {
@@ -191,10 +219,18 @@ impl ProfileStatus {
             (_, Some(error)) => lines.push(format!("  error: {} ({})", error.message, error.code)),
             _ => lines.push("  usage: unknown".to_owned()),
         }
+        if self.usage.is_some() {
+            if let Some(error) = &self.error {
+                lines.push(format!(
+                    "  refresh error: {} ({})",
+                    error.message, error.code
+                ));
+            }
+        }
         lines.push(format!(
             "  observed {} · {} · {}",
             format_epoch(self.observed_at),
-            self.freshness,
+            self.freshness.label(),
             self.source
         ));
         let codex_version = self.codex_version.as_deref().unwrap_or("unknown");
@@ -210,6 +246,7 @@ impl ProfileStatus {
 
 fn inspect_profile(
     registry: &Registry,
+    observations: &ObservationStore,
     profile: &Profile,
     expected_alias: Option<&str>,
     executable: Result<&std::path::Path, &crate::executable::ExecutableError>,
@@ -263,38 +300,116 @@ fn inspect_profile(
             status: status_failure(failure.kind()),
             codex_version: failure.codex_version().map(str::to_owned),
             compatibility: failure.compatibility(),
+            provider_error: Some(failure.kind()),
         })
     })();
 
     let observed_at = current_timestamp()?;
-    Ok(match result {
-        Ok(observation) => ProfileStatus {
-            profile: current_profile.reference(),
-            provider: "codex",
-            availability: classify(&observation.usage),
-            observed_at,
-            source: "codex_app_server",
-            freshness: "fresh",
-            codex_version: Some(observation.codex_version),
-            adapter_version: env!("CARGO_PKG_VERSION"),
-            compatibility: compatibility_report(CodexCompatibilityStatus::Compatible),
-            usage: Some(observation.usage),
-            error: None,
-        },
-        Err(failure) => ProfileStatus {
-            profile: current_profile.reference(),
-            provider: "codex",
-            availability: Availability::Unknown,
-            observed_at,
-            source: "codex_app_server",
-            freshness: "unknown",
-            codex_version: failure.codex_version,
-            adapter_version: env!("CARGO_PKG_VERSION"),
-            compatibility: compatibility_report(failure.compatibility),
-            usage: None,
-            error: Some(failure.status),
-        },
+    match result {
+        Ok(observation) => {
+            let view = observations
+                .observe_usage(
+                    &current_profile.id,
+                    ObservationSource::IdleRead,
+                    &observation.codex_version,
+                    observation.usage,
+                    observed_at,
+                )
+                .map_err(cache_error)?;
+            Ok(status_from_view(current_profile.reference(), view, None))
+        }
+        Err(failure) => {
+            let view = match failure.provider_error {
+                Some(provider_error) => observations
+                    .observe_failure(
+                        &current_profile.id,
+                        ObservationSource::IdleRead,
+                        failure.codex_version.as_deref(),
+                        failure.compatibility,
+                        provider_error,
+                        observed_at,
+                    )
+                    .map(Some)
+                    .map_err(cache_error)?,
+                None => observations
+                    .view(&current_profile.id, observed_at)
+                    .map_err(cache_error)?,
+            };
+            if let Some(view) = view {
+                let usable_active_observation = view.source == ObservationSource::ActiveMonitor
+                    && view.freshness == Freshness::Fresh;
+                Ok(status_from_view(
+                    current_profile.reference(),
+                    view,
+                    (!usable_active_observation).then_some(failure.status),
+                ))
+            } else {
+                Ok(ProfileStatus {
+                    profile: current_profile.reference(),
+                    provider: "codex",
+                    availability: Availability::Unknown,
+                    observed_at,
+                    source: ObservationSource::IdleRead.label().to_owned(),
+                    freshness: Freshness::Unknown,
+                    codex_version: failure.codex_version,
+                    adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    compatibility: compatibility_report(failure.compatibility),
+                    usage: None,
+                    error: Some(failure.status),
+                })
+            }
+        }
+    }
+}
+
+fn status_from_view(
+    profile: String,
+    view: UsageView,
+    error: Option<StatusFailure>,
+) -> ProfileStatus {
+    ProfileStatus {
+        profile,
+        provider: "codex",
+        availability: view.availability,
+        observed_at: view.observed_at,
+        source: view.source.label().to_owned(),
+        freshness: view.freshness,
+        codex_version: view.codex_version,
+        adapter_version: view.adapter_version,
+        compatibility: compatibility_report(view.compatibility),
+        usage: view.usage,
+        error,
+    }
+}
+
+fn cached_profile_status(
+    observations: &ObservationStore,
+    profile: &Profile,
+    observed_at: i64,
+) -> Result<ProfileStatus, AppError> {
+    if let Some(view) = observations
+        .view(&profile.id, observed_at)
+        .map_err(cache_error)?
+    {
+        return Ok(status_from_view(profile.reference(), view, None));
+    }
+    Ok(ProfileStatus {
+        profile: profile.reference(),
+        provider: "codex",
+        availability: Availability::Unknown,
+        observed_at,
+        source: "observation_cache".to_owned(),
+        freshness: Freshness::Unknown,
+        codex_version: None,
+        adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+        compatibility: compatibility_report(CodexCompatibilityStatus::Unverified),
+        usage: None,
+        error: None,
     })
+}
+
+fn cache_error(error: ObservationError) -> AppError {
+    AppError::Io(io::Error::other(error))
 }
 
 const fn compatibility_report(status: CodexCompatibilityStatus) -> CompatibilityReport {
@@ -303,56 +418,6 @@ const fn compatibility_report(status: CodexCompatibilityStatus) -> Compatibility
         protocol: CODEX_STATUS_PROTOCOL,
         supported_codex_versions: SUPPORTED_CODEX_STATUS_VERSIONS,
     }
-}
-
-fn classify(usage: &CodexUsage) -> Availability {
-    let snapshots = usage
-        .rate_limits
-        .iter()
-        .chain(usage.rate_limits_by_limit_id.values());
-    let mut saw_window = false;
-    let mut saw_rounded_full_window = false;
-    for snapshot in snapshots {
-        if let Some(reached_type) = snapshot.rate_limit_reached_type.as_deref() {
-            return if is_explicit_exhaustion(reached_type) {
-                Availability::Exhausted
-            } else {
-                Availability::Unknown
-            };
-        }
-        if snapshot
-            .individual_limit
-            .as_ref()
-            .is_some_and(|limit| limit.remaining_percent == 0)
-        {
-            return Availability::Unknown;
-        }
-        for window in [snapshot.primary.as_ref(), snapshot.secondary.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            saw_window = true;
-            saw_rounded_full_window |= window.used_percent >= 100;
-        }
-    }
-    if saw_window && !saw_rounded_full_window {
-        Availability::Available
-    } else {
-        // Codex rounds usage before exposing it, so displayed 100% alone is
-        // not authoritative proof that the account is exhausted.
-        Availability::Unknown
-    }
-}
-
-fn is_explicit_exhaustion(value: &str) -> bool {
-    matches!(
-        value,
-        "rate_limit_reached"
-            | "workspace_owner_credits_depleted"
-            | "workspace_member_credits_depleted"
-            | "workspace_owner_usage_limit_reached"
-            | "workspace_member_usage_limit_reached"
-    )
 }
 
 fn display_snapshots(usage: &CodexUsage) -> Vec<(String, &RateLimitSnapshot)> {
@@ -513,8 +578,10 @@ mod tests {
         let stale = pending.commit(crate::providers::codex::CodexIdentityAdapter::for_test())?;
         registry.rename(Provider::Codex, "work", "client-a")?;
 
+        let observations = ObservationStore::from_profiles(&registry);
         let report = inspect_profile(
             &registry,
+            &observations,
             &stale,
             Some("work"),
             Ok(std::path::Path::new("/synthetic/provider-must-not-run")),
@@ -529,65 +596,78 @@ mod tests {
         Ok(())
     }
 
-    fn window(used_percent: u32) -> RateLimitWindow {
-        RateLimitWindow {
-            used_percent,
-            remaining_percent: 100_u32.saturating_sub(used_percent.min(100)),
-            window_duration_mins: Some(300),
-            resets_at: Some(1_800_000_000),
-        }
-    }
-
-    fn snapshot(used_percent: u32, reached: Option<&str>) -> RateLimitSnapshot {
-        RateLimitSnapshot {
-            limit_id: Some("codex".to_owned()),
-            limit_name: None,
-            plan_type: None,
-            rate_limit_reached_type: reached.map(str::to_owned),
-            primary: Some(window(used_percent)),
-            secondary: None,
-            credits: None,
-            individual_limit: None,
-        }
-    }
-
-    fn usage(snapshot: RateLimitSnapshot) -> CodexUsage {
-        CodexUsage {
-            rate_limits: Some(snapshot),
-            rate_limits_by_limit_id: BTreeMap::new(),
-            reset_credits: None,
-        }
-    }
-
+    #[cfg(unix)]
     #[test]
-    fn classification_requires_an_explicit_exhaustion_signal() {
-        assert_eq!(
-            classify(&usage(snapshot(20, None))),
-            Availability::Available
-        );
-        assert_eq!(classify(&usage(snapshot(100, None))), Availability::Unknown);
-        assert_eq!(
-            classify(&usage(snapshot(100, Some("rate_limit_reached")))),
-            Availability::Exhausted
-        );
-        assert_eq!(
-            classify(&usage(snapshot(20, Some("future_unknown_state")))),
-            Availability::Unknown
-        );
+    fn busy_profile_uses_only_a_fresh_profile_owned_monitor_observation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
 
-        let mut mixed = snapshot(20, None);
-        mixed.secondary = Some(window(100));
-        assert_eq!(classify(&usage(mixed)), Availability::Unknown);
+        let root = std::fs::canonicalize(std::env::temp_dir())?.join(format!(
+            "calcifer-status-active-cache-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_codex_registration("work")?;
+        let mut auth = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(pending.home().join("auth.json"))?;
+        auth.write_all(
+            serde_json::to_string(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": { "account_id": uuid::Uuid::new_v4().to_string() }
+            }))?
+            .as_bytes(),
+        )?;
+        auth.sync_all()?;
+        let profile = pending.commit(crate::providers::codex::CodexIdentityAdapter::for_test())?;
+        let observations = ObservationStore::from_profiles(&registry);
+        let observed_at = current_timestamp()?;
+        observations.observe_usage(
+            &profile.id,
+            ObservationSource::ActiveMonitor,
+            crate::providers::codex::CodexIdentityAdapter::supported_version(),
+            CodexUsage {
+                rate_limits: Some(RateLimitSnapshot {
+                    limit_id: Some("codex".to_owned()),
+                    limit_name: None,
+                    plan_type: None,
+                    rate_limit_reached_type: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: 20,
+                        remaining_percent: 80,
+                        window_duration_mins: Some(300),
+                        resets_at: Some(1_900_000_000),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    individual_limit: None,
+                }),
+                rate_limits_by_limit_id: BTreeMap::new(),
+                reset_credits: None,
+            },
+            observed_at,
+        )?;
+        let (_locked_profile, lease) = registry.lock_profile_current(&profile, Some("work"))?;
 
-        let mut spend_control_empty = snapshot(20, None);
-        spend_control_empty.individual_limit =
-            Some(crate::providers::codex::SpendControlLimitSnapshot {
-                limit: "100".to_owned(),
-                used: "100".to_owned(),
-                remaining_percent: 0,
-                resets_at: 1_900_000_000,
-            });
-        assert_eq!(classify(&usage(spend_control_empty)), Availability::Unknown);
+        let report = inspect_profile(
+            &registry,
+            &observations,
+            &profile,
+            Some("work"),
+            Ok(std::path::Path::new("/synthetic/provider-must-not-run")),
+        )?;
+
+        assert_eq!(report.availability, Availability::Available);
+        assert_eq!(report.freshness, Freshness::Fresh);
+        assert_eq!(report.source, ObservationSource::ActiveMonitor.label());
+        assert!(report.error.is_none());
+        drop(lease);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

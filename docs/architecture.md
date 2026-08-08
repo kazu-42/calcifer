@@ -551,7 +551,11 @@ The app-server command is still marked experimental at the CLI level even though
 
 `usedPercent` is rounded by Codex. Calcifer derives `remainingPercent = clamp(100 - usedPercent)` for display only. A recognized `rateLimitReachedType` is required to classify a snapshot as exhausted; rounded 100%, null fields, and errors remain unknown for automatic-selection purposes.
 
-The one-shot probe cannot inspect a profile while its `run` or `resume` child owns the exclusive lease. Such a profile reports `profile_busy` / `unknown`. Multiple profiles are currently probed sequentially with a per-profile timeout. Continuous active-session observations, bounded parallel refresh, TTL/backoff, and cached last-known state belong in a future profile-owned app-server/supervisor so credential refresh retains exactly one owner.
+The one-shot probe cannot inspect a profile while its `run` or `resume` child owns the exclusive lease. Calcifer therefore keeps a bounded, disposable observation cache under the private managed root. An idle successful read and the already-live profile-owned monitor publish the same normalized safe model with distinct fixed sources. The active path clones only the monitor's latest fully validated `account/rateLimits/read` result; it has no process-spawn or credential-write operation and therefore cannot create a second owner. A supervised `usageLimitExceeded` turn failure records only a revalidation requirement—never its thread/turn identifiers—and cannot classify exhaustion until a full read at the same or a later observation time succeeds.
+
+Fresh observations expire after a fixed TTL. Expired evidence is `stale`; an explicitly unsupported version or method is `unsupported`; authentication, transport, timeout, overload/provider, spawn, malformed schema, missing fields, rounded-full, and unrecognized-reached evidence is `unknown`. Only a fresh recognized `rateLimitReachedType` is `exhausted`. Failures use capped exponential retry backoff, and all-profile status admits at most four due idle probes per invocation. A stable `(next_refresh_at, local profile ID)` order makes fake-clock tests deterministic; the later selector can additionally exclude its known active-profile set before planning probes.
+
+`usage-observations.json` and its lock are owner-private, symlink-resistant managed files. Updates serialize under a process lock, write a bounded temporary file, fsync it, atomically rename it, and fsync the managed directory. The cache validates its schema, unique canonical local profile IDs, bounded entry/audit counts, normalized usage fields, timestamps, versions, and monotonic audit revisions before use. Audit rows contain only revision, local profile ID, fixed source, timestamp, fixed event kind, and conservative state. Credentials, provider account/workspace IDs, opaque reset-credit IDs, aliases, thread/turn IDs, prompts, tools, and transcript content are not accepted by the cache API or schema. The file is disposable and never substitutes for the target-profile lease and fresh in-lease revalidation required by selection.
 
 The verified upstream versions, exact fields, and source links are recorded in [Provider compatibility notes](provider-compatibility.md).
 
@@ -871,7 +875,7 @@ completed implementations for:
   on top of the default-unused pinned integration in
   [ADR 0003](adr/0003-supervised-codex-session.md), plus a separate Windows
   terminal and process-authority design;
-- additional Codex version/schema gates and observation cache TTL/backoff;
+- additional Codex version/schema gates beyond the implemented 0.144.4 observation cache;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
 - OS credential-store support for Claude setup tokens;

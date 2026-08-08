@@ -2254,7 +2254,7 @@ esac
     assert_eq!(unsupported.status.code(), Some(1));
     assert_eq!(
         unsupported_document["profiles"][0]["availability"],
-        "unknown"
+        "unsupported"
     );
     assert_eq!(
         unsupported_document["profiles"][0]["codex_version"],
@@ -2306,7 +2306,7 @@ esac
         .output()?;
     let unsupported_human_text = String::from_utf8(unsupported_human.stdout)?;
     assert_eq!(unsupported_human.status.code(), Some(1));
-    assert!(unsupported_human_text.contains("[unknown]"));
+    assert!(unsupported_human_text.contains("[unsupported]"));
     assert!(
         unsupported_human_text
             .contains("compatibility incompatible · Codex 0.145.0 · tested 0.144.4")

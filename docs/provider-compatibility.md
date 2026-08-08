@@ -529,7 +529,17 @@ The normalized response can contain:
 
 Reset-credit detail arrays may be absent or shorter than `availableCount`; the count is authoritative. A missing summary means unavailable, not zero. Calcifer intentionally discards opaque reset-credit IDs and backend-provided title/description before constructing its public output.
 
-Each read is attached to the local profile ID, canonical managed home, and exclusive lease—not to an email address. New profiles also have the private version-scoped identity binding described above; legacy unbound profiles can still be read but cannot participate in automatic selection until explicit verification. A profile with an active `run` or `resume` child reports busy/unknown; Calcifer does not start a second app-server against the same refreshable `auth.json`.
+The same normalized response may be published by the already-live supervised
+profile monitor or by a bounded idle one-shot read. Both retain every safe
+bucket/window, reset, spend-control, credit, and reset-credit count/status/expiry
+field. The private observation cache records a fixed source, observation and
+expiry time, detected Codex version, Calcifer adapter version, compatibility,
+and capped retry schedule. It stores no credential, provider account/workspace
+identifier, opaque reset-credit identifier, or conversation content. A
+`usageLimitExceeded` turn signal carries no durable thread/turn ID and only
+forces authoritative revalidation; it is not itself an exhaustion result.
+
+Each read is attached to the local profile ID, canonical managed home, and exclusive lease—not to an email address. New profiles also have the private version-scoped identity binding described above; legacy unbound profiles can still be read but cannot participate in automatic selection until explicit verification. A profile with an active `run` or `resume` child is never probed with a second App Server against the same refreshable `auth.json`. Status may consume a fresh snapshot previously published by that profile-owned monitor; otherwise the profile remains stale or unknown.
 
 `account/usage/read` is a different token-activity report. It is not a quota or exhaustion signal and is not used for profile selection.
 
