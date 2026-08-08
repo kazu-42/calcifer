@@ -220,6 +220,13 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   children and recorded known process groups plus identity-checked runtime, FD,
   and socket evidence. Escaped-session containment is tracked
   separately by issue #56.
+- macOS descriptor-observation failures keep the public
+  `UnsupportedDescriptor` result. A separate diagnostic envelope carries at
+  most one closed, payload-free reason for unsupported kind, unavailable
+  vnode/socket/pipe identity, or unavailable identity for a forbidden kind.
+  The reason is printed only as a fixed subtype at the existing target-process-
+  group stage and contains no numeric process or descriptor identity. It does
+  not grant ownership, cleanup, retry, or readiness authority.
 - At guardian exec entry, lifecycle fd 0, terminal fd 1, and recovery fd 2 are
   each moved into one owned close-on-exec duplicate while the guardian is still
   single-threaded. The boundary requires exactly two references to the original

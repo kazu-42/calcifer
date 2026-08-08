@@ -76,6 +76,82 @@ impl fmt::Display for ProcessGroupDescriptorScanError {
 
 impl std::error::Error for ProcessGroupDescriptorScanError {}
 
+/// Fixed macOS-only reason retained beside the public fail-closed
+/// [`ProcessGroupDescriptorScanError::UnsupportedDescriptor`] classification.
+///
+/// The catalog is diagnostic only. No variant carries a PID, descriptor
+/// number, raw kernel kind, identity token, pathname, or provider data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MacosDescriptorObservationReason {
+    UnsupportedKind,
+    VnodeIdentityUnavailable,
+    SocketIdentityUnavailable,
+    PipeIdentityUnavailable,
+    ForbiddenKindIdentityUnavailable,
+}
+
+impl MacosDescriptorObservationReason {
+    pub const ALL: [Self; 5] = [
+        Self::UnsupportedKind,
+        Self::VnodeIdentityUnavailable,
+        Self::SocketIdentityUnavailable,
+        Self::PipeIdentityUnavailable,
+        Self::ForbiddenKindIdentityUnavailable,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedKind => "unsupported-kind",
+            Self::VnodeIdentityUnavailable => "vnode-identity-unavailable",
+            Self::SocketIdentityUnavailable => "socket-identity-unavailable",
+            Self::PipeIdentityUnavailable => "pipe-identity-unavailable",
+            Self::ForbiddenKindIdentityUnavailable => "forbidden-kind-identity-unavailable",
+        }
+    }
+}
+
+impl fmt::Display for MacosDescriptorObservationReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// Diagnostic envelope for one descriptor scan failure.
+///
+/// Existing callers continue to consume [`ProcessGroupDescriptorScanError`].
+/// Only callers that need fixed internal macOS branch evidence use this
+/// envelope, which grants no retry, signal, wait, or cleanup authority.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ProcessGroupDescriptorScanDiagnostic {
+    classification: ProcessGroupDescriptorScanError,
+    macos_reason: Option<MacosDescriptorObservationReason>,
+}
+
+impl ProcessGroupDescriptorScanDiagnostic {
+    pub const fn classification(self) -> ProcessGroupDescriptorScanError {
+        self.classification
+    }
+
+    pub const fn macos_reason(self) -> Option<MacosDescriptorObservationReason> {
+        self.macos_reason
+    }
+}
+
+impl fmt::Debug for ProcessGroupDescriptorScanDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (self.classification, self.macos_reason);
+        formatter.write_str("ProcessGroupDescriptorScanDiagnostic(<redacted>)")
+    }
+}
+
+impl fmt::Display for ProcessGroupDescriptorScanDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.classification.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ProcessGroupDescriptorScanDiagnostic {}
+
 /// Momentary proof that two stable, complete fd-number/kind snapshots of one
 /// current-user process group contained none of the requested identities.
 /// Every platform-supported descriptor identity is also compared exactly;
@@ -290,12 +366,30 @@ pub fn verify_process_group_forbidden_descriptors_absent_before(
     forbidden: &CrossProcessDescriptorSet<'_>,
     deadline: Instant,
 ) -> Result<ProcessGroupDescriptorIsolationProof, ProcessGroupDescriptorScanError> {
-    verify_with_limits(
+    diagnose_process_group_forbidden_descriptors_absent_before(process_group, forbidden, deadline)
+        .map_err(ProcessGroupDescriptorScanDiagnostic::classification)
+}
+
+/// Performs the same fail-closed scan while retaining one fixed macOS
+/// observation subtype beside `UnsupportedDescriptor` for internal diagnostics.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn diagnose_process_group_forbidden_descriptors_absent_before(
+    process_group: i32,
+    forbidden: &CrossProcessDescriptorSet<'_>,
+    deadline: Instant,
+) -> Result<ProcessGroupDescriptorIsolationProof, ProcessGroupDescriptorScanDiagnostic> {
+    let mut macos_reason = None;
+    verify_with_limits_recording(
         process_group,
         forbidden.as_slice(),
         ScanLimits::PRODUCTION,
         deadline,
+        &mut macos_reason,
     )
+    .map_err(|classification| ProcessGroupDescriptorScanDiagnostic {
+        classification,
+        macos_reason,
+    })
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -313,11 +407,29 @@ struct DescriptorObservation {
     token: Option<[u64; 3]>,
 }
 
+#[cfg(test)]
 fn verify_with_limits(
     process_group: i32,
     forbidden: &[CrossProcessDescriptorIdentity],
     limits: ScanLimits,
     deadline: Instant,
+) -> Result<ProcessGroupDescriptorIsolationProof, ProcessGroupDescriptorScanError> {
+    let mut macos_reason = None;
+    verify_with_limits_recording(
+        process_group,
+        forbidden,
+        limits,
+        deadline,
+        &mut macos_reason,
+    )
+}
+
+fn verify_with_limits_recording(
+    process_group: i32,
+    forbidden: &[CrossProcessDescriptorIdentity],
+    limits: ScanLimits,
+    deadline: Instant,
+    macos_reason: &mut Option<MacosDescriptorObservationReason>,
 ) -> Result<ProcessGroupDescriptorIsolationProof, ProcessGroupDescriptorScanError> {
     check_deadline(deadline)?;
     validate_request(process_group, forbidden, limits, deadline)?;
@@ -327,14 +439,16 @@ fn verify_with_limits(
     let mut descriptors = 0_usize;
     for member in &before {
         check_deadline(deadline)?;
-        let first = platform_descriptor_snapshot(*member, forbidden, limits, deadline)?;
+        let first =
+            platform_descriptor_snapshot(*member, forbidden, limits, deadline, macos_reason)?;
         validate_descriptor_snapshot(&first, forbidden, limits)?;
         check_deadline(deadline)?;
         let current = platform_process_identity(member.pid, deadline)?;
         if current != *member {
             return Err(ProcessGroupDescriptorScanError::ProcessChanged);
         }
-        let second = platform_descriptor_snapshot(*member, forbidden, limits, deadline)?;
+        let second =
+            platform_descriptor_snapshot(*member, forbidden, limits, deadline, macos_reason)?;
         validate_stable_descriptor_snapshots(&first, &second, forbidden, limits)?;
         descriptors = descriptors
             .checked_add(second.len())
@@ -752,6 +866,7 @@ fn platform_descriptor_snapshot(
     _forbidden: &[CrossProcessDescriptorIdentity],
     limits: ScanLimits,
     deadline: Instant,
+    _macos_reason: &mut Option<MacosDescriptorObservationReason>,
 ) -> Result<Vec<DescriptorObservation>, ProcessGroupDescriptorScanError> {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
@@ -925,6 +1040,74 @@ struct MacosPipeTokenPrefix {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_descriptor_info_plan(kind: i32) -> Result<(i32, usize), MacosDescriptorObservationReason> {
+    const PROC_PIDFDVNODEINFO: i32 = 1;
+    const PROC_PIDFDSOCKETINFO: i32 = 3;
+    const PROC_PIDFDPSEMINFO: i32 = 4;
+    const PROC_PIDFDPSHMINFO: i32 = 5;
+    const PROC_PIDFDPIPEINFO: i32 = 6;
+
+    match kind {
+        libc::PROX_FDTYPE_VNODE => Ok((
+            PROC_PIDFDVNODEINFO,
+            std::mem::size_of::<MacosFdStatPrefix>(),
+        )),
+        libc::PROX_FDTYPE_SOCKET => Ok((
+            PROC_PIDFDSOCKETINFO,
+            std::mem::size_of::<MacosSocketTokenPrefix>(),
+        )),
+        libc::PROX_FDTYPE_PSHM => {
+            Ok((PROC_PIDFDPSHMINFO, std::mem::size_of::<MacosFdStatPrefix>()))
+        }
+        libc::PROX_FDTYPE_PSEM => {
+            Ok((PROC_PIDFDPSEMINFO, std::mem::size_of::<MacosFdStatPrefix>()))
+        }
+        libc::PROX_FDTYPE_PIPE => Ok((
+            PROC_PIDFDPIPEINFO,
+            std::mem::size_of::<MacosPipeTokenPrefix>(),
+        )),
+        _ => Err(MacosDescriptorObservationReason::UnsupportedKind),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_identity_token(
+    kind: i32,
+    vnode: [u64; 3],
+    socket: u64,
+    pipe: u64,
+) -> Result<[u64; 3], MacosDescriptorObservationReason> {
+    match kind {
+        libc::PROX_FDTYPE_SOCKET if socket == 0 => {
+            Err(MacosDescriptorObservationReason::SocketIdentityUnavailable)
+        }
+        libc::PROX_FDTYPE_SOCKET => Ok([socket, 0, 0]),
+        libc::PROX_FDTYPE_PIPE if pipe == 0 => {
+            Err(MacosDescriptorObservationReason::PipeIdentityUnavailable)
+        }
+        libc::PROX_FDTYPE_PIPE => Ok([pipe, 0, 0]),
+        libc::PROX_FDTYPE_VNODE | libc::PROX_FDTYPE_PSHM | libc::PROX_FDTYPE_PSEM
+            if vnode[1] == 0 =>
+        {
+            Err(MacosDescriptorObservationReason::VnodeIdentityUnavailable)
+        }
+        libc::PROX_FDTYPE_VNODE | libc::PROX_FDTYPE_PSHM | libc::PROX_FDTYPE_PSEM => Ok(vnode),
+        _ => Err(MacosDescriptorObservationReason::UnsupportedKind),
+    }
+}
+
+#[cfg(target_os = "macos")]
+const fn macos_unidentified_kind_reason(
+    forbidden_kind: bool,
+) -> Option<MacosDescriptorObservationReason> {
+    if forbidden_kind {
+        Some(MacosDescriptorObservationReason::ForbiddenKindIdentityUnavailable)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn macos_list_descriptors(
     pid: i32,
     limits: ScanLimits,
@@ -987,32 +1170,16 @@ fn macos_descriptor_token(
     pid: i32,
     descriptor: libc::proc_fdinfo,
     deadline: Option<Instant>,
+    macos_reason: &mut Option<MacosDescriptorObservationReason>,
 ) -> Result<[u64; 3], ProcessGroupDescriptorScanError> {
-    const PROC_PIDFDVNODEINFO: i32 = 1;
-    const PROC_PIDFDSOCKETINFO: i32 = 3;
-    const PROC_PIDFDPSEMINFO: i32 = 4;
-    const PROC_PIDFDPSHMINFO: i32 = 5;
-    const PROC_PIDFDPIPEINFO: i32 = 6;
     const INFO_BUFFER_WORDS: usize = 512;
 
     check_optional_deadline(deadline)?;
-    let (flavor, required_size) = match descriptor.proc_fdtype as i32 {
-        libc::PROX_FDTYPE_VNODE => (
-            PROC_PIDFDVNODEINFO,
-            std::mem::size_of::<MacosFdStatPrefix>(),
-        ),
-        libc::PROX_FDTYPE_SOCKET => (
-            PROC_PIDFDSOCKETINFO,
-            std::mem::size_of::<MacosSocketTokenPrefix>(),
-        ),
-        libc::PROX_FDTYPE_PSHM => (PROC_PIDFDPSHMINFO, std::mem::size_of::<MacosFdStatPrefix>()),
-        libc::PROX_FDTYPE_PSEM => (PROC_PIDFDPSEMINFO, std::mem::size_of::<MacosFdStatPrefix>()),
-        libc::PROX_FDTYPE_PIPE => (
-            PROC_PIDFDPIPEINFO,
-            std::mem::size_of::<MacosPipeTokenPrefix>(),
-        ),
-        _ => return Err(ProcessGroupDescriptorScanError::UnsupportedDescriptor),
-    };
+    let kind = descriptor.proc_fdtype as i32;
+    let (flavor, required_size) = macos_descriptor_info_plan(kind).map_err(|reason| {
+        *macos_reason = Some(reason);
+        ProcessGroupDescriptorScanError::UnsupportedDescriptor
+    })?;
     let mut buffer = [0_u64; INFO_BUFFER_WORDS];
     let buffer_size = libc::c_int::try_from(std::mem::size_of_val(&buffer))
         .map_err(|_| ProcessGroupDescriptorScanError::ObservationFailed)?;
@@ -1045,36 +1212,29 @@ fn macos_descriptor_token(
     if prefix.file.kind != descriptor.proc_fdtype as i32 {
         return Err(ProcessGroupDescriptorScanError::DescriptorChanged);
     }
-    match descriptor.proc_fdtype as i32 {
+    let vnode = [
+        u64::from(prefix.stat.vst_dev),
+        prefix.stat.vst_ino,
+        u64::from(prefix.stat.vst_gen),
+    ];
+    let (socket, pipe) = match kind {
         libc::PROX_FDTYPE_SOCKET => {
             let socket = unsafe {
                 std::ptr::read_unaligned(buffer.as_ptr().cast::<MacosSocketTokenPrefix>())
             };
-            if socket.socket == 0 {
-                return Err(ProcessGroupDescriptorScanError::UnsupportedDescriptor);
-            }
-            Ok([socket.socket, 0, 0])
+            (socket.socket, 0)
         }
         libc::PROX_FDTYPE_PIPE => {
             let pipe =
                 unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<MacosPipeTokenPrefix>()) };
-            if pipe.handle == 0 {
-                return Err(ProcessGroupDescriptorScanError::UnsupportedDescriptor);
-            }
-            Ok([pipe.handle, 0, 0])
+            (0, pipe.handle)
         }
-        libc::PROX_FDTYPE_VNODE | libc::PROX_FDTYPE_PSHM | libc::PROX_FDTYPE_PSEM => {
-            if prefix.stat.vst_ino == 0 {
-                return Err(ProcessGroupDescriptorScanError::UnsupportedDescriptor);
-            }
-            Ok([
-                u64::from(prefix.stat.vst_dev),
-                prefix.stat.vst_ino,
-                u64::from(prefix.stat.vst_gen),
-            ])
-        }
-        _ => Err(ProcessGroupDescriptorScanError::UnsupportedDescriptor),
-    }
+        _ => (0, 0),
+    };
+    macos_identity_token(kind, vnode, socket, pipe).map_err(|reason| {
+        *macos_reason = Some(reason);
+        ProcessGroupDescriptorScanError::UnsupportedDescriptor
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1110,14 +1270,16 @@ fn platform_capture_descriptor_identity(
     let first = macos_find_descriptor(pid, raw_descriptor)?;
     let first_identity = CrossProcessDescriptorIdentity {
         kind: first.proc_fdtype,
-        token: macos_descriptor_token(pid, first, None).map_err(capture_error_from_scan)?,
+        token: macos_descriptor_token(pid, first, None, &mut None)
+            .map_err(capture_error_from_scan)?,
     };
     let local_after =
         super::descriptor_identity(descriptor).map_err(|error| classify_capture_error(&error))?;
     let second = macos_find_descriptor(pid, raw_descriptor)?;
     let second_identity = CrossProcessDescriptorIdentity {
         kind: second.proc_fdtype,
-        token: macos_descriptor_token(pid, second, None).map_err(capture_error_from_scan)?,
+        token: macos_descriptor_token(pid, second, None, &mut None)
+            .map_err(capture_error_from_scan)?,
     };
     if local_before != local_after || first_identity != second_identity {
         return Err(CrossProcessDescriptorIdentityError::DescriptorChanged);
@@ -1139,6 +1301,7 @@ fn platform_descriptor_snapshot(
     forbidden: &[CrossProcessDescriptorIdentity],
     limits: ScanLimits,
     deadline: Instant,
+    macos_reason: &mut Option<MacosDescriptorObservationReason>,
 ) -> Result<Vec<DescriptorObservation>, ProcessGroupDescriptorScanError> {
     check_deadline(deadline)?;
     let current = macos_process_identity(process.pid, deadline)?;
@@ -1158,12 +1321,18 @@ fn platform_descriptor_snapshot(
                 | libc::PROX_FDTYPE_PIPE
         );
         let token = if supported {
-            Some(macos_descriptor_token(process.pid, entry, Some(deadline))?)
+            Some(macos_descriptor_token(
+                process.pid,
+                entry,
+                Some(deadline),
+                macos_reason,
+            )?)
         } else {
-            if forbidden
+            let forbidden_kind = forbidden
                 .iter()
-                .any(|identity| identity.kind == entry.proc_fdtype)
-            {
+                .any(|identity| identity.kind == entry.proc_fdtype);
+            if let Some(reason) = macos_unidentified_kind_reason(forbidden_kind) {
+                *macos_reason = Some(reason);
                 return Err(ProcessGroupDescriptorScanError::UnsupportedDescriptor);
             }
             None
@@ -1305,11 +1474,13 @@ mod tests {
         assert_eq!(members[0].pid, group.process_group);
         assert_ne!(members[1].pid, group.process_group);
         for member in members {
+            let mut macos_reason = None;
             let observations = platform_descriptor_snapshot(
                 member,
                 &[identity],
                 ScanLimits::PRODUCTION,
                 deadline,
+                &mut macos_reason,
             )?;
             assert_eq!(
                 observations
@@ -1514,6 +1685,82 @@ mod tests {
             ScanLimits::PRODUCTION,
         )?;
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_descriptor_observation_reasons_cover_every_fixed_branch() {
+        assert_eq!(
+            macos_descriptor_info_plan(libc::PROX_FDTYPE_KQUEUE),
+            Err(MacosDescriptorObservationReason::UnsupportedKind)
+        );
+        assert_eq!(
+            macos_identity_token(libc::PROX_FDTYPE_VNODE, [7, 0, 9], 0, 0),
+            Err(MacosDescriptorObservationReason::VnodeIdentityUnavailable)
+        );
+        assert_eq!(
+            macos_identity_token(libc::PROX_FDTYPE_SOCKET, [0; 3], 0, 0),
+            Err(MacosDescriptorObservationReason::SocketIdentityUnavailable)
+        );
+        assert_eq!(
+            macos_identity_token(libc::PROX_FDTYPE_PIPE, [0; 3], 0, 0),
+            Err(MacosDescriptorObservationReason::PipeIdentityUnavailable)
+        );
+        assert_eq!(
+            macos_unidentified_kind_reason(true),
+            Some(MacosDescriptorObservationReason::ForbiddenKindIdentityUnavailable)
+        );
+        assert_eq!(macos_unidentified_kind_reason(false), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_descriptor_observation_reason_catalog_is_closed_and_payload_free() {
+        let reasons = MacosDescriptorObservationReason::ALL;
+        assert_eq!(reasons.len(), 5);
+        let labels = reasons.map(MacosDescriptorObservationReason::label);
+        assert_eq!(
+            labels,
+            [
+                "unsupported-kind",
+                "vnode-identity-unavailable",
+                "socket-identity-unavailable",
+                "pipe-identity-unavailable",
+                "forbidden-kind-identity-unavailable",
+            ]
+        );
+        let unique = labels
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), reasons.len());
+        for label in labels {
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            );
+        }
+
+        for reason in reasons {
+            let diagnostic = ProcessGroupDescriptorScanDiagnostic {
+                classification: ProcessGroupDescriptorScanError::UnsupportedDescriptor,
+                macos_reason: Some(reason),
+            };
+            assert_eq!(
+                diagnostic.classification(),
+                ProcessGroupDescriptorScanError::UnsupportedDescriptor
+            );
+            assert_eq!(diagnostic.macos_reason(), Some(reason));
+            assert_eq!(
+                format!("{diagnostic:?}"),
+                "ProcessGroupDescriptorScanDiagnostic(<redacted>)"
+            );
+            assert_eq!(
+                diagnostic.to_string(),
+                ProcessGroupDescriptorScanError::UnsupportedDescriptor.to_string()
+            );
+            assert!(std::error::Error::source(&diagnostic).is_none());
+        }
     }
 
     #[test]

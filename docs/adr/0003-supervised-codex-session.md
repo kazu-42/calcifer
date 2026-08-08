@@ -954,6 +954,15 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   coordinator performs exactly one zero-time lifecycle poll. That poll can
   expose only a frame already buffered at the fence and can never authorize a
   later descriptor scan.
+- On macOS, the public scan classification remains the fail-closed
+  `UnsupportedDescriptor`. A diagnostic-only envelope may additionally retain
+  exactly one fixed reason: `unsupported-kind`,
+  `vnode-identity-unavailable`, `socket-identity-unavailable`,
+  `pipe-identity-unavailable`, or `forbidden-kind-identity-unavailable`.
+  Coordinator test evidence prints only that fixed subtype beside the existing
+  `stage=TargetProcessGroup` boundary. The subtype carries no PID, fd, raw
+  kind, kernel identity, path, or provider data and grants no retry, ownership,
+  signal, wait, cleanup, or readiness authority.
 - Keeps the real-exec matrix root under an exact parent-held directory
   descriptor. Test-only recursive cleanup is capped at 4,096 nodes and depth
   32, accepts only current-user directories and singly linked regular files,
