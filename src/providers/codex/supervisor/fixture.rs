@@ -506,6 +506,52 @@ fn write_marker(name: &str, value: &[u8]) -> Result<(), FixtureError> {
     file.sync_all().map_err(|_| FixtureError::Storage)
 }
 
+/// Publishes one package-only foreground-transition observation. The marker
+/// is a synchronization point, never terminal or process authority.
+pub(super) fn publish_entry_foreground_observation(
+    retained: bool,
+    operation: &str,
+    rollback: Option<&str>,
+) -> Result<(), ()> {
+    const OPERATIONS: [&str; 8] = [
+        "fg-transition.signal-mask",
+        "fg-transition.initial-identity",
+        "fg-transition.initial-read",
+        "fg-transition.initial-mismatch",
+        "fg-transition.selection-write",
+        "fg-transition.selected-identity",
+        "fg-transition.selected-read",
+        "fg-transition.selected-mismatch",
+    ];
+    const ROLLBACKS: [&str; 6] = [
+        "fg-rollback.generation-changed",
+        "fg-rollback.identity-before-write",
+        "fg-rollback.write",
+        "fg-rollback.identity-after-write",
+        "fg-rollback.read",
+        "fg-rollback.mismatch",
+    ];
+    if !OPERATIONS.contains(&operation)
+        || rollback.is_some_and(|rollback| !ROLLBACKS.contains(&rollback))
+    {
+        return Err(());
+    }
+    let name = if retained {
+        "entry.foreground-retained"
+    } else {
+        "entry.foreground-safe"
+    };
+    // Publish the aggregate marker last. Package tests use it as the
+    // synchronization point before reading the operation-specific evidence,
+    // so every detail must already be durable when that marker becomes
+    // visible.
+    write_marker(operation, b"observed\n").map_err(|_| ())?;
+    if let Some(rollback) = rollback {
+        write_marker(rollback, b"observed\n").map_err(|_| ())?;
+    }
+    write_marker(name, b"observed\n").map_err(|_| ())
+}
+
 fn write_process_marker(name: &str, pid: i32) -> Result<(), FixtureError> {
     if pid <= 0 {
         return Err(FixtureError::Process);

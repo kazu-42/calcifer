@@ -535,6 +535,30 @@ impl OuterPtyChild {
         Ok(())
     }
 
+    fn wait_until_foreground_differs_from_anchor(&mut self, timeout: Duration) -> TestResult {
+        let deadline = deadline_after(timeout)?;
+        let anchor_group = self.anchor_process_group()?;
+        loop {
+            if rustix::termios::tcgetpgrp(&self.master)? != anchor_group {
+                return Ok(());
+            }
+            if self.try_wait()?.is_some() {
+                return Err(io::Error::other(
+                    "entry anchor exited instead of retaining the unresolved foreground",
+                )
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "outer PTY never exposed the unresolved foreground transition",
+                )
+                .into());
+            }
+            sleep_until_next_poll(deadline);
+        }
+    }
+
     fn drain_until_closed(&mut self, timeout: Duration) -> TestResult {
         let deadline = deadline_after(timeout)?;
         loop {
@@ -1628,6 +1652,94 @@ fn production_entry_anchor_requires_exact_completion_and_preserves_exit_status()
         // reaps only this exact direct child after the safety assertion.
         anchor.force_kill_and_reap();
         anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+        fixture.assert_provider_untouched()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn production_entry_foreground_readback_failures_roll_back_before_returning() -> TestResult {
+    let _serial = serial_guard();
+    for scenario in ["foreground-readback-error", "foreground-readback-mismatch"] {
+        let fixture = SupervisorCase::new(scenario)?;
+        let mut anchor = OuterPtyChild::spawn_entry(&fixture, scenario)?;
+        fixture.wait_for_marker(
+            None,
+            "entry.foreground-safe",
+            b"observed\n",
+            PROCESS_TIMEOUT,
+        )?;
+        let operation = match scenario {
+            "foreground-readback-error" => "fg-transition.selected-read",
+            "foreground-readback-mismatch" => "fg-transition.selected-mismatch",
+            _ => unreachable!("the safe foreground fixture catalog is closed"),
+        };
+        fixture.assert_marker(operation, b"observed\n")?;
+        let status = anchor.wait(PROCESS_TIMEOUT)?;
+        assert_status_code(status, Some(EXIT_FAILURE))?;
+        anchor.drain_until_closed(DROP_CLEANUP_TIMEOUT)?;
+        anchor.assert_restored()?;
+        fixture.assert_provider_untouched()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn production_entry_unproved_foreground_rollback_retains_the_anchor() -> TestResult {
+    let _serial = serial_guard();
+    for scenario in [
+        "foreground-generation-replacement",
+        "foreground-rollback-set-error",
+        "foreground-rollback-read-error",
+        "foreground-rollback-mismatch",
+        "foreground-identity-replacement",
+    ] {
+        let fixture = SupervisorCase::new(scenario)?;
+        let mut anchor = OuterPtyChild::spawn_entry(&fixture, scenario)?;
+        fixture.wait_for_marker(
+            None,
+            "entry.foreground-retained",
+            b"observed\n",
+            PROCESS_TIMEOUT,
+        )?;
+        let (operation, rollback) = match scenario {
+            "foreground-generation-replacement" => (
+                "fg-transition.selected-mismatch",
+                "fg-rollback.generation-changed",
+            ),
+            "foreground-rollback-set-error" => ("fg-transition.selected-read", "fg-rollback.write"),
+            "foreground-rollback-read-error" => ("fg-transition.selected-read", "fg-rollback.read"),
+            "foreground-rollback-mismatch" => {
+                ("fg-transition.selected-read", "fg-rollback.mismatch")
+            }
+            "foreground-identity-replacement" => (
+                "fg-transition.selected-identity",
+                "fg-rollback.identity-before-write",
+            ),
+            _ => unreachable!("the retained foreground fixture catalog is closed"),
+        };
+        fixture.assert_marker(operation, b"observed\n")?;
+        fixture.assert_marker(rollback, b"observed\n")?;
+        if anchor.try_wait()?.is_some() {
+            return Err(io::Error::other(
+                "unproved foreground rollback returned an ordinary failure",
+            )
+            .into());
+        }
+        anchor.wait_until_restored(PROCESS_TIMEOUT)?;
+        match scenario {
+            "foreground-generation-replacement"
+            | "foreground-rollback-set-error"
+            | "foreground-identity-replacement" => {
+                anchor.wait_until_foreground_differs_from_anchor(PROCESS_TIMEOUT)?;
+            }
+            "foreground-rollback-read-error" | "foreground-rollback-mismatch" => {
+                anchor.assert_anchor_foreground()?;
+            }
+            _ => unreachable!("the retained foreground fixture catalog is closed"),
+        }
+        anchor.force_kill_and_reap();
+        anchor.drain_until_closed(PROCESS_TIMEOUT)?;
         fixture.assert_provider_untouched()?;
     }
     Ok(())

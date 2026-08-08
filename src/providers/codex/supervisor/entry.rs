@@ -1069,6 +1069,7 @@ enum ProductionEntryError {
     Profile,
     Executable,
     Terminal,
+    Foreground(ForegroundSelectionError),
     Channel,
     Spawn,
 }
@@ -1234,12 +1235,13 @@ fn try_run_production_anchor(
 }
 
 fn run_anchor_command(command: Command) -> Result<ExitCode, ProductionEntryError> {
-    run_anchor_command_inner(command, None)
+    run_anchor_command_inner(command, None, ForegroundFixtureFault::None)
 }
 
 fn run_anchor_command_inner(
     mut command: Command,
     fixture_late_signal: Option<UnixSignal>,
+    foreground_fault: ForegroundFixtureFault,
 ) -> Result<ExitCode, ProductionEntryError> {
     let signals =
         CoordinatorSignalLatches::install().map_err(|_| ProductionEntryError::Terminal)?;
@@ -1268,9 +1270,44 @@ fn run_anchor_command_inner(
                 return Err(error);
             }
         };
-    if let Err(error) = select_foreground_group(&snapshot, anchor_group, coordinator_group) {
-        retain_or_reap_before_handoff(child, snapshot, completion);
-        return Err(error);
+    if let Err(error) = select_foreground_group_with_fault(
+        &snapshot,
+        anchor_group,
+        coordinator_group,
+        foreground_fault,
+    ) {
+        if foreground_fault != ForegroundFixtureFault::None
+            && super::fixture::publish_entry_foreground_observation(
+                matches!(
+                    error,
+                    ForegroundSelectionError::RetainUnchanged(_)
+                        | ForegroundSelectionError::Retain { .. }
+                ),
+                error.operation().label(),
+                error.rollback().map(ForegroundRollbackFailure::label),
+            )
+            .is_err()
+        {
+            RetainedAnchorState {
+                child,
+                snapshot,
+                completion,
+            }
+            .park();
+        }
+        match error {
+            ForegroundSelectionError::Safe(_) => {
+                retain_or_reap_before_handoff(child, snapshot, completion);
+                return Err(ProductionEntryError::Foreground(error));
+            }
+            ForegroundSelectionError::RetainUnchanged(_)
+            | ForegroundSelectionError::Retain { .. } => RetainedAnchorState {
+                child,
+                snapshot,
+                completion,
+            }
+            .park(),
+        }
     }
 
     let generation = AnchorGeneration {
@@ -1423,31 +1460,264 @@ fn select_foreground_group(
     snapshot: &TerminalSnapshot,
     expected_current: rustix::process::Pid,
     selected: rustix::process::Pid,
-) -> Result<(), ProductionEntryError> {
-    if calcifer_unix_child_fd::descriptor_identity(io::stdin().as_fd())
-        .map_err(|_| ProductionEntryError::Terminal)?
-        != snapshot.descriptor_identity()
-        || rustix::termios::tcgetpgrp(io::stdin()).map_err(|_| ProductionEntryError::Terminal)?
-            != expected_current
-    {
-        return Err(ProductionEntryError::Terminal);
-    }
+) -> Result<(), ForegroundSelectionError> {
+    select_foreground_group_with_fault(
+        snapshot,
+        expected_current,
+        selected,
+        ForegroundFixtureFault::None,
+    )
+}
+
+fn select_foreground_group_with_fault(
+    snapshot: &TerminalSnapshot,
+    expected_current: rustix::process::Pid,
+    selected: rustix::process::Pid,
+    fault: ForegroundFixtureFault,
+) -> Result<(), ForegroundSelectionError> {
     let guard = calcifer_unix_child_fd::block_sigttou_for_current_thread()
-        .map_err(|_| ProductionEntryError::Terminal)?;
-    let selected_result = rustix::termios::tcsetpgrp(io::stdin(), selected)
-        .map_err(|_| ProductionEntryError::Terminal)
-        .and_then(|()| {
-            if rustix::termios::tcgetpgrp(io::stdin())
-                .map_err(|_| ProductionEntryError::Terminal)?
-                == selected
-            {
-                Ok(())
-            } else {
-                Err(ProductionEntryError::Terminal)
-            }
-        });
+        .map_err(|_| ForegroundSelectionError::Safe(ForegroundSelectionFailure::SignalMask))?;
+    let mut terminal = StdinForegroundTerminal {
+        identity: snapshot.descriptor_identity(),
+        expected_current,
+        selected,
+        fault,
+        identity_checks: 0,
+        reads: 0,
+        sets: 0,
+    };
+    let selected_result =
+        transactional_foreground_selection(&mut terminal, expected_current, selected);
     drop(guard);
     selected_result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundSelectionFailure {
+    SignalMask,
+    InitialIdentity,
+    InitialRead,
+    InitialMismatch,
+    SelectionWrite,
+    SelectedIdentity,
+    SelectedRead,
+    SelectedMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundFixtureFault {
+    None,
+    SelectedRead,
+    SelectedMismatch,
+    SelectedNewGeneration,
+    RollbackSet,
+    RollbackRead,
+    RollbackMismatch,
+    IdentityAfterSelection,
+}
+
+impl ForegroundSelectionFailure {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SignalMask => "fg-transition.signal-mask",
+            Self::InitialIdentity => "fg-transition.initial-identity",
+            Self::InitialRead => "fg-transition.initial-read",
+            Self::InitialMismatch => "fg-transition.initial-mismatch",
+            Self::SelectionWrite => "fg-transition.selection-write",
+            Self::SelectedIdentity => "fg-transition.selected-identity",
+            Self::SelectedRead => "fg-transition.selected-read",
+            Self::SelectedMismatch => "fg-transition.selected-mismatch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundRollbackFailure {
+    ForegroundGenerationChanged,
+    IdentityBeforeWrite,
+    Write,
+    IdentityAfterWrite,
+    Read,
+    Mismatch,
+}
+
+impl ForegroundRollbackFailure {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ForegroundGenerationChanged => "fg-rollback.generation-changed",
+            Self::IdentityBeforeWrite => "fg-rollback.identity-before-write",
+            Self::Write => "fg-rollback.write",
+            Self::IdentityAfterWrite => "fg-rollback.identity-after-write",
+            Self::Read => "fg-rollback.read",
+            Self::Mismatch => "fg-rollback.mismatch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundSelectionError {
+    Safe(ForegroundSelectionFailure),
+    RetainUnchanged(ForegroundSelectionFailure),
+    Retain {
+        operation: ForegroundSelectionFailure,
+        rollback: ForegroundRollbackFailure,
+    },
+}
+
+impl ForegroundSelectionError {
+    const fn operation(self) -> ForegroundSelectionFailure {
+        match self {
+            Self::Safe(operation) | Self::RetainUnchanged(operation) => operation,
+            Self::Retain { operation, .. } => operation,
+        }
+    }
+
+    const fn rollback(self) -> Option<ForegroundRollbackFailure> {
+        match self {
+            Self::Safe(_) | Self::RetainUnchanged(_) => None,
+            Self::Retain { rollback, .. } => Some(rollback),
+        }
+    }
+}
+
+trait ForegroundTerminalOperations {
+    fn terminal_identity_matches(&mut self) -> bool;
+    fn read_foreground(&mut self) -> Result<rustix::process::Pid, ()>;
+    fn set_foreground(&mut self, process_group: rustix::process::Pid) -> Result<(), ()>;
+}
+
+struct StdinForegroundTerminal {
+    identity: calcifer_unix_child_fd::DescriptorIdentity,
+    expected_current: rustix::process::Pid,
+    selected: rustix::process::Pid,
+    fault: ForegroundFixtureFault,
+    identity_checks: usize,
+    reads: usize,
+    sets: usize,
+}
+
+impl ForegroundTerminalOperations for StdinForegroundTerminal {
+    fn terminal_identity_matches(&mut self) -> bool {
+        self.identity_checks = self.identity_checks.saturating_add(1);
+        if self.fault == ForegroundFixtureFault::IdentityAfterSelection && self.identity_checks >= 2
+        {
+            return false;
+        }
+        calcifer_unix_child_fd::descriptor_identity(io::stdin().as_fd())
+            .is_ok_and(|identity| identity == self.identity)
+    }
+
+    fn read_foreground(&mut self) -> Result<rustix::process::Pid, ()> {
+        self.reads = self.reads.saturating_add(1);
+        match (self.fault, self.reads) {
+            (
+                ForegroundFixtureFault::SelectedRead
+                | ForegroundFixtureFault::RollbackSet
+                | ForegroundFixtureFault::RollbackRead
+                | ForegroundFixtureFault::RollbackMismatch,
+                2,
+            ) => return Err(()),
+            (ForegroundFixtureFault::SelectedMismatch, 2) => return Ok(self.expected_current),
+            (ForegroundFixtureFault::SelectedNewGeneration, 2) => {
+                return rustix::process::Pid::from_raw(i32::MAX).ok_or(());
+            }
+            (ForegroundFixtureFault::RollbackRead, 3) => return Err(()),
+            (ForegroundFixtureFault::RollbackMismatch, 3) => return Ok(self.selected),
+            _ => {}
+        }
+        rustix::termios::tcgetpgrp(io::stdin()).map_err(|_| ())
+    }
+
+    fn set_foreground(&mut self, process_group: rustix::process::Pid) -> Result<(), ()> {
+        self.sets = self.sets.saturating_add(1);
+        if self.fault == ForegroundFixtureFault::RollbackSet && self.sets == 2 {
+            return Err(());
+        }
+        rustix::termios::tcsetpgrp(io::stdin(), process_group).map_err(|_| ())
+    }
+}
+
+fn transactional_foreground_selection(
+    terminal: &mut impl ForegroundTerminalOperations,
+    expected_current: rustix::process::Pid,
+    selected: rustix::process::Pid,
+) -> Result<(), ForegroundSelectionError> {
+    if !terminal.terminal_identity_matches() {
+        return Err(ForegroundSelectionError::RetainUnchanged(
+            ForegroundSelectionFailure::InitialIdentity,
+        ));
+    }
+    match terminal.read_foreground() {
+        Err(()) => {
+            return Err(ForegroundSelectionError::RetainUnchanged(
+                ForegroundSelectionFailure::InitialRead,
+            ));
+        }
+        Ok(observed) if observed != expected_current => {
+            return Err(ForegroundSelectionError::RetainUnchanged(
+                ForegroundSelectionFailure::InitialMismatch,
+            ));
+        }
+        Ok(_) => {}
+    }
+
+    if terminal.set_foreground(selected).is_err() {
+        return rollback_foreground_selection(
+            terminal,
+            expected_current,
+            ForegroundSelectionFailure::SelectionWrite,
+        );
+    }
+    if !terminal.terminal_identity_matches() {
+        return Err(ForegroundSelectionError::Retain {
+            operation: ForegroundSelectionFailure::SelectedIdentity,
+            rollback: ForegroundRollbackFailure::IdentityBeforeWrite,
+        });
+    }
+    match terminal.read_foreground() {
+        Err(()) => rollback_foreground_selection(
+            terminal,
+            expected_current,
+            ForegroundSelectionFailure::SelectedRead,
+        ),
+        Ok(observed) if observed == expected_current => rollback_foreground_selection(
+            terminal,
+            expected_current,
+            ForegroundSelectionFailure::SelectedMismatch,
+        ),
+        Ok(observed) if observed != selected => Err(ForegroundSelectionError::Retain {
+            operation: ForegroundSelectionFailure::SelectedMismatch,
+            rollback: ForegroundRollbackFailure::ForegroundGenerationChanged,
+        }),
+        Ok(_) => Ok(()),
+    }
+}
+
+fn rollback_foreground_selection(
+    terminal: &mut impl ForegroundTerminalOperations,
+    expected_current: rustix::process::Pid,
+    operation: ForegroundSelectionFailure,
+) -> Result<(), ForegroundSelectionError> {
+    let retain = |rollback| ForegroundSelectionError::Retain {
+        operation,
+        rollback,
+    };
+    if !terminal.terminal_identity_matches() {
+        return Err(retain(ForegroundRollbackFailure::IdentityBeforeWrite));
+    }
+    terminal
+        .set_foreground(expected_current)
+        .map_err(|()| retain(ForegroundRollbackFailure::Write))?;
+    if !terminal.terminal_identity_matches() {
+        return Err(retain(ForegroundRollbackFailure::IdentityAfterWrite));
+    }
+    match terminal.read_foreground() {
+        Err(()) => Err(retain(ForegroundRollbackFailure::Read)),
+        Ok(observed) if observed != expected_current => {
+            Err(retain(ForegroundRollbackFailure::Mismatch))
+        }
+        Ok(_) => Err(ForegroundSelectionError::Safe(operation)),
+    }
 }
 
 fn retain_or_reap_before_handoff(
@@ -1459,7 +1729,23 @@ fn retain_or_reap_before_handoff(
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => {
+                let restored =
+                    snapshot
+                        .restore_with_sigttou_block(io::stdin())
+                        .is_ok_and(|proof| {
+                            proof.descriptor_identity() == snapshot.descriptor_identity()
+                        });
+                if restored {
+                    return;
+                }
+                RetainedAnchorState {
+                    child,
+                    snapshot,
+                    completion,
+                }
+                .park();
+            }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -1629,7 +1915,8 @@ impl AnchorGeneration {
     }
 
     fn relay_stopped_coordinator(&mut self) -> Result<(), ProductionEntryError> {
-        select_foreground_group(&self.snapshot, self.coordinator_group, self.anchor_group)?;
+        select_foreground_group(&self.snapshot, self.coordinator_group, self.anchor_group)
+            .map_err(ProductionEntryError::Foreground)?;
         let restored = self
             .snapshot
             .restore_with_sigttou_block(io::stdin())
@@ -1658,7 +1945,8 @@ impl AnchorGeneration {
             }
         }
         self.verify_child_still_stopped()?;
-        select_foreground_group(&self.snapshot, self.anchor_group, self.coordinator_group)?;
+        select_foreground_group(&self.snapshot, self.anchor_group, self.coordinator_group)
+            .map_err(ProductionEntryError::Foreground)?;
         self.signal_coordinator(rustix::process::Signal::CONT)
     }
 
@@ -1832,7 +2120,8 @@ fn restore_anchor_terminal(
         return Err(ProductionEntryError::Terminal);
     }
     if foreground != anchor_group {
-        select_foreground_group(snapshot, coordinator_group, anchor_group)?;
+        select_foreground_group(snapshot, coordinator_group, anchor_group)
+            .map_err(ProductionEntryError::Foreground)?;
     }
     snapshot
         .restore_with_sigttou_block(io::stdin())
@@ -1879,7 +2168,17 @@ fn try_run_entry_anchor_fixture(scenario: &str) -> Result<ExitCode, ProductionEn
         "late-term-after-exit" => Some(UnixSignal::Term),
         _ => None,
     };
-    run_anchor_command_inner(command, late_signal)
+    let foreground_fault = match scenario {
+        "foreground-readback-error" => ForegroundFixtureFault::SelectedRead,
+        "foreground-readback-mismatch" => ForegroundFixtureFault::SelectedMismatch,
+        "foreground-generation-replacement" => ForegroundFixtureFault::SelectedNewGeneration,
+        "foreground-rollback-set-error" => ForegroundFixtureFault::RollbackSet,
+        "foreground-rollback-read-error" => ForegroundFixtureFault::RollbackRead,
+        "foreground-rollback-mismatch" => ForegroundFixtureFault::RollbackMismatch,
+        "foreground-identity-replacement" => ForegroundFixtureFault::IdentityAfterSelection,
+        _ => ForegroundFixtureFault::None,
+    };
+    run_anchor_command_inner(command, late_signal, foreground_fault)
 }
 
 pub(super) fn run_entry_coordinator_fixture(scenario: &str) -> ExitCode {
@@ -1905,7 +2204,16 @@ fn try_run_entry_coordinator_fixture(scenario: &str) -> Result<ExitCode, Product
     }
 
     match scenario {
-        "normal" => finish_entry_fixture(snapshot, completion, ExitCode::SUCCESS),
+        "normal"
+        | "foreground-readback-error"
+        | "foreground-readback-mismatch"
+        | "foreground-generation-replacement"
+        | "foreground-rollback-set-error"
+        | "foreground-rollback-read-error"
+        | "foreground-rollback-mismatch"
+        | "foreground-identity-replacement" => {
+            finish_entry_fixture(snapshot, completion, ExitCode::SUCCESS)
+        }
         "nonzero" => finish_entry_fixture(snapshot, completion, ExitCode::from(42)),
         "missing" => {
             // Keep the malformed-generation raw transition externally
@@ -1977,7 +2285,14 @@ fn validate_entry_fixture_scenario(scenario: &str) -> Result<(), ProductionEntry
         | "late-hup-after-exit"
         | "late-term-after-exit"
         | "suspend-resume"
-        | "retained" => Ok(()),
+        | "retained"
+        | "foreground-readback-error"
+        | "foreground-readback-mismatch"
+        | "foreground-generation-replacement"
+        | "foreground-rollback-set-error"
+        | "foreground-rollback-read-error"
+        | "foreground-rollback-mismatch"
+        | "foreground-identity-replacement" => Ok(()),
         _ => Err(ProductionEntryError::Arguments),
     }
 }
@@ -3272,5 +3587,218 @@ mod tests {
         assert!(coordinator.wait()?.success());
         assert_eq!(poll_until_terminal(&mut anchor)?, CompletionPoll::Verified);
         Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum ForegroundTestFault {
+        None,
+        InitialIdentity,
+        InitialRead,
+        InitialMismatch,
+        SelectedRead,
+        SelectedMismatch,
+        SelectedNewGeneration,
+        RollbackSet,
+        RollbackRead,
+        RollbackMismatch,
+        IdentityAfterSelection,
+    }
+
+    struct ScriptedForegroundTerminal {
+        expected: rustix::process::Pid,
+        selected: rustix::process::Pid,
+        foreground: rustix::process::Pid,
+        fault: ForegroundTestFault,
+        identity_checks: usize,
+        reads: usize,
+        sets: Vec<rustix::process::Pid>,
+    }
+
+    impl ScriptedForegroundTerminal {
+        fn new(fault: ForegroundTestFault) -> Self {
+            let Some(expected) = rustix::process::Pid::from_raw(101) else {
+                unreachable!("the fixed positive test PID is valid");
+            };
+            let Some(selected) = rustix::process::Pid::from_raw(202) else {
+                unreachable!("the fixed positive test PID is valid");
+            };
+            Self {
+                expected,
+                selected,
+                foreground: expected,
+                fault,
+                identity_checks: 0,
+                reads: 0,
+                sets: Vec::new(),
+            }
+        }
+    }
+
+    impl ForegroundTerminalOperations for ScriptedForegroundTerminal {
+        fn terminal_identity_matches(&mut self) -> bool {
+            self.identity_checks += 1;
+            !((matches!(self.fault, ForegroundTestFault::InitialIdentity)
+                && self.identity_checks == 1)
+                || (matches!(self.fault, ForegroundTestFault::IdentityAfterSelection)
+                    && self.identity_checks >= 2))
+        }
+
+        fn read_foreground(&mut self) -> Result<rustix::process::Pid, ()> {
+            self.reads += 1;
+            match (self.fault, self.reads) {
+                (ForegroundTestFault::InitialRead, 1) => Err(()),
+                (ForegroundTestFault::InitialMismatch, 1) => Ok(self.selected),
+                (
+                    ForegroundTestFault::SelectedRead
+                    | ForegroundTestFault::RollbackSet
+                    | ForegroundTestFault::RollbackRead
+                    | ForegroundTestFault::RollbackMismatch,
+                    2,
+                ) => Err(()),
+                (ForegroundTestFault::SelectedMismatch, 2) => Ok(self.expected),
+                (ForegroundTestFault::SelectedNewGeneration, 2) => {
+                    let Some(replacement) = rustix::process::Pid::from_raw(303) else {
+                        return Err(());
+                    };
+                    Ok(replacement)
+                }
+                (ForegroundTestFault::RollbackRead, 3) => Err(()),
+                (ForegroundTestFault::RollbackMismatch, 3) => Ok(self.selected),
+                _ => Ok(self.foreground),
+            }
+        }
+
+        fn set_foreground(&mut self, process_group: rustix::process::Pid) -> Result<(), ()> {
+            self.sets.push(process_group);
+            if matches!(self.fault, ForegroundTestFault::RollbackSet) && self.sets.len() == 2 {
+                return Err(());
+            }
+            self.foreground = process_group;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn foreground_selection_commits_only_after_exact_identity_and_readback() {
+        let mut terminal = ScriptedForegroundTerminal::new(ForegroundTestFault::None);
+        let expected = terminal.expected;
+        let selected = terminal.selected;
+        assert_eq!(
+            transactional_foreground_selection(&mut terminal, expected, selected),
+            Ok(())
+        );
+        assert_eq!(terminal.foreground, terminal.selected);
+        assert_eq!(terminal.sets, vec![terminal.selected]);
+        assert!(terminal.identity_checks >= 2);
+        assert_eq!(terminal.reads, 2);
+    }
+
+    #[test]
+    fn foreground_selection_readback_failures_restore_the_verified_group() {
+        for fault in [
+            ForegroundTestFault::SelectedRead,
+            ForegroundTestFault::SelectedMismatch,
+        ] {
+            let mut terminal = ScriptedForegroundTerminal::new(fault);
+            let expected = terminal.expected;
+            let selected = terminal.selected;
+            assert!(matches!(
+                transactional_foreground_selection(&mut terminal, expected, selected),
+                Err(ForegroundSelectionError::Safe(_))
+            ));
+            assert_eq!(terminal.foreground, terminal.expected);
+            assert_eq!(terminal.sets, vec![terminal.selected, terminal.expected]);
+            assert_eq!(terminal.reads, 3);
+        }
+    }
+
+    #[test]
+    fn foreground_selection_retains_authority_when_rollback_is_unproved() {
+        for fault in [
+            ForegroundTestFault::SelectedNewGeneration,
+            ForegroundTestFault::RollbackSet,
+            ForegroundTestFault::RollbackRead,
+            ForegroundTestFault::RollbackMismatch,
+            ForegroundTestFault::IdentityAfterSelection,
+        ] {
+            let mut terminal = ScriptedForegroundTerminal::new(fault);
+            let expected = terminal.expected;
+            let selected = terminal.selected;
+            assert!(matches!(
+                transactional_foreground_selection(&mut terminal, expected, selected),
+                Err(ForegroundSelectionError::Retain { .. })
+            ));
+            match fault {
+                ForegroundTestFault::RollbackRead | ForegroundTestFault::RollbackMismatch => {
+                    assert_eq!(terminal.foreground, terminal.expected);
+                }
+                ForegroundTestFault::SelectedNewGeneration
+                | ForegroundTestFault::RollbackSet
+                | ForegroundTestFault::IdentityAfterSelection => {
+                    assert_eq!(terminal.foreground, terminal.selected);
+                }
+                _ => unreachable!("the retained-failure matrix is closed"),
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_selection_retains_preexisting_terminal_generation_drift() {
+        for fault in [
+            ForegroundTestFault::InitialIdentity,
+            ForegroundTestFault::InitialRead,
+            ForegroundTestFault::InitialMismatch,
+        ] {
+            let mut terminal = ScriptedForegroundTerminal::new(fault);
+            let expected = terminal.expected;
+            let selected = terminal.selected;
+            assert!(matches!(
+                transactional_foreground_selection(&mut terminal, expected, selected),
+                Err(ForegroundSelectionError::RetainUnchanged(_))
+            ));
+            assert!(terminal.sets.is_empty());
+            assert_eq!(terminal.foreground, expected);
+        }
+    }
+
+    #[test]
+    fn foreground_transition_diagnostics_are_closed_and_payload_free() {
+        let operation = [
+            ForegroundSelectionFailure::SignalMask,
+            ForegroundSelectionFailure::InitialIdentity,
+            ForegroundSelectionFailure::InitialRead,
+            ForegroundSelectionFailure::InitialMismatch,
+            ForegroundSelectionFailure::SelectionWrite,
+            ForegroundSelectionFailure::SelectedIdentity,
+            ForegroundSelectionFailure::SelectedRead,
+            ForegroundSelectionFailure::SelectedMismatch,
+        ];
+        let rollback = [
+            ForegroundRollbackFailure::ForegroundGenerationChanged,
+            ForegroundRollbackFailure::IdentityBeforeWrite,
+            ForegroundRollbackFailure::Write,
+            ForegroundRollbackFailure::IdentityAfterWrite,
+            ForegroundRollbackFailure::Read,
+            ForegroundRollbackFailure::Mismatch,
+        ];
+        let labels = operation
+            .into_iter()
+            .map(ForegroundSelectionFailure::label)
+            .chain(rollback.into_iter().map(ForegroundRollbackFailure::label))
+            .collect::<Vec<_>>();
+        let unique = labels
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), labels.len());
+        for label in labels {
+            assert!(label.is_ascii());
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'.' | b'-'))
+            );
+            assert!(!label.contains(['/', '=', ':', ' ']));
+        }
     }
 }

@@ -434,6 +434,15 @@ payload. Exact retained record plus EOF parks the direct child, immutable tty
 snapshot, and completion
 receiver without returning success or a nonzero shell status.
 
+Foreground ownership between the persistent anchor and one coordinator
+generation is changed as a transaction. The entry revalidates the exact
+terminal descriptor and expected current process group before `tcsetpgrp`, then
+revalidates the descriptor and reads back the selected process group. A failed
+post-write check is safe to return only after the last verified group is
+restored and read back exactly. Descriptor replacement, an intervening third
+foreground group, or any unproved rollback retains the child, immutable
+snapshot, and completion receiver without clobbering the newer terminal owner.
+
 The same anonymous socket has one bounded reverse operation for the internal
 package owner: one exact 25-byte request followed by write-half shutdown. The
 frame contains `CFRCR\x01`, the fixed retained-generation reason, the transit
