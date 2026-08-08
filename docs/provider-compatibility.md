@@ -481,8 +481,10 @@ one-boundary crash recovery driver are also implemented but default-unused.
 The driver persists stop and fork intent before external effects, validates
 same-domain source provenance, adopts exactly one matching post-crash target,
 permits zero candidates one durable retry, and never offers a replay action.
-Public supervisor wiring, authoritative exhaustion selection, and target-fork
-activation remain prerequisites before automatic handoff is enabled.
+The authoritative one-pass selection kernel and lease-retaining candidate
+revalidation runtime are implemented but default-unused. Public supervisor
+wiring and target-fork activation remain prerequisites before automatic
+handoff is enabled.
 
 Relevant upstream sources:
 

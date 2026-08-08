@@ -3325,6 +3325,13 @@ impl VerifiedTargetReservation {
         self.identity.same_provider_identity(&other.identity)
     }
 
+    /// Borrows the provider-side descriptor while both target locks remain
+    /// retained. The guarded selector uses it for the candidate's mandatory
+    /// fresh usage read before transferring this reservation to handoff.
+    pub(crate) fn provider_lock_for_probe(&self) -> Result<Option<&File>, ProfileError> {
+        self.lease.provider_lock_for_probe()
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn send_provider_lease(
         self,

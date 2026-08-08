@@ -119,7 +119,7 @@ pub(crate) enum RoutingCommand {
         command: RoutingDomainCommand,
     },
 
-    /// Create, rename, update, or remove a disabled routing pool.
+    /// Create, activate, update, or remove an ordered routing pool.
     Pool {
         #[command(subcommand)]
         command: RoutingPoolCommand,
@@ -171,6 +171,12 @@ pub(crate) enum RoutingPoolCommand {
         pool: DefinitionReference,
         profiles: Vec<ProfileReference>,
     },
+
+    /// Enable guarded selection after revalidating every current member.
+    Enable { pool: DefinitionReference },
+
+    /// Disable guarded selection without touching durable membership.
+    Disable { pool: DefinitionReference },
 
     /// Remove a disabled pool without touching profiles.
     Remove { pool: DefinitionReference },

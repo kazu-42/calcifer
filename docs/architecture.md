@@ -141,15 +141,15 @@ The public registry proves only local profile provenance. Separately, each new s
 
 Profiles created before this binding remain valid for explicit `run`, `resume`, and status. `calcifer auth verify codex@<alias>` acquires the profile lease, performs the exact `0.144.4` initialize/home/version gate without an account request, parses the same bounded auth projection, and serializes its uniqueness check and marker publication under the registry lock. It never opens a login flow or rewrites credentials. A future selector must use the lease-retaining revalidation API: missing markers, key loss/replacement, unsupported adapters/auth modes, malformed auth, and fingerprint drift stop the whole selection attempt. See [ADR 0002](adr/0002-private-provider-identity-binding.md).
 
-## Implemented private routing definitions
+## Implemented private routing and guarded selection kernel
 
 `routing.json` and `routing.lock` live only under Calcifer's validated private
 user data root. Schema v1 bounds document bytes, definition counts, members per
 definition, and total membership edges. Trust-domain membership is a canonical
 set of immutable profile UUIDs. Pool membership is an ordered, duplicate-free
-subset of exactly one trust domain, and the only serialized activation value is
-`disabled`. Aliases are mutable display/lookup metadata and never durable
-membership authority.
+subset of exactly one trust domain. Pools use a closed `disabled | enabled`
+activation enum and are created disabled. Aliases are mutable display/lookup
+metadata and never durable membership authority.
 
 Membership changes use a two-authority transaction. Calcifer first reads one
 routing revision and resolves the requested aliases to profile UUIDs. It then
@@ -166,8 +166,21 @@ returns a revision conflict; it cannot be overwritten.
 Metadata rename/removal does not probe credentials. This keeps cleanup
 available when a profile has disappeared or drifted. Conversely, successful
 configuration validation is not a lasting identity assertion: later profile
-mutation can make an existing definition invalid, so any future selector must
-repeat lease-retaining validation at use time.
+mutation can make an existing definition invalid. Enabling repeats whole-pool
+identity validation; the internal selector then repeats target identity and a
+fresh authoritative usage read while retaining the target reservation.
+
+The selector accepts only fresh recognized exhaustion, or a persisted
+`usageLimitExceeded` requirement followed by a same-or-later authoritative
+read. It begins after the source in configured order, keeps invocation-local
+visited/cooldown sets, traverses at most once, and returns closed
+`exhausted | all_unknown | busy | no_eligible` stops. Cached evidence may skip
+a still-fresh exhausted candidate but never authorizes a target. The retained
+reservation moves into exactly one transactional-handoff callback; failure is
+not retried against another profile. Output contains local aliases, trust
+domain, generation, and a closed reason, not provider account identifiers or
+reset-credit data. Public run/resume wiring is still disabled, so explicit
+profile pins bypass this capability.
 
 The writer creates an owner-private same-directory temporary, writes and
 fsyncs the complete bounded JSON document, verifies the node, atomically
@@ -575,8 +588,9 @@ are specified in [ADR 0003](adr/0003-supervised-codex-session.md).
 Its fake-child process and readiness-gated PTY foundations are implemented and
 the pinned same-profile App Server/monitor/TUI integration is implemented and
 default-unused. The lineage journal and one-boundary handoff/recovery driver are
-implemented internally; pool selection, its supervised runtime adapter, and
-the public UX remain planned.
+implemented internally. The one-pass pool selector and its lease-retaining
+Codex candidate runtime are also implemented; public supervisor wiring and the
+interactive UX remain planned.
 
 ```text
 resolve pinned profile or explicit pool

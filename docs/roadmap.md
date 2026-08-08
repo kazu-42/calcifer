@@ -55,13 +55,13 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 ## Phase 4: explicit failover pools
 
 - [x] User-level, provider-specific, same-trust-domain definitions with immutable profile IDs and live whole-pool identity validation
-- [x] Persist every pool as default-disabled; selection and launch remain unavailable
+- [x] Persist every pool as default-disabled and require explicit live-validated enable/disable mutations; public selection and launch remain unavailable
 - [ ] Explicit per-invocation pool selection
-- [ ] Bounded one-pass selection with cooldown
-- [ ] Identity and fresh usage revalidation inside the candidate profile lease
+- [x] Bounded one-pass selection with invocation-local visited state and cooldown
+- [x] Identity and fresh usage revalidation inside the retained candidate profile reservation
 - [ ] Visible local profile, provider, trust-domain, and selection-reason notice before launch
-- [ ] No mid-session credential swap
-- [ ] No automatic command or prompt replay
+- [x] No mid-session credential swap in the selection/runtime interface
+- [x] No automatic command or prompt replay in the selection/handoff interface
 - [ ] Audit events containing no secret or stable account identifier
 - [ ] Continue the same logical conversation after confirmed exhaustion by advancing its profile-local thread generation
 

@@ -100,8 +100,11 @@ Routing definitions are stored separately in the private user-level
 `routing.json`; repository paths are never a storage or selection input. Trust
 domains and pools persist immutable profile UUIDs, while `codex@alias` is only
 lookup and display metadata. Renaming a profile therefore changes inspection
-output without rewriting membership. A pool is always stored with
-`activation: "disabled"`, and there is no `routing enable`, `select`, `launch`,
+output without rewriting membership. Every pool is created with
+`activation: "disabled"`. `routing pool enable` is an explicit user-level
+policy change that revalidates every current member before committing
+`activation: "enabled"`; it does not launch a provider or opt an ordinary
+profile-pinned `run`/`resume` into failover. There is still no public `select`
 or automatic-selection command.
 
 Creating a domain, creating a pool, or replacing members revalidates every
@@ -125,13 +128,15 @@ calcifer routing domain remove <uuid|codex@alias>
 calcifer routing pool create <domain-uuid|codex@domain> <alias> codex@a codex@b [...]
 calcifer routing pool rename <uuid|codex@alias> <new-alias>
 calcifer routing pool set-profiles <uuid|codex@alias> codex@a codex@b [...]
+calcifer routing pool enable <uuid|codex@alias>
+calcifer routing pool disable <uuid|codex@alias>
 calcifer routing pool remove <uuid|codex@alias>
 ```
 
 Domain membership is a canonical set; pool membership preserves the requested
 order and requires at least two distinct profiles from its one trust domain.
 Human and JSON inspection contain only Calcifer-local IDs/aliases, provider,
-revision, membership, and disabled activation. They never contain provider
+revision, membership, and explicit activation. They never contain provider
 identity material, account/workspace identifiers, tokens, or reset-credit IDs.
 See [ADR 0004](docs/adr/0004-private-routing-registry.md).
 
