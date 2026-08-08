@@ -428,7 +428,17 @@ signalled, not claimed as reaped.
 
 Ubuntu 24.04 and macOS CI jobs are configured to download the pinned official `0.144.4`
 release archives and verify their fixed architecture-specific SHA-256 digests
-plus the archive's single expected executable. Three independently budgeted
+plus the archive's single expected executable. Before extraction, every target
+uses one reviewed common 128 MiB compressed ceiling. A streaming extractor
+admits exactly one non-empty regular entry, writes at most 384 MiB, removes its
+identity-bound partial output on every failure, and never uses archive size
+metadata as permission to exceed that output limit. The four `0.144.4` assets
+range from 98,301,318 to 109,377,995 compressed bytes and from 259,137,328 to
+298,553,392 executable bytes. Updating the Codex pin or
+either ceiling requires reviewing all four architecture assets and the
+exact-limit/one-byte-over compressed and extracted regression tests; the 384
+MiB ceiling also remains below the compatibility probe's 512 MiB executable
+cap. Three independently budgeted
 matrix scenarios sit behind one aggregate gate. `contracts` runs the complete
 ignored-by-default handoff probe, a real-running-turn one-`SIGTERM` App drain, an
 official `thread/shellCommand` probe whose child calls `setsid(2)` and observes

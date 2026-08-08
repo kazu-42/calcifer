@@ -228,6 +228,11 @@ jobs:
     env:
       CODEX_RELEASE_TAG: rust-v0.144.4
       CODEX_VERSION: 0.144.4
+      # A pin update must review all four asset sizes and the exact-limit tests
+      # before changing either common ceiling. For 0.144.4 the largest archive
+      # is 109377995 bytes and the largest executable entry is 298553392 bytes.
+      CODEX_MAX_ARCHIVE_BYTES: 134217728 # 128 MiB
+      CODEX_MAX_EXTRACTED_BYTES: 402653184 # 384 MiB; below the 512 MiB probe cap
       PACKAGE_INTERNAL_FENCE_SECONDS: 1500
       PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS: 1680
       PACKAGE_OFFICIAL_TUI_WATCHDOG_MARGIN_SECONDS: 180
@@ -290,6 +295,7 @@ jobs:
             --tlsv1.2 \
             --connect-timeout 20 \
             --max-time 300 \
+            --max-filesize "${CODEX_MAX_ARCHIVE_BYTES:?}" \
             --retry 3 \
             --retry-all-errors \
             --retry-max-time 180 \
@@ -315,28 +321,15 @@ jobs:
           fi
 
           expected_entry="codex-${target}"
-          archive_entries="${scratch}/archive-entries.txt"
-          tar -tzf "${archive}" > "${archive_entries}"
-          entry_count="$(awk 'END { print NR + 0 }' "${archive_entries}")"
-          IFS= read -r archive_entry < "${archive_entries}" || true
-          if [[ "${entry_count}" != "1" || "${archive_entry:-}" != "${expected_entry}" ]]; then
-            echo "Codex package must contain exactly ${expected_entry}." >&2
-            exit 1
-          fi
-
-          archive_details="${scratch}/archive-details.txt"
-          tar -tvzf "${archive}" > "${archive_details}"
-          detail_count="$(awk 'END { print NR + 0 }' "${archive_details}")"
-          IFS= read -r archive_detail < "${archive_details}" || true
-          if [[ "${detail_count}" != "1" || "${archive_detail:-}" != -* ]]; then
-            echo "Codex package entry must be a regular file." >&2
-            exit 1
-          fi
-
           extract_dir="${scratch}/extract"
           mkdir "${extract_dir}"
           binary="${extract_dir}/${expected_entry}"
-          (umask 077; tar -xOzf "${archive}" "${expected_entry}" > "${binary}")
+          python3 scripts/extract_pinned_codex.py \
+            --archive "${archive}" \
+            --expected-entry "${expected_entry}" \
+            --output "${binary}" \
+            --max-archive-bytes "${CODEX_MAX_ARCHIVE_BYTES:?}" \
+            --max-extracted-bytes "${CODEX_MAX_EXTRACTED_BYTES:?}"
           if [[ ! -f "${binary}" || -L "${binary}" || ! -s "${binary}" ]]; then
             echo "Codex package did not produce one regular binary." >&2
             exit 1
