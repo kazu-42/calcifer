@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, and an internal Linux/macOS no-gap target-reservation primitive are implemented. A default-unused pinned App Server/typed-monitor/official-TUI supervisor implementation is present. Deterministic recovery and official-package normal/recovery scenarios are green from the 2026-07-20 Issue #54 candidate source on Apple silicon; Ubuntu 24.04/macOS matrix acceptance is pending. Public supervised run/resume, the production cross-profile handoff transaction, active-session failover policy, and automatic failover remain future work.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, a private default-disabled trust-domain/pool registry, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target reservation, and a serialized cross-profile transaction/reconciliation kernel are implemented. The routing registry cannot select or launch a profile. A default-unused pinned App Server/typed-monitor/official-TUI supervisor implementation is present. No public supervised command or automatic selector activates these pieces yet.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -40,7 +40,9 @@ A repository-local file must never be able to select an account or failover pool
 | CLI parser | Parse explicit commands and the `--` provider-argument boundary | Accept implicit external subcommands or an arbitrary executable |
 | Registry | Store non-secret opaque profile metadata | Store raw tokens in diagnostics or logs |
 | Private identity store | Detect equivalent Codex account/workspace scopes without exposing provider identifiers | Claim that different scopes have independent quota |
+| Routing registry | Store private user-level trust domains and ordered default-disabled pools by immutable profile ID | Read repository routing policy, select a candidate, or launch a provider |
 | Conversation lineage registry | Bind one logical conversation to ordered profile-local thread generations | Treat a credential profile ID as the conversation ID |
+| Rollout handoff capability | Seal one registered profile/thread rollout behind retained directory/file descriptors, a root-relative locator, and a bounded content fingerprint | Accept a CLI, config, repository, or caller-supplied import path |
 | Provider adapter | Build an isolated environment and classify supported structured signals | Reimplement undocumented OAuth flows or scrape TUI text |
 | Profile lease | Serialize profile mutation, usage probes, and child lifetime | Rely on PID files as the lock authority |
 | Conversation lease | Serialize lineage transitions and rollout imports across profiles | Allow two generations to write one rollout |
@@ -90,7 +92,8 @@ The planned Codex adapter gives each profile its own managed home and launches C
 
 ```text
 managed root/
-  conversations.json  <- private same-profile thread bindings and workspace heads
+  conversations.json  <- lazy-v2 lineage, workspace heads, and one transition
+  conversations.v1.pre-v2.json <- explicit rollback copy after first v2 mutation
   conversations.lock
   profiles/
     codex/
@@ -138,6 +141,56 @@ The public registry proves only local profile provenance. Separately, each new s
 
 Profiles created before this binding remain valid for explicit `run`, `resume`, and status. `calcifer auth verify codex@<alias>` acquires the profile lease, performs the exact `0.144.4` initialize/home/version gate without an account request, parses the same bounded auth projection, and serializes its uniqueness check and marker publication under the registry lock. It never opens a login flow or rewrites credentials. A future selector must use the lease-retaining revalidation API: missing markers, key loss/replacement, unsupported adapters/auth modes, malformed auth, and fingerprint drift stop the whole selection attempt. See [ADR 0002](adr/0002-private-provider-identity-binding.md).
 
+## Implemented private routing and guarded selection kernel
+
+`routing.json` and `routing.lock` live only under Calcifer's validated private
+user data root. Schema v1 bounds document bytes, definition counts, members per
+definition, and total membership edges. Trust-domain membership is a canonical
+set of immutable profile UUIDs. Pool membership is an ordered, duplicate-free
+subset of exactly one trust domain. Pools use a closed `disabled | enabled`
+activation enum and are created disabled. Aliases are mutable display/lookup
+metadata and never durable membership authority.
+
+Membership changes use a two-authority transaction. Calcifer first reads one
+routing revision and resolves the requested aliases to profile UUIDs. It then
+acquires and retains every referenced profile lease in sorted UUID order,
+refetches the current registry row under that lease, version-gates and
+rederives the current private provider identity, and compares only opaque
+in-memory equality capabilities. Any missing, busy, unverified, drifted,
+key-inconsistent, unsupported, cross-provider, cross-domain, or duplicate
+effective identity aborts the entire change. While all proofs remain alive,
+the routing writer locks `routing.lock` and commits only if the original
+revision is still current. A concurrent routing edit therefore wins wholly or
+returns a revision conflict; it cannot be overwritten.
+
+Metadata rename/removal does not probe credentials. This keeps cleanup
+available when a profile has disappeared or drifted. Conversely, successful
+configuration validation is not a lasting identity assertion: later profile
+mutation can make an existing definition invalid. Enabling repeats whole-pool
+identity validation; the internal selector then repeats target identity and a
+fresh authoritative usage read while retaining the target reservation.
+
+The selector accepts only fresh recognized exhaustion, or a persisted
+`usageLimitExceeded` requirement followed by a same-or-later authoritative
+read. It begins after the source in configured order, keeps invocation-local
+visited/cooldown sets, traverses at most once, and returns closed
+`exhausted | all_unknown | busy | no_eligible` stops. Cached evidence may skip
+a still-fresh exhausted candidate but never authorizes a target. The retained
+reservation moves into exactly one transactional-handoff callback; failure is
+not retried against another profile. Output contains local aliases, trust
+domain, generation, and a closed reason, not provider account identifiers or
+reset-credit data. Public run/resume wiring is still disabled, so explicit
+profile pins bypass this capability.
+
+The writer creates an owner-private same-directory temporary, writes and
+fsyncs the complete bounded JSON document, verifies the node, atomically
+renames it, and fsyncs the parent directory. Failure before rename preserves
+the old revision. Failure after rename returns `routing_commit_uncertain` and
+requires inspection instead of a blind retry. Readers and locks reject unsafe
+type, symlink, hard-link, ownership, mode, or macOS ACL state through the same
+storage primitives used by managed profiles. Platforms without verified
+private ACL creation fail closed. See [ADR 0004](adr/0004-private-routing-registry.md).
+
 ## Implemented same-profile resume
 
 Codex owns its rollout files and state database inside the profile-specific `CODEX_HOME`. Calcifer currently exposes:
@@ -158,7 +211,40 @@ Capture failure never degrades implicitly into an ordinary provider launch. The 
 
 Codex 0.144.4's rollout scanner has an internal 10,000-file cap, but the v2 `thread/list` response does not expose its `reached_scan_cap` flag. Calcifer therefore snapshots each of `sessions` and `archived_sessions` before and after the App Server call, requires each root to contain strictly fewer than 10,000 regular files, and compares canonical relative path, type, owner-safe identity, length, and nanosecond mtime. A symlink, special or writable node, unreadable traversal, cap hit, or pre/post mismatch makes the inventory incomplete. Missing and empty roots normalize identically. `useStateDbOnly` is not used because a rollout can legitimately exist before the state database has indexed or repaired it.
 
-The separate schema-v1 `conversations.json` contains opaque local IDs, versions, timestamps, path-free rollout change fingerprints, lifecycle state, pending launch baselines or metadata-only untracked ownership, and workspace-head references. It never contains profile aliases, provider account IDs, rollout paths, previews, prompts, responses, tool arguments, terminal output, or credentials. A whole-document update uses a private same-directory temporary file, file fsync, atomic rename, and parent-directory fsync under `conversations.lock`. A post-rename directory-sync failure is read back and reported as `conversation_commit_uncertain`; it never authorizes relaunching the provider.
+The conversation registry reads both schema v1 and schema v2. Ordinary
+same-profile reads, exact resumes, captures, and lifecycle refreshes leave a v1
+document at v1. The first successful handoff mutation, and no earlier read,
+first publishes the complete owner-private
+`conversations.v1.pre-v2.json` recovery copy and then atomically publishes v2
+with that copy's exact revision and SHA-256 digest.
+If an earlier failed publication left an older recovery copy while v1 continued
+to change, the next attempt replaces and syncs the copy with the exact current
+v1 revision before v2 can become visible. A missing, linked, malformed, or
+digest-mismatched copy makes every later v2 read fail closed.
+
+Schema v2 keeps the v1 opaque local IDs, versions, timestamps, bounded
+path-free inventory fingerprints, lifecycle state, pending launch ownership,
+and workspace-head references. It adds ordered generations, one exact active
+tail, local trust-domain UUIDs, bounded root-relative rollout locators and
+device/inode/length/mode/owner/link/time/SHA-256 fingerprints, plus at most one
+durable transition. The transition advances without provider I/O through
+`prepared`, `source_stop_requested`, `source_stopped`, `fork_requested`,
+`fork_observed`, and `committed_unattached`. Duplicate or skipped generations,
+a head that does not name the active tail, a skipped transition phase, or a
+second active transition fails closed. A prepared or committed-but-unattached
+transition blocks ordinary head resolution until recovery advances or attaches
+the exact target.
+
+Neither schema contains profile aliases, provider account/workspace IDs,
+previews, transcripts, prompts, responses, tool payloads, terminal output,
+credentials, or arbitrary absolute rollout paths. A whole-document update uses
+a private same-directory temporary file, file fsync, atomic rename, and
+parent-directory fsync under `conversations.lock`. A post-rename
+directory-sync failure is read back and reported as
+`conversation_commit_uncertain`; it never authorizes repeating a stop, fork,
+provider launch, or attachment. Once v2 is visible, older schema-v1 binaries
+fail closed. Downgrade recovery requires a forward-compatible binary or the
+explicit pre-migration copy; Calcifer never rewrites a live v2 lineage to v1.
 
 Bare `calcifer resume` reads and releases the workspace-head lock, acquires the immutable source profile by UUID, and revalidates the same binding under the profile lease before executing `codex resume <exact-uuid>`. If a guardian crash left a pending launch, the command first reacquires both profile locks and reconciles its before/after inventory; one candidate becomes `interrupted` or `unknown_crash`, while ambiguity stops. Bare and explicit exact resume look up an already-bound immutable `{profile_id, thread_id, canonical_cwd}` directly even when pending or needs-selection state hides the mutable workspace head. A clean pre-launch rollout observation cannot erase its persisted interrupted or unknown-crash marker; only lifecycle readback after the provider completes may clear that uncertainty. Retryable authentication, spawn, timeout, transport, or provider availability failures retain the pending launch without destroying the previous ready head; malformed protocol, unsupported schema/version, missing/archive, immutable profile/cwd ownership conflicts, or deleted-baseline results atomically clear the pending launch and require explicit selection. Restored state is the persisted conversation transcript; a dead process, stream, in-flight tool call, prompt, command, approval, or tool action is not restarted or replayed.
 
@@ -236,6 +322,36 @@ dispatcher and outer-terminal harness are not production entry routing: they do
 not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE`
 dispatcher/parser or persistent shell-anchor role, and these scenarios make no
 parser coverage claim.
+
+Before descriptor inventory, the package harness validates the reported
+official-TUI leader through a sealed kernel-observer boundary. Invalid PID,
+process-group query failure, process-group mismatch, session query failure, and
+session mismatch project to five distinct fixed payload-free markers. The exact
+subtype is published before the existing generic job-identity marker. Neither
+marker grants retry, signal, wait, deletion, cleanup, or numeric-process
+authority; every failure retains the existing fail-closed guardian path.
+
+The earlier remote-TUI readiness barrier now has an independent closed
+package-only diagnostic catalog. It records whether failure occurred while
+receiving the one-shot token/exec EOF, at the first post-readiness child
+liveness proof, during forbidden-descriptor inventory and process-group
+isolation, or at the final child liveness proof. Every readiness-channel,
+process, and descriptor-scan enum variant maps to one fixed redacted subtype;
+the two liveness stages use distinct markers for the same process error. The
+subtype is written before `startup-failure.tui-readiness`, so the generic marker
+continues to act as the completed-detail-publication boundary. These markers
+carry no child, PID, descriptor, retry, signal, wait, deletion, or cleanup
+authority. A deterministic package test exits the already-verified launcher
+before readiness publication and proves that the exact subtype survives
+Guardian projection while the existing exactly-one inference rule still emits
+secondary `package-cleanup.inference-evidence` and preserves owned evidence.
+
+macOS cross-process descriptor inspection preserves `UnsupportedDescriptor`
+as its public failure classification. The internal coordinator diagnostic can
+retain one closed payload-free reason for unsupported kind, unavailable
+vnode/socket/pipe identity, or unavailable identity for a forbidden kind. It
+is observation only: unknown data is never reclassified as safe or forbidden,
+and the subtype cannot authorize a rescan or advance the startup gate.
 
 The coordinator/guardian exec boundary keeps three channel classes physically
 separate:
@@ -317,6 +433,15 @@ terminal retained evidence and carries no reason, identity, secret, or provider
 payload. Exact retained record plus EOF parks the direct child, immutable tty
 snapshot, and completion
 receiver without returning success or a nonzero shell status.
+
+Foreground ownership between the persistent anchor and one coordinator
+generation is changed as a transaction. The entry revalidates the exact
+terminal descriptor and expected current process group before `tcsetpgrp`, then
+revalidates the descriptor and reads back the selected process group. A failed
+post-write check is safe to return only after the last verified group is
+restored and read back exactly. Descriptor replacement, an intervening third
+foreground group, or any unproved rollback retains the child, immutable
+snapshot, and completion receiver without clobbering the newer terminal owner.
 
 The same anonymous socket has one bounded reverse operation for the internal
 package owner: one exact 25-byte request followed by write-half shutdown. The
@@ -478,7 +603,11 @@ The app-server command is still marked experimental at the CLI level even though
 
 `usedPercent` is rounded by Codex. Calcifer derives `remainingPercent = clamp(100 - usedPercent)` for display only. A recognized `rateLimitReachedType` is required to classify a snapshot as exhausted; rounded 100%, null fields, and errors remain unknown for automatic-selection purposes.
 
-The one-shot probe cannot inspect a profile while its `run` or `resume` child owns the exclusive lease. Such a profile reports `profile_busy` / `unknown`. Multiple profiles are currently probed sequentially with a per-profile timeout. Continuous active-session observations, bounded parallel refresh, TTL/backoff, and cached last-known state belong in a future profile-owned app-server/supervisor so credential refresh retains exactly one owner.
+The one-shot probe cannot inspect a profile while its `run` or `resume` child owns the exclusive lease. Calcifer therefore keeps a bounded, disposable observation cache under the private managed root. An idle successful read and the already-live profile-owned monitor publish the same normalized safe model with distinct fixed sources. The active path clones only the monitor's latest fully validated `account/rateLimits/read` result; it has no process-spawn or credential-write operation and therefore cannot create a second owner. A supervised `usageLimitExceeded` turn failure records only a revalidation requirement—never its thread/turn identifiers—and cannot classify exhaustion until a full read at the same or a later observation time succeeds.
+
+Fresh observations expire after a fixed TTL. Expired evidence is `stale`; an explicitly unsupported version or method is `unsupported`; authentication, transport, timeout, overload/provider, spawn, malformed schema, missing fields, rounded-full, and unrecognized-reached evidence is `unknown`. Only a fresh recognized `rateLimitReachedType` is `exhausted`. Failures use capped exponential retry backoff, and all-profile status admits at most four due idle probes per invocation. A stable `(next_refresh_at, local profile ID)` order makes fake-clock tests deterministic; the later selector can additionally exclude its known active-profile set before planning probes.
+
+`usage-observations.json` and its lock are owner-private, symlink-resistant managed files. Updates serialize under a process lock, write a bounded temporary file, fsync it, atomically rename it, and fsync the managed directory. The cache validates its schema, unique canonical local profile IDs, bounded entry/audit counts, normalized usage fields, timestamps, versions, and monotonic audit revisions before use. Audit rows contain only revision, local profile ID, fixed source, timestamp, fixed event kind, and conservative state. Credentials, provider account/workspace IDs, opaque reset-credit IDs, aliases, thread/turn IDs, prompts, tools, and transcript content are not accepted by the cache API or schema. The file is disposable and never substitutes for the target-profile lease and fresh in-lease revalidation required by selection.
 
 The verified upstream versions, exact fields, and source links are recorded in [Provider compatibility notes](provider-compatibility.md).
 
@@ -489,8 +618,10 @@ readiness contract, macOS guardian-loss constraint, and public release gates
 are specified in [ADR 0003](adr/0003-supervised-codex-session.md).
 Its fake-child process and readiness-gated PTY foundations are implemented and
 the pinned same-profile App Server/monitor/TUI integration is implemented and
-default-unused. The following pool, journal, handoff, and public-UX transaction
-remains planned.
+default-unused. The lineage journal and one-boundary handoff/recovery driver are
+implemented internally. The one-pass pool selector and its lease-retaining
+Codex candidate runtime are also implemented; public supervisor wiring and the
+interactive UX remain planned.
 
 ```text
 resolve pinned profile or explicit pool
@@ -512,6 +643,23 @@ resolve pinned profile or explicit pool
 
 A pool is traversed at most once per invocation.
 ```
+
+The implemented Linux/macOS rollout capability gives the internal transaction a
+separate path-provenance boundary. It can be minted only from an exact current
+registry profile plus the existing validated root-thread projection; callers
+cannot construct it from a path. The capability retains the private managed
+home and sessions directory descriptors, the open source file, a bounded
+sessions-root-relative locator, and a device/inode/mode/owner/link/time/SHA-256
+fingerprint. It walks every component with descriptor-relative `O_NOFOLLOW`,
+validates source session metadata, and reopens and rehashes both the retained
+descriptor and current managed path before and after its one-shot import phase.
+A separate direct-result and post-crash inventory projection requires a new canonical target thread ID,
+the exact source `forkedFromId`, matching canonical cwd and CLI version, a
+single-link safe rollout below the registered target home, an exact target
+session-meta parent, a bounded durable fork window for recovery, and an inode
+distinct from the source. The transaction remains default-unused until the
+selector supplies its supervised runtime adapter; current run/resume behavior
+and its root-thread validator are unchanged.
 
 The implemented target-reservation primitive gives the future supervisor an
 ephemeral, no-gap ownership transition on Linux and macOS:
@@ -546,7 +694,7 @@ The primitive in this slice acquires only the target A+B pair. Issue #33 is
 responsible for placing it after the handoff and conversation-transition locks
 and for retaining every required owner across the non-idempotent handoff.
 
-The current `run` command does not restart or re-submit a command after the child begins execution. The planned supervisor treats credential profiles and conversation lineage as separate aggregates. It continues the same user-visible conversation after failover by creating a target-profile Codex thread from the validated source rollout, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion. The supervisor connection remains event-only and never races the official TUI to answer approvals or other server-initiated requests; no new turn is admitted without an attached TUI. The full decision and recovery model is in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
+The current `run` command does not restart or re-submit a command after the child begins execution. Existing pool definitions remain inert and default-disabled. The planned supervisor treats credential profiles and conversation lineage as separate aggregates. It continues the same user-visible conversation after failover by creating a target-profile Codex thread from the validated source rollout, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion. The supervisor connection remains event-only and never races the official TUI to answer approvals or other server-initiated requests; no new turn is admitted without an attached TUI. The full decision and recovery model is in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
 
 ## Filesystem and credential mutations
 
@@ -780,10 +928,10 @@ completed implementations for:
   on top of the default-unused pinned integration in
   [ADR 0003](adr/0003-supervised-codex-session.md), plus a separate Windows
   terminal and process-authority design;
-- additional Codex version/schema gates and observation cache TTL/backoff;
+- additional Codex version/schema gates beyond the implemented 0.144.4 observation cache;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
 - OS credential-store support for Claude setup tokens;
-- trust-domain configuration and failover pool UX.
+- explicit selector, enablement, and failover pool execution UX (the inert trust-domain/pool definition UX is implemented).
 
 Credential-management support is a separate platform guarantee from the portable diagnostic surface. Each provider and OS combination must pass its permission, credential-store, process, and recovery tests before being marked supported.

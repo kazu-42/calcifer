@@ -429,6 +429,16 @@ an emergency snapshot, but owns no profile lease and cannot mint lifecycle,
 provider-release, cleanup, or successful-disposition proof. Its only positive
 completion input is the exact fixed record and EOF described above.
 
+Every anchor/coordinator foreground handoff is transactional. Before
+`tcsetpgrp`, the anchor requires the exact terminal descriptor identity and the
+expected current foreground process group. After the write it requires the
+same identity and an exact readback of the selected group. A failed or
+ambiguous post-write check returns an ordinary error only after restoring the
+last verified foreground group and reading that rollback back exactly. If the
+descriptor changed, rollback cannot be proved, or a third process group has
+already become foreground, the anchor does not overwrite that newer authority;
+it retains the child, snapshot, and completion channel instead of returning.
+
 Immediately before `tcsetattr`, each restorer reads back the current foreground
 process group and requires the captured generation. A mismatch performs no
 restore, publishes no restored proof, and retains the remaining lease/evidence.
@@ -813,7 +823,7 @@ never a reconstructed TUI success.
 | Lease integrity | Real exec FD scans, no-gap A/B tests, dedicated transfer/lifecycle reader tests, ambiguous ACK and concurrent-writer tests |
 | Live lifecycle | Every injected failure while guardian lives exactly waits children and joins workers; stuck descendants escalate within bounds |
 | Process containment | Revalidate the real Codex descendant/credential model; on macOS, leader-exit `WNOWAIT` alone must not turn `EPERM` into production containment proof unless a stronger reviewed absence proof excludes an unsignalable live group member, otherwise fail closed |
-| Terminal ownership | Both normal and fallback restore revalidate current foreground ownership immediately before mutation; a reclaim mismatch performs no restore and retains authority; production has a wrapper/anchor or generation-bound handoff that excludes shell/new-job races and numeric PGID reuse |
+| Terminal ownership | Both normal and fallback restore revalidate current foreground ownership immediately before mutation; every anchor/coordinator foreground selection requires exact descriptor/current-group preflight and descriptor/selected-group readback, and any rollback requires exact descriptor/group readback; a reclaim mismatch, third foreground generation, or unproved rollback performs no further mutation and retains authority; production has a wrapper/anchor or generation-bound handoff that excludes shell/new-job races and numeric PGID reuse |
 | Job-control containment | The synthetic same-credential tree proves that a TUI descendant which ignores `SIGTSTP` is contained by process-group `SIGSTOP`; the checksum-pinned `official-tui-normal` scenario requires a stable current-user official-TUI group, group-wide stopped state, no input progress, continuation, and a fresh gate, and passed twice consecutively from the 2026-07-20 Issue #54 candidate source on Apple silicon. Neither is general detached-descendant absence evidence |
 | Guardian loss | Coordinator claims exact wait only for guardian, does not claim grandchild reap on macOS, and retains A indefinitely without `CHILDREN_REAPED` |
 | Retained recovery | A credential-free deterministic fixture stops at all seven closed production checkpoints, proves checkpoint observation alone has no authority, consumes exactly one generation-bound request, and requires the four independent deletion proofs; all seven cases passed three consecutive local runs |
@@ -954,6 +964,15 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   coordinator performs exactly one zero-time lifecycle poll. That poll can
   expose only a frame already buffered at the fence and can never authorize a
   later descriptor scan.
+- On macOS, the public scan classification remains the fail-closed
+  `UnsupportedDescriptor`. A diagnostic-only envelope may additionally retain
+  exactly one fixed reason: `unsupported-kind`,
+  `vnode-identity-unavailable`, `socket-identity-unavailable`,
+  `pipe-identity-unavailable`, or `forbidden-kind-identity-unavailable`.
+  Coordinator test evidence prints only that fixed subtype beside the existing
+  `stage=TargetProcessGroup` boundary. The subtype carries no PID, fd, raw
+  kind, kernel identity, path, or provider data and grants no retry, ownership,
+  signal, wait, cleanup, or readiness authority.
 - Keeps the real-exec matrix root under an exact parent-held directory
   descriptor. Test-only recursive cleanup is capped at 4,096 nodes and depth
   32, accepts only current-user directories and singly linked regular files,

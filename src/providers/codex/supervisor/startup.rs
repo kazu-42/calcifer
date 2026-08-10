@@ -1204,6 +1204,22 @@ impl SupervisedStartupFailure {
     }
 
     #[cfg(test)]
+    pub(super) fn packaged_tui_readiness_failure_marker(&self) -> Option<&'static str> {
+        if self.error != SupervisedStartupError::TuiReadiness {
+            return None;
+        }
+        match &self.owner {
+            StartupFailureOwner::Partial(owner) => match &owner.tui {
+                StartupTuiAuthority::ReadinessFailure(failure) => {
+                    Some(failure.packaged_failure_marker())
+                }
+                _ => None,
+            },
+            StartupFailureOwner::Session(_) => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn packaged_app_socket_failure_marker(&self) -> Option<&'static str> {
         if self.error != SupervisedStartupError::AppSocket {
             return None;

@@ -991,6 +991,39 @@ class WatchdogWorkflowTests(unittest.TestCase):
         )
         self.assertIn('actual_sha256="$(sha256sum', prepare_step)
 
+    def test_pinned_package_extraction_has_reviewed_compressed_and_output_bounds(
+        self,
+    ) -> None:
+        workflow = self._workflow()
+        package_job = workflow.split("  pinned-codex-package:\n", 1)[1].split(
+            "  pinned-codex-gate:\n", 1
+        )[0]
+        prepare_step = package_job.split(
+            "      - name: Prepare checksum-pinned Codex package\n", 1
+        )[1].split("      - name: Run pinned Codex contract probes\n", 1)[0]
+
+        self.assertIn("CODEX_MAX_ARCHIVE_BYTES: 134217728", package_job)
+        self.assertIn("CODEX_MAX_EXTRACTED_BYTES: 402653184", package_job)
+        self.assertIn("python3 scripts/extract_pinned_codex.py \\", prepare_step)
+        self.assertIn(
+            '--max-filesize "${CODEX_MAX_ARCHIVE_BYTES:?}"', prepare_step
+        )
+        self.assertIn(
+            '--max-archive-bytes "${CODEX_MAX_ARCHIVE_BYTES:?}"', prepare_step
+        )
+        self.assertIn(
+            '--max-extracted-bytes "${CODEX_MAX_EXTRACTED_BYTES:?}"', prepare_step
+        )
+        self.assertIn('--expected-entry "${expected_entry}"', prepare_step)
+        self.assertIn('--output "${binary}"', prepare_step)
+        self.assertNotIn("tar -tzf", prepare_step)
+        self.assertNotIn("tar -tvzf", prepare_step)
+        self.assertNotIn("tar -xOzf", prepare_step)
+        self.assertLess(
+            prepare_step.index('if [[ "${actual_sha256}" != "${expected_sha256}" ]]'),
+            prepare_step.index("python3 scripts/extract_pinned_codex.py"),
+        )
+
     def test_failed_watchdog_retains_scratch_for_ephemeral_runner_teardown(
         self,
     ) -> None:

@@ -1918,6 +1918,12 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
             write_packaged_startup_failure_marker(report_root, marker);
         }
     }
+    if let Some(detail) = failure.packaged_tui_readiness_failure_marker() {
+        for marker in packaged_tui_readiness_failure_publication_order(detail) {
+            write_packaged_startup_failure_marker(report_root, marker);
+        }
+        return;
+    }
     if let Some(classification) = failure.packaged_tui_launch_failure_classification() {
         write_packaged_startup_failure_marker(report_root, classification.state_marker());
         write_packaged_startup_failure_marker(report_root, classification.subtype_marker());
@@ -1933,6 +1939,13 @@ fn record_packaged_startup_failure(report_root: Option<&Path>, failure: &Supervi
         write_packaged_startup_failure_marker(report_root, PACKAGED_APP_NOT_STARTED_MARKER);
         write_packaged_startup_failure_marker(report_root, PACKAGED_TUI_NOT_STARTED_MARKER);
     }
+}
+
+#[cfg(test)]
+const fn packaged_tui_readiness_failure_publication_order(
+    detail: &'static str,
+) -> [&'static str; 2] {
+    [detail, "startup-failure.tui-readiness"]
 }
 
 #[cfg(test)]
@@ -3567,10 +3580,11 @@ mod tests {
         packaged_recovery_retention_owner_marker, packaged_recovery_retention_reason_marker,
         packaged_retention_owner_marker, packaged_retention_reason_marker,
         packaged_session_readiness_failure_markers, packaged_startup_quiesce_detail_markers,
-        receive_bounded_command, record_packaged_session_readiness_failure,
-        recovery_shutdown_trigger, restore_wait_retention_reason,
-        retained_generation_can_attempt_recovery, retained_session_recovery_checkpoint,
-        retention_reason_allows_recovery, run_consumed_recovery_retry, tui_exit_drain_deadline,
+        packaged_tui_readiness_failure_publication_order, receive_bounded_command,
+        record_packaged_session_readiness_failure, recovery_shutdown_trigger,
+        restore_wait_retention_reason, retained_generation_can_attempt_recovery,
+        retained_session_recovery_checkpoint, retention_reason_allows_recovery,
+        run_consumed_recovery_retry, tui_exit_drain_deadline,
     };
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -3730,6 +3744,15 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn packaged_tui_readiness_detail_is_published_before_its_generic_commit_marker() {
+        let detail = "startup-failure.tui-readiness.subtype.receive.invalid";
+        assert_eq!(
+            packaged_tui_readiness_failure_publication_order(detail),
+            [detail, "startup-failure.tui-readiness"]
+        );
     }
 
     #[test]

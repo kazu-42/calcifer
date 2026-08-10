@@ -1202,23 +1202,27 @@ impl Registry {
     /// Revalidates a bound profile after acquiring its exclusive process lease.
     /// The returned guard keeps that lease alive until launch authorization is
     /// either consumed or abandoned.
-    #[allow(dead_code)] // Reused by target reservation and pool selection.
     pub(crate) fn revalidate_codex_identity(
         &self,
         profile: &Profile,
         resolve_adapter: impl FnOnce(&Path, Option<&File>) -> Result<CodexIdentityAdapter, ProfileError>,
     ) -> Result<VerifiedProviderIdentityLease, ProfileError> {
         let lease = self.lock_profile(profile)?;
-        let home = self.profile_home(profile)?;
+        // Rename and removal take this same profile lease before publishing a
+        // registry update. Refetching the immutable ID under the lease makes
+        // the current registry row, rather than a stale alias snapshot, the
+        // authority for the identity validation that follows.
+        let profile = self.find_by_id_without_recovery(profile.provider, &profile.id)?;
+        let home = self.profile_home(&profile)?;
         let adapter = resolve_adapter(&home, lease.provider_lock_for_probe()?)?;
-        let profile_directory = self.profile_directory(profile)?;
+        let profile_directory = self.profile_directory(&profile)?;
         let store = IdentityStore::new(&self.root);
         let key = store.load_key()?;
         let current = store.derive_codex_binding(&home, &key, adapter)?;
         store.revalidate_marker(&profile_directory, &key, &current)?;
         Ok(VerifiedProviderIdentityLease {
             _lease: lease,
-            profile: profile.clone(),
+            profile,
             identity: current,
         })
     }
@@ -3321,6 +3325,13 @@ impl VerifiedTargetReservation {
         self.identity.same_provider_identity(&other.identity)
     }
 
+    /// Borrows the provider-side descriptor while both target locks remain
+    /// retained. The guarded selector uses it for the candidate's mandatory
+    /// fresh usage read before transferring this reservation to handoff.
+    pub(crate) fn provider_lock_for_probe(&self) -> Result<Option<&File>, ProfileError> {
+        self.lease.provider_lock_for_probe()
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn send_provider_lease(
         self,
@@ -4103,7 +4114,7 @@ fn secure_create_dir(path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(unix)]
-fn secure_create_dir_all(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn secure_create_dir_all(path: &Path) -> Result<(), ProfileError> {
     match fs::symlink_metadata(path) {
         Ok(_) => return verify_private_directory(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -4139,7 +4150,7 @@ fn secure_create_dir_all(path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(not(unix))]
-fn secure_create_dir_all(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn secure_create_dir_all(path: &Path) -> Result<(), ProfileError> {
     fs::create_dir_all(path)?;
     Ok(())
 }
@@ -4272,7 +4283,7 @@ fn open_verified_macos_node(
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
     if !private_directory_metadata_is_safe(&metadata, rustix::process::getuid().as_raw()) {
         return Err(ProfileError::UnsafeState(
@@ -4284,7 +4295,7 @@ fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(target_os = "macos")]
-fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
     let node = open_verified_macos_node(path, true)?;
     if !private_directory_metadata_is_safe(&node.metadata, rustix::process::getuid().as_raw()) {
         return Err(ProfileError::UnsafeState(
@@ -4500,7 +4511,7 @@ fn verify_deletable_macos_flags_stat(_stat: &rustix::fs::Stat) -> Result<(), Pro
 }
 
 #[cfg(not(unix))]
-fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(ProfileError::UnsafeState(
@@ -4531,7 +4542,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ProfileError> {
     verify_private_regular_file_handle(path, &file)
 }
 
-fn create_new_private_file(path: &Path) -> Result<File, ProfileError> {
+pub(crate) fn create_new_private_file(path: &Path) -> Result<File, ProfileError> {
     verify_safe_creation_parent(path)?;
     let mut options = private_open_options();
     let file = options.write(true).create_new(true).open(path)?;
@@ -4560,7 +4571,7 @@ fn prepare_new_private_file(path: &Path, _file: &File) -> Result<(), ProfileErro
 }
 
 #[cfg(unix)]
-fn open_verified_registry_file(
+pub(crate) fn open_verified_registry_file(
     path: &Path,
     require_single_link: bool,
 ) -> Result<File, ProfileError> {
@@ -4601,7 +4612,7 @@ fn open_verified_registry_file(
 }
 
 #[cfg(not(unix))]
-fn open_verified_registry_file(
+pub(crate) fn open_verified_registry_file(
     path: &Path,
     require_single_link: bool,
 ) -> Result<File, ProfileError> {
@@ -4614,12 +4625,12 @@ fn open_verified_registry_file(
 }
 
 #[cfg(unix)]
-fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> {
+pub(crate) fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> {
     open_verified_private_lock_file(path, true)
 }
 
 #[cfg(not(unix))]
-fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> {
+pub(crate) fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> {
     let mut options = private_open_options();
     let file = options.read(true).write(true).create(true).open(path)?;
     verify_private_regular_file(path)?;
@@ -4800,7 +4811,7 @@ fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, Prof
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = fs::symlink_metadata(path)?;
@@ -4850,7 +4861,7 @@ fn verify_private_regular_file_handle(path: &Path, _file: &File) -> Result<(), P
 }
 
 #[cfg(target_os = "macos")]
-fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     let node = open_verified_macos_node(path, false)?;
     verify_private_macos_regular_node(&node)?;
     verify_safe_creation_parent(path)?;
@@ -4858,7 +4869,7 @@ fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(not(unix))]
-fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(ProfileError::UnsafeState(
@@ -5005,13 +5016,13 @@ fn atomic_write_private(
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn sync_directory(path: &Path) -> Result<(), ProfileError> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn sync_directory(_path: &Path) -> Result<(), ProfileError> {
     Ok(())
 }
 

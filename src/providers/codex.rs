@@ -19,10 +19,8 @@ use serde_json::{Value, json};
     any(target_os = "linux", target_os = "macos")
 ))]
 mod handoff_compat;
-#[cfg(all(
-    feature = "internal-supervisor-fixture",
-    any(target_os = "linux", target_os = "macos")
-))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod handoff_transaction;
 mod json;
 #[cfg(all(
     feature = "internal-supervisor-fixture",
@@ -35,7 +33,20 @@ mod monitor;
 ))]
 mod remote;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod rollout_handoff;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod selection_runtime;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod supervisor;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(unused_imports)]
+// Public selector activation first consumes this sealed surface in issue #36.
+pub(crate) use rollout_handoff::{
+    CodexHandoffFingerprint, CodexRolloutHandoff, CodexRolloutHandoffError, CodexRolloutImport,
+    CodexRolloutLocator, ValidatedForkRollout, VerifiedSourceRollout, mint_profile_rollout_handoff,
+    validate_handoff_fork_result, validate_handoff_inventory_candidate,
+};
 
 #[cfg(all(
     feature = "internal-supervisor-fixture",
@@ -329,7 +340,8 @@ fn is_managed_environment_override(name: &OsStr) -> bool {
 }
 
 /// A normalized Codex account usage snapshot.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodexUsage {
     pub rate_limits: Option<RateLimitSnapshot>,
     pub rate_limits_by_limit_id: BTreeMap<String, RateLimitSnapshot>,
@@ -344,7 +356,7 @@ pub struct CodexUsageObservation {
 }
 
 /// Whether the installed App Server contract was verified for this read.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexCompatibilityStatus {
     Compatible,
@@ -363,7 +375,8 @@ impl CodexCompatibilityStatus {
 }
 
 /// A normalized rate-limit bucket.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitSnapshot {
     pub limit_id: Option<String>,
     pub limit_name: Option<String>,
@@ -376,7 +389,8 @@ pub struct RateLimitSnapshot {
 }
 
 /// Usage and reset information for one rate-limit window.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitWindow {
     pub used_percent: u32,
     /// Display-only complement of `used_percent`, clamped to zero.
@@ -389,7 +403,8 @@ pub struct RateLimitWindow {
 }
 
 /// The account's additional-credit state.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreditsSnapshot {
     pub has_credits: bool,
     pub unlimited: bool,
@@ -397,7 +412,8 @@ pub struct CreditsSnapshot {
 }
 
 /// An optional account-level spend control reported by Codex.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpendControlLimitSnapshot {
     pub limit: String,
     pub used: String,
@@ -406,7 +422,8 @@ pub struct SpendControlLimitSnapshot {
 }
 
 /// Reset-credit availability and optional non-opaque detail.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResetCredits {
     pub available_count: u64,
     pub details: Option<Vec<ResetCreditDetail>>,
@@ -415,7 +432,8 @@ pub struct ResetCredits {
 /// Safe reset-credit fields exposed to Calcifer callers.
 ///
 /// Opaque provider IDs and backend display copy are intentionally excluded.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResetCreditDetail {
     pub granted_at: i64,
     pub expires_at: Option<i64>,

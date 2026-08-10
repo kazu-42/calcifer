@@ -188,6 +188,18 @@ The connection that creates or resumes a thread is subscribed to thread events. 
 
 The path must come only from Calcifer-owned lineage metadata, remain canonically contained in a registered source profile's sessions root, pass type/hard-link/symlink/owner/mode checks, and be read only after the source TUI/App Server are stopped and reaped while Calcifer retains the source lease. Source and target profiles must share an explicitly configured trust domain. The installed Codex version and `codex app-server generate-json-schema --experimental --out <dir>` output must match a tested adapter because the default generated schema omits these unstable fields. CI must also perform a synthetic fork-by-path protocol smoke test; schema presence alone does not prove runtime acceptance or materialization semantics.
 
+The production Linux/macOS path-provenance primitive is now implemented but
+default-unused. It accepts a current registered profile and an already validated
+root-thread projection, never an arbitrary path. Its linear import phase retains
+the managed home, sessions root, and source file descriptors; performs a
+normal-component-only `O_NOFOLLOW` walk; binds device, inode, length, mode,
+UID/GID, link count, nanosecond times, and SHA-256; validates the source session
+ID/thread/cwd/version/source metadata; and revalidates both descriptor and path
+before and after provider import. The corresponding fork-result projection is
+separate from ordinary inventory/read validation and requires a new UUID, exact
+`forkedFromId`, matching cwd/version, target-home containment, a safe active
+target rollout, and source-distinct file identity.
+
 `ThreadForkParams.threadId` remains a required string even for a path-based fork. Calcifer sends `threadId: ""` together with a non-empty validated `path`; Codex then ignores the empty lookup ID and imports by path.
 
 Calcifer now has a private Unix compatibility gate for exactly Codex `0.144.4`.
@@ -416,7 +428,17 @@ signalled, not claimed as reaped.
 
 Ubuntu 24.04 and macOS CI jobs are configured to download the pinned official `0.144.4`
 release archives and verify their fixed architecture-specific SHA-256 digests
-plus the archive's single expected executable. Three independently budgeted
+plus the archive's single expected executable. Before extraction, every target
+uses one reviewed common 128 MiB compressed ceiling. A streaming extractor
+admits exactly one non-empty regular entry, writes at most 384 MiB, removes its
+identity-bound partial output on every failure, and never uses archive size
+metadata as permission to exceed that output limit. The four `0.144.4` assets
+range from 98,301,318 to 109,377,995 compressed bytes and from 259,137,328 to
+298,553,392 executable bytes. Updating the Codex pin or
+either ceiling requires reviewing all four architecture assets and the
+exact-limit/one-byte-over compressed and extracted regression tests; the 384
+MiB ceiling also remains below the compatibility probe's 512 MiB executable
+cap. Three independently budgeted
 matrix scenarios sit behind one aggregate gate. `contracts` runs the complete
 ignored-by-default handoff probe, a real-running-turn one-`SIGTERM` App drain, an
 official `thread/shellCommand` probe whose child calls `setsid(2)` and observes
@@ -448,16 +470,43 @@ unsupported and fails closed. A new Codex release requires a new reviewed
 projection, pinned package, and complete runtime smoke; editing the
 supported-version label alone cannot mint the capability.
 
-This compatibility gate is implemented, but the production handoff transaction
-described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) is not.
-No command currently switches a user's profile or imports a user's rollout.
+Official-TUI job-identity validation preserves its fail-closed public category
+while recording a closed package-only subtype for invalid PID, process-group
+query failure, process-group mismatch, session query failure, or session
+mismatch. The subtype precedes the generic marker and contains no PID, PGID,
+SID, path, OS error, provider output, or credential material. It is observation
+only: it does not authorize a retry or numeric-ID cleanup and does not weaken
+guardian retention, cleanup ordering, or the exit-86 boundary.
+
+Remote-TUI startup readiness likewise keeps the production
+`TuiReadiness` category while package diagnostics distinguish readiness receive,
+first child liveness, descriptor isolation, and final child liveness. All six
+`TuiReadinessError` values, all closed `ProcessError` variants at each liveness
+stage, and all thirteen process-group descriptor-scan errors have fixed,
+payload-free markers. The retained failure exposes only that marker to the
+test/package projection; its child, PTY, readiness channel, session guard, and
+containment methods remain private. The package scanner accepts only the exact
+catalog with a private `classified\n` node and rejects aliases, prefixes,
+extensions, links, wrong modes, oversized files, and payload-bearing files.
+Successful official-TUI startup writes none of these failure markers.
+
+This compatibility gate and the internal handoff transaction/reconciliation
+kernel described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
+are implemented. No command currently switches a user's profile or imports a
+user's rollout.
 The gate receives no Calcifer profile, conversation registry, credential, or
 user rollout, and incompatibility therefore cannot mutate those states.
 The internal Linux/macOS no-gap target-reservation and guardian lease-transfer
-primitive is implemented. Supervisor wiring, transition journaling,
-authoritative exhaustion selection, target-fork integration, and cross-profile
-transition crash recovery remain prerequisites before automatic handoff is
-enabled.
+primitive is implemented. The separate lazy schema-v2 conversation lineage,
+provider-free transition journal, validated user-rollout/fork projection, and
+one-boundary crash recovery driver are also implemented but default-unused.
+The driver persists stop and fork intent before external effects, validates
+same-domain source provenance, adopts exactly one matching post-crash target,
+permits zero candidates one durable retry, and never offers a replay action.
+The authoritative one-pass selection kernel and lease-retaining candidate
+revalidation runtime are implemented but default-unused. Public supervisor
+wiring and target-fork activation remain prerequisites before automatic
+handoff is enabled.
 
 Relevant upstream sources:
 
@@ -512,7 +561,17 @@ The normalized response can contain:
 
 Reset-credit detail arrays may be absent or shorter than `availableCount`; the count is authoritative. A missing summary means unavailable, not zero. Calcifer intentionally discards opaque reset-credit IDs and backend-provided title/description before constructing its public output.
 
-Each read is attached to the local profile ID, canonical managed home, and exclusive lease—not to an email address. New profiles also have the private version-scoped identity binding described above; legacy unbound profiles can still be read but cannot participate in automatic selection until explicit verification. A profile with an active `run` or `resume` child reports busy/unknown; Calcifer does not start a second app-server against the same refreshable `auth.json`.
+The same normalized response may be published by the already-live supervised
+profile monitor or by a bounded idle one-shot read. Both retain every safe
+bucket/window, reset, spend-control, credit, and reset-credit count/status/expiry
+field. The private observation cache records a fixed source, observation and
+expiry time, detected Codex version, Calcifer adapter version, compatibility,
+and capped retry schedule. It stores no credential, provider account/workspace
+identifier, opaque reset-credit identifier, or conversation content. A
+`usageLimitExceeded` turn signal carries no durable thread/turn ID and only
+forces authoritative revalidation; it is not itself an exhaustion result.
+
+Each read is attached to the local profile ID, canonical managed home, and exclusive lease—not to an email address. New profiles also have the private version-scoped identity binding described above; legacy unbound profiles can still be read but cannot participate in automatic selection until explicit verification. A profile with an active `run` or `resume` child is never probed with a second App Server against the same refreshable `auth.json`. Status may consume a fresh snapshot previously published by that profile-owned monitor; otherwise the profile remains stale or unknown.
 
 `account/usage/read` is a different token-activity report. It is not a quota or exhaustion signal and is not used for profile selection.
 

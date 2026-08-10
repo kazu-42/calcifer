@@ -30,7 +30,10 @@ const MANAGED_PROJECT_CONFIG_KEYS: &[&str] = &[
     "profile",
     "profiles",
     "project_root_markers",
+    "routing",
+    "routing_pools",
     "sqlite_home",
+    "trust_domains",
 ];
 
 // This allowlist is deliberately narrower than Codex's full 0.144.4 schema.

@@ -29,7 +29,9 @@ mod process_group_scan;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use process_group_scan::{
     CrossProcessDescriptorIdentityError, CrossProcessDescriptorSet,
-    ProcessGroupDescriptorIsolationProof, ProcessGroupDescriptorScanError,
+    MacosDescriptorObservationReason, ProcessGroupDescriptorIsolationProof,
+    ProcessGroupDescriptorScanDiagnostic, ProcessGroupDescriptorScanError,
+    diagnose_process_group_forbidden_descriptors_absent_before,
     verify_process_group_forbidden_descriptors_absent_before,
 };
 

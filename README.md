@@ -7,7 +7,7 @@
 Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-agent CLIs with isolated account profiles and structured usage visibility.
 
 > [!WARNING]
-> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, confirmed crash-safe local removal, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. A pinned, default-unused Linux/macOS supervisor implementation is present internally, but its cross-platform acceptance evidence is incomplete. On 2026-07-20, the final Issue #54 candidate source passed two consecutive checksum-pinned Codex 0.144.4 normal-session runs (145.61 s and 144.97 s), one retained-cleanup recovery run (170.60 s), and three consecutive deterministic seven-checkpoint recovery runs (11.54 s, 11.21 s, and 11.50 s) on Apple silicon. The required Ubuntu 24.04 and macOS CI matrix runs remain pending. The official scenarios exercise the real App Server and remote TUI through the coordinator, guardian, provider session, PTY, and job-control implementations under a test-owned terminal harness. Their guardian helper enters the shared production guardian-bootstrap core through bounded package-only seams, and their completion endpoint crosses real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries before the parent checks the provider-release-gated exact record and EOF. The test-only role dispatcher does not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-anchor role, so these scenarios make no parser coverage claim. No public supervised command uses this path. Automatic failover, cross-profile session handoff, reauthentication, and verified Windows credential ACLs are not implemented yet.
+> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, confirmed crash-safe local removal, a private default-disabled trust-domain/pool registry, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. The routing registry does not select or launch a profile. A pinned, default-unused Linux/macOS supervisor implementation is present internally, but its cross-platform acceptance evidence is incomplete. On 2026-07-20, the final Issue #54 candidate source passed two consecutive checksum-pinned Codex 0.144.4 normal-session runs (145.61 s and 144.97 s), one retained-cleanup recovery run (170.60 s), and three consecutive deterministic seven-checkpoint recovery runs (11.54 s, 11.21 s, and 11.50 s) on Apple silicon. The required Ubuntu 24.04 and macOS CI matrix runs remain pending. The official scenarios exercise the real App Server and remote TUI through the coordinator, guardian, provider session, PTY, and job-control implementations under a test-owned terminal harness. Their guardian helper enters the shared production guardian-bootstrap core through bounded package-only seams, and their completion endpoint crosses real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries before the parent checks the provider-release-gated exact record and EOF. The test-only role dispatcher does not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-anchor role, so these scenarios make no parser coverage claim. No public supervised command uses this path. Automatic failover, cross-profile session handoff, reauthentication, and verified Windows credential ACLs are not implemented yet.
 
 Calcifer is intended to make routine selection among accounts that you already own or are authorized to use feel boring: authenticate each profile through the provider's official CLI, keep each profile isolated, and start every new CLI process with an explicit profile.
 
@@ -47,6 +47,13 @@ calcifer auth verify codex@work
 
 # Change only a local display alias; no browser or provider process is used.
 calcifer auth rename codex@work client-a
+
+# Define private user-level routing policy. Every non-empty membership update
+# revalidates the current private identity of every member before commit.
+calcifer routing domain create codex accounts codex@client-a codex@personal
+calcifer routing pool create codex@accounts fallback codex@client-a codex@personal
+calcifer routing inspect
+calcifer --json routing inspect
 
 # Remove one local managed profile after a TTY confirmation, or explicitly.
 calcifer auth remove codex@client-a
@@ -88,6 +95,50 @@ provider executable, opens a browser, refreshes a token, nor contacts a
 network service. If registry durability becomes uncertain after its atomic
 visibility point, Calcifer reports `registry_commit_uncertain`; read back
 `auth list` instead of retrying blindly.
+
+Routing definitions are stored separately in the private user-level
+`routing.json`; repository paths are never a storage or selection input. Trust
+domains and pools persist immutable profile UUIDs, while `codex@alias` is only
+lookup and display metadata. Renaming a profile therefore changes inspection
+output without rewriting membership. Every pool is created with
+`activation: "disabled"`. `routing pool enable` is an explicit user-level
+policy change that revalidates every current member before committing
+`activation: "enabled"`; it does not launch a provider or opt an ordinary
+profile-pinned `run`/`resume` into failover. There is still no public `select`
+or automatic-selection command.
+
+Creating a domain, creating a pool, or replacing members revalidates every
+referenced profile's current private identity in immutable-ID lock order. A
+missing profile, provider/trust-domain mismatch, legacy unverified profile,
+identity-key loss, credential drift, duplicate effective provider identity, or
+busy profile aborts the entire update. Metadata-only rename and removal remain
+available for cleanup even after a member becomes invalid. Updates use a
+private lock, revision compare, bounded schema, file fsync, atomic rename, and
+parent-directory fsync. `routing_commit_uncertain` means the complete new
+revision is visible but its directory durability was not confirmed; inspect
+before retrying.
+
+The full inert definition surface is:
+
+```console
+calcifer routing domain create codex <alias> [codex@profile ...]
+calcifer routing domain rename <uuid|codex@alias> <new-alias>
+calcifer routing domain set-profiles <uuid|codex@alias> [codex@profile ...]
+calcifer routing domain remove <uuid|codex@alias>
+calcifer routing pool create <domain-uuid|codex@domain> <alias> codex@a codex@b [...]
+calcifer routing pool rename <uuid|codex@alias> <new-alias>
+calcifer routing pool set-profiles <uuid|codex@alias> codex@a codex@b [...]
+calcifer routing pool enable <uuid|codex@alias>
+calcifer routing pool disable <uuid|codex@alias>
+calcifer routing pool remove <uuid|codex@alias>
+```
+
+Domain membership is a canonical set; pool membership preserves the requested
+order and requires at least two distinct profiles from its one trust domain.
+Human and JSON inspection contain only Calcifer-local IDs/aliases, provider,
+revision, membership, and explicit activation. They never contain provider
+identity material, account/workspace identifiers, tokens, or reset-credit IDs.
+See [ADR 0004](docs/adr/0004-private-routing-registry.md).
 
 `auth remove` is also entirely local and offline. Without `--yes`, it requires
 stdin to be a TTY, displays the local profile ID and deletion scope, and accepts
@@ -396,14 +447,12 @@ remain stable; new fields may be added.
 
 ## Planned interface
 
-The following pool and default-selection commands remain design targets, not an implemented quick start:
+The routing definition commands above are implemented, but selection and supervision remain design targets rather than an implemented quick start:
 
 ```console
 # Select a default for future processes, or pin one invocation.
 calcifer use codex work
 
-# Opt in to a bounded failover pool within one trust domain.
-calcifer pool create codex personal --profiles personal-a,personal-b
 calcifer supervise codex@personal
 ```
 
@@ -434,10 +483,10 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Codex profile isolation | Implemented on Unix | One `CODEX_HOME` per profile; official Codex login and refresh |
 | Same-profile Codex resume | Implemented on Unix for Codex 0.144.4 | Tracked workspace head, explicit exact thread ID, or official `--last`; no prompt replay |
 | Private Codex identity binding | Implemented for 0.144.4 ChatGPT auth | HMAC equality only; duplicate aliases and credential drift fail closed |
-| Codex usage observation | Implemented on demand for idle profiles | Structured App Server response; active profiles need public wiring of the internal typed monitor |
+| Codex usage observation | Implemented with bounded idle refresh and an active-monitor cache projection | Structured App Server response, explicit freshness/compatibility, disposable private cache; supervised launch remains default-unused |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
 | Pinned supervised Codex integration | Internal implementation present; local Apple-silicon acceptance green, Ubuntu 24.04/macOS CI pending for 0.144.4 | Real App Server and remote TUI through the production coordinator/guardian session, typed monitor, PTY gate, and job-control implementation under a test-owned harness. Two consecutive normal runs and one retained-recovery run passed locally. Independent package scenarios share the production guardian-bootstrap core through bounded test seams, cross real parent-to-coordinator-to-guardian `exec` boundaries with the completion endpoint, and check the provider-release-gated exact frame plus EOF. Linux adds a fail-closed loopback-only direct-IP egress boundary; macOS remains native functional evidence. They deliberately bypass the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser and persistent shell-anchor role. No public supervised run/resume |
-| Opt-in profile pools | Design | Same provider and trust domain; bounded selection |
+| Opt-in profile pools | Private default-disabled registry implemented on Unix; selection unavailable | Immutable profile IDs, same provider and trust domain, live whole-pool identity validation, bounded atomic updates |
 | Cross-profile conversation handoff | Internal Linux/macOS target reservation and same-profile supervisor integration implemented | Transition journal, target fork, pool selection, crash recovery, and user-visible switching remain disabled; the planned version-gated fork creates a target-profile thread in one logical conversation |
 | Claude setup-token profiles | Experimental plan | OS credential store where officially supported |
 | Claude subscription OAuth replication | Not planned for MVP | No undocumented OAuth endpoint or Keychain-name emulation |
@@ -462,6 +511,7 @@ Core invariants for implemented and future paths are:
 7. Old rotated credentials are never restored over newer credentials.
 8. Credential-bearing environments are passed only to the selected adapter's validated executable, never to an arbitrary user-supplied command.
 9. A credential profile and a logical conversation have independent lifecycles; a handoff may move the conversation only between stopped processes in one explicit trust domain.
+10. Routing definitions are user-level, private, bounded, and default-disabled. Repository-local files cannot select a pool, and definition updates never launch a provider workload.
 10. Resume restores persisted history but never replays an interrupted prompt or tool action.
 11. Ambient Codex credentials, authentication/provider endpoints, alternate
     managed config/state paths, remote execution and connector credentials,
@@ -473,7 +523,7 @@ Core invariants for implemented and future paths are:
 
 File-based Codex credentials remain readable by the current OS user and the official Codex CLI; Calcifer is not an encrypted vault. Calcifer also does not sandbox the wrapped CLI, its hooks, or commands executed from the current repository.
 
-See [Architecture](docs/architecture.md), [ADR 0001: cross-profile conversation handoff](docs/adr/0001-cross-profile-conversation-handoff.md), [ADR 0003: supervised Codex session](docs/adr/0003-supervised-codex-session.md), [Provider compatibility](docs/provider-compatibility.md), [Security model](docs/security-model.md), and [Security policy](SECURITY.md) before contributing to authentication, storage, process execution, or failover behavior.
+See [Architecture](docs/architecture.md), [ADR 0001: cross-profile conversation handoff](docs/adr/0001-cross-profile-conversation-handoff.md), [ADR 0003: supervised Codex session](docs/adr/0003-supervised-codex-session.md), [ADR 0004: private routing registry](docs/adr/0004-private-routing-registry.md), [Provider compatibility](docs/provider-compatibility.md), [Security model](docs/security-model.md), and [Security policy](SECURITY.md) before contributing to authentication, storage, process execution, or failover behavior.
 
 ## Build from source
 
@@ -580,7 +630,7 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 3. **Implemented:** exact same-profile thread capture, crash reconciliation, no-argument cold restore, and journaled local profile removal. Safe reauth/re-key flows remain.
 4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
-6. Add version-gated cross-profile conversation handoff as the default successful failover path; the no-gap Linux/macOS target-reservation primitive and default-unused pinned same-profile provider/monitor/PTY implementation are present, while their deterministic and official-package acceptance evidence, public supervisor UX, transition journaling, authoritative selection, target-fork integration, and cross-profile crash recovery remain pending. Preserve one profile-local writer per lineage generation.
+6. Activate version-gated cross-profile conversation handoff as the default successful failover path. The no-gap Linux/macOS target reservation, pinned same-profile provider/monitor/PTY, schema-v2 transition journal, validated rollout projections, and one-boundary crash-recovery transaction kernel are present and default-unused; public supervisor UX, authoritative usage/selection, and target-fork activation remain pending. Preserve one profile-local writer per lineage generation.
 7. Add Claude only through provider-supported authentication and usage-observation surfaces.
 
 Detailed gates and non-goals are tracked in [docs/roadmap.md](docs/roadmap.md).

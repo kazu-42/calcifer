@@ -8,6 +8,8 @@ mod profiles;
 mod project_config;
 mod provider_identity;
 mod providers;
+mod routing;
+mod usage_observations;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
@@ -15,7 +17,10 @@ use std::process::{ExitCode, ExitStatus};
 
 use clap::{CommandFactory, Parser, error::ErrorKind};
 
-use crate::cli::{AuthCommand, Cli, Commands, ProviderArgument, UpdateCommand};
+use crate::cli::{
+    AuthCommand, Cli, Commands, DefinitionReference, ProfileReference, ProviderArgument,
+    RoutingCommand, RoutingDomainCommand, RoutingPoolCommand, UpdateCommand,
+};
 use crate::error::AppError;
 use crate::output::ErrorReport;
 
@@ -269,6 +274,7 @@ where
                 Err(error) => render_app_error("auth", &error, cli.json),
             },
         },
+        Commands::Routing { command } => run_routing_command(command, cli.json),
         Commands::Run {
             untracked,
             profile,
@@ -410,7 +416,152 @@ where
     }
 }
 
+fn run_routing_command(command: RoutingCommand, json: bool) -> ExitCode {
+    match command {
+        RoutingCommand::Inspect => match commands::routing::inspect() {
+            Ok(report) => render_routing_report(&report, json),
+            Err(error) => render_app_error("routing", &error, json),
+        },
+        RoutingCommand::Domain { command } => {
+            let result = match command {
+                RoutingDomainCommand::Create {
+                    provider,
+                    alias,
+                    profiles,
+                } => commands::routing::create_domain(
+                    provider_value(provider),
+                    alias,
+                    member_values(profiles),
+                ),
+                RoutingDomainCommand::Rename { domain, new_alias } => {
+                    let (provider, reference) = definition_value(domain);
+                    commands::routing::rename_domain(provider, &reference, new_alias)
+                }
+                RoutingDomainCommand::SetProfiles { domain, profiles } => {
+                    let (provider, reference) = definition_value(domain);
+                    commands::routing::replace_domain_members(
+                        provider,
+                        &reference,
+                        member_values(profiles),
+                    )
+                }
+                RoutingDomainCommand::Remove { domain } => {
+                    let (provider, reference) = definition_value(domain);
+                    commands::routing::remove_domain(provider, &reference)
+                }
+            };
+            match result {
+                Ok(report) => render_routing_update_report(&report, json),
+                Err(error) => render_app_error("routing", &error, json),
+            }
+        }
+        RoutingCommand::Pool { command } => {
+            let result = match command {
+                RoutingPoolCommand::Create {
+                    domain,
+                    alias,
+                    profiles,
+                } => {
+                    let (provider, reference) = definition_value(domain);
+                    commands::routing::create_pool(
+                        provider,
+                        &reference,
+                        alias,
+                        member_values(profiles),
+                    )
+                }
+                RoutingPoolCommand::Rename { pool, new_alias } => {
+                    let (provider, reference) = definition_value(pool);
+                    commands::routing::rename_pool(provider, &reference, new_alias)
+                }
+                RoutingPoolCommand::SetProfiles { pool, profiles } => {
+                    let (provider, reference) = definition_value(pool);
+                    commands::routing::replace_pool_members(
+                        provider,
+                        &reference,
+                        member_values(profiles),
+                    )
+                }
+                RoutingPoolCommand::Enable { pool } => {
+                    let (provider, reference) = definition_value(pool);
+                    commands::routing::set_pool_activation(provider, &reference, true)
+                }
+                RoutingPoolCommand::Disable { pool } => {
+                    let (provider, reference) = definition_value(pool);
+                    commands::routing::set_pool_activation(provider, &reference, false)
+                }
+                RoutingPoolCommand::Remove { pool } => {
+                    let (provider, reference) = definition_value(pool);
+                    commands::routing::remove_pool(provider, &reference)
+                }
+            };
+            match result {
+                Ok(report) => render_routing_update_report(&report, json),
+                Err(error) => render_app_error("routing", &error, json),
+            }
+        }
+    }
+}
+
+const fn provider_value(provider: ProviderArgument) -> profiles::Provider {
+    match provider {
+        ProviderArgument::Codex => profiles::Provider::Codex,
+    }
+}
+
+fn member_values(profiles: Vec<ProfileReference>) -> Vec<(profiles::Provider, String)> {
+    profiles
+        .into_iter()
+        .map(|profile| (provider_value(profile.provider), profile.alias))
+        .collect()
+}
+
+fn definition_value(reference: DefinitionReference) -> (Option<profiles::Provider>, String) {
+    (reference.provider.map(provider_value), reference.value)
+}
+
 fn render_auth_report(report: &commands::auth::AuthReport, json: bool) -> ExitCode {
+    let rendered = if json {
+        report.to_json()
+    } else {
+        Ok(report.to_human())
+    };
+    match rendered {
+        Ok(rendered) if write_stdout(&rendered).is_ok() => ExitCode::SUCCESS,
+        _ => {
+            let _ = write_stderr(if json {
+                JSON_INTERNAL_ERROR
+            } else {
+                HUMAN_INTERNAL_ERROR
+            });
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn render_routing_report(report: &commands::routing::RoutingReport, json: bool) -> ExitCode {
+    let rendered = if json {
+        report.to_json()
+    } else {
+        Ok(report.to_human())
+    };
+    match rendered {
+        Ok(rendered) if write_stdout(&rendered).is_ok() => ExitCode::SUCCESS,
+        _ => {
+            let _ = write_stderr(if json {
+                JSON_INTERNAL_ERROR
+            } else {
+                HUMAN_INTERNAL_ERROR
+            });
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn render_routing_update_report(
+    report: &commands::routing::RoutingUpdateReport,
+    json: bool,
+) -> ExitCode {
     let rendered = if json {
         report.to_json()
     } else {
@@ -589,6 +740,51 @@ mod tests {
         assert!(
             Cli::try_parse_from(["calcifer", "update", "check", "--channel", "nightly",]).is_err()
         );
+    }
+
+    #[test]
+    fn routing_cli_exposes_explicit_pool_activation_without_a_selection_command() {
+        assert!(Cli::try_parse_from(["calcifer", "routing", "inspect"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "calcifer",
+                "routing",
+                "domain",
+                "create",
+                "codex",
+                "accounts",
+                "codex@work",
+                "codex@personal",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "calcifer",
+                "routing",
+                "pool",
+                "create",
+                "codex@accounts",
+                "fallback",
+                "codex@personal",
+                "codex@work",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["calcifer", "routing", "pool", "enable", "codex@fallback",])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["calcifer", "routing", "pool", "disable", "codex@fallback",])
+                .is_ok()
+        );
+        for forbidden in ["enable", "select", "launch", "activate"] {
+            assert!(
+                Cli::try_parse_from(["calcifer", "routing", forbidden]).is_err(),
+                "routing {forbidden} must remain unavailable"
+            );
+        }
     }
 
     #[test]

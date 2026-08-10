@@ -626,6 +626,400 @@ fn empty_status_is_a_successful_stable_json_document() -> Result<(), Box<dyn std
 
 #[cfg(unix)]
 #[test]
+fn routing_registry_is_user_level_private_and_ignores_repository_decoys()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-routing-user-level-{}-{nonce}",
+        std::process::id()
+    ));
+    let root = sandbox.join("state");
+    let repository = sandbox.join("repository");
+    std::fs::create_dir_all(repository.join(".git"))?;
+    std::fs::create_dir_all(repository.join(".calcifer"))?;
+    let decoy = r#"{"provider_identity":"secret-repository-decoy@example.invalid"}"#;
+    std::fs::write(repository.join("routing.json"), decoy)?;
+    std::fs::write(repository.join(".calcifer/routing.json"), decoy)?;
+
+    let create = calcifer()
+        .current_dir(&repository)
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "routing", "domain", "create", "codex", "empty"])
+        .output()?;
+    let create_document: serde_json::Value = serde_json::from_slice(&create.stdout)?;
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8(create.stderr)?
+    );
+    assert_eq!(create_document["action"], "domain_create");
+    assert_eq!(create_document["changed"], true);
+    assert_eq!(create_document["revision"], 1);
+
+    let inspect = calcifer()
+        .current_dir(&repository)
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "routing", "inspect"])
+        .output()?;
+    let rendered = String::from_utf8(inspect.stdout)?;
+    let document: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8(inspect.stderr)?
+    );
+    assert_eq!(document["routing"]["revision"], 1);
+    assert_eq!(document["routing"]["trust_domains"][0]["alias"], "empty");
+    assert_eq!(document["routing"]["pools"], serde_json::json!([]));
+    assert!(!rendered.contains("secret-repository-decoy"));
+    assert_eq!(
+        std::fs::read_to_string(repository.join("routing.json"))?,
+        decoy
+    );
+    assert_eq!(
+        std::fs::read_to_string(repository.join(".calcifer/routing.json"))?,
+        decoy
+    );
+    assert_eq!(std::fs::metadata(&root)?.mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(root.join("routing.json"))?.mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("routing.lock"))?.mode() & 0o777,
+        0o600
+    );
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn routing_cli_validates_live_members_and_preserves_ids_across_alias_rename()
+-> Result<(), Box<dyn std::error::Error>> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-routing-live-{}-{nonce}",
+        std::process::id()
+    ));
+    let root = sandbox.join("state");
+    std::fs::create_dir(&sandbox)?;
+    let (path, log) = install_profile_remove_test_codex(&sandbox)?;
+    let work_id = add_profile_remove_test_profile(&root, &path, &log, "work")?;
+    let personal_id = add_profile_remove_test_profile(&root, &path, &log, "personal")?;
+
+    let domain = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "--json",
+            "routing",
+            "domain",
+            "create",
+            "codex",
+            "accounts",
+            "codex@work",
+            "codex@personal",
+        ])
+        .output()?;
+    assert!(
+        domain.status.success(),
+        "{}",
+        String::from_utf8(domain.stderr)?
+    );
+
+    let pool = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "--json",
+            "routing",
+            "pool",
+            "create",
+            "codex@accounts",
+            "fallback",
+            "codex@personal",
+            "codex@work",
+        ])
+        .output()?;
+    assert!(pool.status.success(), "{}", String::from_utf8(pool.stderr)?);
+
+    let rename = calcifer()
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "auth", "rename", "codex@work", "office"])
+        .output()?;
+    assert!(
+        rename.status.success(),
+        "{}",
+        String::from_utf8(rename.stderr)?
+    );
+
+    let inspect = calcifer()
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "routing", "inspect"])
+        .output()?;
+    let rendered = String::from_utf8(inspect.stdout)?;
+    let document: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8(inspect.stderr)?
+    );
+    assert_eq!(document["routing"]["revision"], 2);
+    let domain_members = if work_id < personal_id {
+        serde_json::json!([
+            {"profile_id": work_id.clone(), "profile": "codex@office"},
+            {"profile_id": personal_id.clone(), "profile": "codex@personal"}
+        ])
+    } else {
+        serde_json::json!([
+            {"profile_id": personal_id.clone(), "profile": "codex@personal"},
+            {"profile_id": work_id.clone(), "profile": "codex@office"}
+        ])
+    };
+    assert_eq!(
+        document["routing"]["trust_domains"][0]["members"],
+        domain_members
+    );
+    assert_eq!(
+        document["routing"]["pools"][0]["members"],
+        serde_json::json!([
+            {"profile_id": personal_id, "profile": "codex@personal"},
+            {"profile_id": work_id, "profile": "codex@office"}
+        ])
+    );
+    assert_eq!(document["routing"]["pools"][0]["activation"], "disabled");
+
+    let enable = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args(["--json", "routing", "pool", "enable", "codex@fallback"])
+        .output()?;
+    assert!(
+        enable.status.success(),
+        "{}",
+        String::from_utf8(enable.stderr)?
+    );
+    let enabled: serde_json::Value = serde_json::from_slice(&enable.stdout)?;
+    assert_eq!(enabled["action"], "pool_enable");
+    assert_eq!(enabled["revision"], 3);
+    assert_eq!(enabled["changed"], true);
+
+    let frozen = calcifer()
+        .env("CALCIFER_HOME", &root)
+        .args([
+            "--json",
+            "routing",
+            "pool",
+            "set-profiles",
+            "codex@fallback",
+            "codex@office",
+            "codex@personal",
+        ])
+        .output()?;
+    assert!(!frozen.status.success());
+    let frozen_error: serde_json::Value = serde_json::from_slice(&frozen.stderr)?;
+    assert_eq!(frozen_error["error"]["code"], "routing_pool_enabled");
+
+    let disable = calcifer()
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "routing", "pool", "disable", "codex@fallback"])
+        .output()?;
+    assert!(
+        disable.status.success(),
+        "{}",
+        String::from_utf8(disable.stderr)?
+    );
+    let disabled: serde_json::Value = serde_json::from_slice(&disable.stdout)?;
+    assert_eq!(disabled["action"], "pool_disable");
+    assert_eq!(disabled["revision"], 4);
+
+    let inspect_disabled = calcifer()
+        .env("CALCIFER_HOME", &root)
+        .args(["--json", "routing", "inspect"])
+        .output()?;
+    let disabled_document: serde_json::Value = serde_json::from_slice(&inspect_disabled.stdout)?;
+    assert_eq!(
+        disabled_document["routing"]["pools"][0]["activation"],
+        "disabled"
+    );
+    for forbidden in [
+        "fingerprint",
+        "account_id",
+        "workspace_id",
+        "access_token",
+        "reset_credit",
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+    let provider_log = std::fs::read_to_string(log)?;
+    assert!(!provider_log.contains(" resume"));
+    assert!(!provider_log.contains(" run"));
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn routing_live_validation_fails_closed_without_publishing_partial_membership()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-routing-fail-closed-{}-{nonce}",
+        std::process::id()
+    ));
+    let root = sandbox.join("state");
+    std::fs::create_dir(&sandbox)?;
+    let (path, log) = install_profile_remove_test_codex(&sandbox)?;
+    let work_id = add_profile_remove_test_profile(&root, &path, &log, "work")?;
+    let personal_id = add_profile_remove_test_profile(&root, &path, &log, "personal")?;
+    let work = root.join("profiles/codex").join(&work_id);
+    let personal = root.join("profiles/codex").join(&personal_id);
+    let personal_auth = std::fs::read(personal.join("home/auth.json"))?;
+    let personal_marker = std::fs::read(personal.join(".calcifer-identity"))?;
+
+    std::fs::copy(work.join("home/auth.json"), personal.join("home/auth.json"))?;
+    std::fs::copy(
+        work.join(".calcifer-identity"),
+        personal.join(".calcifer-identity"),
+    )?;
+    let duplicate = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "--json",
+            "routing",
+            "domain",
+            "create",
+            "codex",
+            "accounts",
+            "codex@work",
+            "codex@personal",
+        ])
+        .output()?;
+    let duplicate_error: serde_json::Value = serde_json::from_slice(&duplicate.stderr)?;
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert_eq!(
+        duplicate_error["error"]["code"],
+        "routing_duplicate_provider_identity"
+    );
+    assert!(!root.join("routing.json").exists());
+
+    std::fs::write(personal.join("home/auth.json"), &personal_auth)?;
+    std::fs::write(personal.join(".calcifer-identity"), &personal_marker)?;
+    std::fs::remove_file(personal.join(".calcifer-identity"))?;
+    let unverified = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "--json",
+            "routing",
+            "domain",
+            "create",
+            "codex",
+            "accounts",
+            "codex@work",
+            "codex@personal",
+        ])
+        .output()?;
+    let unverified_error: serde_json::Value = serde_json::from_slice(&unverified.stderr)?;
+    assert_eq!(unverified.status.code(), Some(1));
+    assert_eq!(
+        unverified_error["error"]["code"],
+        "provider_identity_unverified"
+    );
+    assert!(!root.join("routing.json").exists());
+
+    std::fs::write(personal.join(".calcifer-identity"), &personal_marker)?;
+    std::fs::set_permissions(
+        personal.join(".calcifer-identity"),
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+    let create = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "--json",
+            "routing",
+            "domain",
+            "create",
+            "codex",
+            "accounts",
+            "codex@work",
+            "codex@personal",
+        ])
+        .output()?;
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8(create.stderr)?
+    );
+    let committed = std::fs::read(root.join("routing.json"))?;
+
+    let drift_scope = "secret-drift-scope@example.invalid";
+    std::fs::write(
+        work.join("home/auth.json"),
+        format!("{{\"auth_mode\":\"chatgpt\",\"tokens\":{{\"account_id\":\"{drift_scope}\"}}}}\n"),
+    )?;
+    let drift = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "--json",
+            "routing",
+            "domain",
+            "set-profiles",
+            "codex@accounts",
+            "codex@work",
+            "codex@personal",
+        ])
+        .output()?;
+    let drift_rendered = String::from_utf8(drift.stderr)?;
+    let drift_error: serde_json::Value = serde_json::from_str(&drift_rendered)?;
+    assert_eq!(drift.status.code(), Some(1));
+    assert_eq!(drift_error["error"]["code"], "provider_identity_mismatch");
+    assert!(!drift_rendered.contains(drift_scope));
+    assert_eq!(std::fs::read(root.join("routing.json"))?, committed);
+
+    std::fs::remove_file(root.join("identity.key"))?;
+    let key_loss = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &log)
+        .args([
+            "--json",
+            "routing",
+            "domain",
+            "set-profiles",
+            "codex@accounts",
+            "codex@work",
+            "codex@personal",
+        ])
+        .output()?;
+    let key_error: serde_json::Value = serde_json::from_slice(&key_loss.stderr)?;
+    assert_eq!(key_loss.status.code(), Some(1));
+    assert_eq!(key_error["error"]["code"], "identity_key_unavailable");
+    assert_eq!(std::fs::read(root.join("routing.json"))?, committed);
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn relative_home_is_rejected_without_creating_secret_storage()
 -> Result<(), Box<dyn std::error::Error>> {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -1915,7 +2309,7 @@ esac
     assert_eq!(unsupported.status.code(), Some(1));
     assert_eq!(
         unsupported_document["profiles"][0]["availability"],
-        "unknown"
+        "unsupported"
     );
     assert_eq!(
         unsupported_document["profiles"][0]["codex_version"],
@@ -1967,7 +2361,7 @@ esac
         .output()?;
     let unsupported_human_text = String::from_utf8(unsupported_human.stdout)?;
     assert_eq!(unsupported_human.status.code(), Some(1));
-    assert!(unsupported_human_text.contains("[unknown]"));
+    assert!(unsupported_human_text.contains("[unsupported]"));
     assert!(
         unsupported_human_text
             .contains("compatibility incompatible · Codex 0.145.0 · tested 0.144.4")

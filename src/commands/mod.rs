@@ -3,5 +3,6 @@ pub(crate) mod auth;
 mod codex_conversation;
 pub(crate) mod doctor;
 pub(crate) mod process;
+pub(crate) mod routing;
 pub(crate) mod status;
 pub(crate) mod update;

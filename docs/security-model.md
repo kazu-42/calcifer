@@ -35,9 +35,10 @@ dispatcher/parser or persistent shell-anchor role, and these scenarios make no
 parser coverage claim. Package tests use no real credential, token, account ID,
 or provider identifier. The deterministic provider fixture described below is
 credential-free and loopback-only. No public supervised command calls this path,
-and it persists no terminal transcript. Automatic failover, public supervised
-run/resume, and the production cross-profile conversation handoff transaction
-remain unimplemented;
+and it persists no terminal transcript. The guarded selector and its
+lease-retaining candidate runtime are internal and default-unused; automatic
+failover, public supervised run/resume, and production cross-profile handoff
+wiring remain unavailable;
 [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines handoff
 semantics and [ADR 0003](adr/0003-supervised-codex-session.md) defines the
 staged supervisor.
@@ -108,7 +109,13 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Managed profile roots and homes are private to the current user; secret files are private at creation time. Provider-owned nested rollout directories/files from older installations may retain non-writable `0755`/`0644` modes behind that private home boundary.
 - Tokens and reset-credit IDs are never accepted as ordinary command-line flags because process listings and shell history can expose them.
 - Raw arguments, child environments, credential files, account email, and stable provider IDs are not logged.
-- Conversation metadata stores only Calcifer/profile/thread UUIDs, canonical cwd, tested adapter versions, bounded inventory timestamps, path-free file identity/size/mtime/ctime fingerprints, and lifecycle state. It excludes aliases, rollout paths, App Server previews, transcript bodies, prompts, responses, approvals, tool arguments, terminal streams, credentials, and provider identity.
+- Conversation metadata stores only Calcifer/profile/thread/trust-domain UUIDs,
+  canonical cwd, tested adapter versions, bounded inventory timestamps,
+  path-free inventory fingerprints, schema-v2 managed-root-relative rollout
+  locators and bounded rollout fingerprints, lifecycle state, and handoff
+  phases. It excludes aliases, arbitrary absolute rollout paths, App Server
+  previews, transcript bodies, prompts, responses, approvals, tool arguments,
+  terminal streams, credentials, and provider identity.
 - The internal terminal kernel moves bytes only through one fixed 8 KiB buffer
   per active direction, retains no transcript or payload queue, zeroes reported
   and otherwise unreported bytes before reuse, and emits only fixed redacted
@@ -213,6 +220,13 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   children and recorded known process groups plus identity-checked runtime, FD,
   and socket evidence. Escaped-session containment is tracked
   separately by issue #56.
+- macOS descriptor-observation failures keep the public
+  `UnsupportedDescriptor` result. A separate diagnostic envelope carries at
+  most one closed, payload-free reason for unsupported kind, unavailable
+  vnode/socket/pipe identity, or unavailable identity for a forbidden kind.
+  The reason is printed only as a fixed subtype at the existing target-process-
+  group stage and contains no numeric process or descriptor identity. It does
+  not grant ownership, cleanup, retry, or readiness authority.
 - At guardian exec entry, lifecycle fd 0, terminal fd 1, and recovery fd 2 are
   each moved into one owned close-on-exec duplicate while the guardian is still
   single-threaded. The boundary requires exactly two references to the original
@@ -240,7 +254,13 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   so Calcifer performs no restore, emits no restored proof, and retains its
   lease/evidence. The production-shaped persistent anchor remains the
   controlling-terminal session leader while each coordinator generation owns
-  the foreground process group. It accepts only one exact eight-byte terminal
+  the foreground process group. Each foreground selection requires the exact
+  terminal descriptor and expected current group before mutation plus exact
+  descriptor/selected-group readback afterward. A post-write failure becomes
+  an ordinary error only after an exact rollback readback; descriptor change,
+  a third foreground generation, or any unproved rollback retains the anchor
+  state and performs no authority-clobbering follow-up write. It accepts only
+  one exact eight-byte terminal
   record followed by EOF. The guardian can publish the provider-release-only
   `CFCMP\x01\r\n` record
   only by consuming a move-only `ProviderNeverStarted` or direct-App graceful-
@@ -345,6 +365,16 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 - Codex 0.144.4 hides its 10,000-file rollout scan cap from the v2 App Server response. Calcifer proves a conservative upper bound by snapshotting active and archived roots separately before and after listing, requiring each root to remain below the cap, and mapping every wire path to the stable snapshot. Nested nodes must remain owned, real, non-symlink, and non-writable by group/other; files must have one hard link. The enclosing managed home remains owner-private.
 - Bare resume releases its initial conversation lock before waiting for a profile lease, then revalidates the unchanged UUID binding under that lease. Registry mutation order is coordinator lease, provider lease, then a short conversation lock; no conversation lock spans App Server or interactive provider I/O.
 - A conversation document update uses create-only private same-directory temporary files, file fsync, rename, and directory fsync. Post-rename sync uncertainty is read back and reported without retrying a provider launch. Newer schemas and unsafe owner/type/mode/hard-link state are never rewritten.
+- Conversation schema v2 is lazy: ordinary same-profile reads and mutations do
+  not migrate v1. Before the first handoff mutation publishes v2, Calcifer
+  durably publishes an owner-private, single-link v1 recovery copy and binds
+  its exact revision and SHA-256 digest into v2. A missing or mismatched copy
+  stops v2 reads. V2 accepts
+  only ordered generations with one active tail and one active transition,
+  stores rollout locations only as bounded managed-root-relative components,
+  and blocks ordinary resume throughout every crash-sensitive handoff phase.
+  Older v1 binaries reject v2; recovery uses a forward binary or the explicit
+  pre-migration copy, never an automatic v2-to-v1 rewrite.
 - Profile removal is local-only and requires an explicit TTY `yes` or `--yes`;
   JSON requires `--yes`. Before confirmation, non-TTY invocations perform no
   managed-state read, recovery, or mutation. Removal never starts a provider or
@@ -670,46 +700,55 @@ cannot constrain arbitrary egress from a malicious or compromised executable.
 
 ## Failover requirements
 
-A profile pool is user-created, provider-specific, and bound to one trust domain. Automatic failover is opt-in. The only switching signal is fresh, authoritative, version-supported exhaustion state.
+A profile pool is user-created, provider-specific, and bound to one trust domain. The implemented private user-level registry stores only immutable local profile IDs, local aliases, provider, revision, membership, and the fixed `disabled` activation. Every membership change revalidates the whole affected domain or pool under sorted profile leases and fails before commit on missing/unverified/drifted/duplicate identity or provider/trust-domain mismatch. Inspection exposes no private identity or provider account material. Repository-local `routing`, `routing_pools`, and `trust_domains` configuration is rejected by launch preflight, and repository files are never an input to the routing store. Automatic failover remains unavailable; the only future switching signal is fresh, authoritative, version-supported exhaustion state. See [ADR 0004](adr/0004-private-routing-registry.md).
 
 The selector must distinguish:
 
 ```text
-available | exhausted | unknown
+available | exhausted | stale | unsupported | unknown
 ```
 
-The observation records its provider, profile ID, source, observation time, optional reset time, detected provider version, adapter version, tested-version set, and compatibility state. On-demand Codex status accepts only the tested `0.144.4` initialize/home and typed usage contract. Every incompatible or unverified contract and every error that cannot be proven to mean exhaustion becomes `unknown` and stops selection.
+The observation records its provider, local profile ID, fixed source, observation/expiry time, optional provider reset time, detected provider version, adapter version, tested-version set, and compatibility state. On-demand Codex status accepts only the tested `0.144.4` initialize/home and typed usage contract. Expired evidence is `stale`, an explicitly unsupported version or method is `unsupported`, and malformed/incompatible schema, every unverified contract, or any other error that cannot be proven to mean exhaustion is `unknown`; all three stop selection.
 
 The selector keeps an attempted-profile set, traverses a pool no more than once, and observes a cooldown. Cached state may prefilter candidates, but identity and fresh authoritative usage are revalidated after acquiring the profile lease. It never changes the credentials of a running process and never replays a started command.
 
-A successful switch continues the same logical conversation. Credential profile identity remains immutable for each provider process, while the conversation advances to a new target-profile Codex thread generation. A serialized handoff retains the existing source-profile lease and reserves a freshly revalidated target profile. The source TUI and App Server must then be stopped and reaped while Calcifer retains source ownership. The source rollout is accepted only from Calcifer-owned metadata after canonical containment, owner, mode, regular-file, single-hard-link, and symlink validation. The target App Server imports that history through a version-gated provider API and must return the expected lineage plus a distinct rollout contained under the target profile before activation; Calcifer verifies that the source rollout content is unchanged and never copies credentials into a shared runtime home. The prepared transition is synced before the non-idempotent fork request, so crash recovery adopts only one uniquely matching target fork and otherwise fails closed. Source ownership is released only after the target generation is committed and attached.
+A successful switch continues the same logical conversation. Credential profile identity remains immutable for each provider process, while the conversation advances to a new target-profile Codex thread generation. A serialized handoff retains the existing source-profile lease and reserves a freshly revalidated target profile. The source TUI and App Server must then be stopped and reaped while Calcifer retains source ownership. The source rollout is accepted only from Calcifer-owned metadata after canonical containment, owner, mode, regular-file, single-hard-link, and symlink validation. The implemented Linux/macOS rollout capability has no raw-path constructor: it requires a current registered profile and the adapter's validated thread lineage, retains managed-home/sessions/source descriptors, and binds the source to a bounded root-relative locator plus device/inode/length/mode/UID/GID/link/mtime/ctime/SHA-256. A one-shot import type exposes the sealed absolute path only after immediate revalidation and can become post-import proof only after the retained descriptor and current managed path are both rehashed unchanged. Traversal, symlinked ancestors or files, hard links, special nodes, wrong ownership, writable modes, oversize, archive roots, deletion, replacement, and session metadata drift all fail closed.
 
-The target-reservation and guardian lease-transfer primitive described above is
-implemented, but no production command calls it yet. Issue #33 must integrate
-it beneath the handoff coordinator and conversation-transition locks, own the
-guardian lifecycle through ambiguous ACK outcomes, and preserve the global
-lock order before automatic switching can be enabled.
+The target App Server imports that history through a version-gated provider API and must return the expected lineage plus a distinct rollout contained under the target profile before activation. The separate handoff-only fork projection requires a new canonical thread ID, exact `forkedFromId`, matching canonical cwd and CLI version, target-profile containment, safe target metadata, and a source-distinct inode; it does not relax the ordinary same-profile root-thread projection. Calcifer verifies that the source rollout content is unchanged and never copies credentials into a shared runtime home. The prepared transition is synced before the non-idempotent fork request, so crash recovery adopts only one uniquely matching target fork and otherwise fails closed. Source ownership is released only after the target generation is committed and attached.
+
+The rollout capability, target-reservation/guardian lease-transfer primitives,
+and serialized transaction/reconciliation kernel described above are
+implemented, but no production command calls them yet. The transaction driver
+holds the separate handoff coordinator across one selected external boundary,
+uses only short conversation-registry transactions, persists stop/fork intent
+before effects, and resumes from the durable phase. Target guardian lifecycle
+and ambiguous ACK ownership remain inside the supervised runtime adapter; the
+selector must supply that adapter without changing the global lease order
+before automatic switching can be enabled.
 
 The supervisor may subscribe to thread events for usage monitoring, but it never answers approvals or any other server-initiated request. Only the attached official TUI may respond, and no new turn is admitted while that TUI is absent. Source effective execution settings are fixed at fork time; target authentication and provider routing cannot be replaced by a remote-client override.
 
 If the provider version, experimental schema, path provenance, target identity, or transition state is ambiguous, the handoff stops with the source rollout intact. A fresh thread may be offered as an explicit recovery choice, but it is not reported as a successful automatic resume.
 
-The displayed remaining percentage is derived from a rounded provider value. `0% remaining` alone is not exhaustion. Current status requires a recognized structured `rateLimitReachedType` to report `exhausted`; all missing, malformed, stale, auth, network, and unsupported states are `unknown` for future switching logic.
+The displayed remaining percentage is derived from a rounded provider value. `0% remaining` alone is not exhaustion. Current status requires a fresh recognized structured `rateLimitReachedType` to report `exhausted`; missing, malformed, auth, and network states are `unknown`, while expired and incompatible evidence is explicitly `stale` or `unsupported`. None can drive switching.
 
-Current on-demand status is intentionally limited to idle profiles. An active
-profile retains an exclusive single-writer lease and reports busy/unknown
-rather than starting another App Server that could refresh the same credential
-file. The internal #54 supervisor owns a typed monitor beside its provider
-session, but no public command consumes that observation yet. Public active
-monitoring and automatic failover require the remaining selector, pool,
-transition-journal, and cross-profile recovery transaction before they can be
-enabled.
+On-demand provider reads remain limited to idle profiles. An active profile
+retains an exclusive single-writer lease; the internal supervisor may project
+the latest fully validated read from that already-live, profile-owned App
+Server into the disposable cache, but status never starts another credential
+writer. Cache expiry, capped backoff, and bounded idle-refresh planning are
+implemented. Public automatic failover still requires the guarded selector and
+explicit pool execution path; cached state may only prefilter and never replaces
+fresh target revalidation under the selected profile lease.
 
 The typed monitor retains Codex thread and turn UUIDs only for bounded in-memory
 target matching and one-shot routing. Those UUIDs are provider identifiers, so
 transport, action, and session signal `Debug` surfaces use fixed payload-free
 representations; the values never enter display text, error chains, lifecycle
-evidence, logs, or persisted usage snapshots.
+evidence, logs, or persisted usage snapshots. The cache audit contains only a
+monotonic local revision, local profile ID, fixed source/event/state enums, and
+timestamp; it cannot encode credentials, provider account/workspace IDs,
+reset-credit IDs, aliases, or transcript content.
 
 Immediately before launch, Calcifer reports the local profile alias, provider, trust domain, and selection reason. It does not display email or stable provider account, workspace, or organization identifiers, and repository-local configuration cannot suppress this notice.
 

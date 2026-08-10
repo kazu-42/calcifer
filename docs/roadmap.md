@@ -47,28 +47,30 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Timestamped source, window reset metadata, spend control, and reset-credit count/expiry
 - [x] Provider failure, auth failure, timeout, missing-field, and unknown-format handling
 - [x] Human and stable JSON status commands for one or all idle profiles
-- [ ] Expose active-session monitoring through a public profile-owned supervisor or safe observation cache (the #54 typed monitor is internal and default-unused)
-- [ ] Snapshot cache, staleness state, TTL/backoff, and notification merge
+- [x] Expose the profile-owned monitor through a safe observation-cache projection (the supervised launch remains internal and default-unused)
+- [x] Bounded snapshot cache, explicit staleness, TTL/backoff, notification/read ordering, and idle refresh planning
 
 Calcifer will not ship automatic failover by scraping an unstable human string and treating parse failures as zero.
 
 ## Phase 4: explicit failover pools
 
-- [ ] User-level, provider-specific, same-trust-domain pool configuration
-- [ ] Default-off behavior and explicit per-invocation pin
-- [ ] Bounded one-pass selection with cooldown
-- [ ] Identity and fresh usage revalidation inside the candidate profile lease
+- [x] User-level, provider-specific, same-trust-domain definitions with immutable profile IDs and live whole-pool identity validation
+- [x] Persist every pool as default-disabled and require explicit live-validated enable/disable mutations; public selection and launch remain unavailable
+- [ ] Explicit per-invocation pool selection
+- [x] Bounded one-pass selection with invocation-local visited state and cooldown
+- [x] Identity and fresh usage revalidation inside the retained candidate profile reservation
 - [ ] Visible local profile, provider, trust-domain, and selection-reason notice before launch
-- [ ] No mid-session credential swap
-- [ ] No automatic command or prompt replay
+- [x] No mid-session credential swap in the selection/runtime interface
+- [x] No automatic command or prompt replay in the selection/handoff interface
 - [ ] Audit events containing no secret or stable account identifier
 - [ ] Continue the same logical conversation after confirmed exhaustion by advancing its profile-local thread generation
 
 ## Phase 4.5: required conversation handoff
 
 - [x] Decide that successful automatic failover continues the same user-visible conversation; see [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
-- [ ] Model one logical conversation as a lineage of profile-local provider threads
-- [ ] Bind every lineage generation to profile, canonical cwd, trust domain, thread ID, and exact rollout path
+- [x] Model one logical conversation as an ordered schema-v2 lineage of profile-local provider threads, with one active generation and one crash-durable handoff transition
+- [x] Bind every lineage generation to profile, canonical cwd, trust domain, thread ID, and a validated root-relative rollout locator
+- [x] Add a private-constructor Linux/macOS rollout-handoff capability with descriptor-relative containment, retained open-file identity, bounded SHA-256 fingerprinting, post-import source revalidation, and separate strict direct-fork/post-crash target projections; consume it only through transactional preparation
 - [x] Version-gate Codex's experimental `thread/fork.path` field and remote TUI contract with `codex app-server generate-json-schema --experimental --out <dir>` drift checks plus a synthetic runtime smoke test
 - [x] Extract a bounded, observe-only readiness relay with separate synthetic-fork and exact-resume policies; keep it internal and opaque after readiness (issue #48 and [ADR 0003](adr/0003-supervised-codex-session.md))
 - [x] Prove the default-unused coordinator/guardian authority, bounded lifecycle channel, guardian-direct fake process groups, exact reap, worker join, private runtime cleanup, descriptor non-inheritance, and retained-A crash behavior (issue #50)
@@ -76,14 +78,14 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [ ] Run and pass the non-ignored credential-free deterministic recovery fixture at all seven closed production checkpoints: startup queued, ready, active, suspended, retained quiescing, retained restore pending, and retained cleanup pending. The checkpoint must remain observation-only until the sole generation-bound `CFRCR` request; the first four cases expect failed-clean with zero inference calls and the retained three expect completed-clean with exactly one validated loopback call. Every case must pass the same four independent deletion proofs; the fourth namespace proof additionally requires the identity-checked private compatibility stage parent to be empty. The sealed `cfg(test)` compatibility seam and strict owner-private provider wrapper are recovery-phase evidence, not official Codex compatibility evidence
 - [ ] Run and pass the checksum-pinned official `0.144.4` `official-tui-normal` and `official-tui-recovery` scenarios on this exact tree and in their independent Linux/macOS matrix jobs. Both are designed to exercise the production coordinator/guardian session and shared guardian-bootstrap core through bounded package-only seams, pass the completion endpoint across real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries, and check the provider-release-only `CFCMP\x01\r\n` frame plus EOF at the parent. `CFCMP` is not owner, session, or shell success by itself. The test-only dispatcher bypasses the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser and persistent shell-anchor role, so these scenarios make no parser coverage claim. One aggregate gate must require `contracts`, `official-tui-normal`, and `official-tui-recovery`
 - [ ] Evaluate platform-owned containment for escaped `setsid(2)` descendants separately in issue #56. Until then, keep issue #55's zero-residue claim limited to Calcifer-owned direct children and known process groups plus identity-checked runtime, FD, and socket evidence
-- [ ] Wire that internal supervisor into public run/resume and the cross-profile transition transaction; keep selection, journaling, target fork, and cross-profile transition recovery disabled until their proofs are complete
-- [ ] Canonical containment, hard-link/symlink/owner/mode validation, serialized handoff, and complete source-to-target integration
+- [ ] Wire the internal supervisor adapter and transaction kernel into public run/resume; keep authoritative selection and target-fork activation disabled until their proofs are complete
+- [x] Integrate the implemented canonical containment and hard-link/symlink/owner/mode capability into the serialized source-to-target handoff
 - [x] Linux/macOS no-gap verified target reservation and one-shot guardian provider-lease transfer; internal and unused until supervised handoff integration
 - [ ] Stop and reap the old TUI and App Server before reading its rollout under the target profile
 - [ ] Preserve source effective settings while keeping authentication/provider routing target-profile-owned
-- [ ] Materialize a new target-profile rollout, atomically commit the generation, and reconcile non-idempotent fork crash ambiguity
+- [x] Add the internal one-boundary transaction driver that accepts a validated target fork, atomically commits the generation, and reconciles non-idempotent fork ambiguity with exactly one bounded retry
 - [ ] Keep the monitor event-only and require the official TUI before accepting a new turn
-- [ ] Restore transcript only; never replay an interrupted turn
+- [x] Keep prompt, command, approval, tool-action, and transcript payloads outside the transaction interface so recovery cannot replay an interrupted turn
 
 ## Phase 5: Claude support
 

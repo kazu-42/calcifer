@@ -50,6 +50,7 @@ use super::guardian::{
     PackagedSecondRetention, ProductionGuardianConfig, packaged_concrete_second_retention_for_test,
     run_production_guardian_with_test_seams, write_packaged_startup_failure_marker,
 };
+use super::launcher::PACKAGED_TUI_READINESS_FAILURE_MARKERS;
 use super::process::{ManagedGroupChild, shutdown_app_server_child};
 use super::protocol::{
     ChildDisposition, ChildRole, CleanupStatus, GuardianExitDisposition, SessionStatus, StopAction,
@@ -71,8 +72,8 @@ use super::startup::{
     PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS,
 };
 use super::terminal::{
-    PtyMaster, PtyOwner, RecoveryTty, TerminalChannelPair, TerminalEndpoint, TerminalSize,
-    claim_controlling_terminal_from_stdin, termios_semantically_equal,
+    PtyMaster, PtyOwner, RecoveryTty, TerminalBuffer, TerminalChannelPair, TerminalEndpoint,
+    TerminalRead, TerminalSize, claim_controlling_terminal_from_stdin, termios_semantically_equal,
     verify_controlling_terminal_from_stdin,
 };
 use crate::profiles::{CoordinatorProfileLease, Provider, Registry, TargetGuardianLease};
@@ -626,6 +627,13 @@ const PACKAGE_CONCRETE_SECOND_RETENTION_HELPER_TEST: &str = concat!(
     "packaged_deterministic_second_retention_keeps_concrete_startup_cleanup_owner_until_owned_reap"
 );
 const PACKAGE_CONCRETE_SECOND_RETENTION_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
+const PACKAGE_RESUME_REAL_PROCESS_HELPER_ENV: &str = "CALCIFER_PACKAGE_RESUME_REAL_PROCESS_HELPER";
+const PACKAGE_RESUME_REAL_PROCESS_HELPER_TEST: &str = concat!(
+    "providers::codex::supervisor::packaged_smoke::",
+    "package_resume_real_process_preserves_stale_cont_resize_and_publication_order"
+);
+const PACKAGE_RESUME_REAL_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+const PACKAGE_RESUME_REAL_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const PACKAGE_RECOVERY_CHECKPOINT_WIRE_NAMES: [(RecoveryCheckpoint, &str); 7] = [
     (RecoveryCheckpoint::StartupQueued, "startup-queued-v1"),
@@ -1973,6 +1981,16 @@ const PACKAGE_NETWORK_FAILURE_MARKERS: &[&str] = &[
     "package-network.evidence-reference.api-openai",
     "package-network.evidence-missing",
 ];
+const PACKAGE_RESUME_APPLY_ORIGIN_MARKERS: [&str; 8] = [
+    "exercise.job-control-failed.resume-apply.origin.size-write",
+    "exercise.job-control-failed.resume-apply.origin.coordinator-wait",
+    "exercise.job-control-failed.resume-apply.origin.coordinator-exited",
+    "exercise.job-control-failed.resume-apply.origin.continue-signal",
+    "exercise.job-control-failed.resume-apply.origin.observe-read",
+    "exercise.job-control-failed.resume-apply.origin.observe-invalid",
+    "exercise.job-control-failed.resume-apply.origin.observe-deadline-io",
+    "exercise.job-control-failed.resume-apply.origin.observe-deadline-fence",
+];
 const PACKAGE_JOB_CONTROL_FAILURE_MARKERS: [&str; 8] = [
     "exercise.job-control-failed.tui-stop-wait",
     "exercise.job-control-failed.tui-stopped-snapshot",
@@ -2274,6 +2292,136 @@ impl fmt::Display for PackageJobControlFailure {
 
 impl Error for PackageJobControlFailure {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageResumeApplyOrigin {
+    SizeWrite,
+    CoordinatorWait,
+    CoordinatorExited,
+    ContinueSignal,
+    ObserveRead,
+    ObserveInvalid,
+    ObserveDeadlineIo,
+    ObserveDeadlineFence,
+}
+
+impl PackageResumeApplyOrigin {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::SizeWrite => "exercise.job-control-failed.resume-apply.origin.size-write",
+            Self::CoordinatorWait => {
+                "exercise.job-control-failed.resume-apply.origin.coordinator-wait"
+            }
+            Self::CoordinatorExited => {
+                "exercise.job-control-failed.resume-apply.origin.coordinator-exited"
+            }
+            Self::ContinueSignal => {
+                "exercise.job-control-failed.resume-apply.origin.continue-signal"
+            }
+            Self::ObserveRead => "exercise.job-control-failed.resume-apply.origin.observe-read",
+            Self::ObserveInvalid => {
+                "exercise.job-control-failed.resume-apply.origin.observe-invalid"
+            }
+            Self::ObserveDeadlineIo => {
+                "exercise.job-control-failed.resume-apply.origin.observe-deadline-io"
+            }
+            Self::ObserveDeadlineFence => {
+                "exercise.job-control-failed.resume-apply.origin.observe-deadline-fence"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PackageResumeCoordinatorSignalOutcome {
+    result: Result<(), PackageResumeApplyOrigin>,
+    exact_wait_observed: bool,
+}
+
+fn signal_package_resume_coordinator_with<Wait, Signal, WaitError, SignalError>(
+    try_wait: Wait,
+    send_signal: Signal,
+) -> PackageResumeCoordinatorSignalOutcome
+where
+    Wait: FnOnce() -> Result<bool, WaitError>,
+    Signal: FnOnce() -> Result<(), SignalError>,
+{
+    match try_wait() {
+        Err(_) => PackageResumeCoordinatorSignalOutcome {
+            result: Err(PackageResumeApplyOrigin::CoordinatorWait),
+            exact_wait_observed: false,
+        },
+        Ok(true) => PackageResumeCoordinatorSignalOutcome {
+            result: Err(PackageResumeApplyOrigin::CoordinatorExited),
+            exact_wait_observed: true,
+        },
+        Ok(false) => PackageResumeCoordinatorSignalOutcome {
+            result: send_signal().map_err(|_| PackageResumeApplyOrigin::ContinueSignal),
+            exact_wait_observed: false,
+        },
+    }
+}
+
+fn apply_package_resume_size_with<Apply, ApplyError>(
+    apply: Apply,
+) -> Result<(), PackageResumeApplyOrigin>
+where
+    Apply: FnOnce() -> Result<(), ApplyError>,
+{
+    apply().map_err(|_| PackageResumeApplyOrigin::SizeWrite)
+}
+
+fn record_package_resume_apply_failure_with<Record>(
+    first_origin: &mut Option<PackageResumeApplyOrigin>,
+    candidate: PackageResumeApplyOrigin,
+    mut record: Record,
+) where
+    Record: FnMut(&'static str),
+{
+    if first_origin.is_none() {
+        *first_origin = Some(candidate);
+        record(candidate.marker());
+    }
+    record(PackageJobControlFailure::ResumeApply.marker());
+}
+
+fn record_package_resume_apply_failure(
+    report: &Path,
+    first_origin: &mut Option<PackageResumeApplyOrigin>,
+    candidate: PackageResumeApplyOrigin,
+) {
+    record_package_resume_apply_failure_with(first_origin, candidate, |marker| {
+        record_package_diagnostic_marker(report, marker);
+    });
+}
+
+fn classify_package_resume_apply_stage<T, E>(
+    report: &Path,
+    first_origin: &mut Option<PackageResumeApplyOrigin>,
+    origin: PackageResumeApplyOrigin,
+    result: Result<T, E>,
+) -> Result<T, Box<dyn Error>> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            record_package_resume_apply_failure(report, first_origin, origin);
+            Err(Box::new(PackageJobControlFailure::ResumeApply))
+        }
+    }
+}
+
+fn classify_package_resume_apply_origin<T>(
+    report: &Path,
+    first_origin: &mut Option<PackageResumeApplyOrigin>,
+    result: Result<T, PackageResumeApplyOrigin>,
+) -> Result<T, Box<dyn Error>> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(origin) => {
+            classify_package_resume_apply_stage(report, first_origin, origin, Err::<T, _>(origin))
+        }
+    }
+}
+
 fn classify_package_job_control_stage<T, E>(
     report: &Path,
     failure: PackageJobControlFailure,
@@ -2320,6 +2468,561 @@ fn package_job_control_failures_are_closed_fixed_and_payload_free() {
         failure.to_string() == "the package job-control proof failed"
             && !format!("{failure:?}").contains("private")
     }));
+}
+
+#[test]
+fn package_resume_apply_origins_are_closed_ordered_unique_and_payload_free() {
+    let origins = [
+        PackageResumeApplyOrigin::SizeWrite,
+        PackageResumeApplyOrigin::CoordinatorWait,
+        PackageResumeApplyOrigin::CoordinatorExited,
+        PackageResumeApplyOrigin::ContinueSignal,
+        PackageResumeApplyOrigin::ObserveRead,
+        PackageResumeApplyOrigin::ObserveInvalid,
+        PackageResumeApplyOrigin::ObserveDeadlineIo,
+        PackageResumeApplyOrigin::ObserveDeadlineFence,
+    ];
+    assert_eq!(
+        origins.map(PackageResumeApplyOrigin::marker),
+        PACKAGE_RESUME_APPLY_ORIGIN_MARKERS
+    );
+    let markers = origins
+        .iter()
+        .copied()
+        .map(PackageResumeApplyOrigin::marker)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(markers.len(), origins.len());
+    assert!(markers.iter().all(|marker| {
+        marker.is_ascii()
+            && marker.starts_with("exercise.job-control-failed.resume-apply.origin.")
+            && marker.len() <= 96
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
+}
+
+#[test]
+fn package_resume_apply_classifier_publishes_first_origin_before_generic_and_is_sticky() {
+    let mut first_origin = None;
+    let mut published = Vec::new();
+    record_package_resume_apply_failure_with(
+        &mut first_origin,
+        PackageResumeApplyOrigin::SizeWrite,
+        |marker| published.push(marker),
+    );
+    record_package_resume_apply_failure_with(
+        &mut first_origin,
+        PackageResumeApplyOrigin::ObserveDeadlineFence,
+        |marker| published.push(marker),
+    );
+
+    assert_eq!(first_origin, Some(PackageResumeApplyOrigin::SizeWrite));
+    assert_eq!(
+        published,
+        [
+            PackageResumeApplyOrigin::SizeWrite.marker(),
+            PackageJobControlFailure::ResumeApply.marker(),
+            PackageJobControlFailure::ResumeApply.marker(),
+        ],
+        "the first exact origin must precede the generic marker and later failures cannot replace it"
+    );
+}
+
+#[test]
+fn package_resume_apply_classifier_records_nothing_on_success_and_redacts_failure_payload()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let mut first_origin = None;
+
+    assert_eq!(
+        classify_package_resume_apply_stage(
+            &report,
+            &mut first_origin,
+            PackageResumeApplyOrigin::SizeWrite,
+            Ok::<_, &str>(7_u8),
+        )?,
+        7
+    );
+    assert_eq!(first_origin, None);
+    assert!(
+        PACKAGE_RESUME_APPLY_ORIGIN_MARKERS
+            .iter()
+            .all(|marker| !report.join(marker).exists())
+    );
+
+    let error = require_rejected_test_result(
+        classify_package_resume_apply_stage::<(), _>(
+            &report,
+            &mut first_origin,
+            PackageResumeApplyOrigin::SizeWrite,
+            Err("private PTY and credential payload"),
+        ),
+        "a failed resume-apply stage was accepted",
+    )?;
+    assert_eq!(error.to_string(), "the package job-control proof failed");
+    assert!(!format!("{error:?}").contains("private PTY"));
+    assert_eq!(first_origin, Some(PackageResumeApplyOrigin::SizeWrite));
+    assert_eq!(
+        read_private_bounded(
+            &report.join(PackageResumeApplyOrigin::SizeWrite.marker()),
+            64,
+        )?,
+        b"classified\n"
+    );
+    assert_eq!(
+        read_private_bounded(
+            &report.join(PackageJobControlFailure::ResumeApply.marker()),
+            64,
+        )?,
+        b"classified\n"
+    );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_resume_coordinator_fault_seam_preserves_wait_exit_and_signal_origins() {
+    assert_eq!(
+        apply_package_resume_size_with(|| Err::<(), _>("private ioctl error")),
+        Err(PackageResumeApplyOrigin::SizeWrite)
+    );
+    assert_eq!(
+        apply_package_resume_size_with(|| Ok::<(), &str>(())),
+        Ok(())
+    );
+
+    let wait_failed = signal_package_resume_coordinator_with(
+        || Err::<bool, _>("private wait error"),
+        || Ok::<(), &str>(()),
+    );
+    assert_eq!(
+        wait_failed,
+        PackageResumeCoordinatorSignalOutcome {
+            result: Err(PackageResumeApplyOrigin::CoordinatorWait),
+            exact_wait_observed: false,
+        }
+    );
+
+    let signal_called = std::cell::Cell::new(false);
+    let exited = signal_package_resume_coordinator_with(
+        || Ok::<bool, &str>(true),
+        || {
+            signal_called.set(true);
+            Ok::<(), &str>(())
+        },
+    );
+    assert_eq!(
+        exited,
+        PackageResumeCoordinatorSignalOutcome {
+            result: Err(PackageResumeApplyOrigin::CoordinatorExited),
+            exact_wait_observed: true,
+        }
+    );
+    assert!(!signal_called.get());
+
+    let signal_failed = signal_package_resume_coordinator_with(
+        || Ok::<bool, &str>(false),
+        || Err::<(), _>("private signal error"),
+    );
+    assert_eq!(
+        signal_failed,
+        PackageResumeCoordinatorSignalOutcome {
+            result: Err(PackageResumeApplyOrigin::ContinueSignal),
+            exact_wait_observed: false,
+        }
+    );
+
+    assert_eq!(
+        signal_package_resume_coordinator_with(|| Ok::<bool, &str>(false), || Ok::<(), &str>(()),),
+        PackageResumeCoordinatorSignalOutcome {
+            result: Ok(()),
+            exact_wait_observed: false,
+        }
+    );
+}
+
+#[test]
+fn package_resume_observation_fault_seam_preserves_read_invalid_and_deadline_authority() {
+    let origin = Instant::now();
+    let path = Path::new("/tmp/resume.live");
+    let expected = b"43 125\n";
+    let deadline = origin + Duration::from_secs(1);
+
+    let read_failed = observe_package_resume_marker_with_reader_clock_and_sleep(
+        path,
+        expected,
+        PackageExerciseDeadline {
+            deadline,
+            authority: PackageExerciseDeadlineAuthority::RequestedIo,
+        },
+        |_, _| Err(io::Error::new(io::ErrorKind::PermissionDenied, "private")),
+        || origin,
+        |_| {},
+    );
+    assert_eq!(read_failed, Err(PackageResumeApplyOrigin::ObserveRead));
+
+    let invalid = observe_package_resume_marker_with_reader_clock_and_sleep(
+        path,
+        expected,
+        PackageExerciseDeadline {
+            deadline,
+            authority: PackageExerciseDeadlineAuthority::RequestedIo,
+        },
+        |_, _| Ok(b"private payload\n".to_vec()),
+        || origin,
+        |_| {},
+    );
+    assert_eq!(invalid, Err(PackageResumeApplyOrigin::ObserveInvalid));
+
+    for (authority, expected_origin) in [
+        (
+            PackageExerciseDeadlineAuthority::RequestedIo,
+            PackageResumeApplyOrigin::ObserveDeadlineIo,
+        ),
+        (
+            PackageExerciseDeadlineAuthority::GenerationFence,
+            PackageResumeApplyOrigin::ObserveDeadlineFence,
+        ),
+    ] {
+        let now_calls = std::cell::Cell::new(0_u8);
+        let missing = observe_package_resume_marker_with_reader_clock_and_sleep(
+            path,
+            expected,
+            PackageExerciseDeadline {
+                deadline,
+                authority,
+            },
+            |_, _| Err(io::Error::from(io::ErrorKind::NotFound)),
+            || {
+                let call = now_calls.get();
+                now_calls.set(call.saturating_add(1));
+                if call < 2 { origin } else { deadline }
+            },
+            |_| {},
+        );
+        assert_eq!(missing, Err(expected_origin));
+    }
+
+    let success = observe_package_resume_marker_with_reader_clock_and_sleep(
+        path,
+        expected,
+        PackageExerciseDeadline {
+            deadline,
+            authority: PackageExerciseDeadlineAuthority::RequestedIo,
+        },
+        |_, _| Ok(expected.to_vec()),
+        || origin,
+        |_| {},
+    );
+    assert_eq!(success, Ok(()));
+}
+
+fn wait_for_package_resume_real_process_size_with<Observe, Now, Wait>(
+    expected: TerminalSize,
+    deadline: Instant,
+    mut observe: Observe,
+    mut now: Now,
+    mut wait: Wait,
+) -> Result<(), Box<dyn Error>>
+where
+    Observe: FnMut() -> Result<TerminalSize, Box<dyn Error>>,
+    Now: FnMut() -> Instant,
+    Wait: FnMut(Duration),
+{
+    loop {
+        if now() >= deadline {
+            return Err("resume real-process terminal size exceeded its deadline".into());
+        }
+        let observed = observe()?;
+        let observed_at = now();
+        if observed_at >= deadline {
+            return Err("resume real-process terminal size exceeded its deadline".into());
+        }
+        if observed == expected {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(observed_at);
+        wait(remaining.min(PACKAGE_RESUME_REAL_PROCESS_POLL_INTERVAL));
+    }
+}
+
+#[test]
+fn package_resume_real_process_size_wait_is_bounded_and_retries_only_mismatch()
+-> Result<(), Box<dyn Error>> {
+    let origin = Instant::now();
+    let deadline = origin
+        .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+        .ok_or("resume real-process size deadline overflowed")?;
+    let expected = PACKAGE_SUPERVISOR_RESUMED_SIZE;
+    let observations = std::cell::Cell::new(0_u8);
+    let waits = std::cell::Cell::new(0_u8);
+    wait_for_package_resume_real_process_size_with(
+        expected,
+        deadline,
+        || {
+            let observation = observations.get();
+            observations.set(observation.saturating_add(1));
+            Ok(if observation == 0 {
+                PACKAGE_SUPERVISOR_INITIAL_SIZE
+            } else {
+                expected
+            })
+        },
+        || origin,
+        |duration| {
+            assert_eq!(duration, PACKAGE_RESUME_REAL_PROCESS_POLL_INTERVAL);
+            waits.set(waits.get().saturating_add(1));
+        },
+    )?;
+    assert_eq!(observations.get(), 2);
+    assert_eq!(waits.get(), 1);
+
+    let failed_read_waits = std::cell::Cell::new(0_u8);
+    let error = require_rejected_test_result(
+        wait_for_package_resume_real_process_size_with(
+            expected,
+            deadline,
+            || Err("fixed size read failure".into()),
+            || origin,
+            |_| failed_read_waits.set(failed_read_waits.get().saturating_add(1)),
+        ),
+        "a terminal-size read failure was retried",
+    )?;
+    assert_eq!(error.to_string(), "fixed size read failure");
+    assert_eq!(failed_read_waits.get(), 0);
+
+    let expired_observations = std::cell::Cell::new(0_u8);
+    let error = require_rejected_test_result(
+        wait_for_package_resume_real_process_size_with(
+            expected,
+            deadline,
+            || {
+                expired_observations.set(expired_observations.get().saturating_add(1));
+                Ok(expected)
+            },
+            || deadline,
+            |_| {},
+        ),
+        "an expired terminal-size wait performed an observation",
+    )?;
+    assert_eq!(
+        error.to_string(),
+        "resume real-process terminal size exceeded its deadline"
+    );
+    assert_eq!(expired_observations.get(), 0);
+
+    let crossing_now_calls = std::cell::Cell::new(0_u8);
+    let error = require_rejected_test_result(
+        wait_for_package_resume_real_process_size_with(
+            expected,
+            deadline,
+            || Ok(expected),
+            || {
+                let call = crossing_now_calls.get();
+                crossing_now_calls.set(call.saturating_add(1));
+                if call == 0 { origin } else { deadline }
+            },
+            |_| {},
+        ),
+        "a terminal-size observation crossing its deadline was accepted",
+    )?;
+    assert_eq!(
+        error.to_string(),
+        "resume real-process terminal size exceeded its deadline"
+    );
+    assert_eq!(crossing_now_calls.get(), 2);
+    Ok(())
+}
+
+struct PackageResumeRealProcessChild {
+    child: Option<Child>,
+}
+
+impl PackageResumeRealProcessChild {
+    fn pid(&self) -> Result<rustix::process::Pid, Box<dyn Error>> {
+        self.child
+            .as_ref()
+            .map(rustix::process::Pid::from_child)
+            .ok_or_else(|| "resume real-process child was already consumed".into())
+    }
+
+    fn wait_success(
+        &mut self,
+        master: &PtyMaster,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn Error>> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or("resume real-process child was already consumed")?;
+        let mut output = TerminalBuffer::new();
+        loop {
+            loop {
+                if Instant::now() >= deadline {
+                    return Err("resume real-process child exceeded its deadline".into());
+                }
+                match master.read_into(&mut output)? {
+                    TerminalRead::Data(_) => {}
+                    TerminalRead::EndOfStream | TerminalRead::WouldBlock => break,
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("resume real-process child exceeded its deadline".into());
+            }
+            if let Some(status) = child.try_wait()? {
+                self.child.take();
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err("resume real-process child did not exit successfully".into())
+                };
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let _ = kill_and_reap_unproven_cleanup_child(&mut child)?;
+        Ok(())
+    }
+}
+
+impl Drop for PackageResumeRealProcessChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = kill_and_reap_unproven_cleanup_child(&mut child);
+        }
+    }
+}
+
+fn run_package_resume_real_process_helper() -> Result<(), Box<dyn Error>> {
+    let root = PathBuf::from(
+        std::env::var_os(PACKAGE_RESUME_REAL_PROCESS_HELPER_ENV)
+            .ok_or("resume real-process helper root was missing")?,
+    );
+    let root = fs::canonicalize(root)?;
+    validate_private_directory(&root)?;
+    if fs::read(root.join("owner.marker"))? != b"calcifer-package-smoke-v1\n" {
+        return Err("resume real-process helper root ownership marker was invalid".into());
+    }
+    let report = root.join("supervisor-report");
+    validate_private_directory(&report)?;
+
+    claim_controlling_terminal_from_stdin()?;
+    write_private_atomic_new(&report.join("resume-test.ready"), b"ready\n")?;
+    let deadline = Instant::now()
+        .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+        .ok_or("resume real-process helper deadline overflowed")?;
+    wait_for_private_marker(&report.join("resume-test.stop"), b"stop\n", deadline)?;
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)?;
+
+    verify_controlling_terminal_from_stdin()?;
+    let stdin = io::stdin();
+    // Linux may schedule the continued child before the PTY master's window
+    // update is visible through the slave. Keep the proof inside the original
+    // absolute helper deadline instead of assuming one immediate read.
+    wait_for_package_resume_real_process_size_with(
+        PACKAGE_SUPERVISOR_RESUMED_SIZE,
+        deadline,
+        || Ok(rustix::termios::tcgetwinsize(&stdin)?.into()),
+        Instant::now,
+        thread::sleep,
+    )?;
+    write_private_atomic_new(&report.join("resume.live"), b"43 125\n")
+}
+
+#[test]
+fn package_resume_real_process_preserves_stale_cont_resize_and_publication_order()
+-> Result<(), Box<dyn Error>> {
+    if std::env::var_os(PACKAGE_RESUME_REAL_PROCESS_HELPER_ENV).is_some() {
+        return run_package_resume_real_process_helper();
+    }
+
+    let _process_guard = package_process_test_guard();
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let owner = PtyOwner::open(PACKAGE_SUPERVISOR_INITIAL_SIZE)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            PACKAGE_RESUME_REAL_PROCESS_HELPER_TEST,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PACKAGE_RESUME_REAL_PROCESS_HELPER_ENV, &scratch.root);
+    let master = owner.configure_child(&mut command)?;
+    master.enable_nonblocking()?;
+    let mut child = PackageResumeRealProcessChild {
+        child: Some(command.spawn()?),
+    };
+    let pid = child.pid()?;
+    let process_group = pid.as_raw_nonzero().get();
+    let mut exercise_phase = Some("resume-real-process.ready");
+    let exercise = (|| -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now()
+            .checked_add(PACKAGE_RESUME_REAL_PROCESS_TIMEOUT)
+            .ok_or("resume real-process deadline overflowed")?;
+        wait_for_private_marker(&report.join("resume-test.ready"), b"ready\n", deadline)?;
+
+        // This CONT is deliberately delivered while the exact child is still
+        // running. It must not remain latched across the later self-stop.
+        exercise_phase = Some("resume-real-process.stale-cont");
+        rustix::process::kill_process(pid, rustix::process::Signal::CONT)?;
+        write_private_atomic_new(&report.join("resume-test.stop"), b"stop\n")?;
+        exercise_phase = Some("resume-real-process.stopped");
+        let stopped = wait_for_stable_stopped_package_group(process_group, deadline)?;
+        if !stopped.iter().any(|state| state.pid == process_group) {
+            return Err("resume real-process child was absent from its stopped group".into());
+        }
+
+        exercise_phase = Some("resume-real-process.resize");
+        master.set_size(PACKAGE_SUPERVISOR_RESUMED_SIZE)?;
+        if master.size()? != PACKAGE_SUPERVISOR_RESUMED_SIZE {
+            return Err("stopped PTY resize did not round-trip".into());
+        }
+        match read_private_bounded(&report.join("resume.live"), 16) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err("resume marker was visible before the fresh CONT".into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        exercise_phase = Some("resume-real-process.fresh-cont");
+        rustix::process::kill_process(pid, rustix::process::Signal::CONT)?;
+        exercise_phase = Some("resume-real-process.publication");
+        observe_package_resume_marker(
+            &report.join("resume.live"),
+            b"43 125\n",
+            PackageExerciseDeadline {
+                deadline,
+                authority: PackageExerciseDeadlineAuthority::RequestedIo,
+            },
+        )
+        .map_err(|_| "resume real-process marker observation failed")?;
+        exercise_phase = Some("resume-real-process.child-exit");
+        child.wait_success(&master, deadline)
+    })();
+    drop(master);
+    let child_cleanup = child.cleanup();
+    let scratch_cleanup = scratch.cleanup();
+    let cleanup_phase = match (&child_cleanup, &scratch_cleanup) {
+        (Err(_), _) => Some("resume-real-process.child-cleanup"),
+        (Ok(()), Err(_)) => Some("resume-real-process.scratch-cleanup"),
+        (Ok(()), Ok(())) => None,
+    };
+    let cleanup = match (child_cleanup, scratch_cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(_), Err(_)) => Err("resume real-process child and scratch cleanup failed".into()),
+    };
+    combine_package_exercise_and_cleanup_at_phases(exercise, cleanup, exercise_phase, cleanup_phase)
 }
 
 #[test]
@@ -2378,6 +3081,137 @@ fn package_failure_report_scanner_bridges_only_the_closed_job_control_catalog()
         None,
         "the scanner must reject an unknown job-control filename"
     );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_resume_apply_origin_scanner_is_closed_unambiguous_and_rejects_hostile_inputs()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+
+    for marker in PACKAGE_RESUME_APPLY_ORIGIN_MARKERS {
+        let path = report.join(marker);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            latest_fixed_package_resume_apply_origin_from_report(&report),
+            Some(marker)
+        );
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some(marker)
+        );
+        fs::remove_file(path)?;
+    }
+
+    let generic = PackageJobControlFailure::ResumeApply.marker();
+    let exact = PackageResumeApplyOrigin::ObserveDeadlineIo.marker();
+    write_private_new(&report.join(generic), b"classified\n")?;
+    write_private_new(&report.join(exact), b"classified\n")?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some(exact),
+        "the exact resume origin must precede its generic resume-apply marker"
+    );
+    fs::remove_file(report.join(exact))?;
+    fs::remove_file(report.join(generic))?;
+
+    let first = PackageResumeApplyOrigin::SizeWrite.marker();
+    let second = PackageResumeApplyOrigin::ContinueSignal.marker();
+    write_private_new(&report.join(first), b"classified\n")?;
+    write_private_new(&report.join(second), b"classified\n")?;
+    assert_eq!(
+        latest_fixed_package_resume_apply_origin_from_report(&report),
+        None,
+        "catalog order must not invent chronology for ambiguous exact origins"
+    );
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None
+    );
+    fs::remove_file(report.join(first))?;
+    fs::remove_file(report.join(second))?;
+
+    for rejected in [
+        "exercise.job-control-failed.resume-apply.origin",
+        "exercise.job-control-failed.resume-apply.origin.user-controlled",
+        "exercise.job-control-failed.resume-apply.origin.observe-read.extended",
+    ] {
+        let path = report.join(rejected);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            latest_fixed_package_resume_apply_origin_from_report(&report),
+            None,
+            "a prefix-only, unknown, or extended resume origin was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    let marker_path = report.join(PackageResumeApplyOrigin::ObserveRead.marker());
+    for payload in [
+        b"private\n".as_slice(),
+        b"classified\nprivate-provider-payload\n".as_slice(),
+    ] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            latest_fixed_package_resume_apply_origin_from_report(&report),
+            None,
+            "a payload-bearing or oversized resume origin was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("resume-origin-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        latest_fixed_package_resume_apply_origin_from_report(&report),
+        None,
+        "a symlinked resume origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        latest_fixed_package_resume_apply_origin_from_report(&report),
+        None,
+        "a hardlinked resume origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        latest_fixed_package_resume_apply_origin_from_report(&report),
+        None,
+        "a wrong-mode resume origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let fifo_status = Command::new("/usr/bin/mkfifo").arg(&marker_path).status()?;
+    if !fifo_status.success() {
+        return Err("could not create the resume-origin FIFO fixture".into());
+    }
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(
+        latest_fixed_package_resume_apply_origin_from_report(&report),
+        None,
+        "a FIFO resume origin was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let socket_source = scratch.root.join("resume-origin.socket");
+    let socket_listener = UnixListener::bind(&socket_source)?;
+    fs::set_permissions(&socket_source, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&socket_source, &marker_path)?;
+    assert_eq!(
+        latest_fixed_package_resume_apply_origin_from_report(&report),
+        None,
+        "a socket resume origin was trusted"
+    );
+    drop(socket_listener);
+    fs::remove_file(marker_path)?;
     scratch.cleanup()
 }
 
@@ -2542,7 +3376,27 @@ fn package_official_tui_group_failures_are_closed_fixed_and_payload_free() {
     ];
     let mut markers = vec![
         PackageOfficialTuiGroupFailure::Leader.marker(),
-        PackageOfficialTuiGroupFailure::JobIdentity.marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::InvalidPid,
+        )
+        .marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::ProcessGroupQuery,
+        )
+        .marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::ProcessGroupMismatch,
+        )
+        .marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::SessionQuery,
+        )
+        .marker(),
+        PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+        )
+        .marker(),
+        "exercise.tui-group-validation-failed.job-identity",
         PackageOfficialTuiGroupFailure::Empty.marker(),
         PackageOfficialTuiGroupFailure::Snapshot.marker(),
         PackageOfficialTuiGroupFailure::NotStablyLiveNoObservation.marker(),
@@ -2568,6 +3422,93 @@ fn package_official_tui_group_failures_are_closed_fixed_and_payload_free() {
     markers.sort_unstable();
     markers.dedup();
     assert_eq!(markers.len(), marker_count);
+}
+
+#[test]
+fn package_official_tui_job_identity_observer_classifies_every_closed_boundary() {
+    use PackageOfficialTuiJobIdentityFailure::{
+        InvalidPid, ProcessGroupMismatch, ProcessGroupQuery, SessionMismatch, SessionQuery,
+    };
+
+    let tui = PackageChildMarker {
+        pid: 101,
+        pgid: 101,
+    };
+    let cases = [
+        (
+            PackageChildMarker { pid: 0, pgid: 0 },
+            Err(InvalidPid),
+            Ok(101),
+            Ok(101),
+        ),
+        (
+            PackageChildMarker { pid: -1, pgid: -1 },
+            Err(InvalidPid),
+            Ok(101),
+            Ok(101),
+        ),
+        (tui, Err(ProcessGroupQuery), Err(()), Ok(101)),
+        (tui, Err(ProcessGroupMismatch), Ok(202), Ok(101)),
+        (tui, Err(SessionQuery), Ok(101), Err(())),
+        (tui, Err(SessionMismatch), Ok(101), Ok(202)),
+        (tui, Ok(()), Ok(101), Ok(101)),
+    ];
+
+    for (marker, expected, process_group, session) in cases {
+        let mut process_group_calls = 0;
+        let mut session_calls = 0;
+        let actual = validate_official_tui_job_identity_with_observer(
+            marker,
+            |_| {
+                process_group_calls += 1;
+                process_group
+            },
+            |_| {
+                session_calls += 1;
+                session
+            },
+        )
+        .map_err(|failure| match failure {
+            PackageOfficialTuiGroupFailure::JobIdentity(detail) => detail,
+            other => panic!("unexpected official-TUI identity failure: {other:?}"),
+        });
+
+        assert_eq!(actual, expected);
+        if marker.pid <= 0 {
+            assert_eq!((process_group_calls, session_calls), (0, 0));
+        } else if process_group.is_err() || process_group != Ok(marker.pgid) {
+            assert_eq!((process_group_calls, session_calls), (1, 0));
+        } else {
+            assert_eq!((process_group_calls, session_calls), (1, 1));
+        }
+    }
+}
+
+#[test]
+fn package_official_tui_job_identity_publishes_exact_detail_before_generic_marker()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let failure = PackageOfficialTuiGroupFailure::JobIdentity(
+        PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+    );
+
+    record_package_official_tui_group_failure(&report, failure);
+
+    assert!(fixed_package_failure_marker_is_valid(
+        &report,
+        "exercise.tui-group-validation-failed.job-identity.session-mismatch"
+    ));
+    assert!(fixed_package_failure_marker_is_valid(
+        &report,
+        "exercise.tui-group-validation-failed.job-identity"
+    ));
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some("exercise.tui-group-validation-failed.job-identity.session-mismatch")
+    );
+    scratch.cleanup()
 }
 
 #[test]
@@ -2671,14 +3612,21 @@ fn package_official_tui_descriptor_scan_stops_retry_when_job_identity_is_lost() 
             if liveness_checks == 1 {
                 Ok(())
             } else {
-                Err(PackageOfficialTuiGroupFailure::JobIdentity)
+                Err(PackageOfficialTuiGroupFailure::JobIdentity(
+                    PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+                ))
             }
         },
         |_| waits += 1,
         || origin,
     );
 
-    assert_eq!(result, Err(PackageOfficialTuiGroupFailure::JobIdentity));
+    assert_eq!(
+        result,
+        Err(PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+        ))
+    );
     assert_eq!(observation_calls, 1);
     assert_eq!(liveness_checks, 2);
     assert_eq!(waits, 0);
@@ -2731,14 +3679,21 @@ fn package_official_tui_descriptor_scan_rejects_identity_loss_after_success() {
             if liveness_checks == 1 {
                 Ok(())
             } else {
-                Err(PackageOfficialTuiGroupFailure::JobIdentity)
+                Err(PackageOfficialTuiGroupFailure::JobIdentity(
+                    PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+                ))
             }
         },
         |_| panic!("a successful scan must not enter the retry wait"),
         || origin,
     );
 
-    assert_eq!(result, Err(PackageOfficialTuiGroupFailure::JobIdentity));
+    assert_eq!(
+        result,
+        Err(PackageOfficialTuiGroupFailure::JobIdentity(
+            PackageOfficialTuiJobIdentityFailure::SessionMismatch,
+        ))
+    );
     assert_eq!(observation_calls, 1);
     assert_eq!(liveness_checks, 2);
 }
@@ -2979,6 +3934,95 @@ fn package_failure_report_scanner_bridges_only_the_closed_official_tui_group_cat
         None,
         "the scanner must not return a prefix match or a raw report filename"
     );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_official_tui_job_identity_scanner_rejects_hostile_nodes() -> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    let marker = "exercise.tui-group-validation-failed.job-identity.session-query";
+    let marker_path = report.join(marker);
+
+    for rejected in [
+        "exercise.tui-group-validation-failed.job-identity",
+        "exercise.tui-group-validation-failed.job-identity.user-controlled",
+        "exercise.tui-group-validation-failed.job-identity.session-query.extended",
+    ] {
+        let path = report.join(rejected);
+        write_private_new(&path, b"private\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a prefix-only, unknown, extended, or payload-bearing subtype was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    for payload in [
+        b"private\n".as_slice(),
+        b"classified\nprivate-provider-payload\n".as_slice(),
+    ] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            None,
+            "a payload-bearing or oversized subtype was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("job-identity-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a symlinked subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a hardlinked subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a wrong-mode subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let fifo_status = Command::new("/usr/bin/mkfifo").arg(&marker_path).status()?;
+    if !fifo_status.success() {
+        return Err("could not create the job-identity subtype FIFO fixture".into());
+    }
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a FIFO subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+
+    let socket_source = scratch.root.join("job-identity-subtype.socket");
+    let socket_listener = UnixListener::bind(&socket_source)?;
+    fs::set_permissions(&socket_source, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&socket_source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        None,
+        "a socket subtype was trusted"
+    );
+    drop(socket_listener);
+    fs::remove_file(marker_path)?;
     scratch.cleanup()
 }
 
@@ -3514,6 +4558,110 @@ fn package_failure_report_scanner_bridges_only_the_closed_app_socket_catalog()
         None,
         "the scanner must not return a prefix match or a raw report filename"
     );
+    scratch.cleanup()
+}
+
+#[test]
+fn package_failure_report_scanner_bridges_every_closed_tui_readiness_subtype()
+-> Result<(), Box<dyn Error>> {
+    let catalog: BTreeSet<_> = PACKAGED_TUI_READINESS_FAILURE_MARKERS
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(catalog.len(), PACKAGED_TUI_READINESS_FAILURE_MARKERS.len());
+    assert!(catalog.iter().all(|marker| {
+        marker.is_ascii()
+            && marker.starts_with("startup-failure.tui-readiness.subtype.")
+            && !marker.contains('/')
+            && !marker.contains(' ')
+    }));
+
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    write_private_new(
+        &report.join("startup-failure.tui-readiness"),
+        b"classified\n",
+    )?;
+    for marker in PACKAGED_TUI_READINESS_FAILURE_MARKERS.iter().copied() {
+        let path = report.join(marker);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some(marker)
+        );
+        fs::remove_file(path)?;
+    }
+    scratch.cleanup()
+}
+
+#[test]
+fn package_tui_readiness_subtype_scanner_rejects_untrusted_names_nodes_and_payloads()
+-> Result<(), Box<dyn Error>> {
+    let scratch = PackageScratch::create()?;
+    let report = scratch.root.join("supervisor-report");
+    private_directory(&report)?;
+    write_private_new(
+        &report.join("startup-failure.tui-readiness"),
+        b"classified\n",
+    )?;
+    let marker = "startup-failure.tui-readiness.subtype.receive.invalid";
+    let marker_path = report.join(marker);
+
+    for rejected in [
+        "startup-failure.tui-readiness.subtype.receive",
+        "startup-failure.tui-readiness.subtype.user-controlled",
+        "startup-failure.tui-readiness.subtype.receive.invalid.extended",
+    ] {
+        let path = report.join(rejected);
+        write_private_new(&path, b"classified\n")?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some("startup-failure.tui-readiness"),
+            "a prefix-only, unknown, or extended readiness subtype was trusted"
+        );
+        fs::remove_file(path)?;
+    }
+
+    for payload in [
+        b"private\n".as_slice(),
+        b"classified\nprivate-provider-payload\n".as_slice(),
+    ] {
+        write_private_new(&marker_path, payload)?;
+        assert_eq!(
+            OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+            Some("startup-failure.tui-readiness"),
+            "a payload-bearing or oversized readiness subtype was trusted"
+        );
+        fs::remove_file(&marker_path)?;
+    }
+
+    let source = report.join("tui-readiness-untrusted-source");
+    write_private_new(&source, b"classified\n")?;
+    std::os::unix::fs::symlink(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some("startup-failure.tui-readiness"),
+        "a symlinked readiness subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::hard_link(&source, &marker_path)?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some("startup-failure.tui-readiness"),
+        "a hardlinked readiness subtype was trusted"
+    );
+    fs::remove_file(&marker_path)?;
+    fs::remove_file(source)?;
+
+    write_private_new(&marker_path, b"classified\n")?;
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o640))?;
+    assert_eq!(
+        OfficialTuiPackageHarness::latest_fixed_failure_detail_from_report(&report),
+        Some("startup-failure.tui-readiness"),
+        "a wrong-mode readiness subtype was trusted"
+    );
+    fs::remove_file(marker_path)?;
     scratch.cleanup()
 }
 
@@ -5301,6 +6449,85 @@ fn package_final_error_prefers_the_fixed_app_socket_subtype_written_with_its_gen
     scratch.cleanup()
 }
 
+#[test]
+fn packaged_deterministic_tui_readiness_failure_keeps_exact_primary_and_secondary_evidence()
+-> Result<(), Box<dyn Error>> {
+    let _process_guard = package_process_test_guard();
+    let suite_budget = reserve_package_deterministic_generation()?;
+    let scratch = PackageScratch::create()?;
+    let root = scratch.root.clone();
+    let report = root.join("supervisor-report");
+    let backend = PackageSessionBackend::spawn()?;
+    let mut harness = OfficialTuiPackageHarness::spawn_deterministic_tui_readiness_failure(
+        scratch,
+        backend,
+        suite_budget,
+    )?;
+    let subtype = "startup-failure.tui-readiness.subtype.receive.invalid";
+
+    let exercise = harness.exercise();
+    assert!(
+        exercise.is_err(),
+        "the readiness fault unexpectedly became active"
+    );
+    assert_eq!(harness.latest_fixed_failure_detail(), Some(subtype));
+    assert!(fixed_package_failure_marker_is_valid(&report, subtype));
+    assert!(fixed_package_failure_marker_is_valid(
+        &report,
+        "startup-failure.tui-readiness"
+    ));
+
+    let cleanup_outcome = harness.cleanup_after_exercise(true);
+    let cleanup_error = cleanup_outcome
+        .result
+        .as_ref()
+        .err()
+        .ok_or("zero inference unexpectedly satisfied the exactly-one invariant")?;
+    assert!(
+        cleanup_error
+            .to_string()
+            .contains("did not observe exactly one responses call"),
+        "the cleanup failure did not preserve zero-inference evidence: {cleanup_error}"
+    );
+    assert_eq!(
+        harness.latest_fixed_cleanup_failure_detail(),
+        Some("package-cleanup.inference-evidence")
+    );
+    assert_eq!(
+        harness.latest_fixed_failure_detail(),
+        Some(subtype),
+        "cleanup replaced the immutable readiness cause"
+    );
+    let evidence = match cleanup_outcome.scratch {
+        PackageScratchDisposition::Preserved(evidence) => evidence,
+        PackageScratchDisposition::Deleted => {
+            return Err("failed readiness generation deleted its owned evidence".into());
+        }
+        PackageScratchDisposition::Unavailable => {
+            return Err("failed readiness generation lost its evidence owner".into());
+        }
+    };
+    assert_eq!(evidence.root(), root);
+    assert!(root.join("owner.marker").is_file());
+    assert!(report.join(subtype).is_file());
+    assert!(report.join("startup-failure.tui-readiness").is_file());
+    assert!(
+        harness.coordinator.is_none()
+            && harness.completion.is_none()
+            && harness.backend.is_none()
+            && harness.master.is_none()
+            && harness.output_cancel.is_none()
+            && harness.output_worker.is_none()
+            && harness.output_finished,
+        "readiness cleanup retained a live process, channel, PTY, or worker owner"
+    );
+
+    drop(harness);
+    evidence.cleanup()?;
+    assert!(!root.exists());
+    Ok(())
+}
+
 /// Runs the checksum-pinned official TUI through the actual production
 /// coordinator, guardian driver, provider startup/session owners, PTY pumps,
 /// and job-control state machine. The package parent owns the completion pair,
@@ -5338,10 +6565,9 @@ fn packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_
     let cleanup = cleanup_outcome.result;
     let cleanup_phase = harness.latest_fixed_cleanup_failure_detail();
     let handoff_probe_phase = harness.latest_handoff_probe_phase();
-    let exercise_phase = if exercise.is_err() {
-        select_package_failure_phase(
+    let exercise_failure_detail = if exercise.is_err() {
+        select_package_failure_detail(
             exercise_failure_before_cleanup,
-            exercise_phase_before_cleanup,
             harness.latest_fixed_failure_detail(),
         )
     } else {
@@ -5350,7 +6576,8 @@ fn packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_
     combine_package_exercise_and_cleanup_with_evidence(
         exercise,
         cleanup,
-        PackageOperationFailureEvidence::primary(exercise_phase)
+        PackageOperationFailureEvidence::primary(exercise_failure_detail)
+            .with_last_exercise_phase(exercise_phase_before_cleanup)
             .with_coordinator_origin(harness.latest_fixed_coordinator_origin()),
         cleanup_phase,
         None,
@@ -8197,6 +9424,43 @@ fn package_operation_deadline_is_global_and_preserves_full_recovery_budget_under
 }
 
 #[test]
+fn package_resume_deadline_retains_requested_io_or_generation_fence_authority()
+-> Result<(), Box<dyn Error>> {
+    let origin = Instant::now();
+    let fence = PackageGenerationDeadlineFence::starting_at(origin)?;
+    let requested = fence.exercise_deadline_with_authority(origin, IO_TIMEOUT)?;
+    assert_eq!(
+        requested,
+        PackageExerciseDeadline {
+            deadline: origin
+                .checked_add(IO_TIMEOUT)
+                .ok_or("requested resume deadline overflowed")?,
+            authority: PackageExerciseDeadlineAuthority::RequestedIo,
+        }
+    );
+
+    let near_fence = fence
+        .recovery_start
+        .checked_sub(Duration::from_millis(1))
+        .ok_or("generation fence underflowed")?;
+    let fenced = fence.exercise_deadline_with_authority(near_fence, IO_TIMEOUT)?;
+    assert_eq!(
+        fenced,
+        PackageExerciseDeadline {
+            deadline: fence.recovery_start,
+            authority: PackageExerciseDeadlineAuthority::GenerationFence,
+        }
+    );
+
+    assert_eq!(
+        fence.exercise_deadline_with_authority(fence.recovery_start, IO_TIMEOUT),
+        Err(PackageCleanupFailure::Deadline),
+        "an already-expired generation fence must fail before a resume origin can be minted"
+    );
+    Ok(())
+}
+
+#[test]
 fn package_cleanup_deadlines_cap_at_the_recorded_generation_fence_and_reject_overflow()
 -> Result<(), Box<dyn Error>> {
     let origin = Instant::now();
@@ -8692,6 +9956,7 @@ struct PackageExerciseCleanupFailure {
     exercise_failed: bool,
     cleanup_failed: bool,
     exercise_phase: Option<&'static str>,
+    last_exercise_phase: Option<&'static str>,
     coordinator_origin: Option<FixedPackageCoordinatorOrigin>,
     secondary_failure_detail: Option<&'static str>,
     retry_observations: PackageInitialGateRetryObservations,
@@ -8704,6 +9969,7 @@ struct PackageExerciseCleanupFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackageOperationFailureEvidence {
     primary: Option<&'static str>,
+    last_exercise_phase: Option<&'static str>,
     coordinator_origin: Option<FixedPackageCoordinatorOrigin>,
     secondary: Option<&'static str>,
     retry_observations: PackageInitialGateRetryObservations,
@@ -8713,6 +9979,7 @@ impl PackageOperationFailureEvidence {
     const fn new(primary: Option<&'static str>, secondary: Option<&'static str>) -> Self {
         Self {
             primary,
+            last_exercise_phase: None,
             coordinator_origin: None,
             secondary,
             retry_observations: PackageInitialGateRetryObservations::NONE,
@@ -8728,6 +9995,11 @@ impl PackageOperationFailureEvidence {
         retry_observations: PackageInitialGateRetryObservations,
     ) -> Self {
         self.retry_observations = retry_observations;
+        self
+    }
+
+    const fn with_last_exercise_phase(mut self, last_exercise_phase: Option<&'static str>) -> Self {
+        self.last_exercise_phase = last_exercise_phase;
         self
     }
 
@@ -8747,6 +10019,7 @@ impl fmt::Debug for PackageExerciseCleanupFailure {
             .field("exercise_failed", &self.exercise_failed)
             .field("cleanup_failed", &self.cleanup_failed)
             .field("exercise_phase", &self.exercise_phase)
+            .field("last_exercise_phase", &self.last_exercise_phase)
             .field("coordinator_origin", &self.coordinator_origin)
             .field("secondary_failure_detail", &self.secondary_failure_detail)
             .field("retry_observations", &self.retry_observations)
@@ -8768,6 +10041,9 @@ impl fmt::Display for PackageExerciseCleanupFailure {
         }?;
         if let Some(phase) = self.exercise_phase {
             write!(formatter, " at fixed phase {phase}")?;
+        }
+        if let Some(phase) = self.last_exercise_phase {
+            write!(formatter, "; last fixed exercise phase {phase}")?;
         }
         if let Some(origin) = self.coordinator_origin {
             write!(formatter, "; fixed coordinator origin {}", origin.marker())?;
@@ -8891,6 +10167,7 @@ fn combine_package_exercise_and_cleanup_with_evidence(
             exercise_failed: exercise.is_err(),
             cleanup_failed: cleanup.is_err(),
             exercise_phase: failure_evidence.primary,
+            last_exercise_phase: failure_evidence.last_exercise_phase,
             coordinator_origin: failure_evidence.coordinator_origin,
             secondary_failure_detail: failure_evidence.secondary,
             retry_observations: failure_evidence.retry_observations,
@@ -8903,9 +10180,11 @@ fn combine_package_exercise_and_cleanup_with_evidence(
 }
 
 fn package_operation_failure_can_finalize_during_cleanup(marker: &'static str) -> bool {
-    PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.contains(&marker)
+    PACKAGE_RESUME_APPLY_ORIGIN_MARKERS.contains(&marker)
+        || PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS.contains(&marker)
         || PACKAGED_COMPATIBILITY_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_APP_SOCKET_FAILURE_MARKERS.contains(&marker)
+        || PACKAGED_TUI_READINESS_FAILURE_MARKERS.contains(&marker)
         || PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.contains(&marker)
         || PACKAGE_JOB_CONTROL_FAILURE_MARKERS.contains(&marker)
         || PACKAGE_OFFICIAL_TUI_GROUP_FAILURE_MARKERS.contains(&marker)
@@ -8919,12 +10198,67 @@ fn select_package_failure_phase(
     phase_before_cleanup: Option<&'static str>,
     failure_during_cleanup: Option<&'static str>,
 ) -> Option<&'static str> {
-    failure_before_cleanup
-        .or_else(|| {
-            failure_during_cleanup
-                .filter(|marker| package_operation_failure_can_finalize_during_cleanup(marker))
-        })
+    select_package_failure_detail(failure_before_cleanup, failure_during_cleanup)
         .or(phase_before_cleanup)
+}
+
+fn select_package_failure_detail(
+    failure_before_cleanup: Option<&'static str>,
+    failure_during_cleanup: Option<&'static str>,
+) -> Option<&'static str> {
+    failure_before_cleanup.or_else(|| {
+        failure_during_cleanup
+            .filter(|marker| package_operation_failure_can_finalize_during_cleanup(marker))
+    })
+}
+
+#[test]
+fn package_resume_failure_projection_keeps_origin_last_phase_coordinator_and_cleanup_independent()
+-> Result<(), Box<dyn Error>> {
+    for (origin, phase) in [
+        (
+            PackageResumeApplyOrigin::SizeWrite,
+            PackageExercisePhase::StoppedStateValidated,
+        ),
+        (
+            PackageResumeApplyOrigin::ObserveDeadlineFence,
+            PackageExercisePhase::SuspendedInputBlocked,
+        ),
+    ] {
+        let coordinator =
+            FixedPackageCoordinatorOrigin(PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS[0]);
+        let error = require_rejected_test_result(
+            combine_package_exercise_and_cleanup_with_evidence(
+                Err("private exercise payload".into()),
+                Err("private cleanup payload".into()),
+                PackageOperationFailureEvidence::primary(Some(origin.marker()))
+                    .with_last_exercise_phase(Some(phase.marker()))
+                    .with_coordinator_origin(Some(coordinator)),
+                Some(PackageHarnessCleanupPhase::PtyOutputDrain.marker()),
+                None,
+                None,
+                None,
+            ),
+            "a resume failure with cleanup evidence unexpectedly succeeded",
+        )?;
+        let projected = error
+            .downcast_ref::<PackageExerciseCleanupFailure>()
+            .ok_or("resume failure projection changed type")?;
+        assert_eq!(projected.exercise_phase, Some(origin.marker()));
+        assert_eq!(projected.last_exercise_phase, Some(phase.marker()));
+        assert_eq!(projected.coordinator_origin, Some(coordinator));
+        assert_eq!(
+            projected.cleanup_phase,
+            Some(PackageHarnessCleanupPhase::PtyOutputDrain.marker())
+        );
+        let display = projected.to_string();
+        assert!(display.contains(origin.marker()));
+        assert!(display.contains(phase.marker()));
+        assert!(display.contains(coordinator.marker()));
+        assert!(display.contains(PackageHarnessCleanupPhase::PtyOutputDrain.marker()));
+        assert!(!format!("{projected:?}").contains("private"));
+    }
+    Ok(())
 }
 
 #[test]
@@ -9971,6 +11305,31 @@ impl PackageCleanupBudget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageExerciseDeadlineAuthority {
+    RequestedIo,
+    GenerationFence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageExerciseDeadline {
+    deadline: Instant,
+    authority: PackageExerciseDeadlineAuthority,
+}
+
+impl PackageExerciseDeadline {
+    const fn timeout_origin(self) -> PackageResumeApplyOrigin {
+        match self.authority {
+            PackageExerciseDeadlineAuthority::RequestedIo => {
+                PackageResumeApplyOrigin::ObserveDeadlineIo
+            }
+            PackageExerciseDeadlineAuthority::GenerationFence => {
+                PackageResumeApplyOrigin::ObserveDeadlineFence
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackageGenerationDeadlineFence {
     origin: Instant,
     recovery_start: Instant,
@@ -10087,12 +11446,32 @@ impl PackageGenerationDeadlineFence {
         now: Instant,
         requested_timeout: Duration,
     ) -> Result<Instant, PackageCleanupFailure> {
+        self.exercise_deadline_with_authority(now, requested_timeout)
+            .map(|selected| selected.deadline)
+    }
+
+    fn exercise_deadline_with_authority(
+        self,
+        now: Instant,
+        requested_timeout: Duration,
+    ) -> Result<PackageExerciseDeadline, PackageCleanupFailure> {
         if now < self.origin || now >= self.recovery_start {
             return Err(PackageCleanupFailure::Deadline);
         }
-        now.checked_add(requested_timeout)
-            .map(|requested_deadline| requested_deadline.min(self.recovery_start))
-            .ok_or(PackageCleanupFailure::Deadline)
+        let requested_deadline = now
+            .checked_add(requested_timeout)
+            .ok_or(PackageCleanupFailure::Deadline)?;
+        if requested_deadline <= self.recovery_start {
+            Ok(PackageExerciseDeadline {
+                deadline: requested_deadline,
+                authority: PackageExerciseDeadlineAuthority::RequestedIo,
+            })
+        } else {
+            Ok(PackageExerciseDeadline {
+                deadline: self.recovery_start,
+                authority: PackageExerciseDeadlineAuthority::GenerationFence,
+            })
+        }
     }
 }
 
@@ -10326,6 +11705,26 @@ impl OfficialTuiPackageHarness {
                 launcher,
                 Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore),
             ),
+        )
+    }
+
+    fn spawn_deterministic_tui_readiness_failure(
+        scratch: PackageScratch,
+        backend: PackageSessionBackend,
+        suite_budget: PackageDeterministicSuiteLease,
+    ) -> Result<Self, Box<dyn Error>> {
+        let executable = install_packaged_codex_provider_fixture(&scratch)?;
+        let launcher = install_packaged_tui_readiness_failure_launcher_fixture(&scratch)?;
+        Self::spawn_configured(
+            executable,
+            scratch,
+            backend,
+            None,
+            PackageProviderSuiteBudget::Deterministic {
+                _lease: suite_budget,
+            },
+            PackageInferenceExpectation::ExactlyOne,
+            PackageStartupTestSeams::deterministic(launcher, None),
         )
     }
 
@@ -10974,6 +12373,7 @@ impl OfficialTuiPackageHarness {
         let generation_fence = self
             .generation_deadline_fence
             .ok_or("package generation deadline fence was missing")?;
+        let mut first_resume_apply_origin = None;
         let exercise_deadline = |requested_timeout| -> Result<Instant, Box<dyn Error>> {
             generation_fence
                 .exercise_deadline(Instant::now(), requested_timeout)
@@ -10998,7 +12398,7 @@ impl OfficialTuiPackageHarness {
             exercise_deadline(PACKAGE_SUPERVISOR_STARTUP_TIMEOUT)?,
         )?;
         if let Err(failure) = validate_official_tui_group(tui, exercise_deadline(IO_TIMEOUT)?) {
-            record_package_diagnostic_marker(&report, failure.marker());
+            record_package_official_tui_group_failure(&report, failure);
             return Err(Box::new(failure));
         }
         record_package_exercise_phase(&report, PackageExercisePhase::ChildrenValidated);
@@ -11013,7 +12413,7 @@ impl OfficialTuiPackageHarness {
         record_package_exercise_phase(&report, PackageExercisePhase::RawModeObserved);
         if let Err(failure) = validate_live_official_tui_group(tui, exercise_deadline(IO_TIMEOUT)?)
         {
-            record_package_diagnostic_marker(&report, failure.marker());
+            record_package_official_tui_group_failure(&report, failure);
             return Err(Box::new(failure));
         }
         record_package_exercise_phase(&report, PackageExercisePhase::PostGateTuiLive);
@@ -11130,15 +12530,14 @@ impl OfficialTuiPackageHarness {
 
         let input_before_suspended_write =
             read_private_bounded(&report.join("input.live"), 128 * 1024)?;
-        classify_package_job_control_stage(
-            &report,
-            PackageJobControlFailure::ResumeApply,
+        let resume_size = apply_package_resume_size_with(|| {
             self.master().and_then(|master| {
                 master
                     .set_size(PACKAGE_SUPERVISOR_RESUMED_SIZE)
                     .map_err(|error| Box::new(error) as Box<dyn Error>)
-            }),
-        )?;
+            })
+        });
+        classify_package_resume_apply_origin(&report, &mut first_resume_apply_origin, resume_size)?;
         write_package_pty_input(
             self.master()?,
             PACKAGE_SUPERVISOR_SUSPENDED_INPUT,
@@ -11161,18 +12560,24 @@ impl OfficialTuiPackageHarness {
         }
         record_package_exercise_phase(&report, PackageExercisePhase::SuspendedInputBlocked);
 
-        classify_package_job_control_stage(
+        let resume_signal = self.signal_live_coordinator_for_resume();
+        classify_package_resume_apply_origin(
             &report,
-            PackageJobControlFailure::ResumeApply,
-            self.signal_live_coordinator(rustix::process::Signal::CONT),
+            &mut first_resume_apply_origin,
+            resume_signal.result,
         )?;
-        classify_package_job_control_stage(
+        let resume_observation_deadline = generation_fence
+            .exercise_deadline_with_authority(Instant::now(), IO_TIMEOUT)
+            .map_err(|_| {
+                Box::<dyn Error>::from("package exercise reached the generation recovery fence")
+            })?;
+        classify_package_resume_apply_origin(
             &report,
-            PackageJobControlFailure::ResumeApply,
-            wait_for_private_marker(
+            &mut first_resume_apply_origin,
+            observe_package_resume_marker(
                 &report.join("resume.live"),
                 b"43 125\n",
-                exercise_deadline(IO_TIMEOUT)?,
+                resume_observation_deadline,
             ),
         )?;
         record_package_exercise_phase(&report, PackageExercisePhase::ResumeObserved);
@@ -11258,6 +12663,12 @@ impl OfficialTuiPackageHarness {
         self.generation_cleanup_mut()?.reported_groups_absent = true;
         verify_package_build_namespaces_empty(&root)?;
         self.generation_cleanup_mut()?.runtime_empty = true;
+        if PACKAGED_TUI_READINESS_FAILURE_MARKERS
+            .iter()
+            .any(|marker| report.join(marker).exists())
+        {
+            return Err("successful official-TUI startup published a readiness failure".into());
+        }
         Ok(())
     }
 
@@ -11300,6 +12711,41 @@ impl OfficialTuiPackageHarness {
         let pid = rustix::process::Pid::from_child(&*child);
         rustix::process::kill_process(pid, signal)?;
         Ok(())
+    }
+
+    fn signal_live_coordinator_for_resume(&mut self) -> PackageResumeCoordinatorSignalOutcome {
+        let Some(generation_cleanup) = self.generation_cleanup.as_mut() else {
+            return PackageResumeCoordinatorSignalOutcome {
+                result: Err(PackageResumeApplyOrigin::CoordinatorWait),
+                exact_wait_observed: false,
+            };
+        };
+        if generation_cleanup.exact_coordinator_wait {
+            return PackageResumeCoordinatorSignalOutcome {
+                result: Err(PackageResumeApplyOrigin::CoordinatorWait),
+                exact_wait_observed: false,
+            };
+        }
+        let outcome = match self.coordinator.as_mut() {
+            Some(child) => {
+                let pid = rustix::process::Pid::from_child(&*child);
+                signal_package_resume_coordinator_with(
+                    || child.try_wait().map(|status| status.is_some()),
+                    || rustix::process::kill_process(pid, rustix::process::Signal::CONT),
+                )
+            }
+            None => PackageResumeCoordinatorSignalOutcome {
+                result: Err(PackageResumeApplyOrigin::CoordinatorWait),
+                exact_wait_observed: false,
+            },
+        };
+        if outcome.exact_wait_observed {
+            // The direct Child::try_wait call is the only authority that can
+            // consume this wait. Persist that fact before returning the exact
+            // closed origin so cleanup cannot wait a second time.
+            generation_cleanup.exact_coordinator_wait = true;
+        }
+        outcome
     }
 
     fn wait_for_exact_coordinator(
@@ -11466,11 +12912,15 @@ impl OfficialTuiPackageHarness {
         primary: Option<&'static str>,
         drive_context: Option<&'static str>,
     ) -> Option<&'static str> {
-        Self::fixed_failure_catalog().find(|marker| {
-            Some(*marker) != primary
-                && Some(*marker) != drive_context
-                && fixed_package_failure_marker_is_valid(report, marker)
-        })
+        latest_fixed_package_resume_apply_origin_from_report(report)
+            .filter(|marker| Some(*marker) != primary && Some(*marker) != drive_context)
+            .or_else(|| {
+                Self::fixed_failure_catalog().find(|marker| {
+                    Some(*marker) != primary
+                        && Some(*marker) != drive_context
+                        && fixed_package_failure_marker_is_valid(report, marker)
+                })
+            })
     }
 
     fn fixed_failure_catalog() -> impl Iterator<Item = &'static str> {
@@ -11479,6 +12929,7 @@ impl OfficialTuiPackageHarness {
             .copied()
             .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
+            .chain(PACKAGED_TUI_READINESS_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_JOB_CONTROL_FAILURE_MARKERS.iter().copied())
             .chain(PACKAGE_OFFICIAL_TUI_GROUP_FAILURE_MARKERS.iter().copied())
@@ -14228,12 +15679,28 @@ fn latest_fixed_package_coordinator_origin_from_report(
         .map(FixedPackageCoordinatorOrigin)
 }
 
+fn latest_fixed_package_resume_apply_origin_from_report(report: &Path) -> Option<&'static str> {
+    let mut valid = PACKAGE_RESUME_APPLY_ORIGIN_MARKERS
+        .into_iter()
+        .filter(|marker| fixed_package_failure_marker_is_valid(report, marker));
+    let first = valid.next()?;
+    if valid.next().is_some() {
+        // Marker catalog order is not chronology. Multiple exact origins mean
+        // the evidence is ambiguous, so retain only the generic resume-apply
+        // failure rather than selecting a potentially later cause.
+        None
+    } else {
+        Some(first)
+    }
+}
+
 fn fixed_package_startup_failure_marker(name: &str) -> Option<&'static str> {
     PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS
         .iter()
         .copied()
         .chain(PACKAGED_COMPATIBILITY_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_APP_SOCKET_FAILURE_MARKERS.iter().copied())
+        .chain(PACKAGED_TUI_READINESS_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_SESSION_STARTUP_FAILURE_MARKERS.iter().copied())
         .chain(PACKAGED_STARTUP_FAILURE_MARKERS.iter().copied())
         .find(|marker| *marker == name)
@@ -14385,6 +15852,15 @@ fn fixed_package_startup_failure_from_report(
         PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
         failure => return failure,
     };
+    let tui_readiness = match scan_fixed_package_startup_failure_marker_catalog(
+        report,
+        PACKAGED_TUI_READINESS_FAILURE_MARKERS,
+        deadline,
+    ) {
+        PackageStartupFailureMarkerProbe::Absent => None,
+        PackageStartupFailureMarkerProbe::Valid(failure) => Some(failure),
+        failure => return failure,
+    };
     let session_readiness = match scan_fixed_package_startup_failure_marker_catalog(
         report,
         PACKAGED_SESSION_STARTUP_FAILURE_MARKERS,
@@ -14400,6 +15876,7 @@ fn fixed_package_startup_failure_from_report(
     let detail = match generic.marker() {
         "startup-failure.compatibility" => compatibility_origin.or(compatibility),
         "startup-failure.app-socket" => app_socket,
+        "startup-failure.tui-readiness" => tui_readiness,
         "startup-failure.session-readiness" => session_readiness,
         _ => None,
     };
@@ -14825,6 +16302,59 @@ fn wait_for_private_marker(
     }
 }
 
+fn observe_package_resume_marker(
+    path: &Path,
+    expected: &[u8],
+    selected_deadline: PackageExerciseDeadline,
+) -> Result<(), PackageResumeApplyOrigin> {
+    observe_package_resume_marker_with_reader_clock_and_sleep(
+        path,
+        expected,
+        selected_deadline,
+        read_private_bounded,
+        Instant::now,
+        thread::sleep,
+    )
+}
+
+fn observe_package_resume_marker_with_reader_clock_and_sleep<ReadMarker, Now, Sleep>(
+    path: &Path,
+    expected: &[u8],
+    selected_deadline: PackageExerciseDeadline,
+    mut read_marker: ReadMarker,
+    mut now: Now,
+    mut sleep: Sleep,
+) -> Result<(), PackageResumeApplyOrigin>
+where
+    ReadMarker: FnMut(&Path, usize) -> io::Result<Vec<u8>>,
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    loop {
+        if now() >= selected_deadline.deadline {
+            return Err(selected_deadline.timeout_origin());
+        }
+        let read = read_marker(path, expected.len().saturating_add(1));
+        let observed_at = now();
+        if observed_at >= selected_deadline.deadline {
+            return Err(selected_deadline.timeout_origin());
+        }
+        match read {
+            Ok(bytes) if bytes == expected => return Ok(()),
+            Ok(_) => return Err(PackageResumeApplyOrigin::ObserveInvalid),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PackageResumeApplyOrigin::ObserveRead),
+        }
+        sleep(
+            Duration::from_millis(5).min(
+                selected_deadline
+                    .deadline
+                    .saturating_duration_since(observed_at),
+            ),
+        );
+    }
+}
+
 fn wait_for_private_marker_before_deadline_with_reader_clock_and_sleep<ReadMarker, Now, Sleep>(
     path: &Path,
     expected: &[u8],
@@ -15022,6 +16552,11 @@ struct PackageChildMarker {
 
 const PACKAGE_OFFICIAL_TUI_GROUP_FAILURE_MARKERS: &[&str] = &[
     "exercise.tui-group-validation-failed.leader",
+    "exercise.tui-group-validation-failed.job-identity.invalid-pid",
+    "exercise.tui-group-validation-failed.job-identity.process-group-query",
+    "exercise.tui-group-validation-failed.job-identity.process-group-mismatch",
+    "exercise.tui-group-validation-failed.job-identity.session-query",
+    "exercise.tui-group-validation-failed.job-identity.session-mismatch",
     "exercise.tui-group-validation-failed.job-identity",
     "exercise.tui-group-validation-failed.empty",
     "exercise.tui-group-validation-failed.snapshot",
@@ -15051,9 +16586,36 @@ const PACKAGE_OFFICIAL_TUI_GROUP_FAILURE_MARKERS: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageOfficialTuiJobIdentityFailure {
+    InvalidPid,
+    ProcessGroupQuery,
+    ProcessGroupMismatch,
+    SessionQuery,
+    SessionMismatch,
+}
+
+impl PackageOfficialTuiJobIdentityFailure {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::InvalidPid => "exercise.tui-group-validation-failed.job-identity.invalid-pid",
+            Self::ProcessGroupQuery => {
+                "exercise.tui-group-validation-failed.job-identity.process-group-query"
+            }
+            Self::ProcessGroupMismatch => {
+                "exercise.tui-group-validation-failed.job-identity.process-group-mismatch"
+            }
+            Self::SessionQuery => "exercise.tui-group-validation-failed.job-identity.session-query",
+            Self::SessionMismatch => {
+                "exercise.tui-group-validation-failed.job-identity.session-mismatch"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackageOfficialTuiGroupFailure {
     Leader,
-    JobIdentity,
+    JobIdentity(PackageOfficialTuiJobIdentityFailure),
     Descriptor(calcifer_unix_child_fd::ProcessGroupDescriptorScanError),
     Empty,
     Snapshot,
@@ -15068,7 +16630,7 @@ impl PackageOfficialTuiGroupFailure {
 
         match self {
             Self::Leader => "exercise.tui-group-validation-failed.leader",
-            Self::JobIdentity => "exercise.tui-group-validation-failed.job-identity",
+            Self::JobIdentity(detail) => detail.marker(),
             Self::Empty => "exercise.tui-group-validation-failed.empty",
             Self::Snapshot => "exercise.tui-group-validation-failed.snapshot",
             Self::NotStablyLiveNoObservation => {
@@ -15141,6 +16703,19 @@ impl PackageOfficialTuiGroupFailure {
                 "exercise.tui-group-validation-failed.descriptor.observation-failed"
             }
         }
+    }
+}
+
+fn record_package_official_tui_group_failure(
+    report: &Path,
+    failure: PackageOfficialTuiGroupFailure,
+) {
+    record_package_diagnostic_marker(report, failure.marker());
+    if matches!(failure, PackageOfficialTuiGroupFailure::JobIdentity(_)) {
+        record_package_diagnostic_marker(
+            report,
+            "exercise.tui-group-validation-failed.job-identity",
+        );
     }
 }
 
@@ -15520,21 +17095,53 @@ fn validate_official_tui_group(
 fn validate_official_tui_job_identity(
     tui: PackageChildMarker,
 ) -> Result<(), PackageOfficialTuiGroupFailure> {
+    validate_official_tui_job_identity_with_observer(
+        tui,
+        |pid| {
+            rustix::process::getpgid(Some(pid))
+                .map(rustix::process::Pid::as_raw_pid)
+                .map_err(|_| ())
+        },
+        |pid| {
+            rustix::process::getsid(Some(pid))
+                .map(rustix::process::Pid::as_raw_pid)
+                .map_err(|_| ())
+        },
+    )
+}
+
+fn validate_official_tui_job_identity_with_observer<ObserveProcessGroup, ObserveSession>(
+    tui: PackageChildMarker,
+    mut observe_process_group: ObserveProcessGroup,
+    mut observe_session: ObserveSession,
+) -> Result<(), PackageOfficialTuiGroupFailure>
+where
+    ObserveProcessGroup: FnMut(rustix::process::Pid) -> Result<i32, ()>,
+    ObserveSession: FnMut(rustix::process::Pid) -> Result<i32, ()>,
+{
+    use PackageOfficialTuiJobIdentityFailure::{
+        InvalidPid, ProcessGroupMismatch, ProcessGroupQuery, SessionMismatch, SessionQuery,
+    };
+
     if tui.pid != tui.pgid {
         return Err(PackageOfficialTuiGroupFailure::Leader);
     }
+    if tui.pid <= 0 {
+        return Err(PackageOfficialTuiGroupFailure::JobIdentity(InvalidPid));
+    }
     let pid = rustix::process::Pid::from_raw(tui.pid)
-        .ok_or(PackageOfficialTuiGroupFailure::JobIdentity)?;
-    if rustix::process::getpgid(Some(pid))
-        .map_err(|_| PackageOfficialTuiGroupFailure::JobIdentity)?
-        .as_raw_pid()
-        != tui.pgid
-        || rustix::process::getsid(Some(pid))
-            .map_err(|_| PackageOfficialTuiGroupFailure::JobIdentity)?
-            .as_raw_pid()
-            != tui.pid
-    {
-        return Err(PackageOfficialTuiGroupFailure::JobIdentity);
+        .ok_or(PackageOfficialTuiGroupFailure::JobIdentity(InvalidPid))?;
+    let process_group = observe_process_group(pid)
+        .map_err(|()| PackageOfficialTuiGroupFailure::JobIdentity(ProcessGroupQuery))?;
+    if process_group != tui.pgid {
+        return Err(PackageOfficialTuiGroupFailure::JobIdentity(
+            ProcessGroupMismatch,
+        ));
+    }
+    let session = observe_session(pid)
+        .map_err(|()| PackageOfficialTuiGroupFailure::JobIdentity(SessionQuery))?;
+    if session != tui.pid {
+        return Err(PackageOfficialTuiGroupFailure::JobIdentity(SessionMismatch));
     }
     Ok(())
 }
@@ -19775,6 +21382,34 @@ if [ "$#" -ne 0 ]; then
     exit 64
 fi
 exec {helper} --exact {test} --nocapture --test-threads=1
+"#,
+    );
+    let path = scratch.root.join(PACKAGE_LIBTEST_LAUNCHER_WRAPPER);
+    write_private_executable_new(&path, script.as_bytes())?;
+    Ok(fs::canonicalize(path)?)
+}
+
+fn install_packaged_tui_readiness_failure_launcher_fixture(
+    scratch: &PackageScratch,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let helper = fs::canonicalize(std::env::current_exe()?)?;
+    let helper_metadata = fs::symlink_metadata(&helper)?;
+    if !helper.is_absolute()
+        || !helper_metadata.file_type().is_file()
+        || helper_metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err("libtest readiness launcher helper executable was unsafe".into());
+    }
+    let helper = shell_quote_package_libtest(helper.as_os_str())?;
+    let test = shell_quote_package_libtest(OsStr::new(PACKAGE_LIBTEST_LAUNCHER_HELPER_TEST))?;
+    let fault_name = super::launcher::PACKAGED_TUI_READINESS_FAULT_ENV;
+    let fault_value = super::launcher::PACKAGED_TUI_READINESS_INVALID_FAULT_V1;
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$#" -ne 0 ]; then
+    exit 64
+fi
+{fault_name}={fault_value} exec {helper} --exact {test} --nocapture --test-threads=1
 "#,
     );
     let path = scratch.root.join(PACKAGE_LIBTEST_LAUNCHER_WRAPPER);

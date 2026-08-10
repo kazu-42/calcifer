@@ -6,6 +6,7 @@ use crate::conversations::ConversationError;
 use crate::executable::ExecutableError;
 use crate::profiles::ProfileError;
 use crate::project_config::ProjectConfigError;
+use crate::routing::RoutingError;
 
 #[derive(Debug)]
 pub(crate) enum AppError {
@@ -16,6 +17,7 @@ pub(crate) enum AppError {
     Io(io::Error),
     Profile(ProfileError),
     ProjectConfig(ProjectConfigError),
+    Routing(RoutingError),
     ProviderArgumentRejected,
     ProviderLoginFailed,
     Update(UpdateError),
@@ -31,6 +33,7 @@ impl AppError {
             Self::Io(_) => "process_io_error",
             Self::Profile(error) => error.code(),
             Self::ProjectConfig(error) => error.code(),
+            Self::Routing(error) => error.code(),
             Self::ProviderArgumentRejected => "provider_argument_rejected",
             Self::ProviderLoginFailed => "provider_login_failed",
             Self::Update(error) => error.code(),
@@ -49,6 +52,7 @@ impl AppError {
             }
             Self::Profile(error) => error.safe_message(),
             Self::ProjectConfig(error) => error.safe_message().to_owned(),
+            Self::Routing(error) => error.safe_message().to_owned(),
             Self::ProviderArgumentRejected => "Calcifer rejected a provider argument that could bypass the selected managed account or provider.".to_owned(),
             Self::ProviderLoginFailed => "The official Codex login command did not complete successfully. No profile was registered.".to_owned(),
             Self::Update(error) => error.safe_message().to_owned(),
@@ -85,6 +89,12 @@ impl From<ProfileError> for AppError {
 impl From<ProjectConfigError> for AppError {
     fn from(error: ProjectConfigError) -> Self {
         Self::ProjectConfig(error)
+    }
+}
+
+impl From<RoutingError> for AppError {
+    fn from(error: RoutingError) -> Self {
+        Self::Routing(error)
     }
 }
 
