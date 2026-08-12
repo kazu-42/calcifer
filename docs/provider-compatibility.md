@@ -224,14 +224,18 @@ can be constructed:
    fails before provider startup with the fixed redacted
    `unsupported_noexec_scratch` diagnosis. A cleanup failure retains its exact
    owner and stops selection rather than silently falling through.
-3. Copy the verified Codex bytes once into a mode-`0500` executable below that
-   retained mode-`0700` scratch directory. Every version, schema, fork, App
-   Server, and TUI phase executes that staged copy, so an installer replacing
-   the original pathname cannot mix two legitimate Codex builds within one
-   proof. The copy is length- and SHA-256-equal to the original; both the staged
-   copy and the original executable are fully rehashed before capability
-   minting. A changed original install path therefore fails closed rather than
-   authorizing the staged bytes for future production use.
+3. Before selecting a candidate, copy the verified Codex bytes into the real
+   mode-`0500` executable below its final private directory, sync both the file
+   and directories, and retain that completed topology. A storage or quota
+   failure cleans the whole candidate and retries the next fixed parent; the
+   gate never reserves and releases a substitute file before the real copy.
+   Every version, schema, fork, App Server, and TUI phase executes this exact
+   staged copy, so an installer replacing the original pathname cannot mix two
+   legitimate Codex builds within one proof. The copy is length- and
+   SHA-256-equal to the original; both the staged copy and the original
+   executable are fully rehashed before capability minting. A changed original
+   install path therefore fails closed rather than authorizing the staged bytes
+   for future production use.
 4. Run the exact-version probe from a private workspace and reject every other
    version.
 5. Generate both default and `--experimental` App Server schemas. The default

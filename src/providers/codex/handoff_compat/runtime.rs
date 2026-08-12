@@ -55,8 +55,6 @@ const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const PROBE_EXECUTABLE_FILE: &str = "codex";
 const SCRATCH_EXECUTABILITY_PROBE_FILE: &str = ".calcifer-exec-probe";
 const SCRATCH_EXECUTABILITY_PROBE_BYTES: &[u8] = b"#!/bin/sh\nexit 0\n";
-const SCRATCH_CAPACITY_PROBE_FILE: &str = ".calcifer-capacity-probe";
-const SCRATCH_CAPACITY_PROBE_CHUNK_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -249,8 +247,12 @@ fn verify_before_remote_until(
     source_executable: &CodexExecutableIdentity,
     deadline: Instant,
 ) -> Result<PreRemoteProof, CodexHandoffFailure> {
-    let scratch = ScratchRoot::create_for_executable_until(source_executable, deadline)?;
-    match build_pre_remote_parts(source_executable, &scratch, deadline) {
+    let selected = ScratchRoot::create_for_executable_until(source_executable, deadline)?;
+    let ValidatedScratch {
+        root: scratch,
+        validated: (probe_binary_directory, probe_executable),
+    } = selected;
+    match build_pre_remote_parts(&scratch, probe_binary_directory, probe_executable, deadline) {
         Ok(parts) => Ok(PreRemoteProof {
             scratch,
             probe_binary_directory: parts.probe_binary_directory,
@@ -275,12 +277,11 @@ fn verify_before_remote_until(
 }
 
 fn build_pre_remote_parts(
-    source_executable: &CodexExecutableIdentity,
     scratch: &ScratchRoot,
+    probe_binary_directory: PrivateDirectory,
+    probe_executable: CodexExecutableIdentity,
     deadline: Instant,
 ) -> Result<PreRemoteParts, CodexHandoffCause> {
-    let (probe_binary_directory, probe_executable) =
-        stage_executable_with_origin(source_executable, scratch, deadline)?;
     let executable = &probe_executable;
     let source_home = scratch.create_directory("s")?;
     let target_home = scratch.create_directory("t")?;
@@ -647,6 +648,7 @@ pub(crate) struct PinnedStageCreateFailure {
 enum PinnedStageConstructionOwnership {
     #[cfg(test)]
     ScratchCreate(Box<ScratchRootCreateFailure>),
+    #[cfg(test)]
     Scratch(Box<ScratchRoot>),
     Complete(Box<PinnedExecutableStage>),
 }
@@ -659,6 +661,7 @@ impl fmt::Debug for PinnedStageConstructionOwnership {
                 let _ = failure;
                 formatter.write_str("PinnedStageConstructionOwnership::ScratchCreate(<redacted>)")
             }
+            #[cfg(test)]
             Self::Scratch(scratch) => {
                 let _ = scratch;
                 formatter.write_str("PinnedStageConstructionOwnership::Scratch(<redacted>)")
@@ -729,6 +732,7 @@ pub(super) fn resolve_handoff_retention(
                         deadline,
                     )
                 }
+                #[cfg(test)]
                 PinnedStageConstructionOwnership::Scratch(scratch) => {
                     resolve_scratch_root(*scratch, deadline)
                 }
@@ -830,6 +834,7 @@ impl PinnedStageCreateFailure {
         }
     }
 
+    #[cfg(test)]
     fn with_scratch(error: PinnedStageError, mut scratch: ScratchRoot) -> Self {
         scratch.preserve();
         Self {
@@ -854,6 +859,7 @@ impl PinnedStageCreateFailure {
         match self.ownership.as_ref()? {
             #[cfg(test)]
             PinnedStageConstructionOwnership::ScratchCreate(failure) => failure.retained_path(),
+            #[cfg(test)]
             PinnedStageConstructionOwnership::Scratch(scratch) => Some(scratch.path()),
             PinnedStageConstructionOwnership::Complete(stage) => Some(stage.scratch.path()),
         }
@@ -1017,12 +1023,24 @@ impl PinnedExecutableStage {
         revalidate_executable_until(source, Some(deadline))
             .map_err(map_stage_error)
             .map_err(map_pinned_stage_error)?;
-        let scratch = ScratchRoot::create_for_executable_until_with_origin(
+        let selected = ScratchRoot::create_for_executable_until_with_origin(
             source,
             deadline,
             CompatibilityTimeoutOrigin::FinalScratchSelection,
         )?;
-        Self::stage(source, scratch, deadline).map_err(Into::into)
+        Ok(Self::from_selected(selected))
+    }
+
+    fn from_selected(mut selected: StagedScratchExecutable) -> Self {
+        selected.root.preserve();
+        Self {
+            scratch: selected.root,
+            directory: selected.validated.0,
+            executable: selected.validated.1,
+            cleanup_state: PinnedStageCleanupState::Active,
+            cleanup_first_error: None,
+            cleanup_fault: None,
+        }
     }
 
     #[cfg(test)]
@@ -1067,6 +1085,7 @@ impl PinnedExecutableStage {
         Self::stage(source, scratch, deadline)
     }
 
+    #[cfg(test)]
     fn stage(
         source: &CodexExecutableIdentity,
         mut scratch: ScratchRoot,
@@ -1434,6 +1453,7 @@ struct ExecutableMetadata {
     changed_nanoseconds: i64,
 }
 
+#[cfg(test)]
 fn stage_executable(
     source: &CodexExecutableIdentity,
     scratch: &ScratchRoot,
@@ -2954,6 +2974,13 @@ struct ScratchRoot {
     fail_next_sync: std::cell::Cell<bool>,
 }
 
+struct ValidatedScratch<T> {
+    root: ScratchRoot,
+    validated: T,
+}
+
+type StagedScratchExecutable = ValidatedScratch<(PrivateDirectory, CodexExecutableIdentity)>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScratchRootCleanupState {
     Active,
@@ -3200,68 +3227,32 @@ fn verify_scratch_executability(
     Ok(executed)
 }
 
-fn verify_scratch_staging_capacity(
+fn stage_scratch_executable_for_selection(
     root: &ScratchRoot,
-    required_bytes: u64,
+    source: &CodexExecutableIdentity,
     deadline: Instant,
-) -> Result<(), CodexHandoffError> {
-    if required_bytes == 0 || required_bytes > MAX_EXECUTABLE_BYTES {
-        return Err(CodexHandoffError::Unsupported);
-    }
-    ensure_before_deadline(deadline)?;
-    root.revalidate()?;
-    let descriptor = rustix::fs::openat(
-        &root.descriptor,
-        SCRATCH_CAPACITY_PROBE_FILE,
-        rustix::fs::OFlags::WRONLY
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::EXCL
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::from_raw_mode(0o600),
-    )
-    .map_err(|_| CodexHandoffError::Transport)?;
-    let mut output = File::from(descriptor);
-    let chunk = [0_u8; SCRATCH_CAPACITY_PROBE_CHUNK_BYTES];
-    let mut remaining = required_bytes;
-    while remaining != 0 {
-        ensure_before_deadline(deadline)?;
-        let count = usize::try_from(remaining.min(chunk.len() as u64))
-            .map_err(|_| CodexHandoffError::Unsupported)?;
-        output
-            .write_all(&chunk[..count])
-            .map_err(|_| CodexHandoffError::Transport)?;
-        remaining -= count as u64;
-    }
-    output
+    selection_origin: CompatibilityTimeoutOrigin,
+) -> Result<(PrivateDirectory, CodexExecutableIdentity), CodexHandoffCause> {
+    let staged = stage_executable_with_origin(source, root, deadline)?;
+    staged
+        .0
+        .descriptor
         .sync_all()
         .map_err(|_| CodexHandoffError::Transport)?;
-    let metadata = file_node_metadata(
-        &output
-            .metadata()
-            .map_err(|_| CodexHandoffError::Transport)?,
-        FilePolicy::Private,
-    )?;
-    if metadata.length != required_bytes {
-        return Err(CodexHandoffError::Transport);
-    }
-    drop(output);
-    root.revalidate()?;
-    rustix::fs::unlinkat(
-        &root.descriptor,
-        SCRATCH_CAPACITY_PROBE_FILE,
-        rustix::fs::AtFlags::empty(),
-    )
-    .map_err(|_| CodexHandoffError::Transport)?;
+    ensure_compatibility_deadline(deadline, selection_origin)?;
     root.sync_all()?;
-    Ok(())
+    ensure_compatibility_deadline(deadline, selection_origin)?;
+    staged.0.revalidate()?;
+    root.revalidate()?;
+    ensure_compatibility_deadline(deadline, selection_origin)?;
+    Ok(staged)
 }
 
 impl ScratchRoot {
     fn create_for_executable_until(
         source: &CodexExecutableIdentity,
         deadline: Instant,
-    ) -> Result<Self, CodexHandoffFailure> {
+    ) -> Result<StagedScratchExecutable, CodexHandoffFailure> {
         Self::create_for_executable_until_with_origin(
             source,
             deadline,
@@ -3273,7 +3264,7 @@ impl ScratchRoot {
         source: &CodexExecutableIdentity,
         deadline: Instant,
         origin: CompatibilityTimeoutOrigin,
-    ) -> Result<Self, CodexHandoffFailure> {
+    ) -> Result<StagedScratchExecutable, CodexHandoffFailure> {
         check_pre_version_timeout_seam(origin)?;
         ensure_compatibility_deadline(deadline, origin)?;
         Self::create_from_candidates_until_with_validation(
@@ -3281,7 +3272,7 @@ impl ScratchRoot {
             deadline,
             |parent| Self::create_below(parent, false, false),
             verify_scratch_executability,
-            |root, deadline| verify_scratch_staging_capacity(root, source.length, deadline),
+            |root, deadline| stage_scratch_executable_for_selection(root, source, deadline, origin),
         )
         .map_err(|failure| failure.at_timeout_boundary(origin))
     }
@@ -3349,19 +3340,20 @@ impl ScratchRoot {
             probe,
             |_root, _deadline| Ok(()),
         )
+        .map(|selected| selected.root)
     }
 
-    fn create_from_candidates_until_with_validation<C, F, V>(
+    fn create_from_candidates_until_with_validation<C, F, V, T>(
         candidates: &[ScratchParentCandidate],
         deadline: Instant,
         mut create: C,
         mut probe: F,
-        mut validate_capacity: V,
-    ) -> Result<Self, CodexHandoffFailure>
+        mut validate_candidate: V,
+    ) -> Result<ValidatedScratch<T>, CodexHandoffFailure>
     where
         C: FnMut(&Path) -> Result<Self, ScratchRootCreateFailure>,
         F: FnMut(&ScratchRoot, Instant) -> Result<bool, CodexHandoffError>,
-        V: FnMut(&ScratchRoot, Instant) -> Result<(), CodexHandoffError>,
+        V: FnMut(&ScratchRoot, Instant) -> Result<T, CodexHandoffCause>,
     {
         let mut first_infrastructure_error = None;
         for candidate in candidates {
@@ -3388,17 +3380,29 @@ impl ScratchRoot {
             };
             let probe_result = probe(&root, deadline);
             if matches!(probe_result, Ok(true)) {
-                match validate_capacity(&root, deadline) {
-                    Ok(()) => return Ok(root),
-                    Err(error) if error == CodexHandoffError::Transport => {
-                        first_infrastructure_error.get_or_insert(error);
+                match validate_candidate(&root, deadline) {
+                    Ok(validated) => {
+                        if let Err(error) = ensure_before_deadline(deadline) {
+                            let cleanup_result = root.cleanup(deadline);
+                            return match cleanup_result {
+                                Ok(_) => Err(error.into()),
+                                Err(cleanup) => Err(CodexHandoffFailure::with_retained_cause(
+                                    error.into(),
+                                    CodexHandoffRetention::ScratchCleanup(cleanup),
+                                )),
+                            };
+                        }
+                        return Ok(ValidatedScratch { root, validated });
                     }
-                    Err(error) => {
+                    Err(cause) if cause.release() == CodexHandoffError::Transport => {
+                        first_infrastructure_error.get_or_insert(CodexHandoffError::Transport);
+                    }
+                    Err(cause) => {
                         let cleanup_result = root.cleanup(deadline);
                         return match cleanup_result {
-                            Ok(_) => Err(error.into()),
+                            Ok(_) => Err(cause.into()),
                             Err(cleanup) => Err(CodexHandoffFailure::with_retained_cause(
-                                error.into(),
+                                cause,
                                 CodexHandoffRetention::ScratchCleanup(cleanup),
                             )),
                         };
@@ -4728,7 +4732,7 @@ mod tests {
     }
 
     #[test]
-    fn executable_scratch_selection_retries_after_candidate_capacity_failure()
+    fn executable_scratch_selection_returns_the_real_stage_from_the_fallback_candidate()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = ScratchRoot::create()?;
         let first = fixture.create_directory("candidate-first")?;
@@ -4737,28 +4741,107 @@ mod tests {
             ScratchParentCandidate::private_for_test(first.as_ref()),
             ScratchParentCandidate::private_for_test(second.as_ref()),
         ];
-        let mut capacity_checks = 0;
+        let mut staging_attempts = 0;
 
         let selected = ScratchRoot::create_from_candidates_until_with_validation(
             &candidates,
             Instant::now() + Duration::from_secs(2),
             |parent| ScratchRoot::create_below(parent, false, false),
             |_root, _deadline| Ok(true),
-            |_root, _deadline| {
-                capacity_checks += 1;
-                if capacity_checks == 1 {
-                    Err(CodexHandoffError::Transport)
+            |root, _deadline| {
+                staging_attempts += 1;
+                if staging_attempts == 1 {
+                    Err(CodexHandoffCause::from(CodexHandoffError::Transport))
                 } else {
-                    Ok(())
+                    Ok(root.parent_path.clone())
                 }
             },
         )?;
 
-        assert_eq!(capacity_checks, 2);
-        assert_eq!(selected.parent_path, second.as_ref());
+        assert_eq!(staging_attempts, 2);
+        assert_eq!(selected.validated, second.as_ref());
+        assert_eq!(selected.root.parent_path, second.as_ref());
         assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
-        cleanup_test_scratch(selected)?;
+        cleanup_test_scratch(selected.root)?;
         drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn executable_scratch_selection_retains_the_real_staged_topology()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let source = fixture.path().join("codex-stage-source");
+        fs::write(&source, b"#!/bin/sh\nexit 0\n")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700))?;
+        let identity = capture_executable(&source, Instant::now() + Duration::from_secs(2))?;
+
+        let selected = ScratchRoot::create_for_executable_until(
+            &identity,
+            Instant::now() + Duration::from_secs(2),
+        )?;
+
+        assert_eq!(
+            selected.validated.0.as_ref(),
+            selected.root.path().join("b")
+        );
+        assert_eq!(
+            selected.validated.1.canonical_path,
+            selected.root.path().join("b").join(PROBE_EXECUTABLE_FILE)
+        );
+        selected.validated.0.revalidate()?;
+        selected.root.revalidate()?;
+        revalidate_executable_until(
+            &selected.validated.1,
+            Some(Instant::now() + Duration::from_secs(2)),
+        )?;
+        let ValidatedScratch { root, validated } = selected;
+        drop(validated);
+        cleanup_test_scratch(root)?;
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn executable_scratch_selection_rejects_validation_that_crosses_its_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let candidate = fixture.create_directory("candidate-deadline")?;
+        let candidates = [ScratchParentCandidate::private_for_test(candidate.as_ref())];
+        let deadline = Instant::now() + Duration::from_millis(20);
+
+        let failure = match ScratchRoot::create_from_candidates_until_with_validation(
+            &candidates,
+            deadline,
+            |parent| ScratchRoot::create_below(parent, false, false),
+            |_root, _deadline| Ok(true),
+            |_root, _deadline| {
+                thread::sleep(Duration::from_millis(30));
+                Ok(())
+            },
+        )
+        .map_err(|failure| {
+            failure.at_timeout_boundary(CompatibilityTimeoutOrigin::ScratchSelection)
+        }) {
+            Ok(selected) => {
+                cleanup_test_scratch(selected.root)?;
+                return Err("a validation result crossed the selection deadline".into());
+            }
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.error(), CodexHandoffError::Timeout);
+        assert_eq!(
+            failure.timeout_origin(),
+            Some(CompatibilityTimeoutOrigin::ScratchSelection)
+        );
+        let resolution = Box::new(failure)
+            .resolve(Instant::now() + Duration::from_secs(2))
+            .map_err(|_| "the expired selection root could not be cleaned")?;
+        assert_eq!(resolution.error(), CodexHandoffError::Timeout);
+        assert_eq!(fs::read_dir(candidate.as_ref())?.count(), 0);
+        drop(candidate);
         cleanup_test_scratch(fixture)?;
         Ok(())
     }
