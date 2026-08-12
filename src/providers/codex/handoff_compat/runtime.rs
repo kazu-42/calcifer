@@ -55,6 +55,8 @@ const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const PROBE_EXECUTABLE_FILE: &str = "codex";
 const SCRATCH_EXECUTABILITY_PROBE_FILE: &str = ".calcifer-exec-probe";
 const SCRATCH_EXECUTABILITY_PROBE_BYTES: &[u8] = b"#!/bin/sh\nexit 0\n";
+const SCRATCH_CAPACITY_PROBE_FILE: &str = ".calcifer-capacity-probe";
+const SCRATCH_CAPACITY_PROBE_CHUNK_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -247,7 +249,7 @@ fn verify_before_remote_until(
     source_executable: &CodexExecutableIdentity,
     deadline: Instant,
 ) -> Result<PreRemoteProof, CodexHandoffFailure> {
-    let scratch = ScratchRoot::create_until(deadline)?;
+    let scratch = ScratchRoot::create_for_executable_until(source_executable, deadline)?;
     match build_pre_remote_parts(source_executable, &scratch, deadline) {
         Ok(parts) => Ok(PreRemoteProof {
             scratch,
@@ -1015,7 +1017,8 @@ impl PinnedExecutableStage {
         revalidate_executable_until(source, Some(deadline))
             .map_err(map_stage_error)
             .map_err(map_pinned_stage_error)?;
-        let scratch = ScratchRoot::create_until_with_origin(
+        let scratch = ScratchRoot::create_for_executable_until_with_origin(
+            source,
             deadline,
             CompatibilityTimeoutOrigin::FinalScratchSelection,
         )?;
@@ -3197,11 +3200,98 @@ fn verify_scratch_executability(
     Ok(executed)
 }
 
+fn verify_scratch_staging_capacity(
+    root: &ScratchRoot,
+    required_bytes: u64,
+    deadline: Instant,
+) -> Result<(), CodexHandoffError> {
+    if required_bytes == 0 || required_bytes > MAX_EXECUTABLE_BYTES {
+        return Err(CodexHandoffError::Unsupported);
+    }
+    ensure_before_deadline(deadline)?;
+    root.revalidate()?;
+    let descriptor = rustix::fs::openat(
+        &root.descriptor,
+        SCRATCH_CAPACITY_PROBE_FILE,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .map_err(|_| CodexHandoffError::Transport)?;
+    let mut output = File::from(descriptor);
+    let chunk = [0_u8; SCRATCH_CAPACITY_PROBE_CHUNK_BYTES];
+    let mut remaining = required_bytes;
+    while remaining != 0 {
+        ensure_before_deadline(deadline)?;
+        let count = usize::try_from(remaining.min(chunk.len() as u64))
+            .map_err(|_| CodexHandoffError::Unsupported)?;
+        output
+            .write_all(&chunk[..count])
+            .map_err(|_| CodexHandoffError::Transport)?;
+        remaining -= count as u64;
+    }
+    output
+        .sync_all()
+        .map_err(|_| CodexHandoffError::Transport)?;
+    let metadata = file_node_metadata(
+        &output
+            .metadata()
+            .map_err(|_| CodexHandoffError::Transport)?,
+        FilePolicy::Private,
+    )?;
+    if metadata.length != required_bytes {
+        return Err(CodexHandoffError::Transport);
+    }
+    drop(output);
+    root.revalidate()?;
+    rustix::fs::unlinkat(
+        &root.descriptor,
+        SCRATCH_CAPACITY_PROBE_FILE,
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(|_| CodexHandoffError::Transport)?;
+    root.sync_all()?;
+    Ok(())
+}
+
 impl ScratchRoot {
+    fn create_for_executable_until(
+        source: &CodexExecutableIdentity,
+        deadline: Instant,
+    ) -> Result<Self, CodexHandoffFailure> {
+        Self::create_for_executable_until_with_origin(
+            source,
+            deadline,
+            CompatibilityTimeoutOrigin::ScratchSelection,
+        )
+    }
+
+    fn create_for_executable_until_with_origin(
+        source: &CodexExecutableIdentity,
+        deadline: Instant,
+        origin: CompatibilityTimeoutOrigin,
+    ) -> Result<Self, CodexHandoffFailure> {
+        check_pre_version_timeout_seam(origin)?;
+        ensure_compatibility_deadline(deadline, origin)?;
+        Self::create_from_candidates_until_with_validation(
+            &production_scratch_candidates(),
+            deadline,
+            |parent| Self::create_below(parent, false, false),
+            verify_scratch_executability,
+            |root, deadline| verify_scratch_staging_capacity(root, source.length, deadline),
+        )
+        .map_err(|failure| failure.at_timeout_boundary(origin))
+    }
+
+    #[cfg(test)]
     fn create_until(deadline: Instant) -> Result<Self, CodexHandoffFailure> {
         Self::create_until_with_origin(deadline, CompatibilityTimeoutOrigin::ScratchSelection)
     }
 
+    #[cfg(test)]
     fn create_until_with_origin(
         deadline: Instant,
         origin: CompatibilityTimeoutOrigin,
@@ -3224,6 +3314,7 @@ impl ScratchRoot {
         Self::create_until(deadline)
     }
 
+    #[cfg(test)]
     fn create_from_candidates_until<F>(
         candidates: &[ScratchParentCandidate],
         deadline: Instant,
@@ -3240,15 +3331,37 @@ impl ScratchRoot {
         )
     }
 
+    #[cfg(test)]
     fn create_from_candidates_until_with<C, F>(
         candidates: &[ScratchParentCandidate],
         deadline: Instant,
-        mut create: C,
-        mut probe: F,
+        create: C,
+        probe: F,
     ) -> Result<Self, CodexHandoffFailure>
     where
         C: FnMut(&Path) -> Result<Self, ScratchRootCreateFailure>,
         F: FnMut(&ScratchRoot, Instant) -> Result<bool, CodexHandoffError>,
+    {
+        Self::create_from_candidates_until_with_validation(
+            candidates,
+            deadline,
+            create,
+            probe,
+            |_root, _deadline| Ok(()),
+        )
+    }
+
+    fn create_from_candidates_until_with_validation<C, F, V>(
+        candidates: &[ScratchParentCandidate],
+        deadline: Instant,
+        mut create: C,
+        mut probe: F,
+        mut validate_capacity: V,
+    ) -> Result<Self, CodexHandoffFailure>
+    where
+        C: FnMut(&Path) -> Result<Self, ScratchRootCreateFailure>,
+        F: FnMut(&ScratchRoot, Instant) -> Result<bool, CodexHandoffError>,
+        V: FnMut(&ScratchRoot, Instant) -> Result<(), CodexHandoffError>,
     {
         let mut first_infrastructure_error = None;
         for candidate in candidates {
@@ -3275,7 +3388,22 @@ impl ScratchRoot {
             };
             let probe_result = probe(&root, deadline);
             if matches!(probe_result, Ok(true)) {
-                return Ok(root);
+                match validate_capacity(&root, deadline) {
+                    Ok(()) => return Ok(root),
+                    Err(error) if error == CodexHandoffError::Transport => {
+                        first_infrastructure_error.get_or_insert(error);
+                    }
+                    Err(error) => {
+                        let cleanup_result = root.cleanup(deadline);
+                        return match cleanup_result {
+                            Ok(_) => Err(error.into()),
+                            Err(cleanup) => Err(CodexHandoffFailure::with_retained_cause(
+                                error.into(),
+                                CodexHandoffRetention::ScratchCleanup(cleanup),
+                            )),
+                        };
+                    }
+                }
             }
             let probe_error = probe_result.err();
             match root.cleanup(deadline) {
@@ -4594,6 +4722,42 @@ mod tests {
         assert!(!failure.has_retained_ownership());
         assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
         assert_eq!(fs::read_dir(second.as_ref())?.count(), 0);
+        drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn executable_scratch_selection_retries_after_candidate_capacity_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let first = fixture.create_directory("candidate-first")?;
+        let second = fixture.create_directory("candidate-second")?;
+        let candidates = [
+            ScratchParentCandidate::private_for_test(first.as_ref()),
+            ScratchParentCandidate::private_for_test(second.as_ref()),
+        ];
+        let mut capacity_checks = 0;
+
+        let selected = ScratchRoot::create_from_candidates_until_with_validation(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |parent| ScratchRoot::create_below(parent, false, false),
+            |_root, _deadline| Ok(true),
+            |_root, _deadline| {
+                capacity_checks += 1;
+                if capacity_checks == 1 {
+                    Err(CodexHandoffError::Transport)
+                } else {
+                    Ok(())
+                }
+            },
+        )?;
+
+        assert_eq!(capacity_checks, 2);
+        assert_eq!(selected.parent_path, second.as_ref());
+        assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
+        cleanup_test_scratch(selected)?;
         drop((first, second));
         cleanup_test_scratch(fixture)?;
         Ok(())
