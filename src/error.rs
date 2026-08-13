@@ -20,6 +20,7 @@ pub(crate) enum AppError {
     Routing(RoutingError),
     ProviderArgumentRejected,
     ProviderLoginFailed,
+    SupervisedUnsupportedPlatform,
     Update(UpdateError),
 }
 
@@ -36,6 +37,7 @@ impl AppError {
             Self::Routing(error) => error.code(),
             Self::ProviderArgumentRejected => "provider_argument_rejected",
             Self::ProviderLoginFailed => "provider_login_failed",
+            Self::SupervisedUnsupportedPlatform => "supervised_unsupported_platform",
             Self::Update(error) => error.code(),
         }
     }
@@ -55,6 +57,7 @@ impl AppError {
             Self::Routing(error) => error.safe_message().to_owned(),
             Self::ProviderArgumentRejected => "Calcifer rejected a provider argument that could bypass the selected managed account or provider.".to_owned(),
             Self::ProviderLoginFailed => "The official Codex login command did not complete successfully. No managed profile credential was changed.".to_owned(),
+            Self::SupervisedUnsupportedPlatform => "Supervised Codex resume requires a Linux build with descriptor-backed provider execution. No provider process was started.".to_owned(),
             Self::Update(error) => error.safe_message().to_owned(),
         }
     }

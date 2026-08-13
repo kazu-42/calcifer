@@ -3034,7 +3034,7 @@ impl<'build> RemoteTuiCommand<'build> {
             .map_err(Into::into)
     }
 
-    #[cfg(feature = "internal-supervisor-fixture")]
+    #[cfg(feature = "production-supervisor")]
     pub(super) fn into_launch_command(
         self,
         deadline: Instant,

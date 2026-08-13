@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Explicit Linux `resume --experimental-supervised codex@<alias> <thread-uuid>`
+  for one exact same-profile foreground session through the sealed production
+  supervisor. It rejects JSON, implicit/last resume, provider arguments, pool
+  selection, and cross-profile handoff, and never falls back to direct mode.
+- A default `production-supervisor` feature distinct from the
+  `internal-supervisor-fixture` package and deterministic fault-injection
+  surface.
 - Private Unix user-level `routing.json` trust-domain and ordered-pool
   definitions with immutable profile IDs, fixed disabled activation, bounded
   atomic revision updates, stable redacted human/JSON inspection, and explicit
@@ -18,8 +25,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   effective identities. No selector or provider launch consumes these records.
 - Internal Linux/macOS no-gap target reservation and one-shot guardian
   provider-lease transfer, with consume-by-value ACK state transitions for the
-  future supervised cross-profile handoff. Public commands and persisted
-  schemas remain unchanged until supervisor integration.
+  future supervised cross-profile handoff. The explicit Linux exact-resume
+  command cannot reach this transfer, and persisted handoff schemas remain
+  unchanged until failover integration.
 - Confirmed offline `auth remove` for one Codex profile, with non-TTY and JSON
   fail-safe confirmation, an alpha.4-blocking transient registry barrier, a
   bounded private sidecar, same-filesystem tombstones, immutable-ID registry
@@ -33,6 +41,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Security
 
+- Public supervised exact resume enters the production role parser through a
+  sanitized, zero-argument self-exec carrying a child-only, close-on-exec,
+  one-shot FD capability and exact frame. The child consumes that capability
+  before storage access, then revalidates the immutable profile, canonical
+  working directory, canonical thread UUID, current Calcifer image, and
+  resolved provider executable after the boundary. Ambient internal-role
+  variables alone cannot enter the anchor. macOS and other platforms fail
+  before provider startup; no weaker pathname-exec route is selected.
 - Verified Linux Codex compatibility, App Server, and remote-TUI launches now
   execute one SHA-256-equal native image from a sealed anonymous `memfd` through
   its retained descriptor. Rename, replacement, same-size substitution, and
