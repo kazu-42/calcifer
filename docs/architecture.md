@@ -254,10 +254,23 @@ That compatibility gate starts each command from an empty environment and adds
 only fixed process basics plus synthetic `CODEX_HOME`, home, XDG, and temporary
 paths. It binds the original canonical executable to safe mode/identity
 metadata and SHA-256, creates a byte-identical mode-`0500` staged executable
-inside the retained private scratch tree, and runs every probe phase from that
-copy. This prevents a legitimate installer path replacement from mixing builds;
-both staged and original binaries are fully rehashed before the original-bound
-capability is minted, so an update during the probe fails closed. Default and
+inside the retained private scratch tree, then on Linux seals the verified
+native ELF bytes in an anonymous close-on-exec `memfd`. Every probe and later
+App Server/TUI plan borrows that exact descriptor-backed launch authority and
+executes it through `/proc/self/fd`; neither the installed nor staged pathname
+is reopened as the exec object. The App Server descriptor closes on its exec;
+the remote-TUI path transfers only a fresh child duplicate across the mandatory
+internal-launcher exec, reseals it immediately, and closes it on the final Codex
+exec. App Server includes the authority in its forbidden-FD check; the held TUI
+check excludes only the expected executable identity after the one-shot
+launcher API has resealed it. A real two-exec test proves it absent from the
+provider without relying on post-exec procfs access. This prevents both ordinary installer replacement
+and final pre-exec rename/in-place races from mixing builds. Both staged and
+original binaries are fully rehashed before the original-bound capability is
+minted, so earlier drift fails closed and later drift cannot alter the sealed
+bytes. macOS has no direct-path fallback and cannot mint this capability until
+a reviewed public equivalent exists; see
+[ADR 0005](adr/0005-descriptor-backed-provider-exec.md). Default and
 experimental protocol output must match the reviewed fork, resume, and
 thread-response projections; only the separate `JSONRPCError` and
 `JSONRPCErrorError` documents are required to equal their complete pinned

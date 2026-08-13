@@ -1390,36 +1390,49 @@ fn hold_tui_with_descriptor_inventory<'source>(
     lifecycle: &'source impl StartupLifecycleReporter,
     deadline: Instant,
 ) -> Result<HeldRemoteTui, Box<RemoteTuiReadinessFailure>> {
-    let inventory = (|| {
-        let mut forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
-        ensure_descriptor_stage_before(deadline)?;
-        build
-            .append_forbidden_descriptors(&mut forbidden)
-            .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
-        ensure_descriptor_stage_before(deadline)?;
-        monitor
-            .append_forbidden_descriptors(&mut forbidden)
-            .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
-        ensure_descriptor_stage_before(deadline)?;
-        relay
-            .append_forbidden_descriptors(&mut forbidden)
-            .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
-        ensure_descriptor_stage_before(deadline)?;
-        terminal
-            .append_forbidden_descriptors(&mut forbidden)
-            .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
-        ensure_descriptor_stage_before(deadline)?;
-        lifecycle
-            .append_forbidden_descriptors(&mut forbidden)
-            .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
-        ensure_descriptor_stage_before(deadline)?;
-        Ok::<_, calcifer_unix_child_fd::ProcessGroupDescriptorScanError>(forbidden)
-    })();
+    let inventory = tui_descriptor_inventory(build, monitor, relay, terminal, lifecycle, deadline);
 
     match inventory {
         Ok(forbidden) => pending.hold_and_verify_descriptors(&forbidden, deadline),
         Err(error) => Err(pending.retain_descriptor_isolation_failure(error)),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tui_descriptor_inventory<'source>(
+    build: &'source PinnedSessionBuild,
+    monitor: &'source SessionMonitor,
+    relay: &'source ExactRelaySession,
+    terminal: &'source StartupTerminalAuthority,
+    lifecycle: &'source impl StartupLifecycleReporter,
+    deadline: Instant,
+) -> Result<
+    calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    calcifer_unix_child_fd::ProcessGroupDescriptorScanError,
+> {
+    let mut forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+    ensure_descriptor_stage_before(deadline)?;
+    build
+        .append_remote_tui_pre_exec_forbidden_descriptors(&mut forbidden)
+        .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
+    ensure_descriptor_stage_before(deadline)?;
+    monitor
+        .append_forbidden_descriptors(&mut forbidden)
+        .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
+    ensure_descriptor_stage_before(deadline)?;
+    relay
+        .append_forbidden_descriptors(&mut forbidden)
+        .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
+    ensure_descriptor_stage_before(deadline)?;
+    terminal
+        .append_forbidden_descriptors(&mut forbidden)
+        .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
+    ensure_descriptor_stage_before(deadline)?;
+    lifecycle
+        .append_forbidden_descriptors(&mut forbidden)
+        .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)?;
+    ensure_descriptor_stage_before(deadline)?;
+    Ok(forbidden)
 }
 
 /// Runs the complete post-terminal-arm production startup. Raw profile homes,

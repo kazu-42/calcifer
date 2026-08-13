@@ -2,9 +2,13 @@ use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom};
 use std::net::TcpListener;
 use std::ops::Deref;
 use std::os::fd::AsFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -135,7 +139,7 @@ pub(super) fn verify(
         ensure_no_credentials(proof.scratch.path())?;
         ensure_no_model_request(&proof.model_listener)?;
         proof.probe_binary_directory.revalidate()?;
-        revalidate_executable_until(&proof.probe_executable, Some(deadline))?;
+        proof.probe_executable.revalidate(deadline)?;
         revalidate_executable_until(&executable, Some(deadline))
     })();
     if let Err(error) = verification {
@@ -161,7 +165,7 @@ pub(super) fn verify(
 struct PreRemoteProof {
     scratch: ScratchRoot,
     probe_binary_directory: PrivateDirectory,
-    probe_executable: CodexExecutableIdentity,
+    probe_executable: LaunchExecutable,
     schema: HandoffSchemaContract,
     fork: ForkProof,
     model_listener: TcpListener,
@@ -174,7 +178,7 @@ struct PreRemoteProof {
 
 struct PreRemoteParts {
     probe_binary_directory: PrivateDirectory,
-    probe_executable: CodexExecutableIdentity,
+    probe_executable: LaunchExecutable,
     schema: HandoffSchemaContract,
     fork: ForkProof,
     model_listener: TcpListener,
@@ -279,7 +283,7 @@ fn verify_before_remote_until(
 fn build_pre_remote_parts(
     scratch: &ScratchRoot,
     probe_binary_directory: PrivateDirectory,
-    probe_executable: CodexExecutableIdentity,
+    probe_executable: LaunchExecutable,
     deadline: Instant,
 ) -> Result<PreRemoteParts, CodexHandoffCause> {
     let executable = &probe_executable;
@@ -314,9 +318,8 @@ fn build_pre_remote_parts(
         &environment_home,
     )?;
 
-    revalidate_executable_metadata(executable)?;
-    let version_command =
-        isolated_command(&executable.canonical_path, &target_home, &environment_home);
+    executable.revalidate_metadata()?;
+    let version_command = executable.isolated_command(&target_home, &environment_home);
     check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::VersionChildExit)?;
     check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::VersionStdoutDrain)?;
     let version =
@@ -392,7 +395,7 @@ fn build_pre_remote_parts(
 }
 
 fn verify_remote_tui(
-    executable: &CodexExecutableIdentity,
+    executable: &LaunchExecutable,
     proof: &PreRemoteProof,
     deadline: Instant,
 ) -> Result<RemoteTuiProof, CodexHandoffFailure> {
@@ -407,12 +410,9 @@ fn verify_remote_tui(
         .revalidate(&proof.source_home, &proof.target_home)?;
     let app_server_socket = proof.scratch.path().join("a.sock");
     let proxy_socket = proof.scratch.path().join("p.sock");
-    revalidate_executable_metadata(executable)?;
-    let mut app_server_command = isolated_command(
-        &executable.canonical_path,
-        &proof.fork.target_home,
-        &proof.environment_home,
-    );
+    executable.revalidate_metadata()?;
+    let mut app_server_command =
+        executable.isolated_command(&proof.fork.target_home, &proof.environment_home);
     app_server_command
         .args(["app-server", "--listen"])
         .arg(unix_address(&app_server_socket));
@@ -436,7 +436,7 @@ fn verify_remote_tui(
     .map_err(map_proxy_error)?;
     #[cfg(test)]
     eprintln!("handoff probe: readiness proxy ready");
-    revalidate_executable_metadata(executable)?;
+    executable.revalidate_metadata()?;
     proof.scratch.revalidate()?;
     proof.source_home.revalidate()?;
     proof.target_home.revalidate()?;
@@ -446,11 +446,8 @@ fn verify_remote_tui(
     proof
         .fork
         .revalidate(&proof.source_home, &proof.target_home)?;
-    let mut tui_command = isolated_command(
-        &executable.canonical_path,
-        &proof.fork.target_home,
-        &proof.environment_home,
-    );
+    let mut tui_command =
+        executable.isolated_command(&proof.fork.target_home, &proof.environment_home);
     tui_command
         .args(["resume", "--no-alt-screen", "--remote"])
         .arg(unix_address(proxy.socket_path()))
@@ -976,7 +973,7 @@ impl fmt::Debug for PinnedStageCleanupFailure {
 pub(crate) struct PinnedExecutableStage {
     scratch: ScratchRoot,
     directory: PrivateDirectory,
-    executable: CodexExecutableIdentity,
+    executable: LaunchExecutable,
     cleanup_state: PinnedStageCleanupState,
     cleanup_first_error: Option<PinnedStageError>,
     cleanup_fault: Option<PinnedStageCleanupFault>,
@@ -1005,9 +1002,36 @@ pub(crate) enum PinnedStageCleanupFault {
 }
 
 impl PinnedExecutableStage {
+    /// Borrows the sealed Linux provider image for the reviewed two-stage TUI
+    /// exec chain. Fixture path launches and unsupported platforms have no
+    /// descriptor authority to transfer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn launch_descriptor(&self) -> Option<BorrowedFd<'_>> {
+        self.executable.launch_descriptor()
+    }
+
     /// Appends every persistent descriptor that pins the private executable
     /// stage to one source-pinned child denyset.
     pub(crate) fn append_forbidden_descriptors<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        self.append_storage_descriptors(forbidden)?;
+        self.executable.append_forbidden_descriptor(forbidden)
+    }
+
+    /// Appends the persistent stage descriptors that must be absent while the
+    /// TUI launcher is held before its final exec. The sealed executable is the
+    /// one intentional child-only authority at that boundary and is therefore
+    /// checked only by the full post-exec inventory.
+    pub(crate) fn append_remote_tui_pre_exec_forbidden_descriptors<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        self.append_storage_descriptors(forbidden)
+    }
+
+    fn append_storage_descriptors<'source>(
         &'source self,
         forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
     ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
@@ -1017,14 +1041,15 @@ impl PinnedExecutableStage {
     }
 
     fn from_verified(
-        source: &CodexExecutableIdentity,
+        source: &LaunchExecutable,
         deadline: Instant,
     ) -> Result<Self, CodexHandoffFailure> {
-        revalidate_executable_until(source, Some(deadline))
+        source
+            .revalidate(deadline)
             .map_err(map_stage_error)
             .map_err(map_pinned_stage_error)?;
         let selected = ScratchRoot::create_for_executable_until_with_origin(
-            source,
+            &source.identity,
             deadline,
             CompatibilityTimeoutOrigin::FinalScratchSelection,
         )?;
@@ -1134,7 +1159,7 @@ impl PinnedExecutableStage {
 
     #[cfg(test)]
     pub(crate) fn executable_path_for_test(&self) -> &Path {
-        &self.executable.canonical_path
+        &self.executable.identity.canonical_path
     }
 
     #[cfg(test)]
@@ -1149,7 +1174,9 @@ impl PinnedExecutableStage {
         ensure_stage_deadline(deadline)?;
         self.scratch.revalidate().map_err(map_stage_error)?;
         self.directory.revalidate().map_err(map_stage_error)?;
-        revalidate_executable_until(&self.executable, Some(deadline)).map_err(map_stage_error)
+        self.executable
+            .revalidate(deadline)
+            .map_err(map_stage_error)
     }
 
     /// Rechecks the exact private stage without re-reading its full contents.
@@ -1164,7 +1191,9 @@ impl PinnedExecutableStage {
         }
         self.scratch.revalidate().map_err(map_stage_error)?;
         self.directory.revalidate().map_err(map_stage_error)?;
-        revalidate_executable_metadata(&self.executable).map_err(map_stage_error)
+        self.executable
+            .revalidate_metadata()
+            .map_err(map_stage_error)
     }
 
     pub(crate) fn app_server_command(
@@ -1175,7 +1204,7 @@ impl PinnedExecutableStage {
         deadline: Instant,
     ) -> Result<Command, PinnedStageError> {
         self.revalidate(deadline)?;
-        let mut command = managed_command(&self.executable.canonical_path, codex_home);
+        let mut command = self.executable.managed_command(codex_home);
         command
             .env_remove("RUST_LOG")
             .env_remove("LOG_FORMAT")
@@ -1193,7 +1222,7 @@ impl PinnedExecutableStage {
         deadline: Instant,
     ) -> Result<Command, PinnedStageError> {
         self.revalidate(deadline)?;
-        let mut command = managed_command(&self.executable.canonical_path, codex_home);
+        let mut command = self.executable.managed_command(codex_home);
         command
             .env_remove("RUST_LOG")
             .env_remove("LOG_FORMAT")
@@ -1252,9 +1281,9 @@ impl PinnedExecutableStage {
                         Some(Err(_)) => return Err(PinnedStageError::Storage),
                     }
                     ensure_stage_deadline(deadline)?;
-                    fs::remove_file(&self.executable.canonical_path)
+                    fs::remove_file(&self.executable.identity.canonical_path)
                         .map_err(|_| PinnedStageError::Storage)?;
-                    if fs::symlink_metadata(&self.executable.canonical_path).is_ok() {
+                    if fs::symlink_metadata(&self.executable.identity.canonical_path).is_ok() {
                         return Err(PinnedStageError::ExecutableChanged);
                     }
                     self.cleanup_state =
@@ -1453,12 +1482,294 @@ struct ExecutableMetadata {
     changed_nanoseconds: i64,
 }
 
+/// Exact verified provider bytes plus the only authority allowed to execute them.
+///
+/// Linux copies the verified staged image into an anonymous `memfd`, seals all
+/// content and size mutations, and executes only through that retained file
+/// descriptor. The descriptor is close-on-exec, so the provider image and its
+/// descendants cannot inherit Calcifer's launch authority. Other production
+/// Unix targets have no constructor until an equivalent public primitive is
+/// reviewed; their compatibility verification therefore fails closed.
+struct LaunchExecutable {
+    identity: CodexExecutableIdentity,
+    authority: LaunchAuthority,
+}
+
+enum LaunchAuthority {
+    #[cfg(target_os = "linux")]
+    LinuxSealed(File),
+    #[cfg(test)]
+    FixturePath,
+    #[cfg(all(not(target_os = "linux"), not(test)))]
+    #[expect(
+        dead_code,
+        reason = "documents the unmintable production state on unsupported Unix targets"
+    )]
+    Unsupported,
+}
+
+impl LaunchExecutable {
+    #[cfg(target_os = "linux")]
+    fn launch_descriptor(&self) -> Option<BorrowedFd<'_>> {
+        match &self.authority {
+            LaunchAuthority::LinuxSealed(descriptor) => Some(descriptor.as_fd()),
+            #[cfg(test)]
+            LaunchAuthority::FixturePath => None,
+        }
+    }
+
+    fn from_verified(
+        identity: CodexExecutableIdentity,
+        deadline: Instant,
+    ) -> Result<Self, CodexHandoffError> {
+        #[cfg(target_os = "linux")]
+        {
+            match seal_linux_executable(&identity, deadline) {
+                Ok(descriptor) => Ok(Self {
+                    identity,
+                    authority: LaunchAuthority::LinuxSealed(descriptor),
+                }),
+                #[cfg(test)]
+                Err(CodexHandoffError::Unsupported)
+                    if !verified_executable_is_elf(&identity, deadline)? =>
+                {
+                    // Existing unit fixtures are intentionally tiny shell
+                    // scripts. This cfg(test)-only branch keeps those tests
+                    // focused on their original state-machine contracts; all
+                    // native-image launch-boundary tests use the sealed path.
+                    Ok(Self {
+                        identity,
+                        authority: LaunchAuthority::FixturePath,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(all(not(target_os = "linux"), test))]
+        {
+            let _ = deadline;
+            Ok(Self {
+                identity,
+                authority: LaunchAuthority::FixturePath,
+            })
+        }
+        #[cfg(all(not(target_os = "linux"), not(test)))]
+        {
+            let _ = (identity, deadline);
+            Err(CodexHandoffError::Unsupported)
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn from_verified_strict(
+        identity: CodexExecutableIdentity,
+        deadline: Instant,
+    ) -> Result<Self, CodexHandoffError> {
+        let _ = (identity, deadline);
+        Err(CodexHandoffError::Unsupported)
+    }
+
+    fn command_path(&self) -> PathBuf {
+        match &self.authority {
+            #[cfg(target_os = "linux")]
+            LaunchAuthority::LinuxSealed(descriptor) => {
+                PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
+            }
+            #[cfg(test)]
+            LaunchAuthority::FixturePath => self.identity.canonical_path.clone(),
+            #[cfg(all(not(target_os = "linux"), not(test)))]
+            LaunchAuthority::Unsupported => {
+                unreachable!("unsupported platform cannot mint executable launch authority")
+            }
+        }
+    }
+
+    fn isolated_command(&self, codex_home: &Path, environment_home: &Path) -> Command {
+        isolated_command(&self.command_path(), codex_home, environment_home)
+    }
+
+    fn managed_command(&self, codex_home: &Path) -> Command {
+        managed_command(&self.command_path(), codex_home)
+    }
+
+    fn revalidate(&self, deadline: Instant) -> Result<(), CodexHandoffError> {
+        revalidate_executable_until(&self.identity, Some(deadline))?;
+        self.revalidate_authority()
+    }
+
+    fn revalidate_metadata(&self) -> Result<(), CodexHandoffError> {
+        revalidate_executable_metadata(&self.identity)?;
+        self.revalidate_authority()
+    }
+
+    fn revalidate_authority(&self) -> Result<(), CodexHandoffError> {
+        match &self.authority {
+            #[cfg(target_os = "linux")]
+            LaunchAuthority::LinuxSealed(descriptor) => {
+                let metadata = descriptor
+                    .metadata()
+                    .map_err(|_| CodexHandoffError::Transport)?;
+                let required = rustix::fs::SealFlags::SEAL
+                    | rustix::fs::SealFlags::SHRINK
+                    | rustix::fs::SealFlags::GROW
+                    | rustix::fs::SealFlags::WRITE;
+                let seals = rustix::fs::fcntl_get_seals(descriptor)
+                    .map_err(|_| CodexHandoffError::Unsupported)?;
+                if !metadata.file_type().is_file()
+                    || metadata.len() != self.identity.length
+                    || metadata.mode() & 0o777 != 0o500
+                    || metadata.uid() != rustix::process::geteuid().as_raw()
+                    || metadata.nlink() != 0
+                    || !seals.contains(required)
+                {
+                    return Err(CodexHandoffError::Unsupported);
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            LaunchAuthority::FixturePath => Ok(()),
+            #[cfg(all(not(target_os = "linux"), not(test)))]
+            LaunchAuthority::Unsupported => Err(CodexHandoffError::Unsupported),
+        }
+    }
+
+    fn append_forbidden_descriptor<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        let _ = &forbidden;
+        match &self.authority {
+            #[cfg(target_os = "linux")]
+            LaunchAuthority::LinuxSealed(descriptor) => forbidden.capture(descriptor.as_fd()),
+            #[cfg(test)]
+            LaunchAuthority::FixturePath => Ok(()),
+            #[cfg(all(not(target_os = "linux"), not(test)))]
+            LaunchAuthority::Unsupported => {
+                unreachable!("unsupported platform cannot append executable launch authority")
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verified_executable_is_elf(
+    identity: &CodexExecutableIdentity,
+    deadline: Instant,
+) -> Result<bool, CodexHandoffError> {
+    ensure_before_deadline(deadline)?;
+    let (mut input, metadata) = open_executable(&identity.canonical_path)?;
+    if metadata != metadata_from_identity(identity) {
+        return Err(CodexHandoffError::Unsupported);
+    }
+    let mut magic = [0_u8; 4];
+    input
+        .read_exact(&mut magic)
+        .map_err(|_| CodexHandoffError::Unsupported)?;
+    Ok(magic == *b"\x7fELF")
+}
+
+#[cfg(target_os = "linux")]
+fn seal_linux_executable(
+    identity: &CodexExecutableIdentity,
+    deadline: Instant,
+) -> Result<File, CodexHandoffError> {
+    if !verified_executable_is_elf(identity, deadline)? {
+        return Err(CodexHandoffError::Unsupported);
+    }
+    let (mut input, before) = open_executable(&identity.canonical_path)?;
+    if before != metadata_from_identity(identity) {
+        return Err(CodexHandoffError::Unsupported);
+    }
+
+    let flags = rustix::fs::MemfdFlags::CLOEXEC
+        | rustix::fs::MemfdFlags::ALLOW_SEALING
+        | rustix::fs::MemfdFlags::EXEC;
+    let descriptor = match rustix::fs::memfd_create("calcifer-codex", flags) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::INVAL) => rustix::fs::memfd_create(
+            "calcifer-codex",
+            rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .map_err(|_| CodexHandoffError::Unsupported)?,
+        Err(_) => return Err(CodexHandoffError::Unsupported),
+    };
+    let mut sealed = File::from(descriptor);
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        ensure_before_deadline(deadline)?;
+        let count = input
+            .read(&mut buffer)
+            .map_err(|_| CodexHandoffError::Transport)?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or(CodexHandoffError::Unsupported)?;
+        if total > identity.length || total > MAX_EXECUTABLE_BYTES {
+            return Err(CodexHandoffError::Unsupported);
+        }
+        sealed
+            .write_all(&buffer[..count])
+            .map_err(|_| CodexHandoffError::Transport)?;
+        hasher.update(&buffer[..count]);
+    }
+    let source_after =
+        executable_metadata(&input.metadata().map_err(|_| CodexHandoffError::Transport)?)?;
+    if source_after != before
+        || total != identity.length
+        || <[u8; 32]>::from(hasher.finalize()) != identity.digest
+    {
+        return Err(CodexHandoffError::Unsupported);
+    }
+    rustix::fs::fchmod(&sealed, rustix::fs::Mode::from_raw_mode(0o500))
+        .map_err(|_| CodexHandoffError::Unsupported)?;
+    sealed
+        .sync_all()
+        .map_err(|_| CodexHandoffError::Transport)?;
+
+    let content_seals =
+        rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW | rustix::fs::SealFlags::WRITE;
+    rustix::fs::fcntl_add_seals(&sealed, content_seals)
+        .map_err(|_| CodexHandoffError::Unsupported)?;
+    match rustix::fs::fcntl_add_seals(&sealed, rustix::fs::SealFlags::EXEC) {
+        Ok(()) | Err(rustix::io::Errno::INVAL) => {}
+        Err(_) => return Err(CodexHandoffError::Unsupported),
+    }
+    rustix::fs::fcntl_add_seals(&sealed, rustix::fs::SealFlags::SEAL)
+        .map_err(|_| CodexHandoffError::Unsupported)?;
+
+    sealed
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| CodexHandoffError::Transport)?;
+    let sealed_digest = hash_executable(&mut sealed, Some(deadline))?;
+    if sealed_digest != identity.digest {
+        return Err(CodexHandoffError::Unsupported);
+    }
+    let launch = LaunchExecutable {
+        identity: identity_from_metadata(
+            identity.canonical_path.clone(),
+            metadata_from_identity(identity),
+            identity.digest,
+        ),
+        authority: LaunchAuthority::LinuxSealed(sealed),
+    };
+    launch.revalidate_authority()?;
+    match launch.authority {
+        LaunchAuthority::LinuxSealed(descriptor) => Ok(descriptor),
+        #[cfg(test)]
+        LaunchAuthority::FixturePath => unreachable!("Linux seal constructed a fixture path"),
+    }
+}
+
 #[cfg(test)]
 fn stage_executable(
     source: &CodexExecutableIdentity,
     scratch: &ScratchRoot,
     deadline: Instant,
-) -> Result<(PrivateDirectory, CodexExecutableIdentity), CodexHandoffError> {
+) -> Result<(PrivateDirectory, LaunchExecutable), CodexHandoffError> {
     stage_executable_with_origin(source, scratch, deadline).map_err(CodexHandoffCause::release)
 }
 
@@ -1466,7 +1777,7 @@ fn stage_executable_with_origin(
     source: &CodexExecutableIdentity,
     scratch: &ScratchRoot,
     deadline: Instant,
-) -> Result<(PrivateDirectory, CodexExecutableIdentity), CodexHandoffCause> {
+) -> Result<(PrivateDirectory, LaunchExecutable), CodexHandoffCause> {
     check_pre_version_timeout_seam(CompatibilityTimeoutOrigin::ProbeStageCopyDurability)?;
     ensure_compatibility_deadline(
         deadline,
@@ -1571,7 +1882,8 @@ fn stage_executable_with_origin(
     if staged.digest != source.digest || staged.length != source.length {
         return Err(CodexHandoffError::Unsupported.into());
     }
-    Ok((directory, staged))
+    let launch = LaunchExecutable::from_verified(staged, deadline)?;
+    Ok((directory, launch))
 }
 
 fn capture_executable_at_boundary(
@@ -1793,7 +2105,7 @@ fn ensure_no_model_request(listener: &TcpListener) -> Result<(), CodexHandoffErr
 }
 
 fn generate_and_validate_schemas(
-    executable: &CodexExecutableIdentity,
+    executable: &LaunchExecutable,
     codex_home: &PrivateDirectory,
     environment_home: &PrivateDirectory,
     working_directory: &PrivateDirectory,
@@ -1804,12 +2116,9 @@ fn generate_and_validate_schemas(
     let default_output = create_private_directory(&scratch.path().join("sd"))?;
     let experimental_output = create_private_directory(&scratch.path().join("se"))?;
     for (output, experimental) in [(&default_output, false), (&experimental_output, true)] {
-        revalidate_executable_metadata(executable)?;
-        let mut command = isolated_command(
-            &executable.canonical_path,
-            codex_home.as_ref(),
-            environment_home.as_ref(),
-        );
+        executable.revalidate_metadata()?;
+        let mut command =
+            executable.isolated_command(codex_home.as_ref(), environment_home.as_ref());
         command.args(["app-server", "generate-json-schema"]);
         if experimental {
             command.arg("--experimental");
@@ -1821,7 +2130,7 @@ fn generate_and_validate_schemas(
         environment_home.revalidate()?;
         working_directory.revalidate()?;
         target_config.revalidate(codex_home)?;
-        revalidate_executable_metadata(executable)?;
+        executable.revalidate_metadata()?;
         output.revalidate()?;
     }
 
@@ -1846,7 +2155,7 @@ fn generate_and_validate_schemas(
 }
 
 fn fork_synthetic_rollout(
-    executable: &CodexExecutableIdentity,
+    executable: &LaunchExecutable,
     source_home: &PrivateDirectory,
     target_home: &PrivateDirectory,
     environment_home: &PrivateDirectory,
@@ -1866,12 +2175,8 @@ fn fork_synthetic_rollout(
         FilePolicy::Private,
     )?;
 
-    revalidate_executable_metadata(executable)?;
-    let mut command = isolated_command(
-        &executable.canonical_path,
-        target_home.as_ref(),
-        environment_home.as_ref(),
-    );
+    executable.revalidate_metadata()?;
+    let mut command = executable.isolated_command(target_home.as_ref(), environment_home.as_ref());
     command.args(["app-server", "--stdio"]);
     let mut process = AppServerProcess::spawn_command(command, workspace.as_ref(), None)
         .map_err(map_usage_error)?;
@@ -1958,7 +2263,7 @@ fn fork_synthetic_rollout(
     target_home.revalidate()?;
     environment_home.revalidate()?;
     workspace.revalidate()?;
-    revalidate_executable_metadata(executable)?;
+    executable.revalidate_metadata()?;
     fork.revalidate(source_home, target_home)?;
     #[cfg(test)]
     eprintln!("handoff probe: source and target fingerprints remained stable");
@@ -2979,7 +3284,7 @@ struct ValidatedScratch<T> {
     validated: T,
 }
 
-type StagedScratchExecutable = ValidatedScratch<(PrivateDirectory, CodexExecutableIdentity)>;
+type StagedScratchExecutable = ValidatedScratch<(PrivateDirectory, LaunchExecutable)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScratchRootCleanupState {
@@ -3272,7 +3577,7 @@ fn stage_scratch_executable_for_selection(
     source: &CodexExecutableIdentity,
     deadline: Instant,
     selection_origin: CompatibilityTimeoutOrigin,
-) -> Result<(PrivateDirectory, CodexExecutableIdentity), CodexHandoffCause> {
+) -> Result<(PrivateDirectory, LaunchExecutable), CodexHandoffCause> {
     let staged = stage_executable_with_origin(source, root, deadline)?;
     staged
         .0
@@ -4335,6 +4640,8 @@ mod tests {
     use std::fs::OpenOptions;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
     use super::*;
@@ -4636,10 +4943,12 @@ mod tests {
         fs::write(&executable, b"#!/bin/sh\nexit 0\n")?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
         let identity = capture_executable(&executable, Instant::now() + Duration::from_secs(2))?;
+        let launch =
+            LaunchExecutable::from_verified(identity, Instant::now() + Duration::from_secs(2))?;
         fs::remove_file(&executable)?;
 
         let failure = match PinnedExecutableStage::from_verified(
-            &identity,
+            &launch,
             Instant::now() + Duration::from_secs(2),
         ) {
             Ok(stage) => {
@@ -4664,10 +4973,12 @@ mod tests {
         fs::write(&executable, b"#!/bin/sh\nexit 0\n")?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
         let identity = capture_executable(&executable, Instant::now() + Duration::from_secs(2))?;
+        let launch =
+            LaunchExecutable::from_verified(identity, Instant::now() + Duration::from_secs(2))?;
         let seam = inject_pre_version_timeout(CompatibilityTimeoutOrigin::FinalScratchSelection);
 
         let failure = match PinnedExecutableStage::from_verified(
-            &identity,
+            &launch,
             Instant::now() + Duration::from_secs(2),
         ) {
             Ok(stage) => {
@@ -4934,15 +5245,15 @@ mod tests {
             selected.root.path().join("b")
         );
         assert_eq!(
-            selected.validated.1.canonical_path,
+            selected.validated.1.identity.canonical_path,
             selected.root.path().join("b").join(PROBE_EXECUTABLE_FILE)
         );
         selected.validated.0.revalidate()?;
         selected.root.revalidate()?;
-        revalidate_executable_until(
-            &selected.validated.1,
-            Some(Instant::now() + Duration::from_secs(2)),
-        )?;
+        selected
+            .validated
+            .1
+            .revalidate(Instant::now() + Duration::from_secs(2))?;
         let ValidatedScratch { root, validated } = selected;
         drop(validated);
         cleanup_test_scratch(root)?;
@@ -5490,15 +5801,173 @@ mod tests {
         fs::write(&executable, b"#!/bin/sh\nprintf 'replacement\\n'\n")?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
 
-        let output = Command::new(&staged.canonical_path).output()?;
+        let output = Command::new(staged.command_path()).output()?;
         assert!(output.status.success());
         assert_eq!(output.stdout, b"verified\n");
         assert_eq!(
             revalidate_executable_until(&installed, Some(deadline)),
             Err(CodexHandoffError::Unsupported)
         );
-        revalidate_executable_until(&staged, Some(deadline))?;
+        staged.revalidate(deadline)?;
         cleanup_test_scratch(scratch)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sealed_exec_helper_command(launch: &LaunchExecutable, role: &str) -> Command {
+        let mut command = Command::new(launch.command_path());
+        command
+            .arg(
+                "providers::codex::handoff_compat::runtime::tests::sealed_exec_child_has_no_launch_descriptor",
+            )
+            .args(["--exact", "--ignored", "--nocapture"])
+            .env("CALCIFER_TEST_SEALED_EXEC_ROLE", role)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sealed_exec_two_stage_child(
+        executable: &Path,
+        launch: &LaunchExecutable,
+    ) -> Result<Child, Box<dyn std::error::Error>> {
+        let descriptor = launch
+            .launch_descriptor()
+            .ok_or("a native executable had no sealed launch descriptor")?;
+        let (readiness, peer) = UnixStream::pair()?;
+        drop(peer);
+        let mut command = Command::new(executable);
+        command
+            .arg(
+                "providers::codex::handoff_compat::runtime::tests::sealed_exec_intermediate_launcher",
+            )
+            .args(["--exact", "--ignored", "--nocapture"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = calcifer_unix_child_fd::spawn_with_inherited_readiness_and_executable_fd(
+            command,
+            readiness.as_fd(),
+            descriptor,
+        )
+        .map_err(|error| format!("two-stage descriptor spawn failed: {error:?}"))?;
+        drop(readiness);
+        Ok(child)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_descriptor_exec_survives_final_path_replacement_without_leaking_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = ScratchRoot::create()?;
+        let source_path = fs::canonicalize(std::env::current_exe()?)?;
+        // CI executes this from the full all-features libtest image. Copying,
+        // hashing, and sealing that image twice can exceed the ordinary
+        // short unit-test budget under hosted-runner I/O contention.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let source = capture_executable(&source_path, deadline)?;
+        let (directory, launch) = stage_executable(&source, &scratch, deadline)?;
+        let descriptor = match &launch.authority {
+            LaunchAuthority::LinuxSealed(descriptor) => descriptor,
+            LaunchAuthority::FixturePath => {
+                return Err("a native executable used the test-only pathname fallback".into());
+            }
+        };
+        assert!(rustix::io::fcntl_getfd(descriptor)?.contains(rustix::io::FdFlags::CLOEXEC));
+        launch.revalidate(deadline)?;
+
+        let mut app = sealed_exec_helper_command(&launch, "app-server");
+        let staged_path = launch.identity.canonical_path.clone();
+        let moved_path = directory.join("codex-before-final-race");
+        let staged_length = launch.identity.length;
+        fs::rename(&staged_path, &moved_path)?;
+        let replacement = File::create(&staged_path)?;
+        replacement.set_len(staged_length)?;
+        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o500))?;
+
+        assert_eq!(
+            launch.revalidate_metadata(),
+            Err(CodexHandoffError::Unsupported)
+        );
+        assert!(app.status()?.success());
+        let mut tui = sealed_exec_two_stage_child(&source_path, &launch)?;
+        assert!(tui.wait()?.success());
+
+        let mut attempted_writer = descriptor.try_clone()?;
+        attempted_writer.seek(SeekFrom::Start(0))?;
+        assert!(attempted_writer.write_all(b"replacement").is_err());
+        launch.revalidate_authority()?;
+
+        drop((attempted_writer, launch, directory));
+        cleanup_test_scratch(scratch)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "internal subprocess for descriptor-backed exec isolation"]
+    fn sealed_exec_child_has_no_launch_descriptor() -> Result<(), Box<dyn std::error::Error>> {
+        let role = std::env::var("CALCIFER_TEST_SEALED_EXEC_ROLE")?;
+        if role != "app-server" && role != "remote-tui" {
+            return Err("sealed exec helper was not explicitly requested".into());
+        }
+        for entry in fs::read_dir("/proc/self/fd")? {
+            let entry = entry?;
+            match fs::read_link(entry.path()) {
+                Ok(target) => {
+                    if target.to_string_lossy().contains("memfd:calcifer-codex") {
+                        return Err(
+                            "the sealed launch descriptor reached the provider image".into()
+                        );
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "internal subprocess for the two-stage descriptor exec test"]
+    fn sealed_exec_intermediate_launcher() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::process::CommandExt;
+
+        let _readiness = calcifer_unix_child_fd::take_inherited_readiness_fd()?;
+        let executable = calcifer_unix_child_fd::take_inherited_executable_fd()?;
+        let mut provider = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+        provider
+            .arg(
+                "providers::codex::handoff_compat::runtime::tests::sealed_exec_child_has_no_launch_descriptor",
+            )
+            .args(["--exact", "--ignored", "--nocapture"])
+            .env("CALCIFER_TEST_SEALED_EXEC_ROLE", "remote-tui")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        calcifer_unix_child_fd::scrub_readiness_fd_env(&mut provider);
+        calcifer_unix_child_fd::scrub_executable_fd_env(&mut provider);
+        let error = provider.exec();
+        drop(executable);
+        Err(error.into())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_production_descriptor_exec_is_explicitly_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let executable = fs::canonicalize(std::env::current_exe()?)?;
+        let identity = capture_executable(&executable, Instant::now() + Duration::from_secs(5))?;
+        assert!(matches!(
+            LaunchExecutable::from_verified_strict(
+                identity,
+                Instant::now() + Duration::from_secs(5),
+            ),
+            Err(CodexHandoffError::Unsupported)
+        ));
         Ok(())
     }
 

@@ -27,6 +27,13 @@ short-lived compatibility probe, not a production supervisor: its policy is
 synthetic-fork-specific, its PTY is a bounded smoke-test capture, and it owns no
 real profile or long-lived provider process.
 
+[ADR 0005](0005-descriptor-backed-provider-exec.md) closes the executable
+handoff race for this design on Linux: the compatibility and production plans
+execute the same verified native bytes from a sealed close-on-exec `memfd`, not
+from a revalidated pathname. macOS cannot mint the production capability until
+an equivalent public launch primitive is available; no direct-path fallback is
+part of this supervisor.
+
 Issue #32 added a no-gap type-state lease-transfer primitive using
 `SCM_RIGHTS`. It remains internal until the receiving guardian and ambiguous
 ACK outcomes have a complete process supervisor.

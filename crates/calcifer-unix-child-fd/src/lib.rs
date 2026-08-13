@@ -44,11 +44,20 @@ const CHILD_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Fixed, private environment key carrying the dynamically selected child fd.
 ///
 /// The value is installed only on a command passed to
-/// [`spawn_with_inherited_readiness_fd`]. It is never exported into the parent
-/// process environment.
+/// [`spawn_with_inherited_readiness_fd`] or the audited remote-TUI helper that
+/// inherits both readiness and executable descriptors. It is never exported
+/// into the parent process environment.
 pub const READINESS_FD_ENV: &str = "CALCIFER_SUPERVISOR_READINESS_FD";
 
+/// Fixed, private environment key carrying a one-shot executable descriptor.
+///
+/// This is paired with [`READINESS_FD_ENV`] only for the reviewed remote-TUI
+/// launcher. The launcher reseals both inherited descriptors immediately and
+/// uses this descriptor as the final provider image.
+pub const EXECUTABLE_FD_ENV: &str = "CALCIFER_SUPERVISOR_EXECUTABLE_FD";
+
 static READINESS_FD_TAKEN: AtomicBool = AtomicBool::new(false);
+static EXECUTABLE_FD_TAKEN: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static SIGTTOU_BLOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -351,6 +360,11 @@ impl Drop for StartedChild {
 /// recycled fd number as a new readiness capability.
 pub fn scrub_readiness_fd_env(command: &mut Command) {
     command.env_remove(READINESS_FD_ENV);
+}
+
+/// Removes a consumed or stale executable-descriptor advertisement.
+pub fn scrub_executable_fd_env(command: &mut Command) {
+    command.env_remove(EXECUTABLE_FD_ENV);
 }
 
 /// Path-free device/inode identity returned by `fstat(2)`.
@@ -804,9 +818,9 @@ fn descriptor_identity_raw(raw_descriptor: RawFd) -> io::Result<DescriptorIdenti
 /// reaped before an error is returned.
 pub fn spawn_with_inherited_fd(command: Command, descriptor: BorrowedFd<'_>) -> io::Result<Child> {
     #[cfg(test)]
-    let result = spawn_with_inherited_fd_inner(command, descriptor, false, None);
+    let result = spawn_with_inherited_fd_inner(command, descriptor, None, false, None);
     #[cfg(not(test))]
-    let result = spawn_with_inherited_fd_inner(command, descriptor, false);
+    let result = spawn_with_inherited_fd_inner(command, descriptor, None, false);
     result.map_err(collapse_spawn_error)
 }
 
@@ -824,11 +838,32 @@ pub fn spawn_with_inherited_readiness_fd(
 ) -> Result<Child, InheritedFdSpawnError> {
     #[cfg(test)]
     {
-        spawn_with_inherited_fd_inner(command, descriptor, true, None)
+        spawn_with_inherited_fd_inner(command, descriptor, None, true, None)
     }
     #[cfg(not(test))]
     {
-        spawn_with_inherited_fd_inner(command, descriptor, true)
+        spawn_with_inherited_fd_inner(command, descriptor, None, true)
+    }
+}
+
+/// Spawns the remote-TUI launcher with its readiness channel and sealed
+/// executable image as two independently duplicated, child-only descriptors.
+///
+/// Both source descriptors remain close-on-exec in the parent. Only fresh
+/// child-side duplicates have `FD_CLOEXEC` cleared in the audited post-fork
+/// callback, so concurrent unrelated execs cannot inherit either authority.
+pub fn spawn_with_inherited_readiness_and_executable_fd(
+    command: Command,
+    readiness: BorrowedFd<'_>,
+    executable: BorrowedFd<'_>,
+) -> Result<Child, InheritedFdSpawnError> {
+    #[cfg(test)]
+    {
+        spawn_with_inherited_fd_inner(command, readiness, Some(executable), true, None)
+    }
+    #[cfg(not(test))]
+    {
+        spawn_with_inherited_fd_inner(command, readiness, Some(executable), true)
     }
 }
 
@@ -855,8 +890,23 @@ pub fn spawn_with_inherited_readiness_fd(
 /// final write: dropping only the returned duplicate cannot close the sealed
 /// bootstrap fd.
 pub fn take_inherited_readiness_fd() -> io::Result<OwnedFd> {
-    let raw_descriptor = parse_inherited_readiness_fd()?;
-    if READINESS_FD_TAKEN
+    take_inherited_advertised_fd(READINESS_FD_ENV, &READINESS_FD_TAKEN)
+}
+
+/// Takes the one executable fd installed by
+/// [`spawn_with_inherited_readiness_and_executable_fd`] and immediately
+/// restores `FD_CLOEXEC`.
+///
+/// The returned close-on-exec duplicate must be retained until the final
+/// provider `exec`. It is intentionally a separate one-shot namespace from
+/// the readiness capability.
+pub fn take_inherited_executable_fd() -> io::Result<OwnedFd> {
+    take_inherited_advertised_fd(EXECUTABLE_FD_ENV, &EXECUTABLE_FD_TAKEN)
+}
+
+fn take_inherited_advertised_fd(environment_key: &str, taken: &AtomicBool) -> io::Result<OwnedFd> {
+    let raw_descriptor = parse_inherited_fd(environment_key)?;
+    if taken
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
@@ -866,11 +916,11 @@ pub fn take_inherited_readiness_fd() -> io::Result<OwnedFd> {
         ));
     }
 
-    take_inherited_readiness_fd_inner(raw_descriptor)
+    take_inherited_fd_inner(raw_descriptor)
 }
 
-fn parse_inherited_readiness_fd() -> io::Result<RawFd> {
-    let value = std::env::var_os(READINESS_FD_ENV).ok_or_else(|| {
+fn parse_inherited_fd(environment_key: &str) -> io::Result<RawFd> {
+    let value = std::env::var_os(environment_key).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "the inherited readiness descriptor was not advertised",
@@ -897,7 +947,7 @@ fn parse_inherited_readiness_fd() -> io::Result<RawFd> {
     Ok(raw_descriptor)
 }
 
-fn take_inherited_readiness_fd_inner(raw_descriptor: RawFd) -> io::Result<OwnedFd> {
+fn take_inherited_fd_inner(raw_descriptor: RawFd) -> io::Result<OwnedFd> {
     let flags = descriptor_flags(raw_descriptor)?;
     if flags & libc::FD_CLOEXEC != 0 {
         return Err(io::Error::new(
@@ -926,6 +976,7 @@ fn take_inherited_readiness_fd_inner(raw_descriptor: RawFd) -> io::Result<OwnedF
 fn spawn_with_inherited_fd_inner(
     mut command: Command,
     descriptor: BorrowedFd<'_>,
+    executable: Option<BorrowedFd<'_>>,
     advertise_readiness_fd: bool,
     #[cfg(test)] pre_exec_barrier: Option<PreExecBarrier>,
 ) -> Result<Child, InheritedFdSpawnError> {
@@ -938,6 +989,23 @@ fn spawn_with_inherited_fd_inner(
             "inherited descriptor is not close-on-exec in the parent",
         )));
     }
+    let executable_source = executable.map(|descriptor| descriptor.as_raw_fd());
+    if executable_source == Some(source_descriptor) {
+        return Err(InheritedFdSpawnError::not_started(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inherited readiness and executable descriptors overlap",
+        )));
+    }
+    if let Some(executable_source) = executable_source {
+        let flags =
+            descriptor_flags(executable_source).map_err(InheritedFdSpawnError::not_started)?;
+        if flags & libc::FD_CLOEXEC == 0 {
+            return Err(InheritedFdSpawnError::not_started(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited executable descriptor is not close-on-exec in the parent",
+            )));
+        }
+    }
 
     // Duplicate atomically with close-on-exec and keep the child-facing number
     // outside the standard streams. Rust configures stdio before `pre_exec`, so
@@ -945,9 +1013,18 @@ fn spawn_with_inherited_fd_inner(
     let child_descriptor =
         duplicate_for_child(source_descriptor).map_err(InheritedFdSpawnError::not_started)?;
     let child_raw_descriptor = child_descriptor.as_raw_fd();
+    let child_executable = executable_source
+        .map(duplicate_for_child)
+        .transpose()
+        .map_err(InheritedFdSpawnError::not_started)?;
+    let child_executable_raw = child_executable.as_ref().map(AsRawFd::as_raw_fd);
     scrub_readiness_fd_env(&mut command);
+    scrub_executable_fd_env(&mut command);
     if advertise_readiness_fd {
         command.env(READINESS_FD_ENV, child_raw_descriptor.to_string());
+    }
+    if let Some(child_executable_raw) = child_executable_raw {
+        command.env(EXECUTABLE_FD_ENV, child_executable_raw.to_string());
     }
 
     // SAFETY: `child_raw_descriptor` remains valid through the one immediate
@@ -958,6 +1035,9 @@ fn spawn_with_inherited_fd_inner(
     unsafe {
         command.pre_exec(move || {
             clear_close_on_exec_in_child(child_raw_descriptor)?;
+            if let Some(child_executable_raw) = child_executable_raw {
+                clear_close_on_exec_in_child(child_executable_raw)?;
+            }
             #[cfg(test)]
             if let Some(barrier) = pre_exec_barrier {
                 barrier.synchronize()?;
@@ -971,18 +1051,34 @@ fn spawn_with_inherited_fd_inner(
         .map_err(InheritedFdSpawnError::not_started)?;
     let parent_source_flags = descriptor_flags(source_descriptor);
     let parent_child_flags = descriptor_flags(child_raw_descriptor);
+    let parent_executable_flags = executable_source.map(descriptor_flags).transpose();
+    let parent_child_executable_flags = child_executable_raw.map(descriptor_flags).transpose();
     drop(child_descriptor);
-    match (parent_source_flags, parent_child_flags) {
-        (Ok(source_flags), Ok(child_flags))
-            if source_flags & libc::FD_CLOEXEC != 0 && child_flags & libc::FD_CLOEXEC != 0 =>
-        {
-            Ok(child)
+    drop(child_executable);
+    let parent_flags_preserved = matches!(&parent_source_flags, Ok(flags) if flags & libc::FD_CLOEXEC != 0)
+        && matches!(&parent_child_flags, Ok(flags) if flags & libc::FD_CLOEXEC != 0)
+        && match &parent_executable_flags {
+            Ok(None) => true,
+            Ok(Some(flags)) => flags & libc::FD_CLOEXEC != 0,
+            Err(_) => false,
         }
-        (Ok(_), Ok(_)) => Err(InheritedFdSpawnError::started(
-            io::Error::other("child spawn changed the parent descriptor inheritance flag"),
-            child,
-        )),
-        (Err(error), _) | (_, Err(error)) => Err(InheritedFdSpawnError::started(error, child)),
+        && match &parent_child_executable_flags {
+            Ok(None) => true,
+            Ok(Some(flags)) => flags & libc::FD_CLOEXEC != 0,
+            Err(_) => false,
+        };
+    if parent_flags_preserved {
+        Ok(child)
+    } else {
+        let error = parent_source_flags
+            .err()
+            .or_else(|| parent_child_flags.err())
+            .or_else(|| parent_executable_flags.err())
+            .or_else(|| parent_child_executable_flags.err())
+            .unwrap_or_else(|| {
+                io::Error::other("child spawn changed a parent descriptor inheritance flag")
+            });
+        Err(InheritedFdSpawnError::started(error, child))
     }
 }
 
@@ -1461,7 +1557,7 @@ mod tests {
         let existing_raw = existing_owner.as_raw_fd();
         clear_close_on_exec_in_child(existing_raw)?;
 
-        let inherited = take_inherited_readiness_fd_inner(existing_raw)?;
+        let inherited = take_inherited_fd_inner(existing_raw)?;
         assert_ne!(inherited.as_raw_fd(), existing_raw);
         assert_eq!(
             descriptor_identity(inherited.as_fd())?,
@@ -1604,6 +1700,7 @@ mod tests {
                 spawn_with_inherited_fd_inner(
                     command,
                     source_ref.as_fd(),
+                    None,
                     true,
                     Some(PreExecBarrier {
                         ready: ready_child.as_raw_fd(),
@@ -1698,6 +1795,7 @@ mod tests {
                 spawn_with_inherited_fd_inner(
                     command,
                     source_ref.as_fd(),
+                    None,
                     true,
                     Some(PreExecBarrier {
                         ready: ready_child.as_raw_fd(),

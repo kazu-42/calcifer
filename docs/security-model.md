@@ -549,14 +549,28 @@ capability is bound to device, inode, length, mode, UID/GID, link count,
 nanosecond mtime/ctime, and SHA-256. Before any subprocess starts, Calcifer
 copies those verified bytes to a mode-`0500` executable inside a retained
 mode-`0700` scratch directory and confirms equal length and digest. Every probe
-phase executes only that staged copy, whose metadata is revalidated throughout,
-so a legitimate updater cannot replace the installation path halfway through
-and produce a mixed-build proof. Immediately before minting, Calcifer fully
-rehashes both the staged copy and the original executable under the overall
-deadline. Replacement of the original path therefore fails closed. The
-capability remains bound to the original executable identity and does not expose
-a raw executable-path accessor; arbitrary same-UID tampering remains outside
-the threat guarantee.
+phase on Linux executes a sealed anonymous copy of that staged native ELF
+image. Calcifer creates an executable close-on-exec `memfd`, copies and hashes
+the verified bytes, sets mode `0500`, applies content/size/final seals, and
+rehashes the sealed object. Commands resolve `/proc/self/fd/<retained-fd>` in
+the child instead of reopening either disk pathname. App Server closes the
+authority on its exec. Remote TUI receives a fresh child-only duplicate across
+the internal-launcher exec, reseals it immediately, and closes it on the final
+provider exec. App Server includes the authority in its negative forbidden-FD
+proof. The held TUI proof excludes only this intentional identity after the
+audited launcher has resealed it; a real two-exec test proves it absent from the
+provider without depending on post-exec procfs access. The
+staged and original path identities are still revalidated throughout and fully
+rehashed immediately before minting. Their replacement fails closed, while a
+race after the last path check can execute only the already sealed object.
+
+macOS has no reviewed public equivalent: `fexecve` is unavailable and direct
+`/dev/fd` executable launch is rejected on the supported host. Production
+capability construction therefore returns `unsupported` before provider
+startup, with no pathname fallback. The capability remains bound to the
+original executable identity and exposes neither a raw executable-path accessor
+nor a launch descriptor. See
+[ADR 0005](adr/0005-descriptor-backed-provider-exec.md).
 
 Every subprocess runs below a new mode-`0700`, current-user-owned scratch root
 with separate synthetic source home, target `CODEX_HOME`, workspace, and

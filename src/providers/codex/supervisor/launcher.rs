@@ -8,8 +8,12 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
@@ -261,12 +265,30 @@ impl PreparedRemoteTuiLaunch<'_> {
                 runtime_guard,
             }));
         }
-        let child = match ManagedGroupChild::spawn_session_leader_with_inherited_fd(
+        #[cfg(target_os = "linux")]
+        let spawned = match build.remote_tui_launch_descriptor() {
+            Some(executable) => ManagedGroupChild::spawn_session_leader_with_inherited_fds(
+                ChildRole::Tui,
+                command,
+                sender.as_fd(),
+                executable,
+                deadline,
+            ),
+            None => ManagedGroupChild::spawn_session_leader_with_inherited_fd(
+                ChildRole::Tui,
+                command,
+                sender.as_fd(),
+                deadline,
+            ),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let spawned = ManagedGroupChild::spawn_session_leader_with_inherited_fd(
             ChildRole::Tui,
             command,
             sender.as_fd(),
             deadline,
-        ) {
+        );
+        let child = match spawned {
             Ok(child) => child,
             Err(failure) => {
                 return Err(Box::new(RemoteTuiLaunchFailure {
@@ -616,10 +638,13 @@ impl PendingRemoteTui {
             .observe_forbidden_descriptors_absent(forbidden, deadline)
     }
 
-    /// Holds the launcher before provider exec and verifies the complete
-    /// guardian-local forbidden inventory while `/proc/<pid>/fd` is still
-    /// observable. The returned typestate cannot authorize exec until the
-    /// coordinator has independently accepted the same child identity.
+    /// Holds the launcher before provider exec and verifies every
+    /// guardian-local forbidden descriptor except the one intentional sealed
+    /// executable authority while `/proc/<pid>/fd` is still observable. The
+    /// readiness hold is reachable only after the launcher has taken and
+    /// restored close-on-exec on that authority. The returned typestate cannot
+    /// authorize exec until the coordinator has independently accepted the
+    /// same child identity.
     pub(super) fn hold_and_verify_descriptors(
         mut self,
         forbidden: &calcifer_unix_child_fd::CrossProcessDescriptorSet<'_>,
@@ -779,8 +804,10 @@ impl fmt::Debug for HeldRemoteTui {
     }
 }
 
-/// Move-only proof branded to the exact TUI process group that crossed both
-/// the exec-readiness and descriptor-isolation barriers.
+/// Move-only proof that the held launcher contains no forbidden authority
+/// other than its intentional, resealed, close-on-exec executable descriptor.
+/// The readiness protocol cannot reach this proof until the launcher has taken
+/// and resealed that descriptor through the audited one-shot API.
 #[must_use = "TUI descriptor isolation must remain embedded in ReadyRemoteTui"]
 struct VerifiedTuiDescriptorIsolation {
     containment: ContainmentMetadata,
@@ -1711,6 +1738,17 @@ pub(super) fn run_exec_launcher() -> Result<ExitCode, RemoteTuiLauncherError> {
     // child-only descriptor before terminal mutation, allocation-heavy command
     // parsing, or any possibility of a descendant spawn.
     let readiness = InheritedTuiReadiness::take()?;
+    #[cfg(target_os = "linux")]
+    let launch_executable = match env::var_os(calcifer_unix_child_fd::EXECUTABLE_FD_ENV) {
+        Some(_) => Some(
+            calcifer_unix_child_fd::take_inherited_executable_fd()
+                .map_err(|_| RemoteTuiLauncherError::InvalidCommand)?,
+        ),
+        #[cfg(test)]
+        None => None,
+        #[cfg(not(test))]
+        None => return Err(RemoteTuiLauncherError::InvalidCommand),
+    };
     let proof = claim_controlling_terminal_from_stdin()?;
     if !rustix::termios::isatty(std::io::stdin())
         || !rustix::termios::isatty(std::io::stdout())
@@ -1731,6 +1769,14 @@ pub(super) fn run_exec_launcher() -> Result<ExitCode, RemoteTuiLauncherError> {
     }
 
     let spec = ExecSpec::from_environment()?;
+    #[cfg(target_os = "linux")]
+    let spec = {
+        let mut spec = spec;
+        if let Some(executable) = &launch_executable {
+            spec.program = PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+        }
+        spec
+    };
     #[cfg(test)]
     let readiness_fault = match env::var_os(PACKAGED_TUI_READINESS_FAULT_ENV).as_deref() {
         None => false,
@@ -1756,6 +1802,8 @@ pub(super) fn run_exec_launcher() -> Result<ExitCode, RemoteTuiLauncherError> {
     }
     readiness.publish_before_exec()?;
     let error = command.exec();
+    #[cfg(target_os = "linux")]
+    drop(launch_executable);
     let _ = error.kind();
     Err(RemoteTuiLauncherError::Exec)
 }
@@ -2063,6 +2111,7 @@ pub(super) fn internal_launcher_requested() -> bool {
 
 fn scrub_launcher_environment(command: &mut Command) {
     calcifer_unix_child_fd::scrub_readiness_fd_env(command);
+    calcifer_unix_child_fd::scrub_executable_fd_env(command);
     for name in [
         LAUNCH_CONTRACT_ENV,
         TARGET_PROGRAM_ENV,
@@ -2082,6 +2131,7 @@ fn is_launcher_environment(name: &OsStr) -> bool {
         TARGET_SOCKET_ENV,
         TARGET_THREAD_ENV,
         calcifer_unix_child_fd::READINESS_FD_ENV,
+        calcifer_unix_child_fd::EXECUTABLE_FD_ENV,
     ]
     .into_iter()
     .any(|candidate| name == OsStr::new(candidate));
@@ -2178,12 +2228,29 @@ pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLaunc
             .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)
             .map_err(RemoteTuiLauncherError::DescriptorIsolation)?;
     }
-    let mut child = match ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fd(
+    #[cfg(target_os = "linux")]
+    let executable = File::open(if case == FixtureLaunchCase::ExecFailure {
+        &working_directory
+    } else {
+        &launcher
+    })
+    .map_err(|_| RemoteTuiLauncherError::LauncherUnavailable)?;
+    #[cfg(target_os = "linux")]
+    let spawned = ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fds(
+        ChildRole::Tui,
+        command,
+        sender.as_fd(),
+        executable.as_fd(),
+        deadline,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let spawned = ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fd(
         ChildRole::Tui,
         command,
         sender.as_fd(),
         deadline,
-    ) {
+    );
+    let mut child = match spawned {
         Ok(child) => child,
         Err(failure)
             if matches!(
@@ -2315,12 +2382,25 @@ fn run_fixture_environment_harness(deadline: Instant) -> Result<ExitCode, Remote
     let mut command = prepare_launcher_command(&tui, &launcher)?;
     let pty = PtyOwner::open(TerminalSize::new(37, 111))?;
     let master = pty.configure_child(&mut command)?;
-    let mut child = match ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fd(
+    #[cfg(target_os = "linux")]
+    let executable =
+        File::open(&launcher).map_err(|_| RemoteTuiLauncherError::LauncherUnavailable)?;
+    #[cfg(target_os = "linux")]
+    let spawned = ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fds(
+        ChildRole::Tui,
+        command,
+        sender.as_fd(),
+        executable.as_fd(),
+        deadline,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let spawned = ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fd(
         ChildRole::Tui,
         command,
         sender.as_fd(),
         deadline,
-    ) {
+    );
+    let mut child = match spawned {
         Ok(child) => child,
         Err(failure) => {
             let _ = failure.cleanup(deadline);
@@ -2473,6 +2553,7 @@ pub(super) fn run_fixture_target(
             TARGET_SOCKET_ENV,
             TARGET_THREAD_ENV,
             calcifer_unix_child_fd::READINESS_FD_ENV,
+            calcifer_unix_child_fd::EXECUTABLE_FD_ENV,
             FIXTURE_AMBIENT_ENV_CANARY,
         ]
         .into_iter()
@@ -3005,12 +3086,19 @@ mod tests {
     fn launcher_accepts_explicit_private_environment_removal_without_a_concrete_value() {
         let mut target = remote_command();
         target.env_remove(calcifer_unix_child_fd::READINESS_FD_ENV);
+        target.env_remove(calcifer_unix_child_fd::EXECUTABLE_FD_ENV);
 
         let launcher = prepare_launcher_command(&target, Path::new("/private/calcifer/bin"))
             .unwrap_or_else(|error| panic!("safe environment removal was rejected: {error}"));
 
         assert!(!launcher.get_envs().any(|(name, value)| {
-            name == OsStr::new(calcifer_unix_child_fd::READINESS_FD_ENV) && value.is_some()
+            [
+                calcifer_unix_child_fd::READINESS_FD_ENV,
+                calcifer_unix_child_fd::EXECUTABLE_FD_ENV,
+            ]
+            .into_iter()
+            .any(|candidate| name == OsStr::new(candidate))
+                && value.is_some()
         }));
     }
 
@@ -3144,6 +3232,7 @@ mod tests {
             TARGET_SOCKET_ENV,
             TARGET_THREAD_ENV,
             calcifer_unix_child_fd::READINESS_FD_ENV,
+            calcifer_unix_child_fd::EXECUTABLE_FD_ENV,
         ] {
             command.env(name, OsStr::from_bytes(b"synthetic"));
         }

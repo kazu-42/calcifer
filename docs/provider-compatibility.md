@@ -202,7 +202,10 @@ target rollout, and source-distinct file identity.
 
 `ThreadForkParams.threadId` remains a required string even for a path-based fork. Calcifer sends `threadId: ""` together with a non-empty validated `path`; Codex then ignores the empty lookup ID and imports by path.
 
-Calcifer now has a private Unix compatibility gate for exactly Codex `0.144.4`.
+Calcifer now has a private Linux compatibility gate for exactly Codex `0.144.4`.
+macOS retains portable profile-management tests but cannot mint this supervised
+capability until a public descriptor-backed execution primitive satisfies
+[ADR 0005](adr/0005-descriptor-backed-provider-exec.md).
 The gate does not trust a version string or schema presence by itself. It must
 complete all of these checks before its private, unforgeable handoff capability
 can be constructed:
@@ -232,13 +235,21 @@ can be constructed:
    and directories, and retain that completed topology. A storage or quota
    failure cleans the whole candidate and retries the next fixed parent; the
    gate never reserves and releases a substitute file before the real copy.
-   Every version, schema, fork, App Server, and TUI phase executes this exact
-   staged copy, so an installer replacing the original pathname cannot mix two
-   legitimate Codex builds within one proof. The copy is length- and
-   SHA-256-equal to the original; both the staged copy and the original
-   executable are fully rehashed before capability minting. A changed original
-   install path therefore fails closed rather than authorizing the staged bytes
-   for future production use.
+   On Linux, copy the verified native ELF image again into an anonymous
+   close-on-exec `memfd`, set mode `0500`, apply write/grow/shrink/final seals,
+   and rehash the sealed bytes. Every version, schema, fork, App Server, and TUI
+   phase executes through the retained descriptor's `/proc/self/fd` entry, not
+   the staged or installed pathname. App Server closes the descriptor on its
+   exec. Remote TUI transfers only a fresh child duplicate across its mandatory
+   internal-launcher exec, immediately restores close-on-exec, and closes it on
+   the final provider exec. App Server includes the authority in its negative
+   child forbidden-FD proof. The held TUI proof excludes only this expected
+   identity after the launcher has resealed it, and a real two-exec test proves
+   it absent from the final provider. The disk copy and original are
+   still fully rehashed before capability minting, so path drift fails closed;
+   a race after the final gate can execute only the sealed object. Missing
+   procfs, a script image, any seal failure, or an unsupported OS has no
+   direct-path fallback.
 4. Run the exact-version probe from a private workspace and reject every other
    version.
 5. Generate both default and `--experimental` App Server schemas. The default

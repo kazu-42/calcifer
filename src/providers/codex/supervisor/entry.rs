@@ -2577,6 +2577,7 @@ fn remove_internal_supervisor_environment(command: &mut Command) {
         CODEX_EXECUTABLE_ENV,
         FOREGROUND_PROCESS_GROUP_ENV,
         calcifer_unix_child_fd::READINESS_FD_ENV,
+        calcifer_unix_child_fd::EXECUTABLE_FD_ENV,
     ] {
         command.env_remove(name);
     }
