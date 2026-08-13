@@ -699,6 +699,9 @@ const fn package_guardian_terminal_action(
     match disposition {
         GuardianExitDisposition::Code(0) => PackageGuardianTerminalAction::ReturnSuccess,
         GuardianExitDisposition::Code(code) => PackageGuardianTerminalAction::ExitCode(code),
+        GuardianExitDisposition::UsageExhausted => {
+            PackageGuardianTerminalAction::ExitCode(super::protocol::USAGE_EXHAUSTED_EXIT_CODE)
+        }
         GuardianExitDisposition::InternalFailure => PackageGuardianTerminalAction::ExitCode(1),
         GuardianExitDisposition::Signal(signal) => {
             PackageGuardianTerminalAction::EmulateSignal(signal)
