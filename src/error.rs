@@ -20,6 +20,10 @@ pub(crate) enum AppError {
     Routing(RoutingError),
     ProviderArgumentRejected,
     ProviderLoginFailed,
+    #[cfg_attr(
+        all(feature = "production-supervisor", target_os = "linux"),
+        allow(dead_code)
+    )]
     SupervisedUnsupportedPlatform,
     Update(UpdateError),
 }
