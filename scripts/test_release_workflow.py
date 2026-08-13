@@ -53,7 +53,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}", scorecard_job)
         self.assertIn("--features internal-failover-scorecard", scorecard_job)
         self.assertIn("scripts/failover_scorecard.py", scorecard_job)
-        self.assertIn("name: release-failover-scorecard-v1", scorecard_job)
+        self.assertIn("name: failover-scorecard-release-v1", scorecard_job)
+        self.assertNotIn("name: release-failover-scorecard", scorecard_job)
         self.assertIn("      - failover-scorecard\n", bundle_job)
 
     def test_tag_publish_path_rejects_lightweight_tags(self) -> None:

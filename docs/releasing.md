@@ -159,7 +159,7 @@ the normal CI checks and the separate `Release` PR run to be green.
 
 3. Require remote `main` to still equal that recorded commit, then run the
    release workflow manually and inspect all five native builds, the
-   `release-failover-scorecard-v1` artifact, and the assembled
+   `failover-scorecard-release-v1` artifact, and the assembled
    `release-bundle` artifact. Confirm that the scorecard `source_commit` equals
    the recorded commit, all 20 scenarios agree, unexpected provider starts are
    zero, and the p95 bucket remains within the documented sub-five-second

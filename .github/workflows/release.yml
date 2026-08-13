@@ -201,7 +201,7 @@ jobs:
       - name: Upload the exact-source redacted scorecard
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-failover-scorecard-v1
+          name: failover-scorecard-release-v1
           path: target/failover-scorecard-v1.json
           if-no-files-found: error
           retention-days: 14
