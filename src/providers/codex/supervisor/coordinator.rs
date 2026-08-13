@@ -532,7 +532,8 @@ fn classify_protocol_error(error: ProtocolError) -> CoordinatorDriveError {
 }
 
 /// Protocol-only owner used by both production and allocation-free scripted
-/// tests. `ChildStarted` is intentionally consumed as observation-only data.
+/// tests. `ChildStarted` supplies bounded scan metadata only; the matching
+/// role-bound command is the sole protocol authorization to advance startup.
 struct CoordinatorLifecycle<R> {
     receiver: CoordinatorReceiver<R>,
 }
@@ -594,7 +595,12 @@ impl<R: Read + Write> CoordinatorLifecycle<R> {
                 // Sequence, role and positive PID/PGID syntax are enforced by
                 // CoordinatorReceiver. Numeric identities never escape this
                 // match and can therefore never become signal authority.
-                GuardianEvent::ChildStarted { .. } => {}
+                GuardianEvent::ChildStarted { role, .. } => {
+                    self.command(
+                        CoordinatorCommand::ChildDescriptorsVerified { role },
+                        deadline,
+                    )?;
+                }
                 GuardianEvent::Ready => {
                     let readiness = self
                         .receiver
@@ -1327,12 +1333,6 @@ pub(super) enum CoordinatorRunOutcome {
     Retained(Box<RetainedCoordinatorGeneration>),
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum DescriptorIsolationTestSeam {
-    PermanentTargetChurn,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingDescriptorIsolation {
     process_group: i32,
@@ -1392,8 +1392,6 @@ pub(super) struct ProductionCoordinator {
     bounds: CoordinatorBounds,
     session_failed: bool,
     #[cfg(test)]
-    descriptor_isolation_test_seam: Option<DescriptorIsolationTestSeam>,
-    #[cfg(test)]
     packaged_retention_report_root: Option<PathBuf>,
     #[cfg(test)]
     retain_after_packaged_startup_failure: bool,
@@ -1429,17 +1427,15 @@ impl ProductionCoordinator {
         terminal: CoordinatorTerminal<OutputOnly>,
         bounds: CoordinatorBounds,
     ) -> Result<Self, Box<CoordinatorSetupFailure>> {
-        Self::assemble_with_test_seam(authority, guardian, lifecycle, terminal, bounds, None)
+        Self::assemble_inner(authority, guardian, lifecycle, terminal, bounds)
     }
 
-    fn assemble_with_test_seam(
+    fn assemble_inner(
         authority: CoordinatorProfileLease,
         guardian: Child,
         lifecycle: LifecycleEndpoint,
         terminal: CoordinatorTerminal<OutputOnly>,
         bounds: CoordinatorBounds,
-        #[cfg(test)] descriptor_isolation_test_seam: Option<DescriptorIsolationTestSeam>,
-        #[cfg(not(test))] _descriptor_isolation_test_seam: Option<()>,
     ) -> Result<Self, Box<CoordinatorSetupFailure>> {
         let lifecycle_ready = lifecycle
             .set_read_timeout(Some(bounds.phase_timeout))
@@ -1475,26 +1471,12 @@ impl ProductionCoordinator {
             bounds,
             session_failed: false,
             #[cfg(test)]
-            descriptor_isolation_test_seam,
-            #[cfg(test)]
             packaged_retention_report_root: None,
             #[cfg(test)]
             retain_after_packaged_startup_failure: false,
             #[cfg(test)]
             output_pending_observer: None,
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn assemble_with_descriptor_isolation_test_seam(
-        authority: CoordinatorProfileLease,
-        guardian: Child,
-        lifecycle: LifecycleEndpoint,
-        terminal: CoordinatorTerminal<OutputOnly>,
-        bounds: CoordinatorBounds,
-        seam: DescriptorIsolationTestSeam,
-    ) -> Result<Self, Box<CoordinatorSetupFailure>> {
-        Self::assemble_with_test_seam(authority, guardian, lifecycle, terminal, bounds, Some(seam))
     }
 
     #[cfg(test)]
@@ -1583,6 +1565,10 @@ impl ProductionCoordinator {
                     pending.deadline,
                 )? {
                     DescriptorIsolationRetryOutcome::Verified(()) => {
+                        self.lifecycle.command(
+                            CoordinatorCommand::ChildDescriptorsVerified { role },
+                            self.bounds.phase_deadline()?,
+                        )?;
                         descriptor_gate.clear(role);
                         continue;
                     }
@@ -1674,14 +1660,6 @@ impl ProductionCoordinator {
         calcifer_unix_child_fd::ProcessGroupDescriptorIsolationProof,
         DescriptorIsolationObservationFailure,
     > {
-        #[cfg(test)]
-        if self.descriptor_isolation_test_seam
-            == Some(DescriptorIsolationTestSeam::PermanentTargetChurn)
-        {
-            return Err(DescriptorIsolationObservationFailure::target(
-                calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged,
-            ));
-        }
         let mut forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
         self.authority
             .append_forbidden_descriptor(&mut forbidden)
@@ -2204,8 +2182,6 @@ impl ProductionCoordinator {
             signals,
             bounds: _,
             session_failed: _,
-            #[cfg(test)]
-                descriptor_isolation_test_seam: _,
             #[cfg(test)]
                 packaged_retention_report_root: _,
             #[cfg(test)]
@@ -3088,9 +3064,21 @@ mod tests {
             guardian.receive(Instant::now() + TEST_TIMEOUT)?,
             CoordinatorCommand::TerminalArmAccepted
         );
-        for event in [app, tui, GuardianEvent::Ready] {
-            guardian.record_event(event)?;
-        }
+        guardian.record_event(app)?;
+        assert_eq!(
+            guardian.receive(Instant::now() + TEST_TIMEOUT)?,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::AppServer,
+            }
+        );
+        guardian.record_event(tui)?;
+        assert_eq!(
+            guardian.receive(Instant::now() + TEST_TIMEOUT)?,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
+            }
+        );
+        guardian.record_event(GuardianEvent::Ready)?;
         assert_eq!(
             guardian.receive(Instant::now() + TEST_TIMEOUT)?,
             CoordinatorCommand::OpenInputGate
@@ -4537,12 +4525,24 @@ mod tests {
                 .map_err(|_| "A-leak guardian trigger failed")?;
             return Ok(());
         }
+        matrix_command(
+            &mut receiver,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::AppServer,
+            },
+        )?;
         matrix_event(
             &mut receiver,
             GuardianEvent::ChildStarted {
                 role: ChildRole::Tui,
                 pid: tui_group.raw_pid,
                 pgid: tui_group.raw_pid,
+            },
+        )?;
+        matrix_command(
+            &mut receiver,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
             },
         )?;
         matrix_event(&mut receiver, GuardianEvent::Ready)?;
@@ -4792,6 +4792,9 @@ mod tests {
             CoordinatorCommand::Suspend => "suspend command failed",
             CoordinatorCommand::Resume { .. } => "resume command failed",
             CoordinatorCommand::TerminalRestored => "terminal-restored command failed",
+            CoordinatorCommand::ChildDescriptorsVerified { .. } => {
+                "child-descriptors-verified command failed"
+            }
             CoordinatorCommand::Stop => "stop command failed",
         };
         let actual = receiver

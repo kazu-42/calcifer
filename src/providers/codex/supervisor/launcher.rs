@@ -59,6 +59,7 @@ const FIXTURE_TIMEOUT: Duration = Duration::from_secs(3);
 const FIXTURE_POLL: Duration = Duration::from_millis(10);
 const FIXTURE_VERIFIED_BYTE: u8 = b'V';
 const TUI_SHUTDOWN_DRAIN_MAX_FRAGMENTS_PER_POLL: usize = 16;
+const TUI_EXEC_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const PACKAGED_TUI_LAUNCHER_ENV: &str = "CALCIFER_PACKAGE_TUI_LAUNCHER";
 #[cfg(test)]
@@ -615,24 +616,27 @@ impl PendingRemoteTui {
             .observe_forbidden_descriptors_absent(forbidden, deadline)
     }
 
-    pub(super) fn await_ready(
+    /// Holds the launcher before provider exec and verifies the complete
+    /// guardian-local forbidden inventory while `/proc/<pid>/fd` is still
+    /// observable. The returned typestate cannot authorize exec until the
+    /// coordinator has independently accepted the same child identity.
+    pub(super) fn hold_and_verify_descriptors(
         mut self,
         forbidden: &calcifer_unix_child_fd::CrossProcessDescriptorSet<'_>,
         deadline: Instant,
-    ) -> Result<ReadyRemoteTui, Box<RemoteTuiReadinessFailure>> {
-        let proof = match self.readiness.receive(deadline) {
-            Ok(proof) => proof,
-            Err(error) => {
-                return Err(Box::new(RemoteTuiReadinessFailure {
-                    pending: self,
-                    diagnostic: RemoteTuiReadinessDiagnostic::Receive(error),
-                }));
-            }
-        };
+    ) -> Result<HeldRemoteTui, Box<RemoteTuiReadinessFailure>> {
+        if let Err(error) = self.readiness.receive_pre_exec_hold(deadline) {
+            return Err(Box::new(RemoteTuiReadinessFailure {
+                pending: self,
+                diagnostic: RemoteTuiReadinessDiagnostic::Receive(error),
+                lifecycle_reported: false,
+            }));
+        }
         if let Err(error) = self.child.confirm_running_after_readiness(deadline) {
             return Err(Box::new(RemoteTuiReadinessFailure {
                 pending: self,
                 diagnostic: RemoteTuiReadinessDiagnostic::FirstChildLiveness(error),
+                lifecycle_reported: false,
             }));
         }
         let descriptor_scan = (|| {
@@ -655,6 +659,7 @@ impl PendingRemoteTui {
                 return Err(Box::new(RemoteTuiReadinessFailure {
                     pending: self,
                     diagnostic: RemoteTuiReadinessDiagnostic::DescriptorIsolation(error),
+                    lifecycle_reported: false,
                 }));
             }
         };
@@ -662,12 +667,13 @@ impl PendingRemoteTui {
             return Err(Box::new(RemoteTuiReadinessFailure {
                 pending: self,
                 diagnostic: RemoteTuiReadinessDiagnostic::FinalChildLiveness(error),
+                lifecycle_reported: false,
             }));
         }
-        Ok(ReadyRemoteTui {
+        Ok(HeldRemoteTui {
             child: self.child,
             master: self.master,
-            readiness: proof,
+            readiness: self.readiness,
             runtime_guard: self.runtime_guard,
             descriptor_isolation,
         })
@@ -682,7 +688,94 @@ impl PendingRemoteTui {
         Box::new(RemoteTuiReadinessFailure {
             pending: self,
             diagnostic: RemoteTuiReadinessDiagnostic::DescriptorIsolation(error),
+            lifecycle_reported: false,
         })
+    }
+}
+
+/// TUI launcher held after local descriptor verification and before provider
+/// exec. Only this typestate can consume coordinator authorization.
+#[must_use = "held TUI exec authority must be authorized or contained"]
+pub(super) struct HeldRemoteTui {
+    child: ManagedGroupChild,
+    master: PtyMaster,
+    readiness: TuiReadinessReceiver,
+    runtime_guard: SessionRuntimeGuard,
+    descriptor_isolation: VerifiedTuiDescriptorIsolation,
+}
+
+impl HeldRemoteTui {
+    pub(super) const fn containment(&self) -> ContainmentMetadata {
+        self.child.containment()
+    }
+
+    pub(super) fn authorize_exec_and_await_ready(
+        mut self,
+        deadline: Instant,
+    ) -> Result<ReadyRemoteTui, Box<RemoteTuiReadinessFailure>> {
+        if let Err(error) = self.readiness.authorize_exec() {
+            return Err(Box::new(RemoteTuiReadinessFailure {
+                pending: self.into_pending(),
+                diagnostic: RemoteTuiReadinessDiagnostic::Receive(error),
+                lifecycle_reported: true,
+            }));
+        }
+        let readiness = match self.readiness.receive_after_authorization(deadline) {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                return Err(Box::new(RemoteTuiReadinessFailure {
+                    pending: self.into_pending(),
+                    diagnostic: RemoteTuiReadinessDiagnostic::Receive(error),
+                    lifecycle_reported: true,
+                }));
+            }
+        };
+        if let Err(error) = self.child.confirm_running_after_readiness(deadline) {
+            return Err(Box::new(RemoteTuiReadinessFailure {
+                pending: self.into_pending(),
+                diagnostic: RemoteTuiReadinessDiagnostic::FinalChildLiveness(error),
+                lifecycle_reported: true,
+            }));
+        }
+        Ok(ReadyRemoteTui {
+            child: self.child,
+            master: self.master,
+            readiness,
+            runtime_guard: self.runtime_guard,
+            descriptor_isolation: self.descriptor_isolation,
+        })
+    }
+
+    /// Converts a lifecycle/authorization failure into the existing retained
+    /// readiness-cleanup authority without allowing provider exec.
+    pub(super) fn retain_authorization_failure(self) -> Box<RemoteTuiReadinessFailure> {
+        Box::new(RemoteTuiReadinessFailure {
+            pending: self.into_pending(),
+            diagnostic: RemoteTuiReadinessDiagnostic::Receive(TuiReadinessError::Invalid),
+            lifecycle_reported: true,
+        })
+    }
+
+    fn into_pending(self) -> PendingRemoteTui {
+        PendingRemoteTui {
+            child: self.child,
+            master: self.master,
+            readiness: self.readiness,
+            runtime_guard: self.runtime_guard,
+        }
+    }
+}
+
+impl fmt::Debug for HeldRemoteTui {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (
+            &self.child,
+            &self.master,
+            &self.readiness,
+            &self.runtime_guard,
+            &self.descriptor_isolation,
+        );
+        formatter.write_str("HeldRemoteTui(<redacted>)")
     }
 }
 
@@ -1147,6 +1240,7 @@ const fn packaged_tui_readiness_failure_marker(
 pub(super) struct RemoteTuiReadinessFailure {
     pending: PendingRemoteTui,
     diagnostic: RemoteTuiReadinessDiagnostic,
+    lifecycle_reported: bool,
 }
 
 impl RemoteTuiReadinessFailure {
@@ -1171,6 +1265,7 @@ impl RemoteTuiReadinessFailure {
         let Self {
             pending,
             diagnostic,
+            lifecycle_reported,
         } = *self;
         let error = diagnostic.launcher_error();
         let PendingRemoteTui {
@@ -1183,7 +1278,11 @@ impl RemoteTuiReadinessFailure {
         {
             Ok(outcome) => {
                 let _ = (master, readiness, runtime_guard);
-                Ok(RemoteTuiReadinessResolution { error, outcome })
+                Ok(RemoteTuiReadinessResolution {
+                    error,
+                    outcome,
+                    lifecycle_reported,
+                })
             }
             Err(unreaped) => Err(Box::new(RemoteTuiReadinessContainmentFailure {
                 unreaped,
@@ -1191,6 +1290,7 @@ impl RemoteTuiReadinessFailure {
                 readiness,
                 runtime_guard,
                 readiness_error: error,
+                lifecycle_reported,
             })),
         }
     }
@@ -1214,6 +1314,7 @@ pub(super) struct RemoteTuiReadinessContainmentFailure {
     readiness: TuiReadinessReceiver,
     runtime_guard: SessionRuntimeGuard,
     readiness_error: RemoteTuiLauncherError,
+    lifecycle_reported: bool,
 }
 
 impl RemoteTuiReadinessContainmentFailure {
@@ -1242,11 +1343,13 @@ impl RemoteTuiReadinessContainmentFailure {
                     readiness,
                     runtime_guard,
                     readiness_error,
+                    lifecycle_reported,
                 } = *self;
                 let _ = (unreaped, master, readiness, runtime_guard);
                 Ok(RemoteTuiReadinessResolution {
                     error: readiness_error,
                     outcome,
+                    lifecycle_reported,
                 })
             }
             Err(_) => Err(self),
@@ -1274,11 +1377,20 @@ impl fmt::Debug for RemoteTuiReadinessContainmentFailure {
 pub(super) struct RemoteTuiReadinessResolution {
     error: RemoteTuiLauncherError,
     outcome: ShutdownOutcome,
+    lifecycle_reported: bool,
 }
 
 impl RemoteTuiReadinessResolution {
-    pub(super) const fn outcome(&self) -> ShutdownOutcome {
-        self.outcome
+    /// Projects a reaped TUI only when `ChildStarted(Tui)` crossed the
+    /// lifecycle channel. Before that boundary the exact pre-exec launcher has
+    /// not run the provider, so a cleanly contained launcher is represented as
+    /// `NotStarted` rather than contradicting the coordinator transcript.
+    pub(super) const fn lifecycle_outcome(&self) -> Option<ShutdownOutcome> {
+        if self.lifecycle_reported {
+            Some(self.outcome)
+        } else {
+            None
+        }
     }
 }
 
@@ -1288,6 +1400,7 @@ impl fmt::Debug for RemoteTuiReadinessResolution {
             .debug_struct("RemoteTuiReadinessResolution")
             .field("error", &self.error)
             .field("outcome", &self.outcome)
+            .field("lifecycle_reported", &self.lifecycle_reported)
             .finish()
     }
 }
@@ -1619,20 +1732,28 @@ pub(super) fn run_exec_launcher() -> Result<ExitCode, RemoteTuiLauncherError> {
 
     let spec = ExecSpec::from_environment()?;
     #[cfg(test)]
-    match env::var_os(PACKAGED_TUI_READINESS_FAULT_ENV).as_deref() {
-        None => {}
-        Some(value) if value == OsStr::new(PACKAGED_TUI_READINESS_INVALID_FAULT_V1) => {
-            // Keep the already-verified session leader live long enough for
-            // its parent to publish the exact PID=PGID=SID observation. The
-            // fault then begins strictly at the readiness receive boundary.
-            thread::sleep(Duration::from_millis(200));
-            drop(readiness);
-            return Ok(ExitCode::from(23));
-        }
+    let readiness_fault = match env::var_os(PACKAGED_TUI_READINESS_FAULT_ENV).as_deref() {
+        None => false,
+        Some(value) if value == OsStr::new(PACKAGED_TUI_READINESS_INVALID_FAULT_V1) => true,
         Some(_) => return Err(RemoteTuiLauncherError::InvalidCommand),
-    }
+    };
     let mut command = spec.into_target_command();
     scrub_launcher_environment(&mut command);
+    let readiness = readiness.hold_until_authorized(
+        Instant::now()
+            .checked_add(TUI_EXEC_AUTHORIZATION_TIMEOUT)
+            .ok_or(TuiReadinessError::Deadline)?,
+    )?;
+    #[cfg(test)]
+    if readiness_fault {
+        // Cross both descriptor-verification acknowledgements, then close
+        // without the final token. The fault therefore remains strictly at
+        // the exec-readiness receive boundary and preserves announced-child
+        // lifecycle accounting.
+        thread::sleep(Duration::from_millis(200));
+        drop(readiness);
+        return Ok(ExitCode::from(23));
+    }
     readiness.publish_before_exec()?;
     let error = command.exec();
     let _ = error.kind();
@@ -1980,11 +2101,13 @@ pub(super) fn fixture_target_requested() -> bool {
 }
 
 /// Closed real-exec harness used by `tests/supervisor.rs`. It accepts only
-/// four fixed cases and never accepts a program, shell fragment, prompt, or
+/// fixed named cases and never accepts a program, shell fragment, prompt, or
 /// terminal payload from argv.
 pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLauncherError> {
     let case = match case {
         "success" => FixtureLaunchCase::Success,
+        "hardened" => FixtureLaunchCase::Hardened,
+        "forbidden-descriptor" => FixtureLaunchCase::ForbiddenDescriptor,
         "exec-failure" => FixtureLaunchCase::ExecFailure,
         "early-exit" => FixtureLaunchCase::EarlyExit,
         "environment" => FixtureLaunchCase::Environment,
@@ -1999,7 +2122,10 @@ pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLaunc
         .map_err(|_| RemoteTuiLauncherError::Readiness(TuiReadinessError::Descriptor))?;
     let launcher = current_launcher_executable()?;
     let target_program = match case {
-        FixtureLaunchCase::Success | FixtureLaunchCase::EarlyExit => launcher.clone(),
+        FixtureLaunchCase::Success
+        | FixtureLaunchCase::Hardened
+        | FixtureLaunchCase::ForbiddenDescriptor
+        | FixtureLaunchCase::EarlyExit => launcher.clone(),
         FixtureLaunchCase::ExecFailure => {
             PathBuf::from("/calcifer/internal-fixture/nonexistent-codex")
         }
@@ -2028,6 +2154,8 @@ pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLaunc
             FIXTURE_TARGET_ENV,
             match case {
                 FixtureLaunchCase::Success => "success",
+                FixtureLaunchCase::Hardened => "hardened",
+                FixtureLaunchCase::ForbiddenDescriptor => "success",
                 FixtureLaunchCase::EarlyExit => "early-exit",
                 FixtureLaunchCase::ExecFailure => "exec-failure",
                 FixtureLaunchCase::Environment => {
@@ -2043,6 +2171,13 @@ pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLaunc
     let mut command = prepare_launcher_command(&target, &launcher)?;
     let pty = PtyOwner::open(TerminalSize::new(37, 111))?;
     let master = pty.configure_child(&mut command)?;
+    let mut injected_forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+    if case == FixtureLaunchCase::ForbiddenDescriptor {
+        injected_forbidden
+            .capture(sender.as_fd())
+            .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)
+            .map_err(RemoteTuiLauncherError::DescriptorIsolation)?;
+    }
     let mut child = match ManagedGroupChild::spawn_fixture_session_leader_with_inherited_fd(
         ChildRole::Tui,
         command,
@@ -2072,14 +2207,40 @@ pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLaunc
             }));
         }
     };
+    readiness.receive_pre_exec_hold(deadline)?;
+    if case == FixtureLaunchCase::ForbiddenDescriptor {
+        let rejected =
+            child.observe_forbidden_descriptors_absent_while_live(&injected_forbidden, deadline);
+        let outcome =
+            shutdown_tui_child_draining_output(child, &master, Duration::ZERO, FIXTURE_TIMEOUT)
+                .map_err(|failure| RemoteTuiLauncherError::Process(failure.error()))?;
+        if rejected
+            != Err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ForbiddenDescriptor)
+            || outcome.failure().is_some()
+        {
+            return Err(RemoteTuiLauncherError::InvalidCommand);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    drop(injected_forbidden);
     drop(sender);
+    if case == FixtureLaunchCase::Hardened {
+        let master_forbidden = master
+            .capture_forbidden_descriptor_set_before_tui()
+            .map_err(calcifer_unix_child_fd::ProcessGroupDescriptorScanError::from)
+            .map_err(RemoteTuiLauncherError::DescriptorIsolation)?;
+        let _pre_exec_isolation = child
+            .observe_forbidden_descriptors_absent_while_live(&master_forbidden, deadline)
+            .map_err(RemoteTuiLauncherError::DescriptorIsolation)?;
+    }
+    readiness.authorize_exec()?;
 
     if matches!(
         case,
         FixtureLaunchCase::ExecFailure | FixtureLaunchCase::EarlyExit
     ) {
         thread::sleep(FIXTURE_POLL.saturating_mul(3));
-        let _proof = readiness.receive(deadline)?;
+        let _proof = readiness.receive_after_authorization(deadline)?;
         let observed = child.confirm_running_after_readiness(deadline);
         let outcome =
             shutdown_tui_child_draining_output(child, &master, Duration::ZERO, FIXTURE_TIMEOUT)
@@ -2090,7 +2251,7 @@ pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLaunc
         return Err(RemoteTuiLauncherError::InvalidCommand);
     }
 
-    let _proof = readiness.receive(deadline)?;
+    let _proof = readiness.receive_after_authorization(deadline)?;
     child.confirm_running_after_readiness(deadline)?;
     await_fixture_target_verification(&master, deadline)?;
     let outcome = shutdown_tui_child_draining_output(
@@ -2109,6 +2270,8 @@ pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLaunc
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum FixtureLaunchCase {
     Success,
+    Hardened,
+    ForbiddenDescriptor,
     ExecFailure,
     EarlyExit,
     Environment,
@@ -2167,9 +2330,11 @@ fn run_fixture_environment_harness(deadline: Instant) -> Result<ExitCode, Remote
         }
     };
     drop(sender);
+    readiness.receive_pre_exec_hold(deadline)?;
+    readiness.authorize_exec()?;
 
     let exercise = (|| {
-        let _proof = readiness.receive(deadline)?;
+        let _proof = readiness.receive_after_authorization(deadline)?;
         child.confirm_running_after_readiness(deadline)?;
         await_fixture_target_verification(&master, deadline)
     })();
@@ -2323,9 +2488,21 @@ pub(super) fn run_fixture_target(
         return Err(RemoteTuiLauncherError::InvalidCommand);
     }
 
-    match env::var(FIXTURE_TARGET_ENV).ok().as_deref() {
+    let target = env::var(FIXTURE_TARGET_ENV).ok();
+    #[cfg(target_os = "linux")]
+    if target.as_deref() == Some("hardened") {
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .map_err(|_| RemoteTuiLauncherError::Exec)?;
+        if rustix::process::dumpable_behavior().map_err(|_| RemoteTuiLauncherError::Exec)?
+            != rustix::process::DumpableBehavior::NotDumpable
+        {
+            return Err(RemoteTuiLauncherError::Exec);
+        }
+    }
+
+    match target.as_deref() {
         Some("early-exit") => Ok(ExitCode::from(23)),
-        Some("success") => {
+        Some("success") | Some("hardened") => {
             std::io::stdout()
                 .write_all(&[FIXTURE_VERIFIED_BYTE])
                 .and_then(|()| std::io::stdout().flush())
@@ -2462,6 +2639,7 @@ fn fixture_deadline() -> Result<Instant, RemoteTuiLauncherError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol::{ChildDisposition, StopAction};
     use super::*;
 
     use std::fs;
@@ -2521,6 +2699,27 @@ mod tests {
     }
 
     fn assert_build_independent<T: 'static>() {}
+
+    #[test]
+    fn readiness_resolution_projects_only_a_lifecycle_reported_tui() {
+        let outcome = ShutdownOutcome::clean_tui_for_lifecycle_test(ChildDisposition::Exited {
+            code: 23,
+            stop_action: StopAction::None,
+        });
+        let unreported = RemoteTuiReadinessResolution {
+            error: RemoteTuiLauncherError::Readiness(TuiReadinessError::Timeout),
+            outcome,
+            lifecycle_reported: false,
+        };
+        assert_eq!(unreported.lifecycle_outcome(), None);
+
+        let reported = RemoteTuiReadinessResolution {
+            error: RemoteTuiLauncherError::Readiness(TuiReadinessError::Timeout),
+            outcome,
+            lifecycle_reported: true,
+        };
+        assert_eq!(reported.lifecycle_outcome(), Some(outcome));
+    }
 
     #[test]
     fn packaged_launch_failure_classification_is_fixed_and_separates_authority_state() {

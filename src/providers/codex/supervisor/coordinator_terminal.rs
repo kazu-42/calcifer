@@ -1486,21 +1486,32 @@ mod tests {
             GuardianEvent::TerminalArmed { snapshot }
         );
         receiver.record_command(CoordinatorCommand::TerminalArmAccepted)?;
-        for expected in [
+        assert_eq!(
+            receiver.receive(Instant::now() + TEST_TIMEOUT)?,
             GuardianEvent::ChildStarted {
                 role: ChildRole::AppServer,
                 pid: process,
                 pgid: process,
-            },
+            }
+        );
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::AppServer,
+        })?;
+        assert_eq!(
+            receiver.receive(Instant::now() + TEST_TIMEOUT)?,
             GuardianEvent::ChildStarted {
                 role: ChildRole::Tui,
                 pid: tui_process,
                 pgid: tui_process,
-            },
-            GuardianEvent::Ready,
-        ] {
-            assert_eq!(receiver.receive(Instant::now() + TEST_TIMEOUT)?, expected);
-        }
+            }
+        );
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::Tui,
+        })?;
+        assert_eq!(
+            receiver.receive(Instant::now() + TEST_TIMEOUT)?,
+            GuardianEvent::Ready
+        );
         let readiness = receiver.take_verified_ready()?;
         Ok((readiness, receiver))
     }
