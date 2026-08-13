@@ -117,7 +117,23 @@ impl fmt::Display for CodexFailoverError {
     }
 }
 
-impl std::error::Error for CodexFailoverError {}
+impl std::error::Error for CodexFailoverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Conversation(error) => Some(error),
+            Self::Definition(error) => Some(error),
+            Self::Observation(error) => Some(error),
+            Self::Profile(error) => Some(error),
+            Self::Routing(error) => Some(error),
+            Self::Spawn(error) => Some(error),
+            Self::Handoff
+            | Self::PoolUnavailable(_)
+            | Self::Protocol
+            | Self::Selection
+            | Self::Trigger => None,
+        }
+    }
+}
 
 impl From<crate::conversations::ConversationError> for CodexFailoverError {
     fn from(error: crate::conversations::ConversationError) -> Self {
