@@ -26,8 +26,8 @@ use super::super::handoff_compat::{CodexHandoffError, CompatibilityTimeoutOrigin
 #[cfg(test)]
 use super::launcher::PackagedRemoteTuiLaunchFailureClassification;
 use super::launcher::{
-    PendingRemoteTui, ReadyRemoteTui, RemoteTuiLaunchFailure, RemoteTuiReadinessContainmentFailure,
-    RemoteTuiReadinessFailure, RemoteTuiShutdownFailure,
+    HeldRemoteTui, PendingRemoteTui, ReadyRemoteTui, RemoteTuiLaunchFailure,
+    RemoteTuiReadinessContainmentFailure, RemoteTuiReadinessFailure, RemoteTuiShutdownFailure,
 };
 #[cfg(test)]
 use super::process::{AppGracefulDrainFailureStage, ProcessError};
@@ -1381,7 +1381,7 @@ fn verify_app_descriptor_inventory<'source>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn await_tui_with_descriptor_inventory<'source>(
+fn hold_tui_with_descriptor_inventory<'source>(
     pending: PendingRemoteTui,
     build: &'source PinnedSessionBuild,
     monitor: &'source SessionMonitor,
@@ -1389,7 +1389,7 @@ fn await_tui_with_descriptor_inventory<'source>(
     terminal: &'source StartupTerminalAuthority,
     lifecycle: &'source impl StartupLifecycleReporter,
     deadline: Instant,
-) -> Result<ReadyRemoteTui, Box<RemoteTuiReadinessFailure>> {
+) -> Result<HeldRemoteTui, Box<RemoteTuiReadinessFailure>> {
     let inventory = (|| {
         let mut forbidden = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
         ensure_descriptor_stage_before(deadline)?;
@@ -1417,7 +1417,7 @@ fn await_tui_with_descriptor_inventory<'source>(
     })();
 
     match inventory {
-        Ok(forbidden) => pending.await_ready(&forbidden, deadline),
+        Ok(forbidden) => pending.hold_and_verify_descriptors(&forbidden, deadline),
         Err(error) => Err(pending.retain_descriptor_isolation_failure(error)),
     }
 }
@@ -1868,39 +1868,7 @@ fn continue_supervised_session(
         }
     };
     let relay = Box::new(relay);
-    let tui_containment = pending_tui.containment();
-    let pending_tui = match report_child_started_or_retain(
-        pending_tui,
-        tui_containment,
-        lifecycle,
-        bounds.deadline,
-    ) {
-        Ok(pending) => pending,
-        Err(pending) => {
-            let tui = match await_tui_with_descriptor_inventory(
-                pending,
-                &build,
-                &monitor,
-                &relay,
-                &terminal,
-                lifecycle,
-                bounds.deadline,
-            ) {
-                Ok(tui) => StartupTuiAuthority::Live(Box::new(tui)),
-                Err(failure) => StartupTuiAuthority::ReadinessFailure(failure),
-            };
-            return Err(partial_failure(
-                StartupBuildAuthority::Live(build),
-                StartupAppAuthority::InMonitor,
-                StartupMonitorAuthority::Live(monitor),
-                StartupRelayAuthority::Live(relay),
-                tui,
-                terminal,
-                SupervisedStartupError::Lifecycle,
-            ));
-        }
-    };
-    let tui = match await_tui_with_descriptor_inventory(
+    let held_tui = match hold_tui_with_descriptor_inventory(
         pending_tui,
         &build,
         &monitor,
@@ -1909,6 +1877,39 @@ fn continue_supervised_session(
         lifecycle,
         bounds.deadline,
     ) {
+        Ok(held) => held,
+        Err(failure) => {
+            return Err(partial_failure(
+                StartupBuildAuthority::Live(build),
+                StartupAppAuthority::InMonitor,
+                StartupMonitorAuthority::Live(monitor),
+                StartupRelayAuthority::Live(relay),
+                StartupTuiAuthority::ReadinessFailure(failure),
+                terminal,
+                SupervisedStartupError::TuiReadiness,
+            ));
+        }
+    };
+    let tui_containment = held_tui.containment();
+    let held_tui =
+        match report_child_started_or_retain(held_tui, tui_containment, lifecycle, bounds.deadline)
+        {
+            Ok(held) => held,
+            Err(held) => {
+                let tui =
+                    StartupTuiAuthority::ReadinessFailure(held.retain_authorization_failure());
+                return Err(partial_failure(
+                    StartupBuildAuthority::Live(build),
+                    StartupAppAuthority::InMonitor,
+                    StartupMonitorAuthority::Live(monitor),
+                    StartupRelayAuthority::Live(relay),
+                    tui,
+                    terminal,
+                    SupervisedStartupError::Lifecycle,
+                ));
+            }
+        };
+    let tui = match held_tui.authorize_exec_and_await_ready(bounds.deadline) {
         Ok(tui) => tui,
         Err(failure) => {
             return Err(partial_failure(
@@ -2095,7 +2096,7 @@ impl PartialStartupOwner {
             StartupTuiAuthority::ReadinessFailure(failure) => {
                 match failure.contain(bounds.session.tui_grace, bounds.session.tui_forced) {
                     Ok(resolution) => {
-                        self.tui = StartupTuiAuthority::Clean(Some(resolution.outcome()));
+                        self.tui = StartupTuiAuthority::Clean(resolution.lifecycle_outcome());
                         StartupStep::Advanced
                     }
                     Err(failure) => {
@@ -2108,7 +2109,7 @@ impl PartialStartupOwner {
             StartupTuiAuthority::ReadinessContainmentFailure(failure) => {
                 match failure.retry(bounds.session.tui_grace, bounds.session.tui_forced) {
                     Ok(resolution) => {
-                        self.tui = StartupTuiAuthority::Clean(Some(resolution.outcome()));
+                        self.tui = StartupTuiAuthority::Clean(resolution.lifecycle_outcome());
                         StartupStep::Advanced
                     }
                     Err(failure) => {

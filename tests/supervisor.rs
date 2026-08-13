@@ -1965,7 +1965,23 @@ fn official_tui_launcher_claims_real_pty_execs_and_contains_pre_ready_failures()
     let _serial = serial_guard();
     let fixture = SupervisorCase::new("official-tui-launcher")?;
 
-    for case in ["success", "exec-failure", "early-exit"] {
+    let cases: &[&str] = if cfg!(target_os = "linux") {
+        &[
+            "success",
+            "hardened",
+            "forbidden-descriptor",
+            "exec-failure",
+            "early-exit",
+        ]
+    } else {
+        &[
+            "success",
+            "forbidden-descriptor",
+            "exec-failure",
+            "early-exit",
+        ]
+    };
+    for case in cases {
         let mut command = fixture.fixture_command();
         command.args(["tui-launcher-harness", case]).env(
             "CALCIFER_INTERNAL_TUI_FIXTURE_AMBIENT_CANARY",

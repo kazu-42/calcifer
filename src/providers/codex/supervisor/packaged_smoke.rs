@@ -35,8 +35,8 @@ use super::channel::{
 };
 use super::coordinator::{
     CoordinatorBounds, CoordinatorRunOutcome, CoordinatorTerminalReport,
-    DescriptorIsolationTestSeam, PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS,
-    PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS, ProductionCoordinator,
+    PACKAGED_COORDINATOR_RETAINED_ERROR_MARKERS, PACKAGED_COORDINATOR_RETAINED_REASON_MARKERS,
+    ProductionCoordinator,
 };
 use super::coordinator_terminal::CoordinatorTerminal;
 use super::entry::{
@@ -13880,35 +13880,23 @@ fn run_package_coordinator_helper() -> Result<(), Box<dyn Error>> {
         Duration::from_millis(20),
         PACKAGE_SUPERVISOR_OUTPUT_STALL_TIMEOUT,
     )?;
-    // The exact early-startup regression forces the native descriptor scan to
-    // remain in its documented ProcessChanged retry state. The coordinator
-    // must yield to the already-readable lifecycle channel and consume the
-    // authoritative Failed event; a PID, marker, or scanner result is never
-    // allowed to substitute for that protocol transition.
-    let coordinator =
-        if startup_fault == Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore) {
-            ProductionCoordinator::assemble_with_descriptor_isolation_test_seam(
-                authority,
-                guardian,
-                lifecycle,
-                coordinator_terminal,
-                bounds,
-                DescriptorIsolationTestSeam::PermanentTargetChurn,
-            )
-        } else {
-            ProductionCoordinator::assemble(
-                authority,
-                guardian,
-                lifecycle,
-                coordinator_terminal,
-                bounds,
-            )
-        }
-        .map_err(|_| "package production coordinator assembly failed")?
-        .with_packaged_retention_diagnostics(
-            report_root.clone(),
-            startup_fault == Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore),
-        );
+    // ChildStarted is now a strict pre-exec gate: the guardian cannot advance
+    // to the injected terminal-channel failure until the coordinator has
+    // verified and acknowledged the reported child. Descriptor retry behavior
+    // remains covered by the focused coordinator seam tests; forcing permanent
+    // churn here would intentionally deadlock the new handshake.
+    let coordinator = ProductionCoordinator::assemble(
+        authority,
+        guardian,
+        lifecycle,
+        coordinator_terminal,
+        bounds,
+    )
+    .map_err(|_| "package production coordinator assembly failed")?
+    .with_packaged_retention_diagnostics(
+        report_root.clone(),
+        startup_fault == Some(PackageStartupFault::TerminalChannelWriteRetainedStartupRestore),
+    );
     match coordinator.run() {
         CoordinatorRunOutcome::Terminal(result) => {
             let projection =

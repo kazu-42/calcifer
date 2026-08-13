@@ -331,18 +331,34 @@ subtype is published before the existing generic job-identity marker. Neither
 marker grants retry, signal, wait, deletion, cleanup, or numeric-process
 authority; every failure retains the existing fail-closed guardian path.
 
-The earlier remote-TUI readiness barrier now has an independent closed
-package-only diagnostic catalog. It records whether failure occurred while
-receiving the one-shot token/exec EOF, at the first post-readiness child
-liveness proof, during forbidden-descriptor inventory and process-group
-isolation, or at the final child liveness proof. Every readiness-channel,
+The remote-TUI launcher now crosses a two-party pre-exec descriptor gate before
+provider hardening can make its descriptor table unobservable. After becoming
+the exact session/process-group leader and controlling-terminal owner, the
+launcher publishes a fixed hold token. The guardian verifies its complete
+forbidden inventory, including the PTY master, and only then publishes
+`ChildStarted`. The coordinator independently verifies its forbidden inventory
+for that reported role and returns a role-bound
+`ChildDescriptorsVerified` command. The guardian sends the launcher's fixed
+authorization byte only after both proofs. The launcher requires that byte plus
+EOF, publishes the existing readiness token, and immediately execs Codex;
+token plus close-on-exec EOF remains the exact exec-boundary proof. No
+post-exec descriptor-table read is required, so upstream Linux
+`PR_SET_DUMPABLE=0` hardening remains intact. Wrong role/order, early EOF,
+unknown or trailing bytes, timeout, liveness loss, or any failed descriptor scan
+still closes the gate and enters typed containment.
+
+The readiness barrier retains its independent closed package-only diagnostic
+catalog. It records whether failure occurred while receiving the pre-exec hold
+or one-shot token/exec EOF, at pre-exec child liveness, during pre-exec
+forbidden-descriptor inventory and process-group isolation, or at final
+post-exec child liveness. Every readiness-channel,
 process, and descriptor-scan enum variant maps to one fixed redacted subtype;
 the two liveness stages use distinct markers for the same process error. The
 subtype is written before `startup-failure.tui-readiness`, so the generic marker
 continues to act as the completed-detail-publication boundary. These markers
 carry no child, PID, descriptor, retry, signal, wait, deletion, or cleanup
 authority. A deterministic package test exits the already-verified launcher
-before readiness publication and proves that the exact subtype survives
+after descriptor authorization but before readiness publication and proves that the exact subtype survives
 Guardian projection while the existing exactly-one inference rule still emits
 secondary `package-cleanup.inference-evidence` and preserves owned evidence.
 

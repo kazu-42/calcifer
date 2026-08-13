@@ -588,6 +588,17 @@ impl<R: Read + Write + AsFd> StartupLifecycleReporter for LifecycleStartupReport
                 return Err(StartupLifecycleReportError);
             }
         }
+        match self.lifecycle.receive(deadline) {
+            Ok(CoordinatorCommand::ChildDescriptorsVerified { role }) if role == child.role() => {}
+            Ok(_) => {
+                self.last_error = Some(GuardianLifecycleError::Protocol);
+                return Err(StartupLifecycleReportError);
+            }
+            Err(error) => {
+                self.last_error = Some(error);
+                return Err(StartupLifecycleReportError);
+            }
+        }
         #[cfg(test)]
         if child.role() == super::protocol::ChildRole::Tui {
             match self
@@ -4069,21 +4080,39 @@ mod tests {
                 test_lifecycle(lifecycle.receive(deadline()))?,
                 CoordinatorCommand::TerminalArmAccepted
             );
-            for event in [
-                GuardianEvent::ChildStarted {
+            lifecycle
+                .commands_mut()
+                .record_event(GuardianEvent::ChildStarted {
                     role: ChildRole::AppServer,
                     pid: 101,
                     pgid: 101,
+                })?;
+            send_coordinator_command(
+                &mut coordinator_wire,
+                CoordinatorCommand::ChildDescriptorsVerified {
+                    role: ChildRole::AppServer,
                 },
-                GuardianEvent::ChildStarted {
+                deadline(),
+            )?;
+            let _app_descriptors = test_lifecycle(lifecycle.receive(deadline()))?;
+            lifecycle
+                .commands_mut()
+                .record_event(GuardianEvent::ChildStarted {
                     role: ChildRole::Tui,
                     pid: 202,
                     pgid: 202,
+                })?;
+            send_coordinator_command(
+                &mut coordinator_wire,
+                CoordinatorCommand::ChildDescriptorsVerified {
+                    role: ChildRole::Tui,
                 },
-                GuardianEvent::Ready,
-            ] {
-                lifecycle.commands_mut().record_event(event)?;
-            }
+                deadline(),
+            )?;
+            let _tui_descriptors = test_lifecycle(lifecycle.receive(deadline()))?;
+            lifecycle
+                .commands_mut()
+                .record_event(GuardianEvent::Ready)?;
 
             let queued = match checkpoint {
                 RecoveryCheckpoint::Ready => CoordinatorCommand::OpenInputGate,
@@ -4489,21 +4518,39 @@ mod tests {
             test_lifecycle(lifecycle.receive(deadline()))?,
             CoordinatorCommand::TerminalArmAccepted
         );
-        for event in [
-            GuardianEvent::ChildStarted {
+        lifecycle
+            .commands_mut()
+            .record_event(GuardianEvent::ChildStarted {
                 role: ChildRole::AppServer,
                 pid: 101,
                 pgid: 101,
+            })?;
+        send_coordinator_command(
+            &mut coordinator_wire,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::AppServer,
             },
-            GuardianEvent::ChildStarted {
+            deadline(),
+        )?;
+        let _app_descriptors = test_lifecycle(lifecycle.receive(deadline()))?;
+        lifecycle
+            .commands_mut()
+            .record_event(GuardianEvent::ChildStarted {
                 role: ChildRole::Tui,
                 pid: 202,
                 pgid: 202,
+            })?;
+        send_coordinator_command(
+            &mut coordinator_wire,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
             },
-            GuardianEvent::Ready,
-        ] {
-            lifecycle.commands_mut().record_event(event)?;
-        }
+            deadline(),
+        )?;
+        let _tui_descriptors = test_lifecycle(lifecycle.receive(deadline()))?;
+        lifecycle
+            .commands_mut()
+            .record_event(GuardianEvent::Ready)?;
         send_coordinator_command(
             &mut coordinator_wire,
             CoordinatorCommand::OpenInputGate,
@@ -4609,21 +4656,39 @@ mod tests {
             test_lifecycle(lifecycle.receive(deadline()))?,
             CoordinatorCommand::TerminalArmAccepted
         );
-        for event in [
-            GuardianEvent::ChildStarted {
+        lifecycle
+            .commands_mut()
+            .record_event(GuardianEvent::ChildStarted {
                 role: ChildRole::AppServer,
                 pid: 101,
                 pgid: 101,
+            })?;
+        send_coordinator_command(
+            &mut coordinator_wire,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::AppServer,
             },
-            GuardianEvent::ChildStarted {
+            deadline(),
+        )?;
+        let _app_descriptors = test_lifecycle(lifecycle.receive(deadline()))?;
+        lifecycle
+            .commands_mut()
+            .record_event(GuardianEvent::ChildStarted {
                 role: ChildRole::Tui,
                 pid: 202,
                 pgid: 202,
+            })?;
+        send_coordinator_command(
+            &mut coordinator_wire,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
             },
-            GuardianEvent::Ready,
-        ] {
-            lifecycle.commands_mut().record_event(event)?;
-        }
+            deadline(),
+        )?;
+        let _tui_descriptors = test_lifecycle(lifecycle.receive(deadline()))?;
+        lifecycle
+            .commands_mut()
+            .record_event(GuardianEvent::Ready)?;
         send_coordinator_command(
             &mut coordinator_wire,
             CoordinatorCommand::OpenInputGate,
