@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::profiles::{Profile, Registry};
+use crate::profiles::{Profile, Registry, TargetGuardianLease};
 #[cfg(test)]
 use crate::providers::codex::remote::ReadinessProxyError;
 
@@ -37,6 +37,7 @@ use super::protocol::{
 };
 use super::provider::{
     GuardianSessionAuthority, ProviderLaunchAuthorization, accept_provider_launch_authorization,
+    admit_guardian_session,
 };
 use super::session::{
     ActiveSupervisedSession, AwaitingReadySupervisedSession, DrainingSupervisedSession,
@@ -723,6 +724,7 @@ pub(super) struct ProductionGuardianConfig<'a> {
     pub(super) expected_foreground_process_group: i32,
     pub(super) bounds: GuardianBounds,
     pub(super) completion: GuardianCompletion,
+    pub(super) guardian_lease: Option<TargetGuardianLease>,
 }
 
 #[derive(Clone, Copy)]
@@ -855,6 +857,7 @@ fn bootstrap_guardian_core<'a>(
         expected_foreground_process_group,
         bounds,
         completion,
+        guardian_lease,
     } = config;
     let bounds = bounds.validate()?;
     let endpoint = bootstrap_guardian_from_stdin().map_err(map_channel_error)?;
@@ -884,9 +887,19 @@ fn bootstrap_guardian_core<'a>(
     } else {
         None
     };
-    let guardian_session: GuardianSessionAuthority =
-        admit_same_profile_guardian_session(registry, profile, working_directory, thread_id)
-            .map_err(|_| GuardianSetupError::Admission)?;
+    let guardian_session: GuardianSessionAuthority = match guardian_lease {
+        Some(guardian_lease) => {
+            if guardian_lease.profile() != profile {
+                return Err(GuardianSetupError::Admission);
+            }
+            admit_guardian_session(guardian_lease, registry, working_directory, thread_id)
+                .map_err(|_| GuardianSetupError::Admission)?
+        }
+        None => {
+            admit_same_profile_guardian_session(registry, profile, working_directory, thread_id)
+                .map_err(|_| GuardianSetupError::Admission)?
+        }
+    };
     #[cfg(test)]
     if let Some(after_admission) = _seams.after_admission {
         let selected_home = selected_home.ok_or(GuardianSetupError::Admission)?;

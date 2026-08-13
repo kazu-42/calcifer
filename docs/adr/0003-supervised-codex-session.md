@@ -35,8 +35,10 @@ an equivalent public launch primitive is available; no direct-path fallback is
 part of this supervisor.
 
 Issue #32 added a no-gap type-state lease-transfer primitive using
-`SCM_RIGHTS`. It remains internal until the receiving guardian and ambiguous
-ACK outcomes have a complete process supervisor.
+`SCM_RIGHTS`. The explicit Linux pool-failover path now uses it first to move
+the selected target's A+B authority into the sealed coordinator and again to
+move B into the receiving guardian. Both boundaries require exact descriptor
+validation and same-channel ACKs before the sender releases its copy.
 
 Issue #50 adds the default-unused process-authority foundation with synthetic
 children only. It proves the dedicated lifecycle channel, coordinator A and
@@ -46,7 +48,8 @@ guardian-loss behavior through real `exec` fault injection. It does not launch
 Codex, bridge a PTY, query usage, read credentials, or expose a command.
 The one-reader `SCM_RIGHTS` transfer and ACK proof remains the issue #32
 primitive; issue #50 proves that its reserved transport is physically distinct
-from lifecycle traffic, close-on-exec, and absent after child `exec`.
+from lifecycle traffic, close-on-exec, and absent from unrelated child `exec`
+boundaries.
 
 Issue #52 adds the Linux/macOS terminal-authority foundation around those fake
 children. It proves a real controlling PTY, a physically absent input worker
@@ -1118,10 +1121,10 @@ reviewed selection and handoff proofs.
 - Resume a crash-durable transition only when the user repeats the same
   explicit starting profile/thread and pool; preserve the bounded one-retry
   reconciliation contract.
-- Keep the feature Linux-only, opt-in, and experimental. Direct no-gap transfer
-  of the retained target provider descriptor into the production guardian is a
-  stable-promotion hardening gate; the current reacquisition gap fails closed on
-  contention before provider launch.
+- Keep the feature Linux-only, opt-in, and experimental. The public path now
+  transfers retained A+B into the production coordinator and B into the
+  guardian without pathname reacquisition; stable/default promotion still
+  requires the broader acceptance and compatibility gates in this ADR.
 
 ## Pinned upstream boundary
 

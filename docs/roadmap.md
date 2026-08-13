@@ -84,7 +84,7 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [x] Expose the sealed production supervisor through explicit Linux exact same-profile resume, with no implicit pool traversal, prompt replay, argument passthrough, or silent direct-mode fallback
 - [x] Wire the guarded selector and transaction kernel into explicit public Linux failover
 - [x] Integrate the implemented canonical containment and hard-link/symlink/owner/mode capability into the serialized source-to-target handoff
-- [x] Linux/macOS no-gap verified target reservation and one-shot guardian provider-lease transfer; internal and unused until supervised handoff integration
+- [x] Linux/macOS no-gap verified target reservation and one-shot guardian provider-lease transfer; consumed by the explicit Linux supervised handoff with parent-to-coordinator A+B and coordinator-to-guardian B acknowledgements
 - [x] Stop and reap the old TUI and App Server before reading its rollout for target import
 - [x] Preserve source effective settings while keeping authentication/provider routing target-profile-owned
 - [x] Add the internal one-boundary transaction driver that accepts a validated target fork, atomically commits the generation, and reconciles non-idempotent fork ambiguity with exactly one bounded retry

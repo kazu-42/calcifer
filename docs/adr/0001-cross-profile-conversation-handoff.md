@@ -34,14 +34,18 @@ Each provider process still has exactly one immutable credential profile. The lo
 
 ### Target reservation and guardian transfer
 
-On Linux and macOS, Calcifer has an internal type-state primitive for reserving
-a revalidated target before its guardian exists and splitting that lifetime
-lease without an unlock/reacquire gap:
+On Linux and macOS, Calcifer has a type-state primitive for reserving a
+revalidated target before its guardian exists and splitting that lifetime
+lease without an unlock/reacquire gap. Explicit Linux pool failover uses an
+initial A+B frame from the failover parent to the sealed coordinator, followed
+by this B split from coordinator to guardian:
 
 ```text
 reserved(parent target A+B)
-  -> descriptor_sent(parent target A+B, guardian provisional shared-B; awaiting ACK)
-  -> acknowledged(parent target A, guardian target B)
+  -> coordinator_validated(parent and coordinator share A+B; awaiting ACK)
+  -> parent_released(coordinator target A+B)
+  -> provider_descriptor_sent(coordinator target A+B, guardian provisional shared-B; awaiting ACK)
+  -> acknowledged(coordinator target A, guardian target B)
 ```
 
 `shared-B` is not a second advisory-lock acquisition. `SCM_RIGHTS` gives the
@@ -53,6 +57,13 @@ validate that it is the exact target `provider.lock`, validate owner, regular
 type, private mode, single link, and inode identity, prove that this descriptor
 owns the active lock, then set and read back close-on-exec. It cannot spawn the
 App Server, TUI, or tools from the provisional state.
+
+The preceding parent-to-coordinator frame carries exactly two descriptors in
+the fixed A-then-B order. Before acknowledging, the coordinator independently
+validates both exact managed lock paths, their current registry row and
+directory identity, private metadata, active-lock ownership, and close-on-exec
+state. A swapped, missing, extra, stale, or unsupported ancillary frame fails
+closed without an ACK.
 
 The guardian sends a strict one-shot ACK on that same socket. Only the resulting
 acknowledged sender state can commit; commit closes the parent's B descriptor

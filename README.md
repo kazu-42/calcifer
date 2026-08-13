@@ -291,13 +291,15 @@ Normal `run` and profile-specific `resume` remain fail-closed when Calcifer cann
 
 An active `run` or `resume` holds a split exclusive lease because a second Codex process could race credential refresh and session writes. A launch coordinator owns one half and a provider guardian owns the other; either process surviving a selective crash keeps the profile busy until the exact provider exits. Consequently, status for that active profile is currently `profile_busy` / `unknown`; a list query inspects profiles serially with a per-profile timeout. The experimental Linux supervisor maintains a bounded active observation cache and emits a typed exhaustion outcome, but a switch is considered only when an explicitly selected enabled pool is present and a new structured usage read under the stopped source profile independently confirms exhaustion. Provider identity is revalidated under the same exclusive lease before selecting a target; a changed or externally replaced login fails closed instead of silently rebinding the local alias.
 
-An internal Linux/macOS primitive can reserve a revalidated target and split
-its lifetime lease with a guardian without an unlock/reacquire gap. The public
-Linux failover path retains its target reservation through usage validation,
-fork, reconciliation, and durable generation commit; the existing production
-supervisor then reacquires the exact target locks immediately before launch,
-so contention fails closed before a second provider process starts. Ordinary
-`run`, `resume`, and `status` remain unchanged.
+The public Linux failover path reserves a revalidated target and retains its
+A+B lifetime authority through usage validation, fork, reconciliation, durable
+generation commit, and production-supervisor bootstrap. It transfers the exact
+locked open-file descriptions once to the sealed coordinator, then transfers B
+once to the guardian; each receiver validates the managed lock identity and
+must ACK on the same private `SCM_RIGHTS` channel before the sender releases its
+copy. There is no unlock/reacquire window, pathname retry, or second provider
+start. Ordinary `run`, `resume`, and `status` remain unchanged; macOS exposes
+the underlying transfer primitive but not the Linux-only production supervisor.
 
 Issue #54 also connects the previously synthetic process/PTY kernel to the
 pinned Codex `0.144.4` App Server, typed monitor, readiness relay, and official

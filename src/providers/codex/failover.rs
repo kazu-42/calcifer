@@ -864,11 +864,7 @@ impl HandoffRuntime for ProductionHandoffRuntime<'_> {
         {
             return Err(CodexFailoverError::Handoff);
         }
-        // The current production exact-resume entry re-acquires A then B and
-        // revalidates the immutable profile/thread/cwd immediately before
-        // launch. Dropping the reservation cannot authorize a stale launch;
-        // contention turns into an explicit attach failure.
-        drop(self.reservation.take());
+        let reservation = self.reservation.take().ok_or(CodexFailoverError::Handoff)?;
         eprintln!(
             "{}",
             handoff_notice(
@@ -879,9 +875,9 @@ impl HandoffRuntime for ProductionHandoffRuntime<'_> {
                 self.selection_reason,
             )
         );
-        self.attached_status = Some(spawn_supervised_generation(
+        self.attached_status = Some(spawn_promoted_supervised_generation(
             self.registry,
-            &self.target,
+            reservation,
             self.working_directory,
             &observed.thread_id,
             self.codex_executable,
@@ -905,6 +901,37 @@ fn handoff_notice(
         trust_domain_alias,
         reason.label(),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_promoted_supervised_generation(
+    registry: &Registry,
+    reservation: VerifiedTargetReservation,
+    working_directory: &Path,
+    thread_id: &str,
+    codex_executable: &Path,
+) -> std::io::Result<ExitStatus> {
+    super::spawn_supervised_exact_resume_with_reservation(
+        registry,
+        reservation,
+        working_directory,
+        thread_id,
+        codex_executable,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_promoted_supervised_generation(
+    _registry: &Registry,
+    _reservation: VerifiedTargetReservation,
+    _working_directory: &Path,
+    _thread_id: &str,
+    _codex_executable: &Path,
+) -> std::io::Result<ExitStatus> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the production Codex supervisor is Linux-only",
+    ))
 }
 
 #[cfg(target_os = "linux")]
