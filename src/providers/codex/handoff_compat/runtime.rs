@@ -5863,7 +5863,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let scratch = ScratchRoot::create()?;
         let source_path = fs::canonicalize(std::env::current_exe()?)?;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // CI executes this from the full all-features libtest image. Copying,
+        // hashing, and sealing that image twice can exceed the ordinary
+        // short unit-test budget under hosted-runner I/O contention.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let source = capture_executable(&source_path, deadline)?;
         let (directory, launch) = stage_executable(&source, &scratch, deadline)?;
         let descriptor = match &launch.authority {

@@ -5504,7 +5504,10 @@ mod tests {
 
         drop((pre_exec, final_provider));
         build
-            .cleanup(deadline())
+            // The Linux build owns both a staged libtest image and its sealed
+            // anonymous copy; hosted-runner I/O can exceed the generic 1s
+            // unit-test deadline while removing the staged image.
+            .cleanup(Instant::now() + Duration::from_secs(10))
             .map_err(|failure| format!("native pinned-stage cleanup failed: {failure:?}"))?;
         Ok(())
     }
