@@ -157,6 +157,7 @@ jobs:
           uname -a
 
           test_name='profiles::tests::removal_rejects_same_device_bind_mount_during_validation_and_cleanup'
+          scratch_test_name='providers::codex::handoff_compat::runtime::tests::noexec_primary_scratch_selects_credential_free_fallback'
           test_binary="$(
             cargo +1.96.0 test \
               --lib \
@@ -182,6 +183,7 @@ jobs:
           # Consume the complete list. `grep -q` can close the pipe after an
           # early match and make libtest fail with BrokenPipe under pipefail.
           "$test_binary" --list | grep -Fx "$test_name: test" >/dev/null
+          "$test_binary" --list | grep -Fx "$scratch_test_name: test" >/dev/null
 
           sudo -n unshare \
             --mount \
@@ -189,6 +191,16 @@ jobs:
             -- \
             "$test_binary" \
             "$test_name" \
+            --exact \
+            --ignored \
+            --nocapture
+
+          sudo -n unshare \
+            --mount \
+            --propagation private \
+            -- \
+            "$test_binary" \
+            "$scratch_test_name" \
             --exact \
             --ignored \
             --nocapture

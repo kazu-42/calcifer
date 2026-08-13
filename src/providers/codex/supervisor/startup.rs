@@ -636,6 +636,7 @@ const fn packaged_startup_app_process_error_marker(error: ProcessError) -> &'sta
 #[cfg(test)]
 pub(super) const PACKAGED_COMPATIBILITY_FAILURE_MARKERS: &[&str] = &[
     "startup-failure.compatibility.subtype.unsupported",
+    "startup-failure.compatibility.subtype.unsupported-noexec-scratch",
     "startup-failure.compatibility.subtype.protocol",
     "startup-failure.compatibility.subtype.timeout",
     "startup-failure.compatibility.subtype.transport",
@@ -646,6 +647,8 @@ pub(super) const PACKAGED_COMPATIBILITY_FAILURE_MARKERS: &[&str] = &[
 pub(super) const PACKAGED_COMPATIBILITY_TIMEOUT_ORIGIN_MARKERS: &[&str] = &[
     "startup-failure.compatibility.timeout-origin.deadline-overflow",
     "startup-failure.compatibility.timeout-origin.source-capture",
+    "startup-failure.compatibility.timeout-origin.scratch-selection",
+    "startup-failure.compatibility.timeout-origin.final-scratch-selection",
     "startup-failure.compatibility.timeout-origin.probe-stage-copy-durability",
     "startup-failure.compatibility.timeout-origin.probe-stage-recapture",
     "startup-failure.compatibility.timeout-origin.version-child-exit",
@@ -662,6 +665,12 @@ const fn packaged_compatibility_timeout_origin_marker(
         }
         CompatibilityTimeoutOrigin::SourceCapture => {
             "startup-failure.compatibility.timeout-origin.source-capture"
+        }
+        CompatibilityTimeoutOrigin::ScratchSelection => {
+            "startup-failure.compatibility.timeout-origin.scratch-selection"
+        }
+        CompatibilityTimeoutOrigin::FinalScratchSelection => {
+            "startup-failure.compatibility.timeout-origin.final-scratch-selection"
         }
         CompatibilityTimeoutOrigin::ProbeStageCopyDurability => {
             "startup-failure.compatibility.timeout-origin.probe-stage-copy-durability"
@@ -682,6 +691,9 @@ const fn packaged_compatibility_timeout_origin_marker(
 const fn packaged_compatibility_failure_marker(error: CodexHandoffError) -> &'static str {
     match error {
         CodexHandoffError::Unsupported => "startup-failure.compatibility.subtype.unsupported",
+        CodexHandoffError::UnsupportedNoexecScratch => {
+            "startup-failure.compatibility.subtype.unsupported-noexec-scratch"
+        }
         CodexHandoffError::Protocol => "startup-failure.compatibility.subtype.protocol",
         CodexHandoffError::Timeout => "startup-failure.compatibility.subtype.timeout",
         CodexHandoffError::Transport => "startup-failure.compatibility.subtype.transport",
@@ -4799,6 +4811,10 @@ mod tests {
             (
                 CodexHandoffError::Unsupported,
                 "startup-failure.compatibility.subtype.unsupported",
+            ),
+            (
+                CodexHandoffError::UnsupportedNoexecScratch,
+                "startup-failure.compatibility.subtype.unsupported-noexec-scratch",
             ),
             (
                 CodexHandoffError::Protocol,
