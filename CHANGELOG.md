@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-08-13
+
 ### Added
 
 - A payload-free typed `usageLimitExceeded` terminal outcome in the Linux
@@ -45,6 +47,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   staged adapter gates, same-identity enforcement, credential-only replacement,
   crash convergence, and stable alias-only success output. JSON mode is
   rejected before provider launch.
+- Explicit Linux guarded failover through `calcifer resume` with the
+  `--experimental-supervised` and `--failover-pool` arguments. The opt-in,
+  one-pass flow freshly revalidates authoritative exhaustion, selects only
+  within one enabled provider/trust-domain pool, transactionally forks the
+  validated rollout, attaches the target TUI exactly once, and preserves one
+  logical conversation without replaying a prompt or tool call.
+- Provider-managed Claude profiles on Linux with the reviewed Claude Code
+  2.1.227 adapter boundary and the complete local auth
+  add/list/verify/reauth/rename/remove plus run lifecycle. Usage reporting,
+  routing, and unsupported platforms remain fail-closed.
+- A five-target signed release pipeline, exact cargo-binstall metadata, and a
+  manifest-driven Homebrew preview formula flow. Tag builds verify deterministic
+  archives, checksums, Minisign sidecars, and artifact attestations before
+  staging a byte-verified draft for a separate read-first publication step.
+- Capacity-aware verified executable scratch fallback that validates each
+  candidate through staging and execution instead of failing permanently on a
+  full or unusable first scratch root.
 
 ### Security
 
@@ -122,6 +141,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   old backup after the new credential is visible. Mismatched identities,
   unsafe staging nodes, hard links, malformed/oversized credentials, and
   uncertain commit state fail closed without emitting provider-derived data.
+- Guarded failover treats only the sealed supervisor's typed exhaustion outcome
+  as a trigger, then reacquires the source lease and re-reads structured usage
+  before selection. Ordinary provider exit 75, stale or unknown observations,
+  authentication and network failures, membership drift, and concurrent target
+  ownership all stop before another provider starts; terminal messages expose
+  only local aliases and fixed reasons.
+- Claude launches remove ambient Anthropic, AWS, Vertex, endpoint, credential,
+  and configuration overrides; require a private single-link credential file;
+  and execute only the exact version-gated provider image through the sealed
+  Linux launch boundary. Calcifer never parses, copies, or logs Claude OAuth
+  token contents.
+- Release signing runs only for protected `v*` tags, keeps the Minisign private
+  key out of pull requests and ordinary workflows, and re-verifies the complete
+  signed asset set and immutable release identity before publication.
 
 ## [0.1.0-alpha.4] - 2026-07-15
 
@@ -259,6 +292,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `resume` restores persisted Codex conversation state; it does not restart an in-flight tool call or replay a prompt.
 - Exact previous-thread auto-selection, active-profile monitoring, and provider account-identity verification are not implemented; current status reads idle local profiles, which may alias the same underlying account.
 
-[Unreleased]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.4...HEAD
+[Unreleased]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.5...HEAD
+[0.1.0-alpha.5]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.4...v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/kazu-42/calcifer/compare/v0.1.0-alpha.3...v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/kazu-42/calcifer/releases/tag/v0.1.0-alpha.3
