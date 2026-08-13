@@ -144,14 +144,14 @@ impl TestCompatibilityCapability {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexHandoffError {
     Unsupported,
+    UnsupportedNoexecScratch,
     Protocol,
     Timeout,
     Transport,
     Spawn,
 }
 
-/// A closed, payload-free origin for a compatibility timeout before the first
-/// version-gate milestone.
+/// A closed, payload-free origin for one compatibility timeout boundary.
 ///
 /// These values carry no process, filesystem, cleanup, retry, or completion
 /// authority. They only preserve the first exact deadline boundary while the
@@ -160,6 +160,8 @@ pub(crate) enum CodexHandoffError {
 pub(crate) enum CompatibilityTimeoutOrigin {
     DeadlineOverflow,
     SourceCapture,
+    ScratchSelection,
+    FinalScratchSelection,
     ProbeStageCopyDurability,
     ProbeStageRecapture,
     VersionChildExit,
@@ -168,9 +170,22 @@ pub(crate) enum CompatibilityTimeoutOrigin {
 
 impl CompatibilityTimeoutOrigin {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::DeadlineOverflow,
         Self::SourceCapture,
+        Self::ScratchSelection,
+        Self::FinalScratchSelection,
+        Self::ProbeStageCopyDurability,
+        Self::ProbeStageRecapture,
+        Self::VersionChildExit,
+        Self::VersionStdoutDrain,
+    ];
+
+    #[cfg(test)]
+    pub(crate) const PRE_VERSION: [Self; 7] = [
+        Self::DeadlineOverflow,
+        Self::SourceCapture,
+        Self::ScratchSelection,
         Self::ProbeStageCopyDurability,
         Self::ProbeStageRecapture,
         Self::VersionChildExit,
@@ -182,6 +197,8 @@ impl CompatibilityTimeoutOrigin {
         match self {
             Self::DeadlineOverflow => "deadline-overflow",
             Self::SourceCapture => "source-capture",
+            Self::ScratchSelection => "scratch-selection",
+            Self::FinalScratchSelection => "final-scratch-selection",
             Self::ProbeStageCopyDurability => "probe-stage-copy-durability",
             Self::ProbeStageRecapture => "probe-stage-recapture",
             Self::VersionChildExit => "version-child-exit",
@@ -290,6 +307,14 @@ impl CodexHandoffFailure {
             #[cfg(unix)]
             retained: None,
         }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn at_timeout_boundary(mut self, origin: CompatibilityTimeoutOrigin) -> Self {
+        if matches!(self.error, CodexHandoffError::Timeout) && self.timeout_origin.is_none() {
+            self.timeout_origin = Some(origin);
+        }
+        self
     }
 
     pub(crate) const fn error(&self) -> CodexHandoffError {
@@ -435,6 +460,9 @@ impl fmt::Display for CodexHandoffError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Unsupported => "the installed Codex does not support guarded thread handoff",
+            Self::UnsupportedNoexecScratch => {
+                "unsupported_noexec_scratch: no trusted executable scratch root is available"
+            }
             Self::Protocol => "the Codex handoff compatibility response was invalid",
             Self::Timeout => "the Codex handoff compatibility probe timed out",
             Self::Transport => "the Codex handoff compatibility transport failed",
@@ -1034,6 +1062,8 @@ mod tests {
             [
                 "deadline-overflow",
                 "source-capture",
+                "scratch-selection",
+                "final-scratch-selection",
                 "probe-stage-copy-durability",
                 "probe-stage-recapture",
                 "version-child-exit",

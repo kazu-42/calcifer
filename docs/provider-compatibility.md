@@ -211,17 +211,37 @@ can be constructed:
    component, reject an empty, oversized, non-executable, setuid/setgid, or
    group/other-writable file, and bind the probe to its device, inode, length,
    mode, owner/group, link count, nanosecond mtime/ctime, and SHA-256 digest.
-2. Copy those verified bytes once into a mode-`0500` executable below a retained
-   mode-`0700` scratch directory. Every version, schema, fork, App Server, and
-   TUI phase executes that staged copy, so an installer replacing the original
-   pathname cannot mix two legitimate Codex builds within one proof. The copy
-   is length- and SHA-256-equal to the original; both the staged copy and the
-   original executable are fully rehashed before capability minting. A changed
-   original install path therefore fails closed rather than authorizing the
-   staged bytes for future production use.
-3. Run the exact-version probe from a private workspace and reject every other
+2. Select an executable scratch parent from one fixed, bounded order: `/tmp`,
+   Linux `/run/user/<effective-uid>`, then `/var/tmp`. Calcifer never reads
+   `TMPDIR`, the repository, or another caller-supplied path for this decision.
+   The two system temporary parents must resolve only to their reviewed
+   platform aliases and remain root-owned mode `1777`; the Linux user-runtime
+   parent must be canonical, current-user-owned mode `0700`, with no symlink
+   ancestry. Inside a candidate, Calcifer writes, hashes, directly executes,
+   rehashes, and removes one fixed built-in probe under an identity-bound mode
+   `0700` root. A `noexec` or otherwise non-executable candidate is completely
+   cleaned before the next fixed candidate is tried. Candidate-local capacity
+   or quota failures while creating, writing, or syncing that probe are also
+   cleaned before the next candidate; unrelated I/O and process failures stay
+   terminal rather than being hidden as fallback. If none passes, the gate
+   fails before provider startup with the fixed redacted
+   `unsupported_noexec_scratch` diagnosis. A cleanup failure retains its exact
+   owner and stops selection rather than silently falling through.
+3. Before selecting a candidate, copy the verified Codex bytes into the real
+   mode-`0500` executable below its final private directory, sync both the file
+   and directories, and retain that completed topology. A storage or quota
+   failure cleans the whole candidate and retries the next fixed parent; the
+   gate never reserves and releases a substitute file before the real copy.
+   Every version, schema, fork, App Server, and TUI phase executes this exact
+   staged copy, so an installer replacing the original pathname cannot mix two
+   legitimate Codex builds within one proof. The copy is length- and
+   SHA-256-equal to the original; both the staged copy and the original
+   executable are fully rehashed before capability minting. A changed original
+   install path therefore fails closed rather than authorizing the staged bytes
+   for future production use.
+4. Run the exact-version probe from a private workspace and reject every other
    version.
-4. Generate both default and `--experimental` App Server schemas. The default
+5. Generate both default and `--experimental` App Server schemas. The default
    schema must omit `path` from `ThreadForkParams` and `ThreadResumeParams`; the
    experimental schema must match the reviewed unstable path fields and the
    reviewed fork, resume, and thread-response projections pinned for `0.144.4`.
@@ -229,7 +249,7 @@ can be constructed:
    protocol document. The separately generated `JSONRPCError` and
    `JSONRPCErrorError` documents must match their complete pinned schemas
    exactly in both variants.
-5. Start an experimental stdio App Server and fork a bounded synthetic rollout
+6. Start an experimental stdio App Server and fork a bounded synthetic rollout
    by path. The returned thread must have a new UUID, the expected
    `forkedFromId`, CLI version, model provider, cwd, preview, and persisted
    turns. The fork response must also return the requested model, provider,
@@ -239,7 +259,7 @@ can be constructed:
    other, below the synthetic target `sessions` root, and contain the known
    history sentinel. Exact source and target fingerprints cover device, inode,
    length, mode, owner, link count, nanosecond mtime/ctime, and SHA-256.
-6. Start a real `codex app-server --listen unix://...`, then attach the official
+7. Start a real `codex app-server --listen unix://...`, then attach the official
    TUI in a PTY with
    `codex resume --no-alt-screen --remote unix://... <target-thread-id>`.
    A private transparent WebSocket proxy requires, in order: a successful
