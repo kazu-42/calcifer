@@ -36,7 +36,7 @@ class ImprovementCycleWorkflowContractTests(unittest.TestCase):
     def test_suppresses_duplicate_snapshot_comments(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
-        self.assertIn("calcifer-improvement-cycle-snapshot:v1", workflow)
+        self.assertIn("calcifer-improvement-cycle-snapshot:v2", workflow)
         self.assertIn("already_exists", workflow)
         self.assertIn('if [[ "${already_exists}" == "true" ]]', workflow)
 

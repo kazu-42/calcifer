@@ -165,7 +165,7 @@ struct DescriptorIsolationObservationFailure {
     stage: DescriptorIsolationObservationStage,
     error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError,
     macos_reason: Option<calcifer_unix_child_fd::MacosDescriptorObservationReason>,
-    retryable_target_change: bool,
+    retryable_target_failure: bool,
 }
 
 impl DescriptorIsolationObservationFailure {
@@ -177,7 +177,7 @@ impl DescriptorIsolationObservationFailure {
             stage,
             error,
             macos_reason: None,
-            retryable_target_change: false,
+            retryable_target_failure: false,
         }
     }
 
@@ -187,7 +187,7 @@ impl DescriptorIsolationObservationFailure {
             stage: DescriptorIsolationObservationStage::TargetProcessGroup,
             error,
             macos_reason: None,
-            retryable_target_change: matches!(
+            retryable_target_failure: matches!(
                 error,
                 calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged
                     | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
@@ -199,20 +199,23 @@ impl DescriptorIsolationObservationFailure {
         diagnostic: calcifer_unix_child_fd::ProcessGroupDescriptorScanDiagnostic,
     ) -> Self {
         let error = diagnostic.classification();
+        let macos_reason = diagnostic.macos_reason();
         Self {
             stage: DescriptorIsolationObservationStage::TargetProcessGroup,
             error,
-            macos_reason: diagnostic.macos_reason(),
-            retryable_target_change: matches!(
+            macos_reason,
+            retryable_target_failure: matches!(
                 error,
                 calcifer_unix_child_fd::ProcessGroupDescriptorScanError::DescriptorChanged
                     | calcifer_unix_child_fd::ProcessGroupDescriptorScanError::ProcessChanged
+            ) || retryable_macos_target_identity_observation(
+                macos_reason,
             ),
         }
     }
 
     const fn retryable_target_observation(self) -> bool {
-        self.retryable_target_change
+        self.retryable_target_failure
             || (matches!(
                 self.stage,
                 DescriptorIsolationObservationStage::TargetProcessGroup
@@ -221,6 +224,23 @@ impl DescriptorIsolationObservationFailure {
                 calcifer_unix_child_fd::ProcessGroupDescriptorScanError::Deadline
             ))
     }
+}
+
+/// A just-execed target can briefly expose a descriptor kind before macOS
+/// publishes its stable vnode/socket/pipe token. Retrying that target-only
+/// observation remains bounded by the existing deadline and liveness checks;
+/// it never turns an incomplete observation into an isolation proof.
+const fn retryable_macos_target_identity_observation(
+    reason: Option<calcifer_unix_child_fd::MacosDescriptorObservationReason>,
+) -> bool {
+    matches!(
+        reason,
+        Some(
+            calcifer_unix_child_fd::MacosDescriptorObservationReason::VnodeIdentityUnavailable
+                | calcifer_unix_child_fd::MacosDescriptorObservationReason::SocketIdentityUnavailable
+                | calcifer_unix_child_fd::MacosDescriptorObservationReason::PipeIdentityUnavailable
+        )
+    )
 }
 
 #[cfg(test)]
@@ -2595,7 +2615,7 @@ mod tests {
                     stage: DescriptorIsolationObservationStage::TargetProcessGroup,
                     error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError::UnsupportedDescriptor,
                     macos_reason: Some(reason),
-                    retryable_target_change: false,
+                    retryable_target_failure: false,
                 },
             );
             assert_eq!(
@@ -2643,6 +2663,68 @@ mod tests {
             assert_eq!(proof, 0x42);
             assert_eq!(state.0, 2);
             assert_eq!(state.1, state.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn macos_identity_unavailability_is_bounded_retry_only_for_target_observation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use calcifer_unix_child_fd::MacosDescriptorObservationReason as Reason;
+
+        for transient in [
+            Reason::VnodeIdentityUnavailable,
+            Reason::SocketIdentityUnavailable,
+            Reason::PipeIdentityUnavailable,
+        ] {
+            assert!(retryable_macos_target_identity_observation(Some(transient)));
+        }
+        for terminal in [
+            Reason::UnsupportedKind,
+            Reason::ForbiddenKindIdentityUnavailable,
+        ] {
+            assert!(!retryable_macos_target_identity_observation(Some(terminal)));
+        }
+        assert!(!retryable_macos_target_identity_observation(None));
+
+        let source = DescriptorIsolationObservationFailure {
+            stage: DescriptorIsolationObservationStage::CoordinatorAuthority,
+            error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError::UnsupportedDescriptor,
+            macos_reason: Some(Reason::VnodeIdentityUnavailable),
+            retryable_target_failure: false,
+        };
+        assert!(!source.retryable_target_observation());
+
+        for transient in [
+            Reason::VnodeIdentityUnavailable,
+            Reason::SocketIdentityUnavailable,
+            Reason::PipeIdentityUnavailable,
+        ] {
+            let mut attempts = 0_usize;
+            let outcome = retry_descriptor_isolation_observation(
+                Instant::now() + TEST_TIMEOUT,
+                Duration::from_millis(1),
+                &mut (),
+                |_, _| {
+                    attempts += 1;
+                    let observation = if attempts == 1 {
+                        Err(DescriptorIsolationObservationFailure {
+                            stage: DescriptorIsolationObservationStage::TargetProcessGroup,
+                            error: calcifer_unix_child_fd::ProcessGroupDescriptorScanError::UnsupportedDescriptor,
+                            macos_reason: Some(transient),
+                            retryable_target_failure:
+                                retryable_macos_target_identity_observation(Some(transient)),
+                        })
+                    } else {
+                        Ok(0x84_u8)
+                    };
+                    (observation, Ok(()))
+                },
+                |_, _| Ok(false),
+                |_, _| Ok(false),
+            )?;
+            assert_eq!(outcome, DescriptorIsolationRetryOutcome::Verified(0x84));
+            assert_eq!(attempts, 2);
         }
         Ok(())
     }
@@ -2755,7 +2837,7 @@ mod tests {
                 &mut (),
                 |_, _attempt_deadline| {
                     attempts += 1;
-                    if failure.retryable_target_change {
+                    if failure.retryable_target_failure {
                         std::thread::sleep(Duration::from_millis(2));
                     }
                     (Err(failure), Ok(()))

@@ -11,7 +11,7 @@ permissions:
   issues: write
 
 env:
-  SNAPSHOT_SCHEMA: calcifer-improvement-cycle-snapshot:v1
+  SNAPSHOT_SCHEMA: calcifer-improvement-cycle-snapshot:v2
 
 concurrency:
   group: calcifer-improvement-cycle

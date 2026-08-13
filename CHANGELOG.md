@@ -18,6 +18,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   unexpected-provider-start regression, enforce a sub-five-second p95 bucket,
   exercise durable source/target crash recovery without replaying the fork,
   and bind the release artifact to the exact source commit.
+- macOS supervisor startup now retries only transient target descriptor-token
+  publication gaps inside the existing bounded liveness gate, while the test
+  provider installs its SIGINT disposition before publishing readiness. The
+  improvement snapshot also reports the rolling same-run CI retry rate.
 
 ## [0.1.0-alpha.5] - 2026-08-13
 

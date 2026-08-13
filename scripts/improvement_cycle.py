@@ -17,7 +17,8 @@ REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 CYCLE_LABEL = "improvement-cycle"
 NEXT_LABEL = "improvement-next"
-SNAPSHOT_SCHEMA = "calcifer-improvement-cycle-snapshot:v1"
+PROGRAM_ISSUE = 128
+SNAPSHOT_SCHEMA = "calcifer-improvement-cycle-snapshot:v2"
 
 
 @dataclass(frozen=True)
@@ -152,16 +153,23 @@ def _issue_link(issue: dict[str, object]) -> str:
 
 def _ci_counts(
     runs: Iterable[dict[str, object]], *, cutoff: datetime
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int, int]:
     passed = 0
     failed = 0
     pending = 0
+    retries = 0
+    total = 0
     for run in runs:
         created_at = _parse_github_time(
             run.get("created_at"), "workflow run created_at"
         )
         if created_at < cutoff:
             continue
+        attempt = run.get("run_attempt")
+        if type(attempt) is not int or attempt <= 0:
+            raise ValueError("workflow run_attempt must be a positive integer")
+        total += 1
+        retries += int(attempt > 1)
         status = run.get("status")
         conclusion = run.get("conclusion")
         if status != "completed":
@@ -170,7 +178,7 @@ def _ci_counts(
             passed += 1
         else:
             failed += 1
-    return passed, failed, pending
+    return passed, failed, pending, retries, total
 
 
 def _latest_immutable_release(releases: Iterable[dict[str, object]]) -> str:
@@ -216,7 +224,10 @@ def build_decision(
     if active_cycles and next_issues and active_cycles[0] is next_issues[0]:
         raise ValueError("the active cycle cannot also be the next improvement")
 
-    passed, failed, pending = _ci_counts(runs, cutoff=now - timedelta(days=7))
+    passed, failed, pending, retries, total_runs = _ci_counts(
+        runs, cutoff=now - timedelta(days=7)
+    )
+    retry_percent = 0.0 if total_runs == 0 else retries * 100 / total_runs
     next_issue = (
         _issue_link(next_issues[0])
         if next_issues
@@ -244,12 +255,16 @@ def build_decision(
             "It does not close issues, merge pull requests, deploy code, or infer "
             "runtime success.",
             "",
+            f"Program: [#{PROGRAM_ISSUE}](https://github.com/{repository}/issues/{PROGRAM_ISSUE})",
+            "",
             "| Signal | Baseline |",
             "| --- | ---: |",
             f"| Open product issues | {len(product_issues)} |",
             f"| Open pull requests | {len(pull_requests)} |",
             "| Main CI, last 7 days | "
             f"{passed} passed / {failed} failed / {pending} pending |",
+            "| Same-run CI retries, last 7 days | "
+            f"{retries} / {total_runs} ({retry_percent:.1f}%) |",
             f"| Latest immutable release | {release} |",
             f"| Recommended next issue | {next_issue} |",
             "",
