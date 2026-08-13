@@ -130,6 +130,10 @@ class ImprovementCycleTests(unittest.TestCase):
         )
         self.assertIn("No immutable public release found", decision.body)
         self.assertIn("## Decision gate", decision.body)
+        self.assertIn(
+            "Program: [#128](https://github.com/kazu-42/calcifer/issues/128)",
+            decision.body,
+        )
         self.assertIn("- [ ] Record the hypothesis", decision.body)
         self.assertIn("- [ ] Record the measured effect", decision.body)
 

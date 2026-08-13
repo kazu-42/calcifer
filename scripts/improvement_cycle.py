@@ -17,6 +17,7 @@ REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 CYCLE_LABEL = "improvement-cycle"
 NEXT_LABEL = "improvement-next"
+PROGRAM_ISSUE = 128
 SNAPSHOT_SCHEMA = "calcifer-improvement-cycle-snapshot:v2"
 
 
@@ -253,6 +254,8 @@ def build_decision(
             "This snapshot uses public GitHub repository metadata only. "
             "It does not close issues, merge pull requests, deploy code, or infer "
             "runtime success.",
+            "",
+            f"Program: [#{PROGRAM_ISSUE}](https://github.com/{repository}/issues/{PROGRAM_ISSUE})",
             "",
             "| Signal | Baseline |",
             "| --- | ---: |",
