@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::provider_identity::{IdentityError, IdentityKey, IdentityStore, ProviderIdentity};
+use crate::providers::claude::ClaudeProfileError;
 use crate::providers::codex::CodexIdentityAdapter;
 
 pub(crate) mod reauth;
@@ -166,12 +167,14 @@ const MANAGED_CODEX_FORBIDDEN_CONFIG_KEYS: &[&str] = &[
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Provider {
+    Claude,
     Codex,
 }
 
 impl Provider {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::Claude => "claude",
             Self::Codex => "codex",
         }
     }
@@ -1053,6 +1056,29 @@ impl Registry {
         &self,
         alias: &str,
     ) -> Result<PendingProfile<'_>, ProfileError> {
+        let pending = self.begin_registration(Provider::Codex, alias)?;
+        write_private_file(&pending.home().join("config.toml"), MANAGED_CODEX_CONFIG)?;
+        Ok(pending)
+    }
+
+    pub(crate) fn begin_claude_registration(
+        &self,
+        alias: &str,
+    ) -> Result<PendingProfile<'_>, ProfileError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = alias;
+            Err(ProfileError::UnsupportedPlatform)
+        }
+        #[cfg(target_os = "linux")]
+        self.begin_registration(Provider::Claude, alias)
+    }
+
+    fn begin_registration(
+        &self,
+        provider: Provider,
+        alias: &str,
+    ) -> Result<PendingProfile<'_>, ProfileError> {
         self.recover_incomplete_removal()?;
         self.recover_incomplete_reauth()?;
         validate_alias(alias)?;
@@ -1068,14 +1094,17 @@ impl Registry {
         if document
             .profiles
             .iter()
-            .any(|profile| profile.provider == Provider::Codex && profile.alias == alias)
+            .any(|profile| profile.provider == provider && profile.alias == alias)
         {
-            return Err(ProfileError::AlreadyExists(format!("codex@{alias}")));
+            return Err(ProfileError::AlreadyExists(format!(
+                "{}@{alias}",
+                provider.as_str()
+            )));
         }
 
         let profiles_root = self.root.join("profiles");
         ensure_private_subdirectory(&profiles_root)?;
-        let provider_root = profiles_root.join("codex");
+        let provider_root = profiles_root.join(provider.as_str());
         ensure_private_subdirectory(&provider_root)?;
         refuse_orphaned_staging(&provider_root)?;
 
@@ -1085,7 +1114,6 @@ impl Registry {
         write_private_file(&staging.join(OWNER_MARKER), id.as_bytes())?;
         let home = staging.join("home");
         secure_create_dir(&home)?;
-        write_private_file(&home.join("config.toml"), MANAGED_CODEX_CONFIG)?;
         create_durable_profile_lock_files(&staging)?;
 
         Ok(PendingProfile {
@@ -1094,7 +1122,7 @@ impl Registry {
             profile: Profile {
                 id,
                 alias: alias.to_owned(),
-                provider: Provider::Codex,
+                provider,
                 created_at: unix_timestamp()?,
             },
             staging,
@@ -1106,7 +1134,10 @@ impl Registry {
     pub(crate) fn profile_home(&self, profile: &Profile) -> Result<PathBuf, ProfileError> {
         let directory = self.profile_directory(profile)?;
         let home = directory.join("home");
-        verify_managed_codex_home(&home)?;
+        match profile.provider {
+            Provider::Claude => crate::providers::claude::validate_linux_credentials(&home)?,
+            Provider::Codex => verify_managed_codex_home(&home)?,
+        }
         Ok(home)
     }
 
@@ -3265,6 +3296,20 @@ impl PendingProfile<'_> {
         }
         store.revalidate_marker(&self.staging, &key, &identity)?;
 
+        self.publish()
+    }
+
+    pub(crate) fn commit_claude(self) -> Result<Profile, ProfileError> {
+        if self.profile.provider != Provider::Claude {
+            return Err(ProfileError::UnsafeState(
+                "Claude registration received a non-Claude profile".to_owned(),
+            ));
+        }
+        crate::providers::claude::sync_linux_credentials(&self.home())?;
+        self.publish()
+    }
+
+    fn publish(mut self) -> Result<Profile, ProfileError> {
         let final_directory = self
             .staging
             .parent()
@@ -3897,6 +3942,7 @@ fn receive_provider_lock_descriptor(
 pub(crate) enum ProfileError {
     AlreadyExists(String),
     Busy(String),
+    Claude(ClaudeProfileError),
     DuplicateProviderIdentity { requested: String, existing: String },
     Identity(IdentityError),
     InvalidAlias,
@@ -3919,6 +3965,7 @@ impl ProfileError {
         match self {
             Self::AlreadyExists(_) => "profile_already_exists",
             Self::Busy(_) => "profile_busy",
+            Self::Claude(error) => error.code(),
             Self::DuplicateProviderIdentity { .. } => "duplicate_provider_identity",
             Self::Identity(error) => error.code(),
             Self::InvalidAlias => "invalid_profile_alias",
@@ -3941,6 +3988,7 @@ impl ProfileError {
         match self {
             Self::AlreadyExists(reference) => format!("Profile {reference} already exists."),
             Self::Busy(reference) => format!("Profile {reference} is already in use."),
+            Self::Claude(error) => error.safe_message().to_owned(),
             Self::DuplicateProviderIdentity {
                 requested,
                 existing,
@@ -3988,6 +4036,12 @@ impl From<io::Error> for ProfileError {
 impl From<IdentityError> for ProfileError {
     fn from(error: IdentityError) -> Self {
         Self::Identity(error)
+    }
+}
+
+impl From<ClaudeProfileError> for ProfileError {
+    fn from(error: ClaudeProfileError) -> Self {
+        Self::Claude(error)
     }
 }
 

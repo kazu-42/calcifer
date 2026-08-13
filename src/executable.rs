@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub(crate) enum ExecutableError {
     NotFound,
+    ClaudeNotFound,
     Unsafe,
+    UnsafeClaude,
     Io(io::Error),
 }
 
@@ -14,7 +16,9 @@ impl ExecutableError {
     pub(crate) const fn code(&self) -> &'static str {
         match self {
             Self::NotFound => "codex_not_found",
+            Self::ClaudeNotFound => "claude_not_found",
             Self::Unsafe => "unsafe_codex_executable",
+            Self::UnsafeClaude => "unsafe_claude_executable",
             Self::Io(_) => "executable_io_error",
         }
     }
@@ -22,8 +26,12 @@ impl ExecutableError {
     pub(crate) fn safe_message(&self) -> &'static str {
         match self {
             Self::NotFound => "An executable named 'codex' was not found on PATH.",
+            Self::ClaudeNotFound => "An executable named 'claude' was not found on PATH.",
             Self::Unsafe => {
                 "Calcifer refused the Codex executable because its path or permissions are unsafe."
+            }
+            Self::UnsafeClaude => {
+                "Calcifer refused the Claude executable because its path or permissions are unsafe."
             }
             Self::Io(error) => {
                 let _ = error.kind();
@@ -48,7 +56,19 @@ impl From<io::Error> for ExecutableError {
 }
 
 pub(crate) fn resolve_codex() -> Result<PathBuf, ExecutableError> {
-    let discovered = which::which("codex").map_err(|_| ExecutableError::NotFound)?;
+    resolve_provider("codex")
+}
+
+pub(crate) fn resolve_claude() -> Result<PathBuf, ExecutableError> {
+    resolve_provider("claude").map_err(|error| match error {
+        ExecutableError::NotFound => ExecutableError::ClaudeNotFound,
+        ExecutableError::Unsafe => ExecutableError::UnsafeClaude,
+        other => other,
+    })
+}
+
+fn resolve_provider(name: &str) -> Result<PathBuf, ExecutableError> {
+    let discovered = which::which(name).map_err(|_| ExecutableError::NotFound)?;
     let executable = fs::canonicalize(discovered)?;
     let metadata = fs::symlink_metadata(&executable)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {

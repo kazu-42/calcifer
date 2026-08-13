@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::*;
 
 const REAUTH_JOURNAL_FILE: &str = ".calcifer-reauth.json";
-const REAUTH_JOURNAL_SCHEMA_VERSION: u8 = 1;
+const REAUTH_JOURNAL_SCHEMA_VERSION: u8 = 2;
+const LEGACY_REAUTH_JOURNAL_SCHEMA_VERSION: u8 = 1;
 const MAX_REAUTH_JOURNAL_BYTES: usize = 16 * 1024;
 const MAX_REAUTH_AUTH_BYTES: usize = 1024 * 1024;
 const MAX_REAUTH_TREE_ENTRIES: usize = 10_000;
@@ -63,6 +64,10 @@ fn inject_reauth_fault(point: ReauthFaultPoint) -> Result<(), ProfileError> {
 #[serde(deny_unknown_fields)]
 struct ReauthJournal {
     schema_version: u8,
+    #[serde(default = "legacy_codex_provider")]
+    provider: Provider,
+    #[serde(default = "legacy_codex_credential_name")]
+    credential_name: String,
     profile_id: String,
     transaction_id: String,
     staging_name: String,
@@ -70,6 +75,39 @@ struct ReauthJournal {
     backup_name: String,
     old_auth_digest: String,
     new_auth_digest: String,
+}
+
+const fn legacy_codex_provider() -> Provider {
+    Provider::Codex
+}
+
+fn legacy_codex_credential_name() -> String {
+    "auth.json".to_owned()
+}
+
+const fn credential_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => ".credentials.json",
+        Provider::Codex => "auth.json",
+    }
+}
+
+fn credential_temporary_name(credential_name: &str, transaction_id: &str) -> String {
+    let prefix = if credential_name.starts_with('.') {
+        ""
+    } else {
+        "."
+    };
+    format!("{prefix}{credential_name}.reauth-new-{transaction_id}")
+}
+
+fn credential_backup_name(credential_name: &str, transaction_id: &str) -> String {
+    let prefix = if credential_name.starts_with('.') {
+        ""
+    } else {
+        "."
+    };
+    format!("{prefix}{credential_name}.reauth-old-{transaction_id}")
 }
 
 /// A staged official login guarded by both halves of the profile lifetime
@@ -82,7 +120,7 @@ pub(crate) struct PendingCodexReauth<'a> {
     profile_directory: PathBuf,
     staging: PathBuf,
     transaction_id: String,
-    expected_identity: ProviderIdentity,
+    expected_identity: Option<ProviderIdentity>,
     finished: bool,
     preserve: bool,
 }
@@ -103,44 +141,46 @@ impl Registry {
             Err(error) => return Err(ProfileError::Io(error)),
             Ok(_) => verify_private_directory(&profiles_root)?,
         }
-        let provider_root = profiles_root.join("codex");
-        match fs::symlink_metadata(&provider_root) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(ProfileError::Io(error)),
-            Ok(_) => verify_private_directory(&provider_root)?,
-        }
-
         let mut affected_ids = Vec::new();
-        for profile in document
-            .profiles
-            .iter()
-            .filter(|profile| profile.provider == Provider::Codex)
-        {
-            let profile_directory = provider_root.join(&profile.id);
-            match fs::symlink_metadata(profile_directory.join(REAUTH_JOURNAL_FILE)) {
-                Ok(_) => affected_ids.push(profile.id.clone()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        for provider in [Provider::Claude, Provider::Codex] {
+            let provider_root = profiles_root.join(provider.as_str());
+            match fs::symlink_metadata(&provider_root) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(ProfileError::Io(error)),
+                Ok(_) => verify_private_directory(&provider_root)?,
             }
-        }
-        for entry in fs::read_dir(&provider_root)? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| ProfileError::ReauthRecoveryRequired)?;
-            if !name.starts_with(".reauth-") {
-                continue;
+
+            for profile in document
+                .profiles
+                .iter()
+                .filter(|profile| profile.provider == provider)
+            {
+                let profile_directory = provider_root.join(&profile.id);
+                match fs::symlink_metadata(profile_directory.join(REAUTH_JOURNAL_FILE)) {
+                    Ok(_) => affected_ids.push(profile.id.clone()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(ProfileError::Io(error)),
+                }
             }
-            let owner = document.profiles.iter().find(|profile| {
-                profile.provider == Provider::Codex
-                    && name.starts_with(&format!(".reauth-{}-", profile.id))
-            });
-            let Some(owner) = owner else {
-                return Err(ProfileError::ReauthRecoveryRequired);
-            };
-            if !affected_ids.contains(&owner.id) {
-                affected_ids.push(owner.id.clone());
+            for entry in fs::read_dir(&provider_root)? {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| ProfileError::ReauthRecoveryRequired)?;
+                if !name.starts_with(".reauth-") {
+                    continue;
+                }
+                let owner = document.profiles.iter().find(|profile| {
+                    profile.provider == provider
+                        && name.starts_with(&format!(".reauth-{}-", profile.id))
+                });
+                let Some(owner) = owner else {
+                    return Err(ProfileError::ReauthRecoveryRequired);
+                };
+                if !affected_ids.contains(&owner.id) {
+                    affected_ids.push(owner.id.clone());
+                }
             }
         }
         affected_ids.sort();
@@ -150,7 +190,7 @@ impl Registry {
             let profile = document
                 .profiles
                 .iter()
-                .find(|profile| profile.provider == Provider::Codex && profile.id == id)
+                .find(|profile| profile.id == id)
                 .ok_or(ProfileError::ReauthRecoveryRequired)?;
             let lease = self.lock_profile(profile)?;
             let current = self.find_by_id_without_recovery(profile.provider, &profile.id)?;
@@ -217,7 +257,63 @@ impl Registry {
             profile_directory,
             staging,
             transaction_id,
-            expected_identity: current,
+            expected_identity: Some(current),
+            finished: false,
+            preserve: false,
+        })
+    }
+
+    pub(crate) fn begin_claude_reauthentication(
+        &self,
+        alias: &str,
+    ) -> Result<PendingCodexReauth<'_>, ProfileError> {
+        if !cfg!(target_os = "linux") {
+            return Err(ProfileError::UnsupportedPlatform);
+        }
+        self.recover_incomplete_removal()?;
+        self.recover_incomplete_reauth()?;
+        ensure_registration_supported()?;
+        let selected = self.find_without_recovery(Provider::Claude, alias)?;
+        let (profile, lease) = self.lock_profile_current(&selected, Some(alias))?;
+        let profile_directory = self.profile_directory(&profile)?;
+        recover_reauth_under_lease(self, &profile, &profile_directory)?;
+
+        let home = self.profile_home(&profile)?;
+        let _ = read_private_bounded(
+            &home.join(credential_name(Provider::Claude)),
+            MAX_REAUTH_AUTH_BYTES,
+        )?;
+        let provider_root = profile_directory.parent().ok_or_else(|| {
+            ProfileError::UnsafeState("profile directory has no provider root".to_owned())
+        })?;
+        verify_private_directory(provider_root)?;
+        let transaction_id = Uuid::new_v4().to_string();
+        let staging_name = format!(".reauth-{}-{transaction_id}", profile.id);
+        let staging = provider_root.join(&staging_name);
+        inject_reauth_fault(ReauthFaultPoint::StagingCreate)?;
+        secure_create_dir(&staging)?;
+        let publication = (|| {
+            write_private_file(&staging.join(OWNER_MARKER), profile.id.as_bytes())?;
+            let staging_home = staging.join("home");
+            secure_create_dir(&staging_home)?;
+            sync_directory(&staging_home)?;
+            sync_directory(&staging)?;
+            inject_reauth_fault(ReauthFaultPoint::StagingDirectorySync)?;
+            sync_directory(provider_root)
+        })();
+        if let Err(error) = publication {
+            let _ = safe_remove_reauth_staging(&staging, &profile.id, &transaction_id);
+            return Err(error);
+        }
+
+        Ok(PendingCodexReauth {
+            registry: self,
+            profile,
+            lease,
+            profile_directory,
+            staging,
+            transaction_id,
+            expected_identity: None,
             finished: false,
             preserve: false,
         })
@@ -242,26 +338,42 @@ impl PendingCodexReauth<'_> {
         Ok(())
     }
 
-    pub(crate) fn commit(mut self, adapter: CodexIdentityAdapter) -> Result<Profile, ProfileError> {
+    pub(crate) fn commit(self, adapter: CodexIdentityAdapter) -> Result<Profile, ProfileError> {
+        if self.profile.provider != Provider::Codex {
+            return Err(ProfileError::ReauthRecoveryRequired);
+        }
         let staging_home = self.home();
         verify_managed_codex_home(&staging_home)?;
         let store = IdentityStore::new(&self.registry.root);
         let key = store.load_key()?;
         let staged_identity = store.derive_codex_binding(&staging_home, &key, adapter)?;
-        if !self
-            .expected_identity
-            .same_provider_identity(&staged_identity)
-        {
+        let Some(expected_identity) = self.expected_identity.as_ref() else {
+            return Err(ProfileError::ReauthRecoveryRequired);
+        };
+        if !expected_identity.same_provider_identity(&staged_identity) {
             return Err(ProfileError::from(IdentityError::Mismatch));
         }
 
+        self.commit_credential(credential_name(Provider::Codex))
+    }
+
+    pub(crate) fn commit_claude(self) -> Result<Profile, ProfileError> {
+        if self.profile.provider != Provider::Claude || self.expected_identity.is_some() {
+            return Err(ProfileError::ReauthRecoveryRequired);
+        }
+        crate::providers::claude::sync_linux_credentials(&self.home())?;
+        self.commit_credential(credential_name(Provider::Claude))
+    }
+
+    fn commit_credential(mut self, credential_name: &'static str) -> Result<Profile, ProfileError> {
+        let staging_home = self.home();
         let home = self.registry.profile_home(&self.profile)?;
-        let current_auth = home.join("auth.json");
+        let current_auth = home.join(credential_name);
         let old_bytes = read_private_bounded(&current_auth, MAX_REAUTH_AUTH_BYTES)?;
-        let staged_auth = staging_home.join("auth.json");
+        let staged_auth = staging_home.join(credential_name);
         let new_bytes = read_private_bounded(&staged_auth, MAX_REAUTH_AUTH_BYTES)?;
-        let temporary_name = format!(".auth.json.reauth-new-{}", self.transaction_id);
-        let backup_name = format!(".auth.json.reauth-old-{}", self.transaction_id);
+        let temporary_name = credential_temporary_name(credential_name, &self.transaction_id);
+        let backup_name = credential_backup_name(credential_name, &self.transaction_id);
         let temporary = home.join(&temporary_name);
         let backup = home.join(&backup_name);
         let staging_temporary = self
@@ -273,6 +385,8 @@ impl PendingCodexReauth<'_> {
 
         let journal = ReauthJournal {
             schema_version: REAUTH_JOURNAL_SCHEMA_VERSION,
+            provider: self.profile.provider,
+            credential_name: credential_name.to_owned(),
             profile_id: self.profile.id.clone(),
             transaction_id: self.transaction_id.clone(),
             staging_name: self
@@ -360,13 +474,18 @@ fn recover_reauth_under_lease(
         Err(error) => Err(ProfileError::Io(error)),
         Ok(_) => {
             let journal = read_reauth_journal(&journal_path)?;
-            if journal.profile_id != profile.id {
+            if journal.profile_id != profile.id
+                || journal.provider != profile.provider
+                || journal.credential_name != credential_name(profile.provider)
+            {
                 return Err(ProfileError::ReauthRecoveryRequired);
             }
             let home = profile_directory.join("home");
             verify_private_directory(&home).map_err(|_| ProfileError::ReauthRecoveryRequired)?;
-            verify_managed_codex_config(&home.join("config.toml"))
-                .map_err(|_| ProfileError::ReauthRecoveryRequired)?;
+            if profile.provider == Provider::Codex {
+                verify_managed_codex_config(&home.join("config.toml"))
+                    .map_err(|_| ProfileError::ReauthRecoveryRequired)?;
+            }
             let provider_root = profile_directory
                 .parent()
                 .ok_or(ProfileError::ReauthRecoveryRequired)?;
@@ -383,7 +502,7 @@ fn recover_journaled_reauth(
     staging: &Path,
     journal: &ReauthJournal,
 ) -> Result<(), ProfileError> {
-    let current = home.join("auth.json");
+    let current = home.join(&journal.credential_name);
     let temporary = home.join(&journal.temporary_name);
     let backup = home.join(&journal.backup_name);
     let current_digest = optional_private_digest(&current)?;
@@ -438,7 +557,7 @@ fn finish_committed_reauth(
     staging: &Path,
     journal: &ReauthJournal,
 ) -> Result<(), ProfileError> {
-    let current = home.join("auth.json");
+    let current = home.join(&journal.credential_name);
     if read_private_digest(&current)? != journal.new_auth_digest {
         return Err(ProfileError::ReauthRecoveryRequired);
     }
@@ -468,7 +587,7 @@ fn rollback_unpublished_reauth(
     staging: &Path,
     journal: &ReauthJournal,
 ) -> Result<(), ProfileError> {
-    if read_private_digest(&home.join("auth.json"))? != journal.old_auth_digest {
+    if read_private_digest(&home.join(&journal.credential_name))? != journal.old_auth_digest {
         return Err(ProfileError::ReauthRecoveryRequired);
     }
     remove_exact_private_file(
@@ -521,9 +640,20 @@ fn publish_reauth_journal(
 fn read_reauth_journal(path: &Path) -> Result<ReauthJournal, ProfileError> {
     let bytes = read_private_bounded(path, MAX_REAUTH_JOURNAL_BYTES)
         .map_err(|_| ProfileError::ReauthRecoveryRequired)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ProfileError::ReauthRecoveryRequired)?;
+    let explicit_provider_fields = value.as_object().is_some_and(|object| {
+        object.contains_key("provider") && object.contains_key("credential_name")
+    });
     let journal: ReauthJournal =
         serde_json::from_slice(&bytes).map_err(|_| ProfileError::ReauthRecoveryRequired)?;
-    if journal.schema_version != REAUTH_JOURNAL_SCHEMA_VERSION
+    if !matches!(
+        journal.schema_version,
+        LEGACY_REAUTH_JOURNAL_SCHEMA_VERSION | REAUTH_JOURNAL_SCHEMA_VERSION
+    ) || (journal.schema_version == REAUTH_JOURNAL_SCHEMA_VERSION && !explicit_provider_fields)
+        || (journal.schema_version == LEGACY_REAUTH_JOURNAL_SCHEMA_VERSION
+            && (journal.provider != Provider::Codex || journal.credential_name != "auth.json"))
+        || journal.credential_name != credential_name(journal.provider)
         || validate_profile_id(&journal.profile_id).is_err()
         || Uuid::parse_str(&journal.transaction_id)
             .ok()
@@ -542,8 +672,10 @@ fn validate_journal_paths(
     home: &Path,
 ) -> Result<(), ProfileError> {
     if journal.staging_name != format!(".reauth-{}-{}", journal.profile_id, journal.transaction_id)
-        || journal.temporary_name != format!(".auth.json.reauth-new-{}", journal.transaction_id)
-        || journal.backup_name != format!(".auth.json.reauth-old-{}", journal.transaction_id)
+        || journal.temporary_name
+            != credential_temporary_name(&journal.credential_name, &journal.transaction_id)
+        || journal.backup_name
+            != credential_backup_name(&journal.credential_name, &journal.transaction_id)
         || staging.parent().is_none()
         || home.parent().is_none()
     {
@@ -829,6 +961,8 @@ mod tests {
         write_private_file(&home.join(&temporary_name), &staged)?;
         let journal = ReauthJournal {
             schema_version: REAUTH_JOURNAL_SCHEMA_VERSION,
+            provider: Provider::Codex,
+            credential_name: "auth.json".to_owned(),
             profile_id: pending.profile.id.clone(),
             transaction_id: pending.transaction_id.clone(),
             staging_name: pending
@@ -1173,6 +1307,52 @@ mod tests {
         fs::remove_dir(staging)?;
         fs::remove_dir_all(root)?;
         fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn claude_credential_recovery_converges_on_the_atomic_visibility_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (fault, expect_new) in [
+            (ReauthFaultPoint::CredentialTemporaryDirectorySync, false),
+            (ReauthFaultPoint::NewCredentialRename, true),
+        ] {
+            let root = sandbox("claude-credential-recovery")?;
+            let registry = Registry::at(root.clone());
+            let pending = registry.begin_claude_registration("work")?;
+            write_private_file(
+                &pending.home().join(".credentials.json"),
+                b"old-claude-credential",
+            )?;
+            let profile = pending.commit_claude()?;
+            let home = registry.profile_home(&profile)?;
+
+            let pending = registry.begin_claude_reauthentication("work")?;
+            write_private_file(
+                &pending.home().join(".credentials.json"),
+                b"new-claude-credential",
+            )?;
+            let guard = ReauthFaultGuard::set(fault);
+            let error = pending
+                .commit_claude()
+                .err()
+                .ok_or("injected Claude reauth fault must fail")?;
+            drop(guard);
+            assert_eq!(error.code(), "reauth_recovery_required");
+
+            assert_eq!(registry.list()?, vec![profile]);
+            assert_eq!(
+                fs::read(home.join(".credentials.json"))?,
+                if expect_new {
+                    b"new-claude-credential".as_slice()
+                } else {
+                    b"old-claude-credential".as_slice()
+                }
+            );
+            assert_eq!(fs::read_dir(&home)?.count(), 1);
+            fs::remove_dir_all(root)?;
+        }
         Ok(())
     }
 }

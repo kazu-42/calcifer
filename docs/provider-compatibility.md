@@ -687,12 +687,12 @@ Orca queries inactive Codex accounts with a profile-specific home and the same A
 
 ## Claude direction
 
-Claude support is not implemented in Calcifer. This boundary was revalidated
-against the official Claude Code documentation on 2026-08-13 and the locally
-installed `claude 2.1.227` public help.
+Claude provider-managed profiles are implemented on Linux. The compatibility
+boundary was revalidated against the official Claude Code documentation on
+2026-08-13 and the locally installed `claude 2.1.227` public help.
 
-The supported future profile type is a provider-managed interactive login under
-one Calcifer-owned `CLAUDE_CONFIG_DIR`. Calcifer will invoke `claude auth login`,
+The supported profile type is a provider-managed interactive login under one
+Calcifer-owned `CLAUDE_CONFIG_DIR`. Calcifer invokes `claude auth login`,
 verify only the bounded `claude auth status` JSON contract, and launch the
 official CLI with conflicting authentication/provider environment variables
 removed. It will not parse, copy, refresh, print, or persist OAuth tokens.
@@ -705,7 +705,7 @@ Credential storage is a separate compatibility lane:
 
 | Platform | Official storage contract | Calcifer decision |
 | --- | --- | --- |
-| Linux | `.credentials.json` below `CLAUDE_CONFIG_DIR`, mode `0600` | Eligible after private-root, exact-mode, rotation, and crash-recovery tests |
+| Linux | `.credentials.json` below `CLAUDE_CONFIG_DIR`, mode `0600` | Implemented with a private root, descriptor-correlated exact-mode validation, a lifetime lease, and journaled rotation/recovery |
 | Windows | `.credentials.json` below `CLAUDE_CONFIG_DIR`, protected by the user-profile ACL | Blocked until Calcifer can create and revalidate an equivalent current-user-only ACL and recovery boundary |
 | macOS | encrypted macOS Keychain; the official authentication page does not promise a `CLAUDE_CONFIG_DIR`-scoped Keychain namespace | Blocked for multiple managed identities; Calcifer will not infer or emulate internal Keychain service/account names |
 

@@ -286,6 +286,7 @@ pub(crate) enum AuthCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum ProviderArgument {
+    Claude,
     Codex,
 }
 
@@ -312,7 +313,7 @@ impl FromStr for DefinitionReference {
             });
         }
         let reference = ProfileReference::from_str(value)
-            .map_err(|_| "definition must use a canonical UUID or codex@alias syntax")?;
+            .map_err(|_| "definition must use a canonical UUID or provider@alias syntax")?;
         Ok(Self {
             provider: Some(reference.provider),
             value: reference.alias,
@@ -327,14 +328,16 @@ impl FromStr for ProfileReference {
         let (provider, alias) = value
             .split_once('@')
             .ok_or("profile must use provider@alias syntax")?;
-        if provider != "codex"
-            || alias.contains('@')
-            || crate::profiles::validate_alias(alias).is_err()
-        {
-            return Err("profile must use codex@alias syntax");
+        if alias.contains('@') || crate::profiles::validate_alias(alias).is_err() {
+            return Err("profile must use codex@alias or claude@alias syntax");
         }
+        let provider = match provider {
+            "claude" => ProviderArgument::Claude,
+            "codex" => ProviderArgument::Codex,
+            _ => return Err("profile must use codex@alias or claude@alias syntax"),
+        };
         Ok(Self {
-            provider: ProviderArgument::Codex,
+            provider,
             alias: alias.to_owned(),
         })
     }
