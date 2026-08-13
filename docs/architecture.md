@@ -497,9 +497,9 @@ authority/control descriptors or denied supervisor/authentication environment
 into it. Accounting and containment for descendants that escape with
 `setsid(2)` is tracked separately by issue #56.
 
-Ubuntu 24.04 and macOS package CI jobs are configured to verify the official archive's
-architecture-specific SHA-256 and single executable before running three
-independently budgeted matrix scenarios behind one aggregate gate. `contracts`
+Ubuntu 24.04 package CI jobs verify the official archive's architecture-specific
+SHA-256 and single executable before running three independently budgeted
+scenarios behind one aggregate gate. `contracts`
 runs the complete #28 handoff probe plus the #54 live-turn drain, `setsid(2)`
 descriptor/environment-isolation, and typed-monitor success/redacted-error
 probes. `official-tui-normal` is designed to exercise the production
@@ -515,17 +515,23 @@ dispatcher does not execute the production
 anchor role. These tests use synthetic non-production state or credential-free
 loopback providers and do not authorize public supervised use by themselves.
 The normal scenario passed twice consecutively and retained recovery passed once
-from the 2026-07-20 Issue #54 candidate source on Apple silicon; the Ubuntu 24.04/macOS matrix remains
-pending. Both OS lanes execute the same prebuilt, exactly discovered libtest.
-The Linux lane has no native fallback: it runs inside a fresh namespace after
+from the 2026-07-20 Issue #54 candidate source on Apple silicon; those native
+runs remain historical functional evidence only. The supported Linux lanes
+compile and exactly discover one libtest before probe execution. Every exact
+test, including all four contract probes, has no native fallback and runs in a
+new namespace after
 enumerating interfaces through the current network namespace rather than an
 inherited sysfs mount. It permits only `lo` plus the exact nine upstream Linux
 fallback-tunnel names, forces every present fallback down, rejects an unknown
 interface before mutation, and proves that the fallback devices have no address
 or route and that only loopback is up. It then drops groups and every capability,
 sets `NoNewPrivs`, clears ambient environment authority, rejects inherited
-sockets, and revalidates those invariants before execution. The macOS lane is
-native functional evidence only.
+sockets, and revalidates those invariants plus the frozen libtest, Codex, and
+launcher identities before execution. Codex 0.144.4's unconditional
+`announcement_tip.toml` prewarm therefore has no DNS or non-loopback route and
+cannot import remote content into the result. The macOS matrix lane explicitly
+reports hermetic package probes as unsupported and performs no native-network
+fallback.
 
 A separate non-ignored, credential-free deterministic fixture is configured for
 all seven closed recovery checkpoints: startup queued, ready, active, suspended,

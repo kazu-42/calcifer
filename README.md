@@ -7,7 +7,7 @@
 Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-agent CLIs with isolated account profiles and structured usage visibility.
 
 > [!WARNING]
-> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, confirmed crash-safe local removal, a private default-disabled trust-domain/pool registry, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. The routing registry does not select or launch a profile. A pinned, default-unused Linux/macOS supervisor implementation is present internally, but its cross-platform acceptance evidence is incomplete. On 2026-07-20, the final Issue #54 candidate source passed two consecutive checksum-pinned Codex 0.144.4 normal-session runs (145.61 s and 144.97 s), one retained-cleanup recovery run (170.60 s), and three consecutive deterministic seven-checkpoint recovery runs (11.54 s, 11.21 s, and 11.50 s) on Apple silicon. The required Ubuntu 24.04 and macOS CI matrix runs remain pending. The official scenarios exercise the real App Server and remote TUI through the coordinator, guardian, provider session, PTY, and job-control implementations under a test-owned terminal harness. Their guardian helper enters the shared production guardian-bootstrap core through bounded package-only seams, and their completion endpoint crosses real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries before the parent checks the provider-release-gated exact record and EOF. The test-only role dispatcher does not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-anchor role, so these scenarios make no parser coverage claim. No public supervised command uses this path. Automatic failover, cross-profile session handoff, reauthentication, and verified Windows credential ACLs are not implemented yet.
+> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, confirmed crash-safe local removal, a private default-disabled trust-domain/pool registry, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. The routing registry does not select or launch a profile. A pinned, default-unused Linux/macOS supervisor implementation is present internally, but its cross-platform acceptance evidence is incomplete. On 2026-07-20, the final Issue #54 candidate source passed two consecutive checksum-pinned Codex 0.144.4 normal-session runs (145.61 s and 144.97 s), one retained-cleanup recovery run (170.60 s), and three consecutive deterministic seven-checkpoint recovery runs (11.54 s, 11.21 s, and 11.50 s) on Apple silicon. Those native runs are historical functional evidence, not a hermetic gate. The Ubuntu 24.04 package lanes now put every exact contract and official-TUI probe in a fresh loopback-only network namespace; macOS hermetic package execution is explicitly unsupported and has no native-network fallback. The official scenarios exercise the real App Server and remote TUI through the coordinator, guardian, provider session, PTY, and job-control implementations under a test-owned terminal harness. Their guardian helper enters the shared production guardian-bootstrap core through bounded package-only seams, and their completion endpoint crosses real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries before the parent checks the provider-release-gated exact record and EOF. The test-only role dispatcher does not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-anchor role, so these scenarios make no parser coverage claim. No public supervised command uses this path. Automatic failover, cross-profile session handoff, reauthentication, and verified Windows credential ACLs are not implemented yet.
 
 Calcifer is intended to make routine selection among accounts that you already own or are authorized to use feel boring: authenticate each profile through the provider's official CLI, keep each profile isolated, and start every new CLI process with an explicit profile.
 
@@ -368,13 +368,19 @@ exact coordinator-child wait; the exact provider-release-only
 absence of every reported known process group; and an identity-checked empty
 runtime with zero retained FD and socket references. The CI workflow runs
 `contracts`, `official-tui-normal`, and `official-tui-recovery` as independent
-Ubuntu 24.04/macOS matrix scenarios behind one stable aggregate gate. It builds
-and discovers the exact libtest before the OS-specific boundary. macOS provides
-the native functional probe; Ubuntu runs both official scenarios without a
-fallback in a fresh loopback-only network namespace after proving an exact
-environment allowlist, no inherited socket FD, zero capabilities, and
-`NoNewPrivs`. The two normal local runs and one retained-recovery local run are
-green; the matrix readback remains pending. The watchdog bounds its direct
+Ubuntu 24.04 scenarios behind one stable aggregate gate. Package download,
+checksum verification, compilation, and exact libtest discovery finish before
+execution. Every one of the six exact probes then gets a fresh loopback-only
+network namespace with no native fallback after the runner proves an exact
+environment allowlist, no inherited socket FD, no supplementary groups, zero
+capabilities, and `NoNewPrivs`, and revalidates the frozen libtest, Codex, and
+launcher identities across the privilege boundary. This confinement covers
+Codex 0.144.4's unconditional announcement prewarm: the request may be
+attempted, but no DNS or non-loopback route exists and remote content cannot
+affect compatibility success. A separate macOS matrix entry explicitly reports
+all three hermetic scenarios as unsupported; it does not download Codex or run
+a native-network substitute. Historical native Apple-silicon runs remain
+functional evidence only. The watchdog bounds its direct
 command group, while descendants that deliberately create another session
 remain an explicit ephemeral-runner teardown boundary rather than a claimed
 process-tree cleanup.
@@ -485,7 +491,7 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Private Codex identity binding | Implemented for 0.144.4 ChatGPT auth | HMAC equality only; duplicate aliases and credential drift fail closed |
 | Codex usage observation | Implemented with bounded idle refresh and an active-monitor cache projection | Structured App Server response, explicit freshness/compatibility, disposable private cache; supervised launch remains default-unused |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
-| Pinned supervised Codex integration | Internal implementation present; local Apple-silicon acceptance green, Ubuntu 24.04/macOS CI pending for 0.144.4 | Real App Server and remote TUI through the production coordinator/guardian session, typed monitor, PTY gate, and job-control implementation under a test-owned harness. Two consecutive normal runs and one retained-recovery run passed locally. Independent package scenarios share the production guardian-bootstrap core through bounded test seams, cross real parent-to-coordinator-to-guardian `exec` boundaries with the completion endpoint, and check the provider-release-gated exact frame plus EOF. Linux adds a fail-closed loopback-only direct-IP egress boundary; macOS remains native functional evidence. They deliberately bypass the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser and persistent shell-anchor role. No public supervised run/resume |
+| Pinned supervised Codex integration | Internal implementation present; Ubuntu 24.04 runs every exact 0.144.4 package probe inside a fresh loopback-only namespace, while macOS hermetic execution is explicitly unsupported | Real App Server and remote TUI through the production coordinator/guardian session, typed monitor, PTY gate, and job-control implementation under a test-owned harness. Two consecutive normal runs and one retained-recovery run passed locally as historical native evidence. Independent package scenarios share the production guardian-bootstrap core through bounded test seams, cross real parent-to-coordinator-to-guardian `exec` boundaries with the completion endpoint, and check the provider-release-gated exact frame plus EOF. Linux has no native-network fallback; macOS runs no hermetic substitute. They deliberately bypass the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser and persistent shell-anchor role. No public supervised run/resume |
 | Opt-in profile pools | Private default-disabled registry implemented on Unix; selection unavailable | Immutable profile IDs, same provider and trust domain, live whole-pool identity validation, bounded atomic updates |
 | Cross-profile conversation handoff | Internal Linux/macOS target reservation and same-profile supervisor integration implemented | Transition journal, target fork, pool selection, crash recovery, and user-visible switching remain disabled; the planned version-gated fork creates a target-profile thread in one logical conversation |
 | Claude setup-token profiles | Experimental plan | OS credential store where officially supported |
@@ -597,18 +603,23 @@ formatting and Clippy on Rust 1.96, the stable Linux/macOS/Windows all-feature
 test matrix run serially because process, signal, environment, and PTY tests
 share process-global and kernel-mediated state, deterministic archive-package
 tests, an MSRV compile check, and the full library unit suite plus
-`tests/supervisor.rs`, run serially twice on Linux and macOS at Rust 1.85. Linux
-and macOS jobs are additionally configured to download the
-architecture-specific official Codex `0.144.4` archive, verify its
-pinned SHA-256 digest and single binary, and run three independently budgeted
-matrix scenarios. `contracts` runs the complete #28 handoff probe plus the #54
+`tests/supervisor.rs`, run serially twice on Linux and macOS at Rust 1.85. Three
+Ubuntu 24.04 package jobs additionally download the architecture-specific
+official Codex `0.144.4` archive, verify its pinned SHA-256 digest and single
+binary, and run independently budgeted scenarios. `contracts` runs the complete
+#28 handoff probe plus the #54
 live-turn one-`SIGTERM` App drain, `setsid(2)` descriptor/environment-isolation,
 and typed-monitor success/redacted-error probes. `official-tui-normal` is
 designed to exercise the production coordinator/guardian session, PTY, input
 gate, resize, and stop/resume path with the official remote TUI.
 `official-tui-recovery` independently targets #55's retained-cleanup recovery
 and four-proof deletion gate. Each official scenario has its own outer watchdog,
-and one stable aggregate job requires every matrix entry. Their completion
+and one stable aggregate job requires every matrix entry. Package retrieval and
+build happen before execution; each exact test executes in its own fresh
+loopback-only Linux network namespace with zero capabilities, no supplementary
+groups, no inherited socket, and no native fallback. macOS has no reviewed
+public containment primitive here, so its matrix entry reports the three
+hermetic scenarios as unsupported and runs no provider probe. Their completion
 endpoint is designed to cross real package-parent-to-coordinator and
 coordinator-to-guardian `exec` boundaries, with the parent configured to accept
 only the provider-release-gated exact frame followed by EOF. The guardian helper
@@ -617,8 +628,8 @@ dispatcher does not execute the production
 `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-
 anchor role. These are version-specific compatibility and recovery checks, not
 a sandbox or proof that arbitrary detached descendants are absent. Local
-Apple-silicon runs are green; Ubuntu 24.04/macOS workflow readback remains
-pending. See
+Apple-silicon runs remain historical native functional evidence and are not a
+hermetic acceptance gate. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for security-sensitive review expectations.
 
 ## Roadmap
