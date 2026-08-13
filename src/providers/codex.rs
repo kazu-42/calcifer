@@ -2268,7 +2268,7 @@ fn wait_for_child(child: &mut Child) -> io::Result<std::process::ExitStatus> {
     }
 }
 
-fn configure_own_process_group(command: &mut Command) {
+pub(super) fn configure_own_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

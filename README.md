@@ -47,7 +47,8 @@ A running process keeps the profile it started with. Switching affects newly sta
 
 ## What works today
 
-The first functional slice manages isolated Codex homes on macOS and Linux:
+Calcifer manages isolated Codex homes on macOS and Linux, plus provider-managed
+Claude profiles on Linux:
 
 ```console
 # Browser authentication is handled by the official Codex CLI.
@@ -100,6 +101,31 @@ calcifer resume codex@work
 calcifer resume codex@work 01900000-0000-7000-8000-000000000001
 calcifer resume
 ```
+
+On Linux, the same local lifecycle is available for the reviewed Claude Code
+adapter. Claude usage/status reporting and automatic routing remain unavailable
+rather than fabricating a zero quota:
+
+```console
+calcifer auth add claude work
+calcifer auth list
+calcifer auth verify claude@work
+calcifer auth reauth claude@work
+calcifer auth rename claude@work client-a
+calcifer run claude@client-a -- --model sonnet
+calcifer auth remove claude@client-a --yes
+```
+
+Each Claude registration owns one private `CLAUDE_CONFIG_DIR`. The official
+CLI performs login and refresh; Calcifer never parses or copies its OAuth
+tokens. Before a launch, Calcifer requires the exact reviewed CLI/status
+contract and a user-owned, regular, single-link `.credentials.json` with mode
+`0600`, while removing ambient Claude, Anthropic, AWS, and Vertex credential or
+provider-selection variables. Reauthentication logs in under a fresh private
+staging directory and rotates only the credential file through the same
+journaled visibility boundary used for crash recovery. Because the supported
+status contract exposes no stable account identifier, Claude aliases are not
+claimed to deduplicate provider identities.
 
 Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes authentication, project trust, and session state there, so exiting Calcifer does not discard the conversation. Before publication, Calcifer version-gates the installed Codex `0.144.4` adapter and derives an installation-private HMAC fingerprint from the effective ChatGPT account/workspace scope in the provider-owned credential file. A second local alias for the same scope is rejected without displaying or storing the raw scope outside `auth.json`; different scopes are not claimed to guarantee independent provider quota. Profiles created by earlier releases remain usable for explicit operations and become failover-eligible only after an explicit, non-interactive `auth verify` succeeds. Calcifer accepts supported Codex project-trust updates semantically while continuing to require profile-local file storage for both Codex account and MCP OAuth credentials and reject profile/provider routing overrides, including MCP OAuth callback URL and port overrides. Managed Codex role configuration is currently unsupported: both a top-level `agents` table and any auto-discovered `CODEX_HOME/agents` node fail closed because role files can add indirect complete configuration layers. `calcifer resume codex@work` remains the explicit official `codex resume --last` convenience; bare `calcifer resume` resolves Calcifer's exact tracked workspace thread and never falls back to `--last`.
 
@@ -549,7 +575,7 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Pinned supervised Codex integration | Experimental exact same-profile resume is public on Linux; Ubuntu 24.04 runs every exact 0.144.4 package probe inside a fresh loopback-only namespace and executes verified native provider bytes from a sealed close-on-exec `memfd`. macOS hermetic and descriptor-backed execution are explicitly unsupported | `resume --experimental-supervised` enters the sealed production anchor with one explicit profile and canonical thread UUID. Real App Server and remote TUI run through the production coordinator/guardian session, typed monitor, PTY gate, and job-control implementation. Linux has no native-network or pathname-exec fallback; macOS runs no weaker substitute. Pool selection and cross-profile handoff are not reachable from this command |
 | Opt-in profile pools | Private default-disabled registry implemented on Unix; selection unavailable | Immutable profile IDs, same provider and trust domain, live whole-pool identity validation, bounded atomic updates |
 | Cross-profile conversation handoff | Internal Linux/macOS target reservation and same-profile supervisor integration implemented | Transition journal, target fork, pool selection, crash recovery, and user-visible switching remain disabled; the planned version-gated fork creates a target-profile thread in one logical conversation |
-| Claude provider-managed profiles | Linux adapter boundary implemented; public lifecycle pending | Exact 2.1.227 status schema, isolated `CLAUDE_CONFIG_DIR`, conflicting environment removal, and Linux `0600` single-link credential validation are sealed; Windows awaits ACL proof and macOS awaits a documented config-scoped Keychain isolation contract |
+| Claude provider-managed profiles | Linux lifecycle implemented | `auth add/list/verify/reauth/rename/remove` and `run` use the exact 2.1.227 status schema, an isolated `CLAUDE_CONFIG_DIR`, conflicting environment removal, `0600` single-link credential validation, and journaled atomic rotation; Windows awaits ACL proof and macOS awaits a documented config-scoped Keychain isolation contract |
 | Claude setup-token ingestion | Deferred | The official command prints but does not store the inference-only token; Calcifer requires a reviewed OS credential broker and no-echo recovery path first |
 | Claude subscription OAuth replication | Not planned | No token copying, undocumented OAuth endpoint, or Keychain-name emulation |
 | Mid-session account hot-swap or command replay | Non-goal | Unsafe side-effect semantics |

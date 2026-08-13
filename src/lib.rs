@@ -193,19 +193,24 @@ where
             ExitCode::from(report.exit_code())
         }
         Commands::Auth { command } => match command {
-            AuthCommand::Add {
-                provider: ProviderArgument::Codex,
-                alias,
-            } => {
+            AuthCommand::Add { provider, alias } => {
                 if cli.json {
                     return render_app_error("auth", &AppError::InteractiveJsonUnsupported, true);
                 }
-                match commands::auth::add_codex(&alias) {
+                let result = match provider {
+                    ProviderArgument::Claude => commands::auth::add_claude(&alias),
+                    ProviderArgument::Codex => commands::auth::add_codex(&alias),
+                };
+                match result {
                     Ok(report) => render_auth_report(&report, false),
                     Err(error) => render_app_error("auth", &error, false),
                 }
             }
             AuthCommand::Verify { profile } => match profile.provider {
+                ProviderArgument::Claude => match commands::auth::verify_claude(&profile.alias) {
+                    Ok(report) => render_auth_report(&report, cli.json),
+                    Err(error) => render_app_error("auth", &error, cli.json),
+                },
                 ProviderArgument::Codex => match commands::auth::verify_codex(&profile.alias) {
                     Ok(report) => render_auth_report(&report, cli.json),
                     Err(error) => render_app_error("auth", &error, cli.json),
@@ -216,6 +221,12 @@ where
                     return render_app_error("auth", &AppError::InteractiveJsonUnsupported, true);
                 }
                 match profile.provider {
+                    ProviderArgument::Claude => {
+                        match commands::auth::reauth_claude(&profile.alias) {
+                            Ok(report) => render_auth_report(&report, false),
+                            Err(error) => render_app_error("auth", &error, false),
+                        }
+                    }
                     ProviderArgument::Codex => match commands::auth::reauth_codex(&profile.alias) {
                         Ok(report) => render_auth_report(&report, false),
                         Err(error) => render_app_error("auth", &error, false),
@@ -223,6 +234,12 @@ where
                 }
             }
             AuthCommand::Rename { profile, new_alias } => match profile.provider {
+                ProviderArgument::Claude => {
+                    match commands::auth::rename_claude(&profile.alias, &new_alias) {
+                        Ok(report) => render_rename_report(&report, cli.json),
+                        Err(error) => render_app_error("auth", &error, cli.json),
+                    }
+                }
                 ProviderArgument::Codex => {
                     match commands::auth::rename_codex(&profile.alias, &new_alias) {
                         Ok(report) => render_rename_report(&report, cli.json),
@@ -230,56 +247,63 @@ where
                     }
                 }
             },
-            AuthCommand::Remove { profile, yes } => match profile.provider {
-                ProviderArgument::Codex => {
-                    if !yes
-                        && (cli.json || !io::stdin().is_terminal() || !io::stderr().is_terminal())
-                    {
-                        return render_app_error("auth", &AppError::ConfirmationRequired, cli.json);
+            AuthCommand::Remove { profile, yes } => {
+                if !yes && (cli.json || !io::stdin().is_terminal() || !io::stderr().is_terminal()) {
+                    return render_app_error("auth", &AppError::ConfirmationRequired, cli.json);
+                }
+                let registry = match profiles::Registry::discover().map_err(AppError::from) {
+                    Ok(registry) => registry,
+                    Err(error) => return render_app_error("auth", &error, cli.json),
+                };
+                let confirmed_profile_id = if !yes {
+                    let preview = match profile.provider {
+                        ProviderArgument::Claude => {
+                            commands::auth::preview_remove_claude(&registry, &profile.alias)
+                        }
+                        ProviderArgument::Codex => {
+                            commands::auth::preview_remove_codex(&registry, &profile.alias)
+                        }
+                    };
+                    let preview = match preview {
+                        Ok(preview) => preview,
+                        Err(error) => return render_app_error("auth", &error, false),
+                    };
+                    let prompt = format!(
+                        "Remove {} (local profile {}, created {})?\nThis deletes only Calcifer-managed local credentials and sessions; it does not revoke provider tokens or guarantee secure erasure.\nType 'yes' to continue:",
+                        preview.reference(),
+                        preview.id,
+                        preview.created_at
+                    );
+                    if write_stderr(&prompt).is_err() {
+                        return ExitCode::FAILURE;
                     }
-                    let registry = match profiles::Registry::discover().map_err(AppError::from) {
-                        Ok(registry) => registry,
-                        Err(error) => return render_app_error("auth", &error, cli.json),
-                    };
-                    let confirmed_profile_id = if !yes {
-                        let preview =
-                            match commands::auth::preview_remove_codex(&registry, &profile.alias) {
-                                Ok(preview) => preview,
-                                Err(error) => return render_app_error("auth", &error, false),
-                            };
-                        let prompt = format!(
-                            "Remove {} (local profile {}, created {})?\nThis deletes only Calcifer-managed local credentials and sessions; it does not revoke provider tokens or guarantee secure erasure.\nType 'yes' to continue:",
-                            preview.reference(),
-                            preview.id,
-                            preview.created_at
-                        );
-                        if write_stderr(&prompt).is_err() {
-                            return ExitCode::FAILURE;
-                        }
-                        let mut confirmation = String::new();
-                        if io::stdin().read_line(&mut confirmation).is_err()
-                            || !is_explicit_confirmation(&confirmation)
-                        {
-                            return render_app_error(
-                                "auth",
-                                &AppError::ConfirmationRequired,
-                                false,
-                            );
-                        }
-                        Some(preview.id)
-                    } else {
-                        None
-                    };
-                    match commands::auth::remove_codex(
+                    let mut confirmation = String::new();
+                    if io::stdin().read_line(&mut confirmation).is_err()
+                        || !is_explicit_confirmation(&confirmation)
+                    {
+                        return render_app_error("auth", &AppError::ConfirmationRequired, false);
+                    }
+                    Some(preview.id)
+                } else {
+                    None
+                };
+                let result = match profile.provider {
+                    ProviderArgument::Claude => commands::auth::remove_claude(
                         &registry,
                         &profile.alias,
                         confirmed_profile_id.as_deref(),
-                    ) {
-                        Ok(report) => render_remove_report(&report, cli.json),
-                        Err(error) => render_app_error("auth", &error, cli.json),
-                    }
+                    ),
+                    ProviderArgument::Codex => commands::auth::remove_codex(
+                        &registry,
+                        &profile.alias,
+                        confirmed_profile_id.as_deref(),
+                    ),
+                };
+                match result {
+                    Ok(report) => render_remove_report(&report, cli.json),
+                    Err(error) => render_app_error("auth", &error, cli.json),
                 }
-            },
+            }
             AuthCommand::List => match commands::auth::list() {
                 Ok(report) => render_auth_report(&report, cli.json),
                 Err(error) => render_app_error("auth", &error, cli.json),
@@ -295,6 +319,15 @@ where
                 return render_app_error("run", &AppError::InteractiveJsonUnsupported, true);
             }
             match profile.provider {
+                ProviderArgument::Claude if untracked => {
+                    render_app_error("run", &AppError::ProviderArgumentRejected, false)
+                }
+                ProviderArgument::Claude => {
+                    match commands::process::run_claude(&profile.alias, &provider_args) {
+                        Ok(status) => exit_code_from_status(status),
+                        Err(error) => render_app_error("run", &error, false),
+                    }
+                }
                 ProviderArgument::Codex => {
                     match commands::process::run_codex(&profile.alias, untracked, &provider_args) {
                         Ok(status) => exit_code_from_status(status),
@@ -315,6 +348,7 @@ where
             }
             let result = match (experimental_supervised, profile) {
                 (true, Some(profile)) => match profile.provider {
+                    ProviderArgument::Claude => Err(AppError::ProviderArgumentRejected),
                     ProviderArgument::Codex => match session_id.as_deref() {
                         Some(session_id) => commands::process::resume_supervised_codex(
                             &profile.alias,
@@ -326,6 +360,7 @@ where
                 },
                 (true, None) => Err(AppError::ProviderArgumentRejected),
                 (false, Some(profile)) => match profile.provider {
+                    ProviderArgument::Claude => Err(AppError::ProviderArgumentRejected),
                     ProviderArgument::Codex => commands::process::resume_codex(
                         &profile.alias,
                         session_id.as_deref(),
@@ -343,12 +378,20 @@ where
                 Err(error) => render_app_error("resume", &error, false),
             }
         }
-        Commands::Status { profile } => match commands::status::StatusReport::inspect(
-            profile.as_ref().map(|profile| profile.alias.as_str()),
-        ) {
-            Ok(report) => render_status_report(&report, cli.json),
-            Err(error) => render_app_error("status", &error, cli.json),
-        },
+        Commands::Status { profile } => {
+            if profile
+                .as_ref()
+                .is_some_and(|profile| profile.provider == ProviderArgument::Claude)
+            {
+                return render_app_error("status", &AppError::ProviderArgumentRejected, cli.json);
+            }
+            match commands::status::StatusReport::inspect(
+                profile.as_ref().map(|profile| profile.alias.as_str()),
+            ) {
+                Ok(report) => render_status_report(&report, cli.json),
+                Err(error) => render_app_error("status", &error, cli.json),
+            }
+        }
         Commands::Update {
             command: UpdateCommand::Check { channel },
         } => match commands::update::check(channel) {
@@ -370,6 +413,11 @@ where
                 );
             }
             match expected_profile.provider {
+                ProviderArgument::Claude => render_app_error(
+                    "__internal-codex",
+                    &AppError::ProviderArgumentRejected,
+                    false,
+                ),
                 ProviderArgument::Codex => {
                     let notice = match mode {
                         cli::InternalProcessMode::Run => format!(
@@ -528,6 +576,7 @@ fn run_routing_command(command: RoutingCommand, json: bool) -> ExitCode {
 
 const fn provider_value(provider: ProviderArgument) -> profiles::Provider {
     match provider {
+        ProviderArgument::Claude => profiles::Provider::Claude,
         ProviderArgument::Codex => profiles::Provider::Codex,
     }
 }

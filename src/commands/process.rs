@@ -26,9 +26,12 @@ use uuid::Uuid;
 use crate::cli::InternalProcessMode;
 use crate::conversations::{ConversationError, ConversationRegistry};
 use crate::error::AppError;
-use crate::executable::resolve_codex;
+use crate::executable::{resolve_claude, resolve_codex};
 use crate::profiles::{Provider, Registry};
 use crate::project_config::verify_current_repository_config;
+use crate::providers::claude::{
+    managed_command as managed_claude_command, verify_profile as verify_claude_profile,
+};
 use crate::providers::codex::{managed_command, sanitize_managed_environment};
 
 #[cfg(unix)]
@@ -52,6 +55,25 @@ pub(crate) fn run_codex(
     };
     let registry = Registry::discover()?;
     spawn_supervisor(&registry, alias, mode, None, provider_args)
+}
+
+pub(crate) fn run_claude(alias: &str, provider_args: &[OsString]) -> Result<ExitStatus, AppError> {
+    if !cfg!(target_os = "linux") {
+        return Err(crate::profiles::ProfileError::UnsupportedPlatform.into());
+    }
+    let registry = Registry::discover()?;
+    let profile = registry.find(Provider::Claude, alias)?;
+    let lease = registry.lock_profile(&profile)?;
+    let executable = resolve_claude()?;
+    let home = registry.profile_home(&profile)?;
+    let neutral_working_directory = registry.neutral_working_directory()?;
+    verify_claude_profile(&executable, &home, &neutral_working_directory)
+        .map_err(crate::profiles::ProfileError::from)?;
+    let status = managed_claude_command(&executable, &home)
+        .args(provider_args)
+        .status()?;
+    drop(lease);
+    Ok(status)
 }
 
 pub(crate) fn resume_codex(
