@@ -21,8 +21,17 @@ The release workflow enforces these boundaries:
   `kazu-42/calcifer` repository; a fork or repository transfer fails before
   writing a GitHub Release until the manifest contract is deliberately updated.
 - The tagged commit must be reachable from `main`.
-- The six branch-protection checks must have completed successfully for the
+- The seven branch-protection checks must have completed successfully for the
   tagged commit.
+- The `Failover Scorecard` check runs the fixed schema-v1 guarded-failover
+  matrix through the public `resume --experimental-supervised --failover-pool`
+  command. It requires all 20 expected outcomes, zero unexpected provider
+  starts, a p95 duration bucket below five seconds, and proof that its
+  controlled integration regression is rejected. Its source/target crash
+  cases must also resume the production durable handoff transaction without a
+  second fork. Its uploaded JSON contains
+  only fixed outcome codes, local fixture aliases, bounded counts, recovery
+  results, and duration buckets.
 - The repository quality gate runs again before release builds start.
 - Every target is built on a native GitHub-hosted runner; the completed archive
   is extracted there and its packaged binary is smoke-tested.
@@ -151,9 +160,12 @@ the normal CI checks and the separate `Release` PR run to be green.
    ```
 
 3. Require remote `main` to still equal that recorded commit, then run the
-   release workflow manually and inspect all five native builds and the
-   assembled `release-bundle` artifact. Select the run by commit, never by
-   repository-wide recency:
+   release workflow manually and inspect all five native builds, the
+   `failover-scorecard-release-v1` artifact, and the assembled
+   `release-bundle` artifact. Confirm that the scorecard `source_commit` equals
+   the recorded commit, all 20 scenarios agree, unexpected provider starts are
+   zero, and the p95 bucket remains within the documented sub-five-second
+   budget. Select the run by commit, never by repository-wide recency:
 
    ```console
    git fetch origin main

@@ -767,6 +767,22 @@ The public failover adapter acquires this target A+B pair after the handoff and
 conversation-transition authorities, retains it across the non-idempotent fork
 and durable commit, then promotes it through the production supervisor.
 
+CI also compiles a separate `internal-failover-scorecard` fixture and invokes
+the public guarded-resume command in a fresh private home for a fixed 20-case
+scenario matrix. The default release binary cannot enter this fixture. The
+source-crash and target-crash cases persist a real private conversation
+journal, fail after the idempotent stop or attach effect, reconstruct their
+runtime, and resume through the production transaction driver. They reject a
+replayed fork or an incomplete generation attachment before reporting
+recovery. The
+scorecard accepts only fixed outcome codes, the local aliases `source` and
+`target`, bounded generation/provider-start counts, fixed recovery results, and
+coarse duration buckets. It rejects extra fields, an unexpected provider start,
+an outcome mismatch, a missing or reordered scenario, failure to detect the
+controlled regression, or a p95 bucket of five seconds or more. The release
+workflow reruns the same matrix with the exact source commit and gates bundle
+assembly on its success; it never reads or uploads user runtime state.
+
 The current `run` command does not restart or re-submit a command after the child begins execution. Existing pool definitions remain inert and default-disabled. The planned supervisor treats credential profiles and conversation lineage as separate aggregates. It continues the same user-visible conversation after failover by creating a target-profile Codex thread from the validated source rollout, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion. The supervisor connection remains event-only and never races the official TUI to answer approvals or other server-initiated requests; no new turn is admitted without an attached TUI. The full decision and recovery model is in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
 
 ## Filesystem and credential mutations

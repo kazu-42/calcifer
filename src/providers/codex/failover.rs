@@ -46,6 +46,9 @@ const APP_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HANDOFF_STEPS: usize = 8;
 const USAGE_EXHAUSTED_EXIT_CODE: i32 = 75;
 
+#[cfg(feature = "internal-failover-scorecard")]
+mod scorecard;
+
 #[derive(Debug)]
 pub(crate) enum CodexFailoverError {
     Conversation(crate::conversations::ConversationError),
@@ -217,6 +220,17 @@ pub(crate) fn resume_supervised_with_failover(
     let pool_id = definitions
         .resolve_pool_id(pool_provider, pool_reference)
         .map_err(CodexFailoverError::Definition)?;
+    #[cfg(feature = "internal-failover-scorecard")]
+    if let Some(result) = scorecard::run_if_requested(
+        registry,
+        initial_profile,
+        &definitions,
+        &pool_id,
+        working_directory,
+        initial_thread_id,
+    ) {
+        return result;
+    }
     let conversations = ConversationRegistry::from_profiles(registry);
     let (mut current_profile, mut current_thread_id, mut cooldown, mut completed_status) =
         match conversations.current_handoff_context()? {

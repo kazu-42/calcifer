@@ -18,7 +18,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             1,
         )
 
-    def test_tag_publish_path_requires_the_pinned_codex_package_gate(self) -> None:
+    def test_tag_publish_path_requires_runtime_acceptance_gates(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("          required_checks=(\n")
         end = workflow.index("          )\n", start)
@@ -36,9 +36,26 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 "Test (macos-latest)",
                 "Test (windows-latest)",
                 "Pinned Codex Package",
+                "Failover Scorecard",
                 "MSRV (1.85.0)",
             ),
         )
+
+    def test_release_bundle_waits_for_the_exact_source_failover_scorecard(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        scorecard_start = workflow.index("  failover-scorecard:\n")
+        build_start = workflow.index("  build:\n", scorecard_start)
+        scorecard_job = workflow[scorecard_start:build_start]
+        bundle_start = workflow.index("  bundle:\n", build_start)
+        sign_start = workflow.index("  sign:\n", bundle_start)
+        bundle_job = workflow[bundle_start:sign_start]
+
+        self.assertIn("SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}", scorecard_job)
+        self.assertIn("--features internal-failover-scorecard", scorecard_job)
+        self.assertIn("scripts/failover_scorecard.py", scorecard_job)
+        self.assertIn("name: failover-scorecard-release-v1", scorecard_job)
+        self.assertNotIn("name: release-failover-scorecard", scorecard_job)
+        self.assertIn("      - failover-scorecard\n", bundle_job)
 
     def test_tag_publish_path_rejects_lightweight_tags(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
