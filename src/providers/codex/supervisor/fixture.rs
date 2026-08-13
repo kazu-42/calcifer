@@ -965,6 +965,7 @@ fn run_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError> {
             GuardianEvent::LeaseCommitted
             | GuardianEvent::TerminalArmed { .. }
             | GuardianEvent::InputGateOpened
+            | GuardianEvent::UsageExhausted
             | GuardianEvent::SignalForwarded { .. }
             | GuardianEvent::ResizeApplied { .. }
             | GuardianEvent::Suspended

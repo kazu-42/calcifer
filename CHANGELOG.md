@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- A payload-free typed `usageLimitExceeded` terminal outcome in the Linux
+  production supervisor. The active monitor can now stop and reap the exact
+  App Server and TUI, complete terminal recovery, and project reserved exit
+  code 75 without exposing provider identifiers. This is a signal for a future
+  caller to perform a fresh authoritative usage read; it does not itself
+  authorize pool selection or automatic failover.
+
 - Explicit Linux `resume --experimental-supervised codex@<alias> <thread-uuid>`
   for one exact same-profile foreground session through the sealed production
   supervisor. It rejects JSON, implicit/last resume, provider arguments, pool
@@ -40,6 +47,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   rejected before provider launch.
 
 ### Security
+
+- The usage-exhaustion outcome is accepted only from the active monitored
+  session and becomes successful only after the exact App Server/TUI shutdown,
+  worker join, terminal restore, and recovery disarm sequence. Natural provider
+  exit 75 remains an ordinary provider exit internally; any future selector
+  must freshly revalidate authoritative exhaustion instead of trusting the
+  shell code alone.
 
 - Public supervised exact resume enters the production role parser through a
   sanitized, zero-argument self-exec carrying a child-only, close-on-exec,

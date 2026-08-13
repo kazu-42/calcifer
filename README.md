@@ -496,7 +496,12 @@ The command requires a foreground TTY and rejects `--json`, `--last`, implicit
 workspace selection, every argument after `--`, pool traversal, and
 cross-profile handoff before provider startup. A failure never retries through
 direct resume. The ordinary exact-resume command remains the portable recovery
-path. Normal and single-wrapper-failure paths restore the terminal before they
+path. When the monitored exact thread reports a typed `usageLimitExceeded`
+failure, the supervisor first stops and reaps its exact children and restores
+the terminal, then returns reserved exit code 75. That code is not standalone
+failover authority: automatic selection remains unavailable and a future
+caller must perform a fresh authoritative usage read under the same profile
+lease. Normal and single-wrapper-failure paths restore the terminal before they
 return. If both restoration authorities are forcibly killed while raw mode is
 active, the invoking shell or terminal emulator may need an explicit `reset`;
 reverting or restarting Calcifer cannot restore a dead process's terminal

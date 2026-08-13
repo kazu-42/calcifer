@@ -802,6 +802,14 @@ monotonic local revision, local profile ID, fixed source/event/state enums, and
 timestamp; it cannot encode credentials, provider account/workspace IDs,
 reset-credit IDs, aliases, or transcript content.
 
+A recognized active `usageLimitExceeded` event is projected across the
+supervisor protocol as a payload-free terminal cause. Reserved shell exit code
+75 is emitted only after the exact children are reaped and terminal recovery is
+complete. The code is intentionally insufficient selection authority: a
+natural provider exit can use the same numeric code, so the future parent
+selector must additionally revalidate a fresh authoritative exhaustion view
+before it can traverse a configured pool.
+
 Immediately before launch, Calcifer reports the local profile alias, provider, trust domain, and selection reason. It does not display email or stable provider account, workspace, or organization identifiers, and repository-local configuration cannot suppress this notice.
 
 ## Security-sensitive review areas

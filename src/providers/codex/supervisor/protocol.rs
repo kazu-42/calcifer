@@ -20,6 +20,10 @@ const HEADER_BYTES: usize = 8;
 const MAX_FRAME_BYTES: usize = 64;
 const MAX_BODY_BYTES: usize = MAX_FRAME_BYTES - HEADER_BYTES;
 
+/// Reserved shell projection for the typed supervisor outcome. Callers must
+/// still perform fresh source-usage revalidation before authorizing failover.
+pub(super) const USAGE_EXHAUSTED_EXIT_CODE: u8 = 75;
+
 const DIRECTION_MASK: u8 = 0x80;
 const TYPE_MASK: u8 = 0x7f;
 const COORDINATOR_DIRECTION: u8 = 0x00;
@@ -49,6 +53,7 @@ const GUARDIAN_SUSPENDED: u8 = 10;
 const GUARDIAN_RESUMED: u8 = 11;
 const GUARDIAN_TERMINAL_QUIESCED: u8 = 12;
 const GUARDIAN_TERMINAL_RECOVERY_DISARMED: u8 = 13;
+const GUARDIAN_USAGE_EXHAUSTED: u8 = 14;
 
 const EMPTY_BODY_BYTES: usize = 1;
 const SNAPSHOT_FINGERPRINT_BYTES: usize = 32;
@@ -102,6 +107,9 @@ pub(super) enum GuardianEvent {
         rows: u16,
         cols: u16,
     },
+    /// The exact monitored thread reported the typed `usageLimitExceeded`
+    /// turn failure. This carries no provider identifiers or retry authority.
+    UsageExhausted,
     TerminalQuiesced,
     TerminalRecoveryDisarmed,
     Failed {
@@ -271,6 +279,7 @@ pub(super) enum SessionTerminationCause {
     CoordinatorStop,
     ForwardedHup,
     ForwardedTerm,
+    UsageExhaustion,
 }
 
 /// Exact process disposition the guardian applies only after publishing its
@@ -279,6 +288,7 @@ pub(super) enum SessionTerminationCause {
 pub(super) enum GuardianExitDisposition {
     Code(u8),
     Signal(u8),
+    UsageExhausted,
     InternalFailure,
 }
 
@@ -679,6 +689,10 @@ impl TerminalLifecycleValidator {
                 },
                 Event::Resumed { rows, cols },
             ) if rows == expected_rows && cols == expected_cols => State::ReadyForGate,
+            (State::Active, Event::UsageExhausted) => {
+                self.termination_cause = Some(SessionTerminationCause::UsageExhaustion);
+                State::AwaitQuiesced
+            }
             // Exact TUI completion after the gate opens is itself a trusted
             // shutdown trigger. Requiring STOP here would deadlock after the
             // input path has disappeared. A stopped TUI is deliberately not
@@ -866,7 +880,7 @@ pub(super) fn project_terminal_semantics(
     cause: SessionTerminationCause,
 ) -> (SessionStatus, GuardianExitDisposition) {
     use ChildDisposition::{Exited, NotStarted, Signaled};
-    use GuardianExitDisposition::{Code, InternalFailure, Signal};
+    use GuardianExitDisposition::{Code, InternalFailure, Signal, UsageExhausted};
     use SessionStatus::{Completed, Failed};
 
     let app_expected = matches!(
@@ -924,6 +938,18 @@ pub(super) fn project_terminal_semantics(
             },
         ) => (Failed, Signal(signal)),
         (
+            SessionTerminationCause::UsageExhaustion,
+            Exited {
+                code: 0,
+                stop_action: StopAction::None | StopAction::Term,
+            }
+            | Signaled {
+                signal: 15,
+                core_dumped: false,
+                stop_action: StopAction::Term,
+            },
+        ) => (Completed, UsageExhausted),
+        (
             SessionTerminationCause::ForwardedHup,
             Signaled {
                 signal: 1,
@@ -958,7 +984,8 @@ pub(super) fn project_terminal_semantics(
             SessionTerminationCause::NaturalTuiEof
             | SessionTerminationCause::CoordinatorStop
             | SessionTerminationCause::ForwardedHup
-            | SessionTerminationCause::ForwardedTerm,
+            | SessionTerminationCause::ForwardedTerm
+            | SessionTerminationCause::UsageExhaustion,
             NotStarted | Exited { .. } | Signaled { .. },
         ) => (Failed, InternalFailure),
     }
@@ -1045,6 +1072,7 @@ pub(super) fn send_guardian_event<W: Write>(
             encode_terminal_size(rows, cols, &mut body[1..5])?;
             (GUARDIAN_RESUMED, TERMINAL_SIZE_BODY_BYTES)
         }
+        GuardianEvent::UsageExhausted => (GUARDIAN_USAGE_EXHAUSTED, EMPTY_BODY_BYTES),
         GuardianEvent::TerminalQuiesced => (GUARDIAN_TERMINAL_QUIESCED, EMPTY_BODY_BYTES),
         GuardianEvent::TerminalRecoveryDisarmed => {
             (GUARDIAN_TERMINAL_RECOVERY_DISARMED, EMPTY_BODY_BYTES)
@@ -2111,6 +2139,11 @@ fn receive_guardian_event<R: Read>(
             let (rows, cols) = decode_terminal_size(&frame.body[1..5])?;
             Ok(GuardianEvent::Resumed { rows, cols })
         }
+        GUARDIAN_USAGE_EXHAUSTED => {
+            frame.require_exact_len(EMPTY_BODY_BYTES)?;
+            frame.require_payload_version()?;
+            Ok(GuardianEvent::UsageExhausted)
+        }
         GUARDIAN_TERMINAL_QUIESCED => {
             frame.require_exact_len(EMPTY_BODY_BYTES)?;
             frame.require_payload_version()?;
@@ -2454,6 +2487,7 @@ fn encode_guardian_exit_disposition(
         GuardianExitDisposition::Signal(signal) if (1..=127).contains(&signal) => [2, signal],
         GuardianExitDisposition::Signal(_) => return Err(ProtocolError::InvalidValue),
         GuardianExitDisposition::InternalFailure => [3, 0],
+        GuardianExitDisposition::UsageExhausted => [4, 0],
     };
     output.copy_from_slice(&encoded);
     Ok(())
@@ -2469,6 +2503,7 @@ fn decode_guardian_exit_disposition(
         [1, code] => Ok(GuardianExitDisposition::Code(*code)),
         [2, signal @ 1..=127] => Ok(GuardianExitDisposition::Signal(*signal)),
         [3, 0] => Ok(GuardianExitDisposition::InternalFailure),
+        [4, 0] => Ok(GuardianExitDisposition::UsageExhausted),
         _ => Err(ProtocolError::InvalidValue),
     }
 }
@@ -2750,6 +2785,7 @@ mod tests {
             app_started(),
             tui_started(),
             GuardianEvent::Ready,
+            GuardianEvent::UsageExhausted,
             GuardianEvent::Failed {
                 phase: Phase::Readiness,
                 code: FailureCode::Timeout,
@@ -3584,6 +3620,36 @@ mod tests {
         validator.accept_command(CoordinatorCommand::OpenInputGate)?;
         validator.accept_event(GuardianEvent::InputGateOpened)?;
         Ok(validator)
+    }
+
+    #[test]
+    fn usage_exhaustion_is_a_typed_terminal_cause() -> Result<(), Box<dyn Error>> {
+        let mut validator = active_terminal_validator()?;
+        validator.accept_event(GuardianEvent::UsageExhausted)?;
+        validator.accept_event(GuardianEvent::TerminalQuiesced)?;
+        validator.accept_command(CoordinatorCommand::TerminalRestored)?;
+        validator.accept_event(GuardianEvent::TerminalRecoveryDisarmed)?;
+        validator.accept_event(GuardianEvent::ChildrenReaped {
+            app: ChildDisposition::Signaled {
+                signal: 15,
+                core_dumped: false,
+                stop_action: StopAction::Term,
+            },
+            tui: ChildDisposition::Signaled {
+                signal: 15,
+                core_dumped: false,
+                stop_action: StopAction::Term,
+            },
+            worker: WorkerJoinStatus::JoinedClean,
+            cleanup: CleanupStatus::Complete,
+            session: SessionStatus::Completed,
+            guardian_exit: GuardianExitDisposition::UsageExhausted,
+        })?;
+        assert_eq!(
+            validator.take_terminal_exit_disposition(),
+            Some(GuardianExitDisposition::UsageExhausted)
+        );
+        Ok(())
     }
 
     #[test]

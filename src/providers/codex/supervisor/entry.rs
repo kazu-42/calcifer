@@ -2678,6 +2678,9 @@ fn apply_coordinator_outcome(outcome: CoordinatorRunOutcome) -> ExitCode {
 fn apply_guardian_disposition(disposition: GuardianExitDisposition) -> ExitCode {
     match disposition {
         GuardianExitDisposition::Code(code) => ExitCode::from(code),
+        GuardianExitDisposition::UsageExhausted => {
+            ExitCode::from(super::protocol::USAGE_EXHAUSTED_EXIT_CODE)
+        }
         GuardianExitDisposition::InternalFailure => ExitCode::from(1),
         GuardianExitDisposition::Signal(signal) => {
             let _ = signal_hook::low_level::emulate_default_handler(i32::from(signal));
