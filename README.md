@@ -464,7 +464,7 @@ codex@work [available]
   reset credits: 2 available
     codexRateLimits · available · expires 2027-02-01T08:00:00Z
   observed 2026-07-15T12:34:56Z · fresh · codex_app_server
-  compatibility compatible · Codex 0.144.4 · tested 0.144.4 · adapter 0.1.0-alpha.4
+  compatibility compatible · Codex 0.144.4 · tested 0.144.4 · adapter 0.1.0-alpha.5
 ```
 
 Stable JSON adds `codex_version`, `adapter_version`, and a `compatibility`
@@ -495,7 +495,7 @@ Example JSON envelope:
 {
   "schema_version": 1,
   "command": "doctor",
-  "calcifer_version": "0.1.0-alpha.4",
+  "calcifer_version": "0.1.0-alpha.5",
   "ok": true,
   "status": "warn",
   "checks": []
@@ -666,8 +666,8 @@ Starting with `v0.1.0-alpha.3`, Calcifer publishes pre-release archives for
 Linux glibc 2.35+ on x86-64/ARM64, macOS Intel/Apple silicon, and Windows x86-64 on the
 [GitHub Releases page](https://github.com/kazu-42/calcifer/releases). Every
 release includes SHA-256 checksums and GitHub artifact attestations minted by
-the release workflow over the assembled release assets. Starting with the next
-release after alpha.4, every platform archive also has a Minisign sidecar made
+the release workflow over the assembled release assets. Starting with
+`v0.1.0-alpha.5`, every platform archive also has a Minisign sidecar made
 inside the protected `release-signing` environment.
 The binaries are not yet code-signed or notarized.
 

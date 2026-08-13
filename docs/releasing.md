@@ -78,7 +78,7 @@ The manifest contract is documented in [release-manifest.md](release-manifest.md
 | macOS Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` | `.zip` |
 
-The archives are Minisign-signed starting with the next release after alpha.4,
+The archives are Minisign-signed starting with `v0.1.0-alpha.5`,
 but the executables are not operating-system code-signed or notarized. GitHub
 artifact attestations provide workflow provenance, not an operating-system
 code-signing identity.
@@ -178,7 +178,7 @@ the normal CI checks and the separate `Release` PR run to be green.
    `version` must match `Cargo.toml` exactly:
 
    ```console
-   version=0.1.0-alpha.4
+   version=0.1.0-alpha.5
    git fetch origin main --tags
    git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
    git tag -a "v${version}" "$release_commit" -m "Calcifer v${version}"
@@ -375,7 +375,7 @@ On Linux or macOS, extract the archive for the current architecture and copy the
 binary into a user-owned directory on `PATH`:
 
 ```console
-version=0.1.0-alpha.4
+version=0.1.0-alpha.5
 # Choose the exact Rust target for this host from the supported-artifacts table.
 target=x86_64-unknown-linux-gnu
 prefix="calcifer-v${version}-${target}"
