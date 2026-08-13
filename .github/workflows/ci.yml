@@ -77,6 +77,41 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo +1.96.0 doc --no-deps --all-features --locked
 
+  failover-scorecard:
+    name: Failover Scorecard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Build the public failover acceptance fixture
+        run: >-
+          cargo +1.96.0 build --release --locked
+          --features internal-failover-scorecard --bin calcifer
+      - name: Run the guarded-failover scenario matrix
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/failover_scorecard.py \
+            --calcifer target/release/calcifer \
+            --fixture-codex tests/fixtures/failover-scorecard-codex.sh \
+            --output target/failover-scorecard-v1.json \
+            --source-commit "${SOURCE_COMMIT}"
+      - name: Upload the redacted failover scorecard
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failover-scorecard-v1
+          path: target/failover-scorecard-v1.json
+          if-no-files-found: error
+          retention-days: 14
+
   test:
     name: Test (${{ matrix.os }})
     strategy:

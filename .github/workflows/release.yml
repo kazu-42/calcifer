@@ -12,15 +12,20 @@ on:
       - scripts/package_release.py
       - scripts/publish_release.py
       - scripts/generate_homebrew_formula.py
+      - scripts/failover_scorecard.py
       - scripts/release_manifest.py
       - scripts/test_binstall_metadata.py
       - scripts/test_generate_homebrew_formula.py
+      - scripts/test_failover_scorecard.py
       - scripts/test_package_release.py
       - scripts/test_publish_release.py
       - scripts/test_release_manifest.py
       - scripts/test_release_workflow.py
       - scripts/test_verify_release.py
       - scripts/verify_release.py
+      - src/providers/codex/failover.rs
+      - src/providers/codex/failover/scorecard.rs
+      - tests/fixtures/failover-scorecard-codex.sh
   push:
     tags:
       - "v*"
@@ -150,6 +155,7 @@ jobs:
             "Test (macos-latest)"
             "Test (windows-latest)"
             "Pinned Codex Package"
+            "Failover Scorecard"
             "MSRV (1.85.0)"
           )
           for required_check in "${required_checks[@]}"; do
@@ -162,6 +168,43 @@ jobs:
           done
       - name: Run repository quality gate
         run: make check
+
+  failover-scorecard:
+    name: Verify release failover scorecard
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
+      - name: Build the public failover acceptance fixture
+        run: >-
+          cargo +"${RUST_TOOLCHAIN}" build --release --locked
+          --features internal-failover-scorecard --bin calcifer
+      - name: Run the exact-source guarded-failover matrix
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          python3 scripts/failover_scorecard.py \
+            --calcifer target/release/calcifer \
+            --fixture-codex tests/fixtures/failover-scorecard-codex.sh \
+            --output target/failover-scorecard-v1.json \
+            --source-commit "${SOURCE_COMMIT}"
+      - name: Upload the exact-source redacted scorecard
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-failover-scorecard-v1
+          path: target/failover-scorecard-v1.json
+          if-no-files-found: error
+          retention-days: 14
 
   build:
     name: Build (${{ matrix.target }})
@@ -319,6 +362,7 @@ jobs:
     needs:
       - validate
       - build
+      - failover-scorecard
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

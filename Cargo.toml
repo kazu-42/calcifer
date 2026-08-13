@@ -38,6 +38,7 @@ pubkey = "RWScrwKKsqmN5v9pAGdgdW0jNSHokfmerI53KJiE2gRNmcaNS36gOtC6"
 default = ["production-supervisor"]
 production-supervisor = ["dep:log", "dep:tungstenite"]
 internal-supervisor-fixture = ["production-supervisor"]
+internal-failover-scorecard = ["production-supervisor"]
 
 [[bin]]
 name = "calcifer-supervisor-fixture"
