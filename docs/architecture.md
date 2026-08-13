@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, a private default-disabled trust-domain/pool registry, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target reservation, and a serialized cross-profile transaction/reconciliation kernel are implemented. The routing registry cannot select or launch a profile. A default-unused pinned App Server/typed-monitor/official-TUI supervisor implementation is present. No public supervised command or automatic selector activates these pieces yet.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, a private default-disabled trust-domain/pool registry, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target reservation, and a serialized cross-profile transaction/reconciliation kernel are implemented. The routing registry cannot select or launch a profile. Linux exposes the pinned App Server/typed-monitor/official-TUI supervisor only for explicit exact same-profile resume. No public automatic selector or cross-profile handoff activates the remaining pieces yet.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -328,14 +328,18 @@ compatibility proofs only: production leases, transition journaling and
 recovery, pool policy, authoritative exhaustion selection, and user-state
 handoff remain unimplemented.
 
-## Default-unused Unix supervisor implementation
+## Production Unix supervisor implementation
 
 The internal supervisor first composed fake-child process authority with a real
 PTY and outer terminal on Linux and macOS. Issue #54 now also connects that
 kernel to the pinned Codex `0.144.4` App Server, a separately typed monitor, the
-readiness relay, and the official remote TUI. It remains an internal,
-default-unused integration: no public command selects it, and it changes no
-registry or conversation schema.
+readiness relay, and the official remote TUI. The production graph is compiled
+by default. On Linux, the public `resume --experimental-supervised` boundary
+may enter it only with one immutable profile and one canonical thread UUID. It
+does not select a pool, fork a target thread, replay input, or change the
+registry or conversation schema. macOS retains the compiled state-machine
+surface but fails before provider spawn because it cannot mint the required
+descriptor-backed launch capability.
 
 Independently budgeted checksum-pinned normal-session and retained-recovery
 package scenarios are configured to exercise the production coordinator,
@@ -676,12 +680,12 @@ The verified upstream versions, exact fields, and source links are recorded in [
 The staged process topology, separate lifecycle/lease-transfer channels,
 readiness contract, macOS guardian-loss constraint, and public release gates
 are specified in [ADR 0003](adr/0003-supervised-codex-session.md).
-Its fake-child process and readiness-gated PTY foundations are implemented and
-the pinned same-profile App Server/monitor/TUI integration is implemented and
-default-unused. The lineage journal and one-boundary handoff/recovery driver are
-implemented internally. The one-pass pool selector and its lease-retaining
-Codex candidate runtime are also implemented; public supervisor wiring and the
-interactive UX remain planned.
+Its fake-child process and readiness-gated PTY foundations are implemented, and
+the pinned same-profile App Server/monitor/TUI integration is reachable through
+an explicit Linux exact-resume command. The lineage journal and one-boundary
+handoff/recovery driver remain internal. The one-pass pool selector and its
+lease-retaining Codex candidate runtime are also implemented; public failover
+wiring and the cross-profile interactive UX remain planned.
 
 ```text
 resolve pinned profile or explicit pool
@@ -717,9 +721,10 @@ A separate direct-result and post-crash inventory projection requires a new cano
 the exact source `forkedFromId`, matching canonical cwd and CLI version, a
 single-link safe rollout below the registered target home, an exact target
 session-meta parent, a bounded durable fork window for recovery, and an inode
-distinct from the source. The transaction remains default-unused until the
-selector supplies its supervised runtime adapter; current run/resume behavior
-and its root-thread validator are unchanged.
+distinct from the source. The transaction remains unreachable from the public
+exact supervised command until the selector supplies its supervised runtime
+adapter; ordinary run/resume behavior and its root-thread validator are
+unchanged.
 
 The implemented target-reservation primitive gives the future supervisor an
 ephemeral, no-gap ownership transition on Linux and macOS:
@@ -890,13 +895,14 @@ The current process launcher:
   ambiguous loss parks with the relevant lease and process authority held, and
   the coordinator never turns a previously reported numeric PID into delayed
   signal authority;
-- exercise through the default-unused Unix supervisor that only the live
+- exercise through the production Unix supervisor that only the live
   guardian signals the TUI group, HUP/TERM are forwarded once, INT/QUIT can
   remain attached, WINCH is coalesced, and TSTP/CONT uses
   restore-before-stop plus a fresh gate; the checksum-pinned
   `official-tui-normal` scenario covers resize and group-wide stop/continue with
-  the official TUI and passed twice from that candidate source on Apple silicon, while
-  public supervised resume remains a release gate;
+  the official TUI and passed twice from that candidate source on Apple silicon;
+  the Linux public exact-resume entry reaches the same sealed production anchor,
+  while automatic selection remains a separate release gate;
 - preserve ordinary child exit codes; the terminal fixture additionally
   preserves nonzero and terminating-signal disposition only after exact waits,
   restoration, recovery disarm, and final guardian proof;
@@ -984,10 +990,10 @@ Before the first stable release, the project still needs reviewed decisions or
 completed implementations for:
 
 - deliberate all-profile re-key recovery after identity-key loss;
-- public Linux/macOS supervised resume and active-session monitor/failover UX
-  on top of the default-unused pinned integration in
-  [ADR 0003](adr/0003-supervised-codex-session.md), plus a separate Windows
-  terminal and process-authority design;
+- active-session selection/failover UX on top of the Linux public exact-resume
+  integration in [ADR 0003](adr/0003-supervised-codex-session.md), a reviewed
+  macOS descriptor-exec primitive, and a separate Windows terminal and
+  process-authority design;
 - additional Codex version/schema gates beyond the implemented 0.144.4 observation cache;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);

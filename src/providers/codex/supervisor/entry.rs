@@ -1,10 +1,10 @@
 //! Internal, foreground-only process entry for one production-shaped Codex
 //! supervisor generation.
 //!
-//! This remains default-off until the public wrapper has a reviewed shell-job
-//! contract. In particular, the hidden coordinator uses a process group that
-//! differs from the anchor's shell job group; this module must not be exposed
-//! as a general background-job implementation.
+//! The public wrapper exposes only explicit exact same-profile resume. The
+//! hidden coordinator uses a process group that differs from the anchor's
+//! shell job group; this module is not a general background-job
+//! implementation.
 
 use std::env;
 use std::ffi::OsStr;
@@ -22,6 +22,7 @@ use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 
 const COMPLETION_FRAME: [u8; 8] = *b"CFCMP\x01\r\n";
 const RETAINED_UNRECOVERABLE_FRAME: [u8; COMPLETION_FRAME.len()] = *b"CFRET\x01\r\n";
+const PUBLIC_ENTRY_FRAME: [u8; 8] = *b"CFPUB\x01\r\n";
 #[cfg(test)]
 const TEST_CHECKPOINT_PHASE_OFFSET: usize = 5;
 #[cfg(test)]
@@ -1099,6 +1100,50 @@ pub(super) fn run_internal_production_role() -> ExitCode {
     }
 }
 
+/// Starts the sealed anchor role for one exact same-profile thread. The public
+/// caller supplies no internal role arguments or arbitrary executable; every
+/// projected value is bounded and revalidated again after exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_supervised_exact_resume(
+    registry: &Registry,
+    profile: &Profile,
+    working_directory: &Path,
+    thread_id: &str,
+    codex_executable: &Path,
+) -> io::Result<ExitStatus> {
+    if profile.provider != Provider::Codex {
+        return Err(io::Error::other("unsupported supervised provider"));
+    }
+    validate_thread_id(thread_id).map_err(|_| io::Error::other("invalid supervised thread"))?;
+    validate_canonical_directory(working_directory, MAX_WORKING_DIRECTORY_BYTES)
+        .map_err(|_| io::Error::other("invalid supervised working directory"))?;
+    validate_canonical_file(codex_executable, MAX_EXECUTABLE_PATH_BYTES)
+        .map_err(|_| io::Error::other("invalid supervised provider executable"))?;
+    let executable = env::current_exe()?;
+    validate_canonical_file(&executable, MAX_EXECUTABLE_PATH_BYTES)
+        .map_err(|_| io::Error::other("invalid supervisor executable"))?;
+
+    let mut command = Command::new(executable);
+    crate::providers::codex::sanitize_managed_environment(&mut command);
+    command
+        .env_remove("CODEX_HOME")
+        .env("CALCIFER_HOME", registry.managed_root())
+        .env(ROLE_ENV, ANCHOR_ROLE_V1)
+        .env(PROFILE_ID_ENV, &profile.id)
+        .env(THREAD_ID_ENV, thread_id)
+        .env(CODEX_EXECUTABLE_ENV, codex_executable)
+        .current_dir(working_directory);
+    let (mut authorization, inherited) = UnixStream::pair()?;
+    authorization.write_all(&PUBLIC_ENTRY_FRAME)?;
+    authorization.shutdown(std::net::Shutdown::Write)?;
+    drop(authorization);
+    let mut child =
+        calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(command, inherited.as_fd())
+            .map_err(|_| io::Error::other("supervisor entry spawn failed"))?;
+    drop(inherited);
+    child.wait()
+}
+
 fn parse_and_run_production_role() -> Result<ExitCode, ProductionEntryError> {
     if env::args_os().count() != 1 {
         return Err(ProductionEntryError::Arguments);
@@ -1112,6 +1157,7 @@ fn parse_and_run_production_role() -> Result<ExitCode, ProductionEntryError> {
 }
 
 fn parse_and_run_anchor_role() -> Result<ExitCode, ProductionEntryError> {
+    consume_public_entry_authorization()?;
     let profile_id = bounded_environment_utf8(PROFILE_ID_ENV, MAX_PROFILE_ID_BYTES)?;
     let thread_id = bounded_environment_utf8(THREAD_ID_ENV, MAX_THREAD_ID_BYTES)?;
     validate_thread_id(&thread_id)?;
@@ -1135,6 +1181,26 @@ fn parse_and_run_anchor_role() -> Result<ExitCode, ProductionEntryError> {
         codex_executable: &codex_executable,
         coordinator_executable: &coordinator_executable,
     }))
+}
+
+fn consume_public_entry_authorization() -> Result<(), ProductionEntryError> {
+    let inherited = calcifer_unix_child_fd::take_inherited_readiness_fd()
+        .map_err(|_| ProductionEntryError::Environment)?;
+    let mut authorization = UnixStream::from(inherited);
+    let mut frame = [0_u8; PUBLIC_ENTRY_FRAME.len()];
+    authorization
+        .read_exact(&mut frame)
+        .map_err(|_| ProductionEntryError::Environment)?;
+    let mut trailing = [0_u8; 1];
+    if frame != PUBLIC_ENTRY_FRAME
+        || authorization
+            .read(&mut trailing)
+            .map_err(|_| ProductionEntryError::Environment)?
+            != 0
+    {
+        return Err(ProductionEntryError::Environment);
+    }
+    Ok(())
 }
 
 fn parse_and_run_guardian_role() -> Result<ExitCode, ProductionEntryError> {
@@ -1277,7 +1343,7 @@ fn run_anchor_command_inner(
         foreground_fault,
     ) {
         if foreground_fault != ForegroundFixtureFault::None
-            && super::fixture::publish_entry_foreground_observation(
+            && publish_fixture_foreground_observation(
                 matches!(
                     error,
                     ForegroundSelectionError::RetainUnchanged(_)
@@ -1286,7 +1352,6 @@ fn run_anchor_command_inner(
                 error.operation().label(),
                 error.rollback().map(ForegroundRollbackFailure::label),
             )
-            .is_err()
         {
             RetainedAnchorState {
                 child,
@@ -1337,6 +1402,22 @@ fn run_anchor_command_inner(
     }
 
     Ok(generation.drive())
+}
+
+fn publish_fixture_foreground_observation(
+    retained: bool,
+    operation: &'static str,
+    rollback: Option<&'static str>,
+) -> bool {
+    #[cfg(feature = "internal-supervisor-fixture")]
+    {
+        super::fixture::publish_entry_foreground_observation(retained, operation, rollback).is_err()
+    }
+    #[cfg(not(feature = "internal-supervisor-fixture"))]
+    {
+        let _ = (retained, operation, rollback);
+        false
+    }
 }
 
 fn await_direct_child_exit_without_reaping(

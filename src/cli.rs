@@ -11,7 +11,8 @@ use uuid::Uuid;
     about = "Manage isolated profiles for official coding-agent CLIs",
     long_about = "Calcifer is a pre-alpha local profile manager for official coding-agent CLIs.\n\
                   The current functional slice supports isolated Codex profiles, explicit resume,\n\
-                  and structured per-profile usage reads. Automatic failover is not implemented yet.",
+                  structured per-profile usage reads, and experimental Linux supervised exact resume.\n\
+                  Automatic failover is not implemented yet.",
     arg_required_else_help = true
 )]
 pub(crate) struct Cli {
@@ -69,8 +70,16 @@ pub(crate) enum Commands {
     /// Resume a tracked workspace head or a session in an explicit profile.
     Resume {
         /// Use official --last without capture; requires a profile and no exact ID.
-        #[arg(long, requires = "profile", conflicts_with = "session_id")]
+        #[arg(
+            long,
+            requires = "profile",
+            conflicts_with_all = ["session_id", "experimental_supervised"]
+        )]
         untracked: bool,
+
+        /// On Linux, use the pinned foreground supervisor for one exact same-profile thread.
+        #[arg(long, requires_all = ["profile", "session_id"])]
+        experimental_supervised: bool,
 
         /// Provider and local profile alias; omit to resume this workspace's tracked head.
         profile: Option<ProfileReference>,

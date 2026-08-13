@@ -45,8 +45,8 @@ pub fn run_internal_supervisor_fixture() -> ExitCode {
 }
 
 /// Returns whether this feature-gated process was entered as the sealed Codex
-/// TUI launcher. This is not a CLI command and is unavailable in normal builds.
-#[cfg(feature = "internal-supervisor-fixture")]
+/// TUI launcher. This is an internal role discriminator, not a CLI command.
+#[cfg(feature = "production-supervisor")]
 #[doc(hidden)]
 pub fn internal_tui_launcher_requested() -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -60,7 +60,7 @@ pub fn internal_tui_launcher_requested() -> bool {
 }
 
 /// Runs the sealed, feature-gated Codex TUI launcher entrypoint.
-#[cfg(feature = "internal-supervisor-fixture")]
+#[cfg(feature = "production-supervisor")]
 #[doc(hidden)]
 pub fn run_internal_tui_launcher() -> ExitCode {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -73,9 +73,9 @@ pub fn run_internal_tui_launcher() -> ExitCode {
     }
 }
 
-/// Returns whether this default-off process was exec'd as the sealed
+/// Returns whether this internal process was exec'd as the sealed
 /// production-shaped Codex guardian.
-#[cfg(feature = "internal-supervisor-fixture")]
+#[cfg(feature = "production-supervisor")]
 #[doc(hidden)]
 pub fn internal_production_supervisor_role_requested() -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -90,7 +90,7 @@ pub fn internal_production_supervisor_role_requested() -> bool {
 
 /// Runs the sealed production-shaped guardian role. This is an internal exec
 /// boundary, not a public CLI command.
-#[cfg(feature = "internal-supervisor-fixture")]
+#[cfg(feature = "production-supervisor")]
 #[doc(hidden)]
 pub fn run_internal_production_supervisor_role() -> ExitCode {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -112,12 +112,12 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    #[cfg(feature = "internal-supervisor-fixture")]
+    #[cfg(feature = "production-supervisor")]
     if internal_production_supervisor_role_requested() {
         return run_internal_production_supervisor_role();
     }
 
-    #[cfg(feature = "internal-supervisor-fixture")]
+    #[cfg(feature = "production-supervisor")]
     if internal_tui_launcher_requested() {
         return run_internal_tui_launcher();
     }
@@ -305,6 +305,7 @@ where
         }
         Commands::Resume {
             untracked,
+            experimental_supervised,
             profile,
             session_id,
             provider_args,
@@ -312,8 +313,19 @@ where
             if cli.json {
                 return render_app_error("resume", &AppError::InteractiveJsonUnsupported, true);
             }
-            let result = match profile {
-                Some(profile) => match profile.provider {
+            let result = match (experimental_supervised, profile) {
+                (true, Some(profile)) => match profile.provider {
+                    ProviderArgument::Codex => match session_id.as_deref() {
+                        Some(session_id) => commands::process::resume_supervised_codex(
+                            &profile.alias,
+                            session_id,
+                            &provider_args,
+                        ),
+                        None => Err(AppError::ProviderArgumentRejected),
+                    },
+                },
+                (true, None) => Err(AppError::ProviderArgumentRejected),
+                (false, Some(profile)) => match profile.provider {
                     ProviderArgument::Codex => commands::process::resume_codex(
                         &profile.alias,
                         session_id.as_deref(),
@@ -321,10 +333,10 @@ where
                         &provider_args,
                     ),
                 },
-                None if !untracked && session_id.is_none() => {
+                (false, None) if !untracked && session_id.is_none() => {
                     commands::process::resume_workspace_codex(&provider_args)
                 }
-                None => Err(AppError::ProviderArgumentRejected),
+                (false, None) => Err(AppError::ProviderArgumentRejected),
             };
             match result {
                 Ok(status) => exit_code_from_status(status),
@@ -833,6 +845,40 @@ mod tests {
                 assert_eq!(provider_args, [OsString::from("--untracked")]);
             }
             _ => panic!("run command parsed as a different command"),
+        }
+    }
+
+    #[test]
+    fn experimental_supervision_requires_one_explicit_profile_and_exact_thread() {
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        assert!(
+            Cli::try_parse_from([
+                "calcifer",
+                "resume",
+                "--experimental-supervised",
+                "codex@work",
+                thread_id,
+            ])
+            .is_ok()
+        );
+        for arguments in [
+            vec!["calcifer", "resume", "--experimental-supervised"],
+            vec![
+                "calcifer",
+                "resume",
+                "--experimental-supervised",
+                "codex@work",
+            ],
+            vec![
+                "calcifer",
+                "resume",
+                "--experimental-supervised",
+                "--untracked",
+                "codex@work",
+                thread_id,
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
         }
     }
 

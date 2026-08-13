@@ -7,7 +7,20 @@
 Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-agent CLIs with isolated account profiles and structured usage visibility.
 
 > [!WARNING]
-> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, staged same-identity reauthentication, confirmed crash-safe local removal, a private default-disabled trust-domain/pool registry, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. The routing registry does not select or launch a profile. A pinned, default-unused Linux/macOS supervisor implementation is present internally, but its cross-platform acceptance evidence is incomplete. On 2026-07-20, the final Issue #54 candidate source passed two consecutive checksum-pinned Codex 0.144.4 normal-session runs (145.61 s and 144.97 s), one retained-cleanup recovery run (170.60 s), and three consecutive deterministic seven-checkpoint recovery runs (11.54 s, 11.21 s, and 11.50 s) on Apple silicon. Those native runs are historical functional evidence, not a hermetic gate. The Ubuntu 24.04 package lanes now put every exact contract and official-TUI probe in a fresh loopback-only network namespace; macOS hermetic package execution is explicitly unsupported and has no native-network fallback. The official scenarios exercise the real App Server and remote TUI through the coordinator, guardian, provider session, PTY, and job-control implementations under a test-owned terminal harness. Their guardian helper enters the shared production guardian-bootstrap core through bounded package-only seams, and their completion endpoint crosses real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries before the parent checks the provider-release-gated exact record and EOF. The test-only role dispatcher does not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-anchor role, so these scenarios make no parser coverage claim. No public supervised command uses this path. Automatic failover, cross-profile session handoff, and verified Windows credential ACLs are not implemented yet.
+> **Status: functional pre-alpha.** Codex profile registration with private
+> provider-identity deduplication, staged same-identity reauthentication,
+> confirmed crash-safe local removal, a private default-disabled
+> trust-domain/pool registry, pinned launches, same-profile resume, and
+> on-demand usage status are implemented on Unix. Linux additionally exposes
+> an explicit experimental supervised exact-resume path through the pinned App
+> Server, typed monitor, official remote TUI, and foreground terminal anchor.
+> It requires one profile and one canonical thread UUID; it does not select a
+> pool, switch profiles, replay input, or fall back to direct resume. The
+> routing registry still does not select or launch a profile, and automatic
+> failover and cross-profile session handoff remain disabled. macOS production
+> supervised launch is unsupported because no reviewed public descriptor-exec
+> primitive can bind the launched image to the verified bytes. Verified Windows
+> credential ACLs are not implemented yet.
 
 Calcifer is intended to make routine selection among accounts that you already own or are authorized to use feel boring: authenticate each profile through the provider's official CLI, keep each profile isolated, and start every new CLI process with an explicit profile.
 
@@ -251,7 +264,9 @@ persisted schemas are unchanged.
 
 Issue #54 also connects the previously synthetic process/PTY kernel to the
 pinned Codex `0.144.4` App Server, typed monitor, readiness relay, and official
-remote TUI behind an internal, default-unused entrypoint. The coordinator holds
+remote TUI. The production graph is compiled by default, and Linux exposes it
+only through `resume --experimental-supervised` with an exact same-profile
+thread. The coordinator holds
 lease A, the guardian holds lease B, and App Server, TUI, shell tools, and
 unrelated children inherit neither lease nor supervisor control descriptors.
 The persistent shell-facing anchor accepts only one exact eight-byte terminal
@@ -468,9 +483,27 @@ Clap's standard `--help` and `--version` output remains text even when `--json`
 is present. Within schema version 1, existing field names and meanings will
 remain stable; new fields may be added.
 
-## Planned interface
+## Supervised exact resume and planned routing interface
 
-The routing definition commands above are implemented, but selection and supervision remain design targets rather than an implemented quick start:
+Linux can opt into the production supervisor for one existing thread. This is
+an exact same-profile resume only:
+
+```console
+calcifer resume --experimental-supervised codex@work 01900000-0000-7000-8000-000000000001
+```
+
+The command requires a foreground TTY and rejects `--json`, `--last`, implicit
+workspace selection, every argument after `--`, pool traversal, and
+cross-profile handoff before provider startup. A failure never retries through
+direct resume. The ordinary exact-resume command remains the portable recovery
+path. Normal and single-wrapper-failure paths restore the terminal before they
+return. If both restoration authorities are forcibly killed while raw mode is
+active, the invoking shell or terminal emulator may need an explicit `reset`;
+reverting or restarting Calcifer cannot restore a dead process's terminal
+state.
+
+The routing definition commands above are implemented, but automatic selection
+and failover remain planned interfaces:
 
 ```console
 # Select a default for future processes, or pin one invocation.
@@ -506,9 +539,9 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Codex profile isolation | Implemented on Unix | One `CODEX_HOME` per profile; official Codex login and refresh |
 | Same-profile Codex resume | Implemented on Unix for Codex 0.144.4 | Tracked workspace head, explicit exact thread ID, or official `--last`; no prompt replay |
 | Private Codex identity binding | Implemented for 0.144.4 ChatGPT auth | HMAC equality only; duplicate aliases and credential drift fail closed |
-| Codex usage observation | Implemented with bounded idle refresh and an active-monitor cache projection | Structured App Server response, explicit freshness/compatibility, disposable private cache; supervised launch remains default-unused |
+| Codex usage observation | Implemented with bounded idle refresh and an active-monitor cache projection | Structured App Server response, explicit freshness/compatibility, disposable private cache; the Linux supervised exact-resume path owns a live typed monitor but does not select another profile |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
-| Pinned supervised Codex integration | Internal Linux implementation present; Ubuntu 24.04 runs every exact 0.144.4 package probe inside a fresh loopback-only namespace and executes verified native provider bytes from a sealed close-on-exec `memfd`. macOS hermetic and descriptor-backed execution are explicitly unsupported | Real App Server and remote TUI through the production coordinator/guardian session, typed monitor, PTY gate, and job-control implementation under a test-owned harness. Independent package scenarios share the production guardian-bootstrap core through bounded test seams, cross real parent-to-coordinator-to-guardian `exec` boundaries with the completion endpoint, and check the provider-release-gated exact frame plus EOF. Linux has no native-network or pathname-exec fallback; the installed/staged pathname cannot replace the sealed launch image and the launch descriptor cannot reach provider descendants. macOS runs no weaker substitute. The package scenarios deliberately bypass the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser and persistent shell-anchor role. No public supervised run/resume |
+| Pinned supervised Codex integration | Experimental exact same-profile resume is public on Linux; Ubuntu 24.04 runs every exact 0.144.4 package probe inside a fresh loopback-only namespace and executes verified native provider bytes from a sealed close-on-exec `memfd`. macOS hermetic and descriptor-backed execution are explicitly unsupported | `resume --experimental-supervised` enters the sealed production anchor with one explicit profile and canonical thread UUID. Real App Server and remote TUI run through the production coordinator/guardian session, typed monitor, PTY gate, and job-control implementation. Linux has no native-network or pathname-exec fallback; macOS runs no weaker substitute. Pool selection and cross-profile handoff are not reachable from this command |
 | Opt-in profile pools | Private default-disabled registry implemented on Unix; selection unavailable | Immutable profile IDs, same provider and trust domain, live whole-pool identity validation, bounded atomic updates |
 | Cross-profile conversation handoff | Internal Linux/macOS target reservation and same-profile supervisor integration implemented | Transition journal, target fork, pool selection, crash recovery, and user-visible switching remain disabled; the planned version-gated fork creates a target-profile thread in one logical conversation |
 | Claude setup-token profiles | Experimental plan | OS credential store where officially supported |
@@ -658,7 +691,7 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 3. **Implemented:** exact same-profile thread capture, crash reconciliation, no-argument cold restore, and journaled local profile removal. Safe reauth/re-key flows remain.
 4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
 5. Add explicit same-trust-domain pools and fail-closed automatic selection.
-6. Activate version-gated cross-profile conversation handoff as the default successful failover path. The no-gap Linux/macOS target reservation, pinned same-profile provider/monitor/PTY, schema-v2 transition journal, validated rollout projections, and one-boundary crash-recovery transaction kernel are present and default-unused; public supervisor UX, authoritative usage/selection, and target-fork activation remain pending. Preserve one profile-local writer per lineage generation.
+6. Activate version-gated cross-profile conversation handoff as the default successful failover path. The no-gap Linux/macOS target reservation, schema-v2 transition journal, validated rollout projections, and one-boundary crash-recovery transaction kernel remain internal. Linux now has an explicit exact same-profile supervised-resume UX; authoritative usage selection, pool traversal, and target-fork activation remain pending. Preserve one profile-local writer per lineage generation.
 7. Add Claude only through provider-supported authentication and usage-observation surfaces.
 
 Detailed gates and non-goals are tracked in [docs/roadmap.md](docs/roadmap.md).

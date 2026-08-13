@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[cfg(all(
-    feature = "internal-supervisor-fixture",
+    feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
 mod handoff_compat;
@@ -23,12 +23,12 @@ mod handoff_compat;
 mod handoff_transaction;
 mod json;
 #[cfg(all(
-    feature = "internal-supervisor-fixture",
+    feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
 mod monitor;
 #[cfg(all(
-    feature = "internal-supervisor-fixture",
+    feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
 mod remote;
@@ -54,13 +54,15 @@ pub(crate) use rollout_handoff::{
 ))]
 pub(crate) use supervisor::run_internal_fixture;
 
+#[cfg(all(feature = "production-supervisor", target_os = "linux"))]
+pub(crate) use supervisor::spawn_supervised_exact_resume;
 #[cfg(all(
-    feature = "internal-supervisor-fixture",
+    feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
 pub(crate) use supervisor::{internal_production_role_requested, run_internal_production_role};
 #[cfg(all(
-    feature = "internal-supervisor-fixture",
+    feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
 pub(crate) use supervisor::{internal_tui_launcher_requested, run_internal_tui_launcher};

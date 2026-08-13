@@ -14,8 +14,9 @@ coordinator/guardian process authority with fake children, and issue #52 adds a
 default-unused Unix terminal kernel with a real PTY, typed input gate,
 fixed-buffer streaming, signal/job-control policy, and redundant restoration.
 Issue #54 connects that kernel to the pinned real App Server, a separate typed
-monitor, and the official remote TUI behind an internal, default-unused
-entrypoint. It separately implements the persistent shell anchor and a move-
+monitor, and the official remote TUI. The production graph is compiled by
+default; Linux exposes only an explicit exact same-profile resume through its
+sealed foreground anchor. It separately implements the persistent shell anchor and a move-
 only completion gate. Independently budgeted checksum-pinned normal-session and
 retained-recovery package scenarios are configured to exercise the production
 coordinator, guardian, provider-session, PTY, and signal/job-control
@@ -34,11 +35,15 @@ execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE`
 dispatcher/parser or persistent shell-anchor role, and these scenarios make no
 parser coverage claim. Package tests use no real credential, token, account ID,
 or provider identifier. The deterministic provider fixture described below is
-credential-free and loopback-only. No public supervised command calls this path,
-and it persists no terminal transcript. The guarded selector and its
+credential-free and loopback-only. The public Linux exact-resume entry persists
+no terminal transcript and cannot select a pool, fork a thread, replay input,
+or silently fall back to direct resume. Its zero-argument self-exec must consume
+a parent-minted, child-only FD capability and exact frame before it reads
+managed storage; ambient internal-role environment variables are insufficient.
+The guarded selector and its
 lease-retaining candidate runtime are internal and default-unused; automatic
-failover, public supervised run/resume, and production cross-profile handoff
-wiring remain unavailable;
+failover, supervised new-run, and production cross-profile handoff wiring
+remain unavailable;
 [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) defines handoff
 semantics and [ADR 0003](adr/0003-supervised-codex-session.md) defines the
 staged supervisor.
@@ -203,7 +208,7 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   state. The ACK is one-shot, strictly parsed, and bound to the same socket; the
   sender releases its provider descriptor only by close, never explicit
   unlock. Descriptor-held flock state is the authority; a PID is not.
-- In the internal #50/#52/#54 supervised-session path, provider PIDs and
+- In the #50/#52/#54 supervised-session path, provider PIDs and
   process groups are observation and live-guardian containment metadata, not
   lease or reap authority. Normal release requires stopped terminal pumps,
   exact direct-child waits, `TERMINAL_QUIESCED`, coordinator restoration with
@@ -214,7 +219,8 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   than inferring safety from PID disappearance; see
   [ADR 0003](adr/0003-supervised-codex-session.md). Foundation fixtures launch
   fixed synthetic children; #54 can instead launch the pinned App Server and
-  official remote TUI. Both paths remain unavailable to the public CLI.
+  official remote TUI. Linux may reach the latter only through explicit exact
+  resume; fixture roles remain unavailable to the public CLI.
   Reported numeric PID/PGID values are never reused by the coordinator as
   delayed signal authority; the fake children instead receive a dedicated
   guardian-liveness pipe whose EOF lets them exit after abrupt guardian death.
@@ -374,8 +380,8 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   This is deterministic recovery-phase evidence, not Codex-version compatibility
   evidence. All seven cases passed three consecutive local runs on the exact
   tree; cross-platform CI readback remains pending.
-  Public supervised UX remains disabled until its operational recovery and
-  cross-profile transaction gates are complete.
+  Public failover UX remains disabled until its cross-profile transaction and
+  selector integration gates are complete.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
 - Bounded metadata-only App Servers for status and thread capture inherit only
   the provider-side lease. On Unix the multithreaded parent never clears

@@ -4651,6 +4651,170 @@ fn untracked_resume_rejects_bare_and_exact_forms_before_spawning_helpers()
 }
 
 #[test]
+fn supervised_resume_json_is_rejected_before_provider_or_storage_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = calcifer()
+        .env_clear()
+        .args([
+            "--json",
+            "resume",
+            "--experimental-supervised",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr)?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(error["schema_version"], 1);
+    assert_eq!(error["command"], "resume");
+    assert_eq!(error["ok"], false);
+    assert_eq!(error["error"]["code"], "interactive_json_unsupported");
+    Ok(())
+}
+
+#[test]
+fn supervised_resume_rejects_provider_arguments_before_storage_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = calcifer()
+        .env_clear()
+        .args([
+            "resume",
+            "--experimental-supervised",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+            "--",
+            "--model",
+            "gpt-5",
+        ])
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "error: Calcifer rejected a provider argument that could bypass the selected managed account or provider.\n"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn supervised_resume_reports_the_linux_boundary_before_storage_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = calcifer()
+        .env_clear()
+        .args([
+            "resume",
+            "--experimental-supervised",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "error: Supervised Codex resume requires a Linux build with descriptor-backed provider execution. No provider process was started.\n"
+    );
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "production-supervisor",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+fn ambient_internal_anchor_environment_lacks_the_public_entry_capability()
+-> Result<(), Box<dyn std::error::Error>> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "calcifer-supervised-ambient-entry-{}-{nonce}",
+        std::process::id()
+    ));
+    let output = calcifer()
+        .env_clear()
+        .env("CALCIFER_HOME", &root)
+        .env(
+            "CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE",
+            "same-profile-anchor-v1",
+        )
+        .env("CALCIFER_INTERNAL_CODEX_PROFILE_ID", "profile-id")
+        .env(
+            "CALCIFER_INTERNAL_CODEX_THREAD_ID",
+            "01900000-0000-7000-8000-000000000001",
+        )
+        .env("CALCIFER_INTERNAL_CODEX_EXECUTABLE", "/bin/false")
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(70));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert!(
+        !root.exists(),
+        "storage must not be read before FD admission"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "production-supervisor"))]
+#[test]
+fn supervised_resume_enters_the_sealed_anchor_before_any_provider_spawn_without_a_tty()
+-> Result<(), Box<dyn std::error::Error>> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-supervised-resume-entry-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&sandbox)?;
+    let root = sandbox.join("state");
+    let (path, provider_log) = install_profile_remove_test_codex(&sandbox)?;
+
+    let add = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .args(["auth", "add", "codex", "work"])
+        .output()?;
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let provider_before = std::fs::read(&provider_log)?;
+
+    let output = calcifer()
+        .current_dir(&sandbox)
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .args([
+            "resume",
+            "--experimental-supervised",
+            "codex@work",
+            "01900000-0000-7000-8000-000000000001",
+        ])
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "Calcifer: supervised exact resume for codex@work (experimental, no failover).\n"
+    );
+    assert_eq!(
+        std::fs::read(&provider_log)?,
+        provider_before,
+        "the no-TTY anchor failure must happen before App Server or TUI spawn"
+    );
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[test]
 fn provider_json_flag_does_not_change_calcifer_error_rendering()
 -> Result<(), Box<dyn std::error::Error>> {
     let output = calcifer()

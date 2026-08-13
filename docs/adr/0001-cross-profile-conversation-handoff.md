@@ -302,6 +302,7 @@ The baseline source contracts are:
 - A Calcifer logical conversation ID remains stable while the provider thread ID changes at each handoff.
 - The lineage registry and conversation lease become first-class state alongside credential profiles.
 - The supervised path must use App Server plus remote TUI; the current direct `run` and same-profile `resume` commands remain available and unchanged.
-- Production handoff stays disabled until the default-unused pinned supervisor
-  is wired into the reviewed cross-profile transaction kernel with pool policy,
-  authoritative exhaustion selection, and target-reservation ownership.
+- Production handoff stays disabled until the pinned supervisor's explicit
+  same-profile entry is wired into the reviewed cross-profile transaction
+  kernel with pool policy, authoritative exhaustion selection, and
+  target-reservation ownership.

@@ -1531,7 +1531,7 @@ impl ExactRelayRoute {
 
     #[cfg(all(
         test,
-        feature = "internal-supervisor-fixture",
+        feature = "production-supervisor",
         any(target_os = "linux", target_os = "macos")
     ))]
     pub(super) fn spawn_exact(
@@ -1550,7 +1550,7 @@ impl ExactRelayRoute {
         )
     }
 
-    #[cfg(feature = "internal-supervisor-fixture")]
+    #[cfg(feature = "production-supervisor")]
     pub(super) fn spawn_exact_until(
         &self,
         probe: crate::providers::codex::remote::ExactResumeProbe<'_>,

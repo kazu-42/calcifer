@@ -18,17 +18,21 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+#[cfg(feature = "internal-supervisor-fixture")]
+use std::process::Stdio;
+use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+#[cfg(any(test, feature = "internal-supervisor-fixture"))]
+use super::process::SpawnFailureState;
 use super::process::{
     ChildLiveness, ContainmentMetadata, ForwardedTuiSignal, InheritedTuiReadiness,
     InteractiveTerminalSignal, ManagedGroupChild, ProcessError, ShutdownOutcome, SpawnCleanupProof,
-    SpawnFailure, SpawnFailureState, TerminalShutdownSignal, TuiReadinessError,
-    TuiReadinessReceiver, UnreapedChildren, VerifiedTuiReadiness,
+    SpawnFailure, TerminalShutdownSignal, TuiReadinessError, TuiReadinessReceiver,
+    UnreapedChildren, VerifiedTuiReadiness,
     shutdown_tui_after_forwarded_signal_with_output_progress,
     shutdown_tui_after_output_eof_with_output_progress, shutdown_tui_child_with_output_progress,
     tui_readiness_pair,
@@ -2145,6 +2149,7 @@ fn is_launcher_environment(name: &OsStr) -> bool {
     production_private
 }
 
+#[cfg(feature = "internal-supervisor-fixture")]
 pub(super) fn fixture_target_requested() -> bool {
     env::var_os(FIXTURE_TARGET_ENV).is_some()
         || env::var_os(FIXTURE_ENVIRONMENT_TARGET_ENV).is_some()
@@ -2153,6 +2158,7 @@ pub(super) fn fixture_target_requested() -> bool {
 /// Closed real-exec harness used by `tests/supervisor.rs`. It accepts only
 /// fixed named cases and never accepts a program, shell fragment, prompt, or
 /// terminal payload from argv.
+#[cfg(feature = "internal-supervisor-fixture")]
 pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLauncherError> {
     let case = match case {
         "success" => FixtureLaunchCase::Success,
@@ -2334,6 +2340,7 @@ pub(super) fn run_fixture_harness(case: &str) -> Result<ExitCode, RemoteTuiLaunc
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "internal-supervisor-fixture")]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum FixtureLaunchCase {
     Success,
@@ -2344,6 +2351,7 @@ enum FixtureLaunchCase {
     Environment,
 }
 
+#[cfg(feature = "internal-supervisor-fixture")]
 fn run_fixture_environment_harness(deadline: Instant) -> Result<ExitCode, RemoteTuiLauncherError> {
     let launcher = current_launcher_executable()?;
     let working_directory = env::current_dir()

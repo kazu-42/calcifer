@@ -1,6 +1,6 @@
 # ADR 0003: Supervise a profile-owned Codex App Server and official remote TUI
 
-- Status: Accepted design; internal foundations #48/#50/#52 and the default-unused #54 provider implementation are present; the pinned Linux package probes are egress-confined and macOS hermetic execution is explicitly unsupported
+- Status: Accepted and partially implemented; Linux exposes exact same-profile supervised resume, while pool selection and cross-profile handoff remain disabled; the pinned Linux package probes are egress-confined and macOS hermetic execution is explicitly unsupported
 - Date: 2026-07-15
 - Last updated: 2026-08-13
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
@@ -52,9 +52,10 @@ Issue #52 adds the Linux/macOS terminal-authority foundation around those fake
 children. It proves a real controlling PTY, a physically absent input worker
 until a typed readiness/raw-mode/open-gate handshake completes, fixed-buffer
 full-duplex streaming, terminal restoration, signal and job-control semantics,
-and redundant coordinator/guardian recovery. It remains behind
-`internal-supervisor-fixture`; it does not launch real Codex, read credentials,
-monitor usage, persist terminal data, or add a public command.
+and redundant coordinator/guardian recovery. Its production implementation is
+compiled by `production-supervisor`; deterministic fake-child roles remain
+behind `internal-supervisor-fixture`. The foundation alone does not launch real
+Codex, read credentials, monitor usage, or persist terminal data.
 
 Issue #54 connects those authorities to the pinned `0.144.4` App Server, a
 separate typed monitor, the readiness relay, and the official remote TUI behind
@@ -76,25 +77,28 @@ guardian consumes provider-release proof. The test-only role dispatcher and
 outer-terminal harness do not execute the production
 `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent
 shell-anchor role, and these scenarios make no parser coverage claim.
-Issue #54 still exposes no public supervised run/resume or failover command and
-does not implement a cross-profile transition journal.
+The Linux public exact-resume entry now reaches Issue #54's sealed production
+anchor. It exposes no supervised new-run or failover command and does not
+activate the cross-profile transition journal.
 
 ## Decision and initial scope
 
-Calcifer will add a Linux/macOS-only, explicit, default-off supervised session
-path. The first public form will resume one canonical existing thread in one
-explicit profile. Existing direct `run`, exact `resume`, workspace-head
-`resume`, and `status` remain independent and unchanged.
+Calcifer exposes a Linux-only, explicit, default-off supervised session path.
+Its first public form resumes one canonical existing thread in one explicit
+profile. macOS fails before provider startup under
+[ADR 0005](0005-descriptor-backed-provider-exec.md). Existing direct `run`,
+exact `resume`, workspace-head `resume`, and `status` remain independent and
+unchanged.
 
 Implementation is divided into staged foundations and integrations. Issue #48
 implements the bounded readiness-relay transport kernel extracted from #28,
 issue #50 implements process authority with fake children, issue #52 implements
-the terminal kernel, and issue #54 supplies the default-unused pinned provider
-integration. The provider guardian owns lease B and is the direct parent of the
+the terminal kernel, and issue #54 supplies the pinned provider integration.
+The provider guardian owns lease B and is the direct parent of the
 App Server and official TUI; the coordinator retains lease A and communicates
-with the guardian over inherited connected socketpairs. Public command routing,
-active-session selection, and cross-profile transition state remain separate
-later slices.
+with the guardian over inherited connected socketpairs. Linux exact-resume
+command routing is implemented; active-session selection and cross-profile
+transition activation remain separate later slices.
 
 ## Process topology
 
@@ -452,9 +456,9 @@ Immediately before `tcsetattr`, each restorer reads back the current foreground
 process group and requires the captured generation. A mismatch performs no
 restore, publishes no restored proof, and retains the remaining lease/evidence.
 The anchor prevents the invoking shell from reclaiming the tty between wrapper
-and coordinator while this internal generation is active; public supervised UX
-and operational recovery guidance remain unexposed until the rest of the P0
-gates are complete.
+and coordinator while this generation is active. The public experimental UX
+documents that loss of both restoration authorities may require resetting the
+invoking terminal; normal and singly faulted paths restore before returning.
 
 This is a live, one-generation recovery capability carried only by the running
 anonymous endpoint. It is not persisted, does not survive loss of both terminal
@@ -1076,21 +1080,27 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   pending.
 - Remains reachable only through internal test entrypoints.
 
-### Slice 4: explicit public exact resume
+### Slice 4: explicit public exact resume (implemented on Linux)
 
-- Add an explicit form such as:
+- Expose this explicit form:
 
   ```text
   calcifer resume --experimental-supervised codex@work <thread-uuid>
   ```
 
-- Reject new run, `--last`, implicit workspace selection, remote overrides,
-  cross-profile fork, pool traversal, and automatic failover in this path.
-- Expose only after all P0 gates pass on Linux and macOS.
+- Reject new run, `--last`, implicit workspace selection, every provider
+  argument after `--`, remote overrides, cross-profile fork, pool traversal,
+  and automatic failover in this path.
+- Enter the sealed foreground anchor without a direct-mode fallback. Linux may
+  proceed only after descriptor-backed executable capability creation; macOS
+  returns unsupported before provider startup.
+- Require a parent-minted child-only FD and exact entry frame before the anchor
+  reads managed storage, so ambient internal-role variables cannot bypass the
+  public argument and repository preflight.
 
-Before Slice 4, all new code remains internal and default-unused. No slice may
-publish a command that merely returns “not implemented” or silently delegates
-to direct mode.
+Before Slice 4, all new code was internal and default-unused. No later slice may
+silently delegate to direct mode or activate failover without its separately
+reviewed selection and handoff proofs.
 
 ## Pinned upstream boundary
 
@@ -1128,16 +1138,17 @@ The staged work changes no credential layout, profile registry, conversation
 schema, rollout, default pointer, or direct command. It does not copy
 `auth.json`, share a runtime `CODEX_HOME`, migrate a thread, or replay input.
 
-Before Slice 4, reverting removes only internal code and tests. After Slice 4,
-disabling the explicit supervised option leaves direct exact resume available
-for the same profile-local thread. A failed supervised attempt reports failure,
-preserves user data, and never silently retries through direct mode.
+Reverting the production feature removes the public supervised path and its
+production-only dependencies. Disabling the explicit supervised option leaves
+direct exact resume available for the same profile-local thread. A failed
+supervised attempt reports failure, preserves user data, and never silently
+retries through direct mode.
 
 Rollback is not terminal recovery. If both in-process restoration authorities
 are killed while raw mode is active, reverting a build cannot restore that live
-tty; the invoking shell or terminal emulator must reset it. The #52 slice
-remains default-unused, and any later public slice must preserve this external
-recovery boundary in its user-facing guidance.
+tty; the invoking shell or terminal emulator must reset it. The foreground
+supervisor is explicit and experimental, and any later public slice must
+preserve this external recovery boundary in its user-facing guidance.
 
 Private cleanup occurs only after identity checks. Replacements and ambiguous
 guardian-loss state are deliberately preserved for explicit recovery rather

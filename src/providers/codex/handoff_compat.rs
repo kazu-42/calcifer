@@ -4,7 +4,7 @@ use std::fmt;
 #[cfg(any(
     all(test, unix),
     all(
-        feature = "internal-supervisor-fixture",
+        feature = "production-supervisor",
         any(target_os = "linux", target_os = "macos")
     )
 ))]
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[cfg(any(
     all(test, unix),
     all(
-        feature = "internal-supervisor-fixture",
+        feature = "production-supervisor",
         any(target_os = "linux", target_os = "macos")
     )
 ))]
@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 #[cfg(all(
-    feature = "internal-supervisor-fixture",
+    feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
 use super::supervisor::ProviderLaunchAuthorization;
@@ -32,7 +32,7 @@ mod runtime;
 #[cfg(unix)]
 pub(in crate::providers::codex) use runtime::PinnedExecutableStage;
 #[cfg(all(
-    feature = "internal-supervisor-fixture",
+    feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
 pub(in crate::providers::codex) use runtime::PinnedStageError;
@@ -476,7 +476,7 @@ impl std::error::Error for CodexHandoffError {}
 /// Runs the complete private compatibility gate without reading or mutating a
 /// Calcifer profile, conversation binding, credential, or user rollout.
 #[cfg(all(
-    feature = "internal-supervisor-fixture",
+    feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
 #[allow(dead_code)] // Consumed by the handoff transaction introduced in issue #33.

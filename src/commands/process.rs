@@ -71,6 +71,42 @@ pub(crate) fn resume_codex(
     spawn_supervisor(&registry, alias, mode, session_id, provider_args)
 }
 
+pub(crate) fn resume_supervised_codex(
+    alias: &str,
+    session_id: &str,
+    provider_args: &[OsString],
+) -> Result<ExitStatus, AppError> {
+    validate_provider_arguments(provider_args)?;
+    if !provider_args.is_empty() {
+        return Err(AppError::ProviderArgumentRejected);
+    }
+    validate_canonical_thread_id(session_id)?;
+    #[cfg(all(feature = "production-supervisor", target_os = "linux"))]
+    {
+        let registry = Registry::discover()?;
+        let profile = registry.find(Provider::Codex, alias)?;
+        let executable = resolve_codex()?;
+        let launch_context = verify_current_repository_config()?;
+        eprintln!(
+            "Calcifer: supervised exact resume for {} (experimental, no failover).",
+            profile.reference()
+        );
+        crate::providers::codex::spawn_supervised_exact_resume(
+            &registry,
+            &profile,
+            launch_context.working_directory(),
+            session_id,
+            &executable,
+        )
+        .map_err(AppError::from)
+    }
+    #[cfg(not(all(feature = "production-supervisor", target_os = "linux")))]
+    {
+        let _ = (alias, session_id);
+        Err(AppError::SupervisedUnsupportedPlatform)
+    }
+}
+
 pub(crate) fn resume_workspace_codex(provider_args: &[OsString]) -> Result<ExitStatus, AppError> {
     validate_provider_arguments(provider_args)?;
     let launch_context = verify_current_repository_config()?;

@@ -364,8 +364,10 @@ Server/process owner, lease lifecycle, terminal bridge, usage polling, or a
 public command required by the supervised-session design in
 [ADR 0003](adr/0003-supervised-codex-session.md).
 
-Issue #54 adds the default-unused pinned same-profile integration. Its App
-Server shutdown contract is deliberately different from the synthetic
+Issue #54 adds the pinned same-profile integration. Linux exposes it only for
+an explicit exact resume through `resume --experimental-supervised`; macOS
+fails before provider spawn because the production launch capability is
+unsupported. Its App Server shutdown contract is deliberately different from the synthetic
 compatibility probe: Calcifer sends exactly one `SIGTERM` to the exact direct
 App child and can mint `PinnedAppGracefulDrain` only after that same child is
 exactly waited with code zero. There is no App `SIGKILL` fallback, no second
@@ -576,9 +578,10 @@ The driver persists stop and fork intent before external effects, validates
 same-domain source provenance, adopts exactly one matching post-crash target,
 permits zero candidates one durable retry, and never offers a replay action.
 The authoritative one-pass selection kernel and lease-retaining candidate
-revalidation runtime are implemented but default-unused. Public supervisor
-wiring and target-fork activation remain prerequisites before automatic
-handoff is enabled.
+revalidation runtime are implemented but default-unused. The Linux exact
+same-profile supervised resume does not call them. Public failover wiring and
+target-fork activation remain prerequisites before automatic handoff is
+enabled.
 
 Relevant upstream sources:
 
