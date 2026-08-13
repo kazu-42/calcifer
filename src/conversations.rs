@@ -1428,7 +1428,15 @@ fn serialize_v1_document(document: &ConversationDocument) -> Result<Vec<u8>, Con
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn bind_document(
@@ -2543,6 +2551,14 @@ mod tests {
     use super::*;
 
     type JsonCorruption = fn(&mut serde_json::Value);
+
+    #[test]
+    fn sha256_hex_matches_the_stable_known_answer() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     fn test_root(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(

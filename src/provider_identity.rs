@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
@@ -224,7 +224,7 @@ impl<'a> IdentityStore<'a> {
             .ok_or(IdentityError::Invalid)?;
         validate_account_scope(&account_scope)?;
 
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&key.secret)
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&key.secret)
             .map_err(|_| IdentityError::KeyUnavailable)?;
         update_length_delimited(&mut mac, FINGERPRINT_DOMAIN)?;
         update_length_delimited(&mut mac, CODEX_PROVIDER.as_bytes())?;
@@ -585,6 +585,17 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn hmac_sha256_matches_the_stable_known_answer() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(b"key")?;
+        mac.update(b"The quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            encode_hex(&mac.finalize().into_bytes()),
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+        Ok(())
+    }
 
     fn temporary_root(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
