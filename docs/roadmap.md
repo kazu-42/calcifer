@@ -93,11 +93,15 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 
 ## Phase 5: Claude support
 
-- [ ] Revalidate Anthropic's current public documentation and policy
-- [ ] Use officially supported setup-token or credential-store surfaces and fail closed without an OS credential store
+- [x] Revalidate Anthropic's current public documentation and CLI surface (2026-08-13; see provider compatibility notes)
+- [x] Choose provider-managed `claude auth login` under isolated `CLAUDE_CONFIG_DIR` as the supported profile contract; keep setup-token ingestion behind a future OS credential-broker gate
+- [ ] Implement and recovery-test Linux provider-managed profiles with exact `0600` credential-file validation
+- [ ] Keep Windows profile registration disabled until current-user-only ACL creation and recovery are verified
+- [ ] Keep macOS multi-profile registration disabled until Anthropic documents a config-directory-scoped Keychain namespace or another supported isolation mechanism
 - [ ] Sanitize conflicting Claude authentication environment variables
-- [ ] Keep regular subscription OAuth replication out of scope unless Anthropic provides a stable, permitted integration contract
-- [ ] Treat macOS, Linux, and Windows credential behavior as separate compatibility lanes
+- [x] Keep direct subscription OAuth replication and undocumented refresh/Keychain conventions out of scope
+- [x] Treat macOS, Linux, and Windows credential behavior as separate compatibility lanes
+- [ ] Keep usage `unknown` / `N/A` until a stable structured authoritative source is compatibility-gated
 
 ## Release gates
 
