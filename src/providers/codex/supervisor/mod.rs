@@ -116,7 +116,9 @@ pub(crate) fn run_internal_production_role() -> std::process::ExitCode {
 }
 
 #[cfg(all(feature = "production-supervisor", target_os = "linux"))]
-pub(crate) use entry::spawn_supervised_exact_resume;
+pub(crate) use entry::{
+    spawn_supervised_exact_resume, spawn_supervised_exact_resume_with_reservation,
+};
 
 #[cfg(all(
     feature = "production-supervisor",

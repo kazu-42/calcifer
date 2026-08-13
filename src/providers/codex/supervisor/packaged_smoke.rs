@@ -13984,6 +13984,7 @@ fn run_package_guardian_helper() -> Result<(), Box<dyn Error>> {
             expected_foreground_process_group: foreground,
             bounds: package_guardian_bounds(provider_target),
             completion,
+            guardian_lease: None,
         },
         PackagedGuardianSeams {
             after_admission: replace_package_profile_config_after_admission,

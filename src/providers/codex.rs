@@ -61,8 +61,6 @@ pub(crate) use supervisor::run_internal_fixture;
 
 #[cfg(all(feature = "production-supervisor", target_os = "linux"))]
 pub(crate) use failover::{CodexFailoverError, resume_supervised_with_failover};
-#[cfg(all(feature = "production-supervisor", target_os = "linux"))]
-pub(crate) use supervisor::spawn_supervised_exact_resume;
 #[cfg(all(
     feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
@@ -73,6 +71,10 @@ pub(crate) use supervisor::{internal_production_role_requested, run_internal_pro
     any(target_os = "linux", target_os = "macos")
 ))]
 pub(crate) use supervisor::{internal_tui_launcher_requested, run_internal_tui_launcher};
+#[cfg(all(feature = "production-supervisor", target_os = "linux"))]
+pub(crate) use supervisor::{
+    spawn_supervised_exact_resume, spawn_supervised_exact_resume_with_reservation,
+};
 
 /// Capability proving that the installed Codex process passed the exact
 /// identity-adapter initialize/home/version gate.

@@ -194,16 +194,16 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   `.git` boundary rather than either the caller's repository cwd or a profile
   home below user-selected `CALCIFER_HOME`.
 - Interactive launch uses a coordinator/provider-guardian pair with two fixed-order lease files. Either surviving process blocks a second writer after a selective crash, while the official provider and its background tools inherit neither descriptor.
-- Future supervised target handoff has an internal Linux/macOS no-gap transfer
-  primitive. The future supervisor must first supply an already-authenticated
-  private Unix control socket; stream authentication and lifecycle deadlines
-  are integration requirements for issue #33, not properties inferred by the
-  descriptor primitive. It then sends exactly one sentinel byte and exactly
-  one provider-lease descriptor. Missing, duplicated, unknown, or truncated
-  ancillary data fails closed. The guardian compares the received and visible
-  lock's device/inode, requires a current-UID private single-link regular file,
-  proves that the received open-file description owns the active advisory lock,
-  and sets and reads back `FD_CLOEXEC` before it may acknowledge the transfer.
+- Explicit Linux supervised target handoff uses the internal Linux/macOS no-gap
+  transfer primitive across private Unix control sockets inherited only through
+  reviewed exec boundaries. Parent-to-coordinator promotion sends one sentinel
+  plus the exact A+B descriptors; coordinator-to-guardian promotion sends a
+  distinct sentinel plus exactly B. Missing, duplicated, swapped, unknown, or
+  truncated ancillary data fails closed. Each receiver compares the received
+  and visible lock device/inode, requires a current-UID private single-link
+  regular file, proves that the received open-file description owns the active
+  advisory lock, and sets and reads back `FD_CLOEXEC` before it may acknowledge
+  the transfer.
   No App Server, TUI, or provider tool may start from the provisional pre-ACK
   state. The ACK is one-shot, strictly parsed, and bound to the same socket; the
   sender releases its provider descriptor only by close, never explicit
@@ -776,11 +776,13 @@ coordinator across one selected external boundary, uses only short
 conversation-registry transactions, persists fork intent before the
 non-idempotent request, and resumes from the durable phase. The current public
 adapter retains the target reservation through fork and durable commit, then
-drops it immediately before the existing production supervisor reacquires the
-same target locks and revalidates exact profile/thread/cwd. A contender can
-therefore cause an actionable attach failure but cannot authorize a second
-provider writer. Direct no-gap transfer of the retained provider descriptor
-into that guardian remains a stable-promotion hardening item.
+transfers the same A+B locked open-file descriptions into the sealed production
+coordinator. After exact profile/path/inode/owner/mode/link/active-lock
+validation and a same-channel ACK, the coordinator transfers the same B
+open-file description to the guardian under a second ACK. A is held
+continuously by either the failover parent or coordinator, and B is held
+continuously by the failover parent, coordinator, or guardian. No pathname
+reacquisition or unlocked retry exists in this promotion path.
 
 The supervisor may subscribe to thread events for usage monitoring, but it never answers approvals or any other server-initiated request. Only the attached official TUI may respond, and no new turn is admitted while that TUI is absent. Source effective execution settings are fixed at fork time; target authentication and provider routing cannot be replaced by a remote-client override.
 

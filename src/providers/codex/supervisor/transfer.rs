@@ -1,16 +1,16 @@
-//! Dedicated, default-unused channel for a future one-shot lease transfer.
+//! Dedicated channel for one-shot supervisor authority transfer.
 //!
 //! This is deliberately a different type and socket pair from the lifecycle
 //! channel. It exposes descriptor identities for real-exec leak assertions and
 //! typed sender/receiver operations, but no raw stream accessor, `Read`
 //! implementation, or local `recvmsg` surface. Those operations delegate to
 //! the already-tested single ancillary receiver and one-shot send/ACK state
-//! machine in `profiles.rs` from issue #32. This issue proves that a future
-//! supervisor reserves a distinct channel and never gives lifecycle code
-//! access to that receiver.
+//! machine in `profiles.rs`. The public Linux failover path uses two distinct
+//! instances: parent-to-coordinator A+B promotion, then coordinator-to-guardian
+//! B promotion. Lifecycle code never receives either raw stream.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
-#![allow(dead_code)] // The first integration is intentionally deferred past issue #50.
+#![allow(dead_code)] // Legacy single-B helpers remain covered by transfer contract tests.
 
 use std::fmt;
 use std::os::fd::AsFd;
@@ -21,8 +21,11 @@ use rustix::net::{AddressFamily, SocketType};
 
 use super::channel::DescriptorIdentity;
 use crate::profiles::{
-    AwaitingProviderLeaseAck, Profile, ProfileError, ProviderLeaseTransferSendError, Registry,
-    UnacknowledgedTargetGuardianLease, VerifiedTargetReservation,
+    AwaitingPromotedProviderLeaseAck, AwaitingProviderLeaseAck, AwaitingTargetReservationAck,
+    Profile, ProfileError, PromotedProviderLeaseTransferSendError, PromotedTargetReservation,
+    ProviderLeaseTransferSendError, Registry, TargetReservationTransferSendError,
+    UnacknowledgedPromotedTargetReservation, UnacknowledgedTargetGuardianLease,
+    VerifiedTargetReservation,
 };
 
 /// The only endpoint allowed to send the one-shot provider lease.
@@ -32,10 +35,56 @@ pub(super) struct TransferSender {
 }
 
 impl TransferSender {
+    pub(super) fn set_read_timeout(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> std::io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    /// Closes the sender direction and waits until the unique promoted child
+    /// endpoint closes. The parent uses this before killing the shell anchor,
+    /// so EOF proves that no coordinator still owns the forwarded endpoint.
+    pub(super) fn shutdown_and_wait_for_peer_close(self) -> std::io::Result<()> {
+        use std::io::Read;
+
+        self.stream.shutdown(std::net::Shutdown::Write)?;
+        let mut stream = &self.stream;
+        let mut byte = [0_u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "target reservation transfer emitted trailing data",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(super) fn send_provider_lease(
         &self,
         reservation: VerifiedTargetReservation,
     ) -> Result<AwaitingProviderLeaseAck<'_>, Box<ProviderLeaseTransferSendError>> {
+        reservation.send_provider_lease(&self.stream)
+    }
+
+    pub(super) fn send_target_reservation(
+        &self,
+        reservation: VerifiedTargetReservation,
+    ) -> Result<AwaitingTargetReservationAck<'_>, Box<TargetReservationTransferSendError>> {
+        reservation.send_target_reservation(&self.stream)
+    }
+
+    pub(super) fn send_promoted_provider_lease(
+        &self,
+        reservation: PromotedTargetReservation,
+    ) -> Result<AwaitingPromotedProviderLeaseAck<'_>, Box<PromotedProviderLeaseTransferSendError>>
+    {
         reservation.send_provider_lease(&self.stream)
     }
 }
@@ -53,6 +102,27 @@ impl TransferReceiver {
         profile: &Profile,
     ) -> Result<UnacknowledgedTargetGuardianLease<'channel>, ProfileError> {
         registry.receive_profile_provider_lease(profile, &self.stream)
+    }
+
+    pub(super) fn receive_target_reservation<'channel>(
+        &'channel self,
+        registry: &Registry,
+        profile: &Profile,
+    ) -> Result<UnacknowledgedPromotedTargetReservation<'channel>, ProfileError> {
+        registry.receive_target_reservation(profile, &self.stream)
+    }
+
+    pub(super) fn take_inherited() -> Result<Self, TransferChannelError> {
+        let inherited = calcifer_unix_child_fd::take_inherited_transfer_fd()
+            .map_err(|_| TransferChannelError::DescriptorFlags)?;
+        let stream = UnixStream::from(inherited);
+        verify_close_on_exec(&stream)?;
+        verify_connected_unix_stream(&stream)?;
+        Ok(Self { stream })
+    }
+
+    pub(super) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.stream.as_fd()
     }
 }
 
@@ -100,6 +170,10 @@ impl TransferChannelPair {
 
     pub(super) fn receiver_identity(&self) -> Result<DescriptorIdentity, TransferChannelError> {
         read_identity(&self.receiver.stream)
+    }
+
+    pub(super) fn split(self) -> (TransferSender, TransferReceiver) {
+        (self.sender, self.receiver)
     }
 }
 

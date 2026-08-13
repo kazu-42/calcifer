@@ -271,7 +271,7 @@ pub(super) fn spawn_guardian_with_lifecycle_stdin(
     command: Command,
     pair: LifecyclePair,
 ) -> Result<SpawnedGuardian, GuardianSpawnFailure> {
-    spawn_guardian_with_lifecycle_stdin_inner(command, pair, None)
+    spawn_guardian_with_lifecycle_stdin_inner(command, pair, None, None)
 }
 
 /// Moves the lifecycle endpoint into stdin and gives only this exact guardian
@@ -283,13 +283,25 @@ pub(super) fn spawn_guardian_with_lifecycle_stdin_and_completion(
     pair: LifecyclePair,
     completion: BorrowedFd<'_>,
 ) -> Result<SpawnedGuardian, GuardianSpawnFailure> {
-    spawn_guardian_with_lifecycle_stdin_inner(command, pair, Some(completion))
+    spawn_guardian_with_lifecycle_stdin_inner(command, pair, Some(completion), None)
+}
+
+/// Moves the lifecycle endpoint into stdin and passes independent completion
+/// and reservation-transfer capabilities to the promoted target guardian.
+pub(super) fn spawn_guardian_with_lifecycle_stdin_completion_and_transfer(
+    command: Command,
+    pair: LifecyclePair,
+    completion: BorrowedFd<'_>,
+    transfer: BorrowedFd<'_>,
+) -> Result<SpawnedGuardian, GuardianSpawnFailure> {
+    spawn_guardian_with_lifecycle_stdin_inner(command, pair, Some(completion), Some(transfer))
 }
 
 fn spawn_guardian_with_lifecycle_stdin_inner(
     mut command: Command,
     pair: LifecyclePair,
     completion: Option<BorrowedFd<'_>>,
+    transfer: Option<BorrowedFd<'_>>,
 ) -> Result<SpawnedGuardian, GuardianSpawnFailure> {
     let LifecyclePair {
         coordinator,
@@ -315,8 +327,25 @@ fn spawn_guardian_with_lifecycle_stdin_inner(
     let guardian_descriptor = OwnedFd::from(stream);
     command.stdin(Stdio::from(guardian_descriptor));
 
-    let child = match completion {
-        Some(completion) => {
+    let child = match (completion, transfer) {
+        (Some(completion), Some(transfer)) => {
+            match calcifer_unix_child_fd::spawn_with_inherited_readiness_and_transfer_fd(
+                command, completion, transfer,
+            ) {
+                Ok(child) => child,
+                Err(failure) => {
+                    let child = failure
+                        .into_started_child()
+                        .map(calcifer_unix_child_fd::StartedChild::into_child);
+                    return Err(GuardianSpawnFailure {
+                        coordinator,
+                        child,
+                        error: ChannelError::Spawn,
+                    });
+                }
+            }
+        }
+        (Some(completion), None) => {
             match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(command, completion) {
                 Ok(child) => child,
                 Err(failure) => {
@@ -331,7 +360,7 @@ fn spawn_guardian_with_lifecycle_stdin_inner(
                 }
             }
         }
-        None => match command.spawn() {
+        (None, None) => match command.spawn() {
             Ok(child) => child,
             Err(_) => {
                 return Err(GuardianSpawnFailure {
@@ -341,6 +370,13 @@ fn spawn_guardian_with_lifecycle_stdin_inner(
                 });
             }
         },
+        (None, Some(_)) => {
+            return Err(GuardianSpawnFailure {
+                coordinator,
+                child: None,
+                error: ChannelError::Spawn,
+            });
+        }
     };
 
     if let Err(error) = coordinator.verify_invariants() {

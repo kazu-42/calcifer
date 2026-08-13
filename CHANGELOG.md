@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Explicit Linux pool failover now retains target A+B through fork and durable
+  commit, transfers both locked open-file descriptions to the sealed
+  coordinator, then transfers B to the guardian without pathname
+  reacquisition. Both boundaries require exact validation and same-channel
+  acknowledgement before the sender releases its copy.
+
 ## [0.1.0-alpha.5] - 2026-08-13
 
 ### Added

@@ -42,6 +42,9 @@ const FOREGROUND_PROCESS_GROUP_ENV: &str = "CALCIFER_INTERNAL_CODEX_FOREGROUND_P
 const ANCHOR_ROLE_V1: &str = "same-profile-anchor-v1";
 const COORDINATOR_ROLE_V1: &str = "same-profile-coordinator-v1";
 const GUARDIAN_ROLE_V1: &str = "same-profile-guardian-v1";
+const PROMOTED_ANCHOR_ROLE_V1: &str = "promoted-target-anchor-v1";
+const PROMOTED_COORDINATOR_ROLE_V1: &str = "promoted-target-coordinator-v1";
+const PROMOTED_GUARDIAN_ROLE_V1: &str = "promoted-target-guardian-v1";
 const MAX_PROFILE_ID_BYTES: usize = 64;
 const MAX_THREAD_ID_BYTES: usize = 64;
 const MAX_EXECUTABLE_PATH_BYTES: usize = 4_096;
@@ -141,9 +144,14 @@ fn recovery_request_frame_is_valid(
         && u64::from_be_bytes(inode) == expected_generation.inode
 }
 
-use crate::profiles::{Profile, Provider, Registry};
+#[cfg(target_os = "linux")]
+use crate::profiles::VerifiedTargetReservation;
+use crate::profiles::{Profile, PromotedTargetReservation, Provider, Registry};
 
-use super::channel::{LifecyclePair, spawn_guardian_with_lifecycle_stdin_and_completion};
+use super::channel::{
+    LifecyclePair, spawn_guardian_with_lifecycle_stdin_and_completion,
+    spawn_guardian_with_lifecycle_stdin_completion_and_transfer,
+};
 use super::coordinator::{CoordinatorBounds, CoordinatorRunOutcome, ProductionCoordinator};
 use super::coordinator_terminal::CoordinatorTerminal;
 use super::guardian::{GuardianBounds, ProductionGuardianConfig, run_production_guardian};
@@ -152,6 +160,7 @@ use super::signals::{CoordinatorSignalAction, CoordinatorSignalLatches};
 use super::terminal::{
     RecoveryTty, TerminalChannelPair, TerminalSnapshot, claim_controlling_terminal_from_stdin,
 };
+use super::transfer::{TransferChannelPair, TransferReceiver};
 
 /// Redacted completion-edge error. No descriptor number, kernel identity,
 /// terminal state, profile, path, or provider payload reaches diagnostics.
@@ -1144,6 +1153,90 @@ pub(crate) fn spawn_supervised_exact_resume(
     child.wait()
 }
 
+/// Starts one exact target generation by promoting the selector's already-held
+/// A+B reservation into the sealed coordinator/guardian chain. The parent does
+/// not release either descriptor until the coordinator validates both exact
+/// lock files and acknowledges the transfer.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_supervised_exact_resume_with_reservation(
+    registry: &Registry,
+    reservation: VerifiedTargetReservation,
+    working_directory: &Path,
+    thread_id: &str,
+    codex_executable: &Path,
+) -> io::Result<ExitStatus> {
+    let profile = reservation.profile().clone();
+    if profile.provider != Provider::Codex {
+        return Err(io::Error::other("unsupported supervised provider"));
+    }
+    validate_thread_id(thread_id).map_err(|_| io::Error::other("invalid supervised thread"))?;
+    validate_canonical_directory(working_directory, MAX_WORKING_DIRECTORY_BYTES)
+        .map_err(|_| io::Error::other("invalid supervised working directory"))?;
+    validate_canonical_file(codex_executable, MAX_EXECUTABLE_PATH_BYTES)
+        .map_err(|_| io::Error::other("invalid supervised provider executable"))?;
+    let executable = env::current_exe()?;
+    validate_canonical_file(&executable, MAX_EXECUTABLE_PATH_BYTES)
+        .map_err(|_| io::Error::other("invalid supervisor executable"))?;
+
+    let (sender, receiver) = TransferChannelPair::new()
+        .map_err(|_| io::Error::other("supervisor transfer channel failed"))?
+        .split();
+    let mut command = Command::new(executable);
+    crate::providers::codex::sanitize_managed_environment(&mut command);
+    command
+        .env_remove("CODEX_HOME")
+        .env("CALCIFER_HOME", registry.managed_root())
+        .env(ROLE_ENV, PROMOTED_ANCHOR_ROLE_V1)
+        .env(PROFILE_ID_ENV, &profile.id)
+        .env(THREAD_ID_ENV, thread_id)
+        .env(CODEX_EXECUTABLE_ENV, codex_executable)
+        .current_dir(working_directory);
+    let (mut authorization, inherited) = UnixStream::pair()?;
+    authorization.write_all(&PUBLIC_ENTRY_FRAME)?;
+    authorization.shutdown(std::net::Shutdown::Write)?;
+    drop(authorization);
+    let mut child = calcifer_unix_child_fd::spawn_with_inherited_readiness_and_transfer_fd(
+        command,
+        inherited.as_fd(),
+        receiver.as_fd(),
+    )
+    .map_err(|_| io::Error::other("supervisor entry spawn failed"))?;
+    drop((inherited, receiver));
+
+    let awaiting = match sender.send_target_reservation(reservation) {
+        Ok(awaiting) => awaiting,
+        Err(failure) => {
+            let (reservation, _error) = (*failure).into_parts();
+            let peer_closed = sender.shutdown_and_wait_for_peer_close().is_ok();
+            if peer_closed {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            drop(reservation);
+            return Err(io::Error::other("target reservation transfer failed"));
+        }
+    };
+    let acknowledged = match awaiting.receive_ack() {
+        Ok(acknowledged) => acknowledged,
+        Err(failure) => {
+            let (awaiting, _error) = (*failure).into_parts();
+            let reservation = awaiting.into_reservation();
+            let peer_closed = sender.shutdown_and_wait_for_peer_close().is_ok();
+            if peer_closed {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            drop(reservation);
+            return Err(io::Error::other(
+                "target reservation acknowledgement failed",
+            ));
+        }
+    };
+    acknowledged.commit();
+    drop(sender);
+    child.wait()
+}
+
 fn parse_and_run_production_role() -> Result<ExitCode, ProductionEntryError> {
     if env::args_os().count() != 1 {
         return Err(ProductionEntryError::Arguments);
@@ -1152,6 +1245,9 @@ fn parse_and_run_production_role() -> Result<ExitCode, ProductionEntryError> {
         Some(ANCHOR_ROLE_V1) => parse_and_run_anchor_role(),
         Some(COORDINATOR_ROLE_V1) => parse_and_run_coordinator_role(),
         Some(GUARDIAN_ROLE_V1) => parse_and_run_guardian_role(),
+        Some(PROMOTED_ANCHOR_ROLE_V1) => parse_and_run_promoted_anchor_role(),
+        Some(PROMOTED_COORDINATOR_ROLE_V1) => parse_and_run_promoted_coordinator_role(),
+        Some(PROMOTED_GUARDIAN_ROLE_V1) => parse_and_run_promoted_guardian_role(),
         _ => Err(ProductionEntryError::Arguments),
     }
 }
@@ -1180,6 +1276,37 @@ fn parse_and_run_anchor_role() -> Result<ExitCode, ProductionEntryError> {
         thread_id: &thread_id,
         codex_executable: &codex_executable,
         coordinator_executable: &coordinator_executable,
+        transfer: None,
+    }))
+}
+
+fn parse_and_run_promoted_anchor_role() -> Result<ExitCode, ProductionEntryError> {
+    consume_public_entry_authorization()?;
+    let transfer =
+        TransferReceiver::take_inherited().map_err(|_| ProductionEntryError::Environment)?;
+    let profile_id = bounded_environment_utf8(PROFILE_ID_ENV, MAX_PROFILE_ID_BYTES)?;
+    let thread_id = bounded_environment_utf8(THREAD_ID_ENV, MAX_THREAD_ID_BYTES)?;
+    validate_thread_id(&thread_id)?;
+    let codex_executable =
+        bounded_environment_path(CODEX_EXECUTABLE_ENV, MAX_EXECUTABLE_PATH_BYTES, true)?;
+    let working_directory = env::current_dir().map_err(|_| ProductionEntryError::Environment)?;
+    validate_canonical_directory(&working_directory, MAX_WORKING_DIRECTORY_BYTES)?;
+    let coordinator_executable =
+        env::current_exe().map_err(|_| ProductionEntryError::Executable)?;
+    validate_canonical_file(&coordinator_executable, MAX_EXECUTABLE_PATH_BYTES)?;
+    let registry = Registry::discover().map_err(|_| ProductionEntryError::Profile)?;
+    let profile = registry
+        .find_by_id(Provider::Codex, &profile_id)
+        .map_err(|_| ProductionEntryError::Profile)?;
+
+    Ok(run_production_anchor(ProductionAnchorConfig {
+        registry: &registry,
+        profile: &profile,
+        working_directory: &working_directory,
+        thread_id: &thread_id,
+        codex_executable: &codex_executable,
+        coordinator_executable: &coordinator_executable,
+        transfer: Some(transfer),
     }))
 }
 
@@ -1236,6 +1363,52 @@ fn parse_and_run_guardian_role() -> Result<ExitCode, ProductionEntryError> {
         expected_foreground_process_group,
         bounds: production_guardian_bounds(),
         completion,
+        guardian_lease: None,
+    })
+    .apply())
+}
+
+fn parse_and_run_promoted_guardian_role() -> Result<ExitCode, ProductionEntryError> {
+    let completion = CompletionTransit::take_inherited()
+        .map_err(|_| ProductionEntryError::Environment)?
+        .into_guardian();
+    let transfer =
+        TransferReceiver::take_inherited().map_err(|_| ProductionEntryError::Environment)?;
+    let profile_id = bounded_environment_utf8(PROFILE_ID_ENV, MAX_PROFILE_ID_BYTES)?;
+    let thread_id = bounded_environment_utf8(THREAD_ID_ENV, MAX_THREAD_ID_BYTES)?;
+    validate_thread_id(&thread_id)?;
+    let codex_executable =
+        bounded_environment_path(CODEX_EXECUTABLE_ENV, MAX_EXECUTABLE_PATH_BYTES, true)?;
+    let expected_foreground_process_group = env::var(FOREGROUND_PROCESS_GROUP_ENV)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .ok_or(ProductionEntryError::Environment)?;
+    let working_directory = env::current_dir().map_err(|_| ProductionEntryError::Environment)?;
+    validate_canonical_directory(&working_directory, MAX_WORKING_DIRECTORY_BYTES)?;
+    let runtime_parent =
+        crate::profiles::managed_runtime_root().map_err(|_| ProductionEntryError::Profile)?;
+    let registry = Registry::discover().map_err(|_| ProductionEntryError::Profile)?;
+    let profile = registry
+        .find_by_id(Provider::Codex, &profile_id)
+        .map_err(|_| ProductionEntryError::Profile)?;
+    let guardian_lease = transfer
+        .receive_provider_lease(&registry, &profile)
+        .map_err(|_| ProductionEntryError::Profile)?
+        .send_ack()
+        .map_err(|_| ProductionEntryError::Profile)?;
+
+    Ok(run_production_guardian(ProductionGuardianConfig {
+        registry: &registry,
+        profile: &profile,
+        working_directory: &working_directory,
+        thread_id: &thread_id,
+        codex_executable: &codex_executable,
+        runtime_parent: &runtime_parent,
+        expected_foreground_process_group,
+        bounds: production_guardian_bounds(),
+        completion,
+        guardian_lease: Some(guardian_lease),
     })
     .apply())
 }
@@ -1265,6 +1438,45 @@ fn parse_and_run_coordinator_role() -> Result<ExitCode, ProductionEntryError> {
             thread_id: &thread_id,
             codex_executable: &codex_executable,
             guardian_executable: &guardian_executable,
+            promoted: None,
+        },
+        completion,
+    ))
+}
+
+fn parse_and_run_promoted_coordinator_role() -> Result<ExitCode, ProductionEntryError> {
+    let completion =
+        CompletionTransit::take_inherited().map_err(|_| ProductionEntryError::Environment)?;
+    let transfer =
+        TransferReceiver::take_inherited().map_err(|_| ProductionEntryError::Environment)?;
+    let profile_id = bounded_environment_utf8(PROFILE_ID_ENV, MAX_PROFILE_ID_BYTES)?;
+    let thread_id = bounded_environment_utf8(THREAD_ID_ENV, MAX_THREAD_ID_BYTES)?;
+    validate_thread_id(&thread_id)?;
+    let codex_executable =
+        bounded_environment_path(CODEX_EXECUTABLE_ENV, MAX_EXECUTABLE_PATH_BYTES, true)?;
+    let working_directory = env::current_dir().map_err(|_| ProductionEntryError::Environment)?;
+    validate_canonical_directory(&working_directory, MAX_WORKING_DIRECTORY_BYTES)?;
+    let guardian_executable = env::current_exe().map_err(|_| ProductionEntryError::Executable)?;
+    validate_canonical_file(&guardian_executable, MAX_EXECUTABLE_PATH_BYTES)?;
+    let registry = Registry::discover().map_err(|_| ProductionEntryError::Profile)?;
+    let profile = registry
+        .find_by_id(Provider::Codex, &profile_id)
+        .map_err(|_| ProductionEntryError::Profile)?;
+    let promoted = transfer
+        .receive_target_reservation(&registry, &profile)
+        .map_err(|_| ProductionEntryError::Profile)?
+        .send_ack()
+        .map_err(|_| ProductionEntryError::Profile)?;
+
+    Ok(run_production_coordinator(
+        ProductionCoordinatorConfig {
+            registry: &registry,
+            profile: &profile,
+            working_directory: &working_directory,
+            thread_id: &thread_id,
+            codex_executable: &codex_executable,
+            guardian_executable: &guardian_executable,
+            promoted: Some(promoted),
         },
         completion,
     ))
@@ -1277,6 +1489,7 @@ struct ProductionAnchorConfig<'a> {
     thread_id: &'a str,
     codex_executable: &'a Path,
     coordinator_executable: &'a Path,
+    transfer: Option<TransferReceiver>,
 }
 
 /// Shell-facing lifetime owner for one hidden coordinator generation.
@@ -1297,15 +1510,28 @@ fn try_run_production_anchor(
     config: ProductionAnchorConfig<'_>,
 ) -> Result<ExitCode, ProductionEntryError> {
     validate_anchor_config(&config)?;
-    run_anchor_command(coordinator_command(&config)?)
+    let command = coordinator_command(&config)?;
+    run_anchor_command(command, config.transfer)
 }
 
-fn run_anchor_command(command: Command) -> Result<ExitCode, ProductionEntryError> {
-    run_anchor_command_inner(command, None, ForegroundFixtureFault::None)
+fn run_anchor_command(
+    command: Command,
+    transfer: Option<TransferReceiver>,
+) -> Result<ExitCode, ProductionEntryError> {
+    run_anchor_command_inner_with_transfer(command, transfer, None, ForegroundFixtureFault::None)
 }
 
 fn run_anchor_command_inner(
+    command: Command,
+    fixture_late_signal: Option<UnixSignal>,
+    foreground_fault: ForegroundFixtureFault,
+) -> Result<ExitCode, ProductionEntryError> {
+    run_anchor_command_inner_with_transfer(command, None, fixture_late_signal, foreground_fault)
+}
+
+fn run_anchor_command_inner_with_transfer(
     mut command: Command,
+    transfer: Option<TransferReceiver>,
     fixture_late_signal: Option<UnixSignal>,
     foreground_fault: ForegroundFixtureFault,
 ) -> Result<ExitCode, ProductionEntryError> {
@@ -1317,15 +1543,26 @@ fn run_anchor_command_inner(
         .map_err(|_| ProductionEntryError::Channel)?
         .split();
     command.process_group(0);
-    let mut child =
-        match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(command, transit.as_fd()) {
-            Ok(child) => child,
-            Err(error) => {
-                drop((transit, completion, snapshot, signals));
-                drop(error);
-                return Err(ProductionEntryError::Spawn);
-            }
-        };
+    let spawned = match transfer.as_ref() {
+        Some(transfer) => calcifer_unix_child_fd::spawn_with_inherited_readiness_and_transfer_fd(
+            command,
+            transit.as_fd(),
+            transfer.as_fd(),
+        ),
+        None => calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(command, transit.as_fd()),
+    };
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            drop((transit, completion, snapshot, signals));
+            drop(error);
+            return Err(ProductionEntryError::Spawn);
+        }
+    };
+    // The coordinator is the unique reader after this point. Parent-side EOF
+    // therefore proves this exact exec boundary has closed before the shell
+    // anchor can be terminated on a failed promotion ACK.
+    drop(transfer);
     drop(transit);
 
     let coordinator_group =
@@ -1465,7 +1702,14 @@ fn coordinator_command(
     crate::providers::codex::sanitize_managed_environment(&mut command);
     remove_internal_supervisor_environment(&mut command);
     command
-        .env(ROLE_ENV, COORDINATOR_ROLE_V1)
+        .env(
+            ROLE_ENV,
+            if config.transfer.is_some() {
+                PROMOTED_COORDINATOR_ROLE_V1
+            } else {
+                COORDINATOR_ROLE_V1
+            },
+        )
         .env(PROFILE_ID_ENV, &config.profile.id)
         .env(THREAD_ID_ENV, config.thread_id)
         .env(CODEX_EXECUTABLE_ENV, config.codex_executable)
@@ -2514,6 +2758,7 @@ struct ProductionCoordinatorConfig<'a> {
     thread_id: &'a str,
     codex_executable: &'a Path,
     guardian_executable: &'a Path,
+    promoted: Option<PromotedTargetReservation>,
 }
 
 /// Concrete production-shaped coordinator path. A is acquired and refetched
@@ -2530,21 +2775,34 @@ fn run_production_coordinator(
 }
 
 fn try_run_production_coordinator(
-    config: ProductionCoordinatorConfig<'_>,
+    mut config: ProductionCoordinatorConfig<'_>,
     completion: CompletionTransit,
 ) -> Result<CoordinatorRunOutcome, ProductionEntryError> {
     validate_coordinator_config(&config)?;
+    let promoted_mode = config.promoted.is_some();
+    let mut promoted = config.promoted.take();
     let foreground_process_group =
         await_current_process_group_foreground(Instant::now() + Duration::from_secs(15))?;
-    let authority = config
-        .registry
-        .lock_profile_coordinator(config.profile)
-        .map_err(|_| ProductionEntryError::Profile)?;
-    let current = config
-        .registry
-        .refetch_by_id_under_lease(Provider::Codex, &config.profile.id)
-        .map_err(|_| ProductionEntryError::Profile)?;
-    if &current != config.profile {
+    let mut authority = if promoted_mode {
+        if promoted.as_ref().map(PromotedTargetReservation::profile) != Some(config.profile) {
+            return Err(ProductionEntryError::Profile);
+        }
+        None
+    } else {
+        let authority = config
+            .registry
+            .lock_profile_coordinator(config.profile)
+            .map_err(|_| ProductionEntryError::Profile)?;
+        let current = config
+            .registry
+            .refetch_by_id_under_lease(Provider::Codex, &config.profile.id)
+            .map_err(|_| ProductionEntryError::Profile)?;
+        if &current != config.profile {
+            return Err(ProductionEntryError::Profile);
+        }
+        Some(authority)
+    };
+    if promoted_mode == authority.is_some() {
         return Err(ProductionEntryError::Profile);
     }
 
@@ -2556,7 +2814,16 @@ fn try_run_production_coordinator(
         RecoveryTty::duplicate(io::stdin()).map_err(|_| ProductionEntryError::Terminal)?;
     let lifecycle_pair = LifecyclePair::new().map_err(|_| ProductionEntryError::Channel)?;
 
-    let mut command = guardian_command(&config, foreground_process_group)?;
+    let promoted_transfer = if promoted_mode {
+        Some(
+            TransferChannelPair::new()
+                .map_err(|_| ProductionEntryError::Channel)?
+                .split(),
+        )
+    } else {
+        None
+    };
+    let mut command = guardian_command(&config, foreground_process_group, promoted_mode)?;
     command
         .stdout(
             guardian_endpoint
@@ -2570,21 +2837,36 @@ fn try_run_production_coordinator(
         )
         .process_group(0);
 
-    let spawned = match spawn_guardian_with_lifecycle_stdin_and_completion(
-        command,
-        lifecycle_pair,
-        completion.as_fd(),
-    ) {
+    let spawned_result = match promoted_transfer.as_ref() {
+        Some((_, receiver)) => spawn_guardian_with_lifecycle_stdin_completion_and_transfer(
+            command,
+            lifecycle_pair,
+            completion.as_fd(),
+            receiver.as_fd(),
+        ),
+        None => spawn_guardian_with_lifecycle_stdin_and_completion(
+            command,
+            lifecycle_pair,
+            completion.as_fd(),
+        ),
+    };
+    let spawned = match spawned_result {
         Ok(spawned) => spawned,
         Err(failure) => {
             let (lifecycle, child, _error) = failure.into_parts();
+            let retained_authority = match (authority.take(), promoted.take()) {
+                (Some(authority), None) => authority,
+                (None, Some(promoted)) => promoted.retain_coordinator_only(),
+                _ => return Err(ProductionEntryError::Profile),
+            };
+            drop(promoted_transfer);
             let Some(child) = child else {
-                drop((authority, lifecycle, terminal, completion));
+                drop((retained_authority, lifecycle, terminal, completion));
                 return Err(ProductionEntryError::Spawn);
             };
             drop(completion);
             return match ProductionCoordinator::assemble(
-                authority,
+                retained_authority,
                 child,
                 lifecycle,
                 terminal,
@@ -2596,6 +2878,35 @@ fn try_run_production_coordinator(
         }
     };
     let (guardian, lifecycle) = spawned.into_parts();
+    let authority = match (promoted_transfer, promoted, authority) {
+        (Some((sender, receiver)), Some(promoted), None) => {
+            drop(receiver);
+            sender
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .map_err(|_| ProductionEntryError::Channel)?;
+            match sender.send_promoted_provider_lease(promoted) {
+                Ok(awaiting) => match awaiting.receive_ack() {
+                    Ok(acknowledged) => acknowledged
+                        .commit()
+                        .map_err(|_| ProductionEntryError::Profile)?
+                        .into_coordinator_profile_lease(),
+                    Err(failure) => {
+                        let (awaiting, _error) = (*failure).into_parts();
+                        let promoted = awaiting.into_reservation();
+                        drop(sender);
+                        promoted.retain_coordinator_only()
+                    }
+                },
+                Err(failure) => {
+                    let (promoted, _error) = (*failure).into_parts();
+                    drop(sender);
+                    promoted.retain_coordinator_only()
+                }
+            }
+        }
+        (None, None, Some(authority)) => authority,
+        _ => return Err(ProductionEntryError::Profile),
+    };
     drop(completion);
     let coordinator = match ProductionCoordinator::assemble(
         authority,
@@ -2631,12 +2942,20 @@ fn await_current_process_group_foreground(deadline: Instant) -> Result<i32, Prod
 fn guardian_command(
     config: &ProductionCoordinatorConfig<'_>,
     foreground_process_group: i32,
+    promoted: bool,
 ) -> Result<Command, ProductionEntryError> {
     let mut command = Command::new(config.guardian_executable);
     crate::providers::codex::sanitize_managed_environment(&mut command);
     remove_internal_supervisor_environment(&mut command);
     command
-        .env(ROLE_ENV, GUARDIAN_ROLE_V1)
+        .env(
+            ROLE_ENV,
+            if promoted {
+                PROMOTED_GUARDIAN_ROLE_V1
+            } else {
+                GUARDIAN_ROLE_V1
+            },
+        )
         .env(PROFILE_ID_ENV, &config.profile.id)
         .env(THREAD_ID_ENV, config.thread_id)
         .env(CODEX_EXECUTABLE_ENV, config.codex_executable)
@@ -2659,6 +2978,7 @@ fn remove_internal_supervisor_environment(command: &mut Command) {
         FOREGROUND_PROCESS_GROUP_ENV,
         calcifer_unix_child_fd::READINESS_FD_ENV,
         calcifer_unix_child_fd::EXECUTABLE_FD_ENV,
+        calcifer_unix_child_fd::TRANSFER_FD_ENV,
     ] {
         command.env_remove(name);
     }

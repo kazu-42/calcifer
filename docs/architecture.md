@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, a private default-disabled trust-domain/pool registry, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, an internal Linux/macOS no-gap target reservation, and a serialized cross-profile transaction/reconciliation kernel are implemented. The routing registry cannot select or launch a profile. Linux exposes the pinned App Server/typed-monitor/official-TUI supervisor only for explicit exact same-profile resume. No public automatic selector or cross-profile handoff activates the remaining pieces yet.
+> Status: evolving pre-alpha architecture. Unix Codex profile registration with private provider-identity binding, a private default-disabled trust-domain/pool registry, pinned launch, same-profile resume, structured on-demand status, a synthetic Codex 0.144.4 handoff compatibility gate, a Linux/macOS no-gap target reservation, and a serialized cross-profile transaction/reconciliation kernel are implemented. Linux exposes an explicit, guarded pool failover path that consumes these pieces and promotes the retained A+B reservation into the production coordinator/guardian chain. Ordinary launches remain profile-pinned and do not traverse pools.
 
 Calcifer is designed as a local orchestrator around official coding-agent CLIs. It selects an isolated profile, constructs a provider-specific child environment, and launches the official executable directly without a shell.
 
@@ -727,24 +727,31 @@ exact supervised command until the selector supplies its supervised runtime
 adapter; ordinary run/resume behavior and its root-thread validator are
 unchanged.
 
-The implemented target-reservation primitive gives the future supervisor an
+The implemented target-reservation primitive gives the production supervisor an
 ephemeral, no-gap ownership transition on Linux and macOS:
 
 ```text
 verified target reserved: parent owns target A + B
-  -> B descriptor sent once: parent still owns A + B;
-     guardian provisionally holds a descriptor for the same locked open-file description
+  -> A+B descriptors sent once: parent still owns A+B;
+     coordinator provisionally holds descriptors for the same locked open-file descriptions
+  -> coordinator validates both exact visible locks, proves ownership and close-on-exec,
+     then sends an ACK on the same control socket
+  -> parent strictly parses that ACK and closes its A+B copies without LOCK_UN
+  -> promoted coordinator owns target A+B
+  -> B descriptor sent once: coordinator still owns A+B;
+     guardian provisionally holds the same B locked open-file description
   -> guardian validates the exact visible lock, proves that descriptor owns its lock,
      sets and reads back close-on-exec, then sends an ACK on the same control socket
-  -> sender strictly parses that ACK and closes its B descriptor without LOCK_UN
-  -> split ownership: parent owns target A / guardian owns target B
+  -> coordinator strictly parses that ACK and closes its B copy without LOCK_UN
+  -> split ownership: coordinator owns target A / guardian owns target B
 ```
 
 Sending consumes the reservation, and the awaiting-ACK state has no resend or
 commit-without-ACK operation. A send failure returns the complete A+B
 reservation. An invalid descriptor or ACK cannot advance either side. These
-states are internal and ephemeral; they add no registry schema, journal event,
-provider protocol, or public CLI operation.
+states are internal and ephemeral; the explicit Linux pool failover path
+consumes them without adding a registry schema, journal event, provider
+protocol, or separate public CLI operation.
 
 The complete supervisor must respect one global acquisition order:
 
@@ -756,9 +763,9 @@ already-held source lifetime lease
   -> target provider lease B
 ```
 
-The primitive in this slice acquires only the target A+B pair. Issue #33 is
-responsible for placing it after the handoff and conversation-transition locks
-and for retaining every required owner across the non-idempotent handoff.
+The public failover adapter acquires this target A+B pair after the handoff and
+conversation-transition authorities, retains it across the non-idempotent fork
+and durable commit, then promotes it through the production supervisor.
 
 The current `run` command does not restart or re-submit a command after the child begins execution. Existing pool definitions remain inert and default-disabled. The planned supervisor treats credential profiles and conversation lineage as separate aggregates. It continues the same user-visible conversation after failover by creating a target-profile Codex thread from the validated source rollout, but it must not resubmit the failed turn. The wrapped agent may already have produced external side effects before reporting quota exhaustion. The supervisor connection remains event-only and never races the official TUI to answer approvals or other server-initiated requests; no new turn is admitted without an attached TUI. The full decision and recovery model is in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md).
 
@@ -933,12 +940,13 @@ The current process launcher:
   cannot discover repository-local configuration through an ancestor;
 - avoid logging raw arguments or the child environment.
 
-Ordinary `run` and `resume` keep their existing guardian path: the guardian
-directly acquires provider lease B during the authenticated launch handshake.
-The Linux/macOS `SCM_RIGHTS` transfer is a separate internal primitive for the
-future supervised target handoff, where A+B must be reserved before a target
-guardian exists. No public command currently calls it, and the ordinary
-run/resume/status behavior and persisted schemas are unchanged.
+Ordinary `run` and same-profile `resume` keep their existing guardian path: the
+guardian directly acquires provider lease B during the authenticated launch
+handshake. Explicit Linux pool failover instead uses the Linux/macOS
+`SCM_RIGHTS` primitive because A+B is already reserved before the target
+guardian exists. The failover parent transfers A+B to the coordinator, and the
+coordinator transfers B to the guardian; ordinary run/resume/status behavior
+and persisted schemas are unchanged.
 
 The official CLI still receives ordinary terminal, locale, proxy, and CA
 environment needed for interactive and enterprise operation. Calcifer does not
@@ -993,8 +1001,7 @@ completed implementations for:
 
 - deliberate all-profile re-key recovery after identity-key loss;
 - stable/default promotion criteria for the explicit Linux failover UX, a
-  no-gap target reservation transfer into the production guardian, a reviewed
-  macOS descriptor-exec primitive, and a separate Windows terminal and
+  reviewed macOS descriptor-exec primitive, and a separate Windows terminal and
   process-authority design;
 - additional Codex version/schema gates beyond the implemented 0.144.4 observation cache;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;

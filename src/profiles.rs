@@ -1528,6 +1528,66 @@ impl Registry {
         })
     }
 
+    /// Receives the complete A+B reservation selected and identity-validated
+    /// by the public failover parent. Both descriptors must still own the
+    /// exact managed lock files, remain close-on-exec, and protect the same
+    /// immutable registry row before the coordinator may acknowledge them.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn receive_target_reservation<'control>(
+        &self,
+        expected: &Profile,
+        control: &'control std::os::unix::net::UnixStream,
+    ) -> Result<UnacknowledgedPromotedTargetReservation<'control>, ProfileError> {
+        use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+
+        let profile_directory = self.profile_directory(expected)?;
+        let profile_directory_identity = private_directory_identity(&profile_directory)?;
+        let coordinator_path = profile_directory.join(COORDINATOR_LOCK_FILE);
+        let provider_path = profile_directory.join(PROVIDER_LOCK_FILE);
+        let [coordinator, provider] = receive_target_reservation_descriptors(control)?;
+        for descriptor in [&coordinator, &provider] {
+            let flags = fcntl_getfd(descriptor).map_err(io::Error::from)?;
+            fcntl_setfd(descriptor, flags | FdFlags::CLOEXEC).map_err(io::Error::from)?;
+            if !fcntl_getfd(descriptor)
+                .map_err(io::Error::from)?
+                .contains(FdFlags::CLOEXEC)
+            {
+                return Err(ProfileError::UnsafeState(
+                    "received target reservation is inheritable".to_owned(),
+                ));
+            }
+        }
+        let coordinator = File::from(coordinator);
+        let provider = File::from(provider);
+        let coordinator_identity = private_lock_file_identity(&coordinator, &coordinator_path)?;
+        let provider_identity = private_lock_file_identity(&provider, &provider_path)?;
+        verify_received_lock_ownership(&coordinator, &coordinator_path, "coordinator")?;
+        verify_received_lock_ownership(&provider, &provider_path, "provider")?;
+
+        let current = self.find_by_id_without_recovery(expected.provider, &expected.id)?;
+        if current != *expected
+            || self.profile_directory(&current)? != profile_directory
+            || private_directory_identity(&profile_directory)? != profile_directory_identity
+            || private_lock_file_identity(&coordinator, &coordinator_path)? != coordinator_identity
+            || private_lock_file_identity(&provider, &provider_path)? != provider_identity
+        {
+            return Err(ProfileError::UnsafeState(
+                "received target reservation changed during admission".to_owned(),
+            ));
+        }
+
+        Ok(UnacknowledgedPromotedTargetReservation {
+            reservation: PromotedTargetReservation {
+                lease: ProfileLease {
+                    coordinator: Some(coordinator),
+                    provider: Some(provider),
+                },
+                profile: current,
+            },
+            control,
+        })
+    }
+
     #[cfg(unix)]
     pub(crate) fn supervisor_socket_path(
         &self,
@@ -3461,6 +3521,44 @@ impl VerifiedTargetReservation {
         self.lease.provider_lock_for_probe()
     }
 
+    /// Transfers the complete post-selection A+B reservation to the sealed
+    /// target coordinator. The receiver must validate both exact managed lock
+    /// files and acknowledge them on this same stream before the sender may
+    /// release its copies.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(dead_code)] // Linux production; macOS exercises the transfer in tests.
+    pub(crate) fn send_target_reservation(
+        self,
+        control: &std::os::unix::net::UnixStream,
+    ) -> Result<AwaitingTargetReservationAck<'_>, Box<TargetReservationTransferSendError>> {
+        let Some(coordinator) = self.lease.coordinator.as_ref() else {
+            return Err(Box::new(TargetReservationTransferSendError {
+                reservation: self,
+                error: ProfileError::UnsafeState(
+                    "target reservation transfer requires the coordinator lock".to_owned(),
+                ),
+            }));
+        };
+        let Some(provider) = self.lease.provider.as_ref() else {
+            return Err(Box::new(TargetReservationTransferSendError {
+                reservation: self,
+                error: ProfileError::UnsafeState(
+                    "target reservation transfer requires the provider lock".to_owned(),
+                ),
+            }));
+        };
+        match send_target_reservation_descriptors(control, coordinator, provider) {
+            Ok(()) => Ok(AwaitingTargetReservationAck {
+                reservation: self,
+                control,
+            }),
+            Err(error) => Err(Box::new(TargetReservationTransferSendError {
+                reservation: self,
+                error,
+            })),
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn send_provider_lease(
         self,
@@ -3557,6 +3655,199 @@ impl ProfileLease {
     }
 }
 
+/// Complete A+B authority after it crosses the sealed parent/coordinator exec
+/// boundary. Provider identity has already been compared by the selector; the
+/// receiver revalidates only local immutable profile and descriptor identity.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct PromotedTargetReservation {
+    lease: ProfileLease,
+    profile: Profile,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PromotedTargetReservation {
+    pub(crate) const fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
+    pub(crate) fn send_provider_lease(
+        self,
+        control: &std::os::unix::net::UnixStream,
+    ) -> Result<AwaitingPromotedProviderLeaseAck<'_>, Box<PromotedProviderLeaseTransferSendError>>
+    {
+        if self.lease.coordinator.is_none() {
+            return Err(Box::new(PromotedProviderLeaseTransferSendError {
+                reservation: self,
+                error: ProfileError::UnsafeState(
+                    "promoted provider transfer requires the coordinator lock".to_owned(),
+                ),
+            }));
+        }
+        let Some(provider) = self.lease.provider.as_ref() else {
+            return Err(Box::new(PromotedProviderLeaseTransferSendError {
+                reservation: self,
+                error: ProfileError::UnsafeState(
+                    "promoted provider transfer requires the provider lock".to_owned(),
+                ),
+            }));
+        };
+        match send_provider_lock_descriptor(control, provider) {
+            Ok(()) => Ok(AwaitingPromotedProviderLeaseAck {
+                reservation: self,
+                control,
+            }),
+            Err(error) => Err(Box::new(PromotedProviderLeaseTransferSendError {
+                reservation: self,
+                error,
+            })),
+        }
+    }
+
+    /// Abandons an unacknowledged guardian promotion while retaining A for
+    /// exact coordinator cleanup. No receiver has acknowledged B on this path.
+    pub(crate) fn retain_coordinator_only(mut self) -> CoordinatorProfileLease {
+        drop(self.lease.provider.take());
+        CoordinatorProfileLease { lease: self.lease }
+    }
+}
+
+/// Receiver-side A+B authority cannot be used until its ACK is sent on the
+/// exact stream that carried both descriptors.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct UnacknowledgedPromotedTargetReservation<'control> {
+    reservation: PromotedTargetReservation,
+    control: &'control std::os::unix::net::UnixStream,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'control> UnacknowledgedPromotedTargetReservation<'control> {
+    pub(crate) fn send_ack(
+        self,
+    ) -> Result<PromotedTargetReservation, Box<TargetReservationAckSendError<'control>>> {
+        match send_target_reservation_ack(self.control) {
+            Ok(()) => Ok(self.reservation),
+            Err(error) => Err(Box::new(TargetReservationAckSendError {
+                reservation: self,
+                error,
+            })),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+pub(crate) struct TargetReservationAckSendError<'control> {
+    reservation: UnacknowledgedPromotedTargetReservation<'control>,
+    error: ProfileError,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+impl<'control> TargetReservationAckSendError<'control> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        UnacknowledgedPromotedTargetReservation<'control>,
+        ProfileError,
+    ) {
+        (self.reservation, self.error)
+    }
+
+    fn into_error(self) -> ProfileError {
+        self.error
+    }
+}
+
+/// Sender-side A+B authority after the descriptor frame has been emitted but
+/// before the coordinator's validation ACK has arrived.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+pub(crate) struct AwaitingTargetReservationAck<'control> {
+    reservation: VerifiedTargetReservation,
+    control: &'control std::os::unix::net::UnixStream,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+impl<'control> AwaitingTargetReservationAck<'control> {
+    pub(crate) fn receive_ack(
+        self,
+    ) -> Result<AcknowledgedTargetReservationTransfer, Box<TargetReservationAckError<'control>>>
+    {
+        match receive_target_reservation_ack(self.control) {
+            Ok(()) => Ok(AcknowledgedTargetReservationTransfer {
+                reservation: self.reservation,
+            }),
+            Err(error) => Err(Box::new(TargetReservationAckError {
+                awaiting: self,
+                error,
+            })),
+        }
+    }
+
+    /// Recovers the complete sender-side A+B authority after an invalid,
+    /// missing, or timed-out coordinator ACK. Callers keep this reservation
+    /// alive until the exact promoted child tree is known to have exited.
+    pub(crate) fn into_reservation(self) -> VerifiedTargetReservation {
+        self.reservation
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+pub(crate) struct AcknowledgedTargetReservationTransfer {
+    reservation: VerifiedTargetReservation,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+impl AcknowledgedTargetReservationTransfer {
+    /// Releases only the sender copies. The acknowledged coordinator owns the
+    /// same two locked open-file descriptions before this transition exists.
+    pub(crate) fn commit(self) {
+        drop(self.reservation);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+pub(crate) struct TargetReservationAckError<'control> {
+    awaiting: AwaitingTargetReservationAck<'control>,
+    error: ProfileError,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+impl<'control> TargetReservationAckError<'control> {
+    pub(crate) fn into_parts(self) -> (AwaitingTargetReservationAck<'control>, ProfileError) {
+        (self.awaiting, self.error)
+    }
+
+    fn into_error(self) -> ProfileError {
+        self.error
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+pub(crate) struct TargetReservationTransferSendError {
+    reservation: VerifiedTargetReservation,
+    error: ProfileError,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+impl TargetReservationTransferSendError {
+    pub(crate) fn into_parts(self) -> (VerifiedTargetReservation, ProfileError) {
+        (self.reservation, self.error)
+    }
+
+    #[cfg(test)]
+    fn into_error(self) -> ProfileError {
+        self.error
+    }
+}
+
 /// A complete target reservation whose provider descriptor was sent once.
 ///
 /// This state has no resend operation. Dropping it before an ACK closes the
@@ -3609,6 +3900,91 @@ impl AcknowledgedProviderLeaseTransfer {
             lease: self.reservation.lease,
             profile: self.reservation.profile,
         })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct AwaitingPromotedProviderLeaseAck<'control> {
+    reservation: PromotedTargetReservation,
+    control: &'control std::os::unix::net::UnixStream,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'control> AwaitingPromotedProviderLeaseAck<'control> {
+    pub(crate) fn receive_ack(
+        self,
+    ) -> Result<
+        AcknowledgedPromotedProviderLeaseTransfer,
+        Box<PromotedProviderLeaseAckError<'control>>,
+    > {
+        match receive_provider_lease_ack(self.control) {
+            Ok(()) => Ok(AcknowledgedPromotedProviderLeaseTransfer {
+                reservation: self.reservation,
+            }),
+            Err(error) => Err(Box::new(PromotedProviderLeaseAckError {
+                awaiting: self,
+                error,
+            })),
+        }
+    }
+
+    pub(crate) fn into_reservation(self) -> PromotedTargetReservation {
+        self.reservation
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct AcknowledgedPromotedProviderLeaseTransfer {
+    reservation: PromotedTargetReservation,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl AcknowledgedPromotedProviderLeaseTransfer {
+    pub(crate) fn commit(mut self) -> Result<TargetCoordinatorLease, ProfileError> {
+        let provider = self.reservation.lease.provider.take().ok_or_else(|| {
+            ProfileError::UnsafeState("transferred provider lock is not held".to_owned())
+        })?;
+        drop(provider);
+        Ok(TargetCoordinatorLease {
+            lease: self.reservation.lease,
+            profile: self.reservation.profile,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct PromotedProviderLeaseAckError<'control> {
+    awaiting: AwaitingPromotedProviderLeaseAck<'control>,
+    error: ProfileError,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'control> PromotedProviderLeaseAckError<'control> {
+    pub(crate) fn into_parts(self) -> (AwaitingPromotedProviderLeaseAck<'control>, ProfileError) {
+        (self.awaiting, self.error)
+    }
+
+    #[cfg(test)]
+    fn into_error(self) -> ProfileError {
+        self.error
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct PromotedProviderLeaseTransferSendError {
+    reservation: PromotedTargetReservation,
+    error: ProfileError,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PromotedProviderLeaseTransferSendError {
+    pub(crate) fn into_parts(self) -> (PromotedTargetReservation, ProfileError) {
+        (self.reservation, self.error)
+    }
+
+    #[cfg(test)]
+    fn into_error(self) -> ProfileError {
+        self.error
     }
 }
 
@@ -3665,6 +4041,14 @@ pub(crate) struct TargetCoordinatorLease {
 impl TargetCoordinatorLease {
     pub(crate) const fn profile(&self) -> &Profile {
         &self.profile
+    }
+
+    /// Converts the promoted coordinator authority into the same A-only type
+    /// consumed by the production coordinator after exact profile equality was
+    /// checked during transfer admission.
+    pub(crate) fn into_coordinator_profile_lease(self) -> CoordinatorProfileLease {
+        let Self { lease, profile: _ } = self;
+        CoordinatorProfileLease { lease }
     }
 }
 
@@ -3791,6 +4175,50 @@ const PROVIDER_LEASE_TRANSFER_MARKER: u8 = 0xC1;
 const PROVIDER_LEASE_ACK_MARKER: u8 = 0xA1;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+const TARGET_RESERVATION_TRANSFER_MARKER: u8 = 0xC2;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const TARGET_RESERVATION_ACK_MARKER: u8 = 0xA2;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn send_target_reservation_descriptors(
+    control: &std::os::unix::net::UnixStream,
+    coordinator: &File,
+    provider: &File,
+) -> Result<(), ProfileError> {
+    use std::io::IoSlice;
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsFd;
+
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, sendmsg};
+
+    let descriptors = [coordinator.as_fd(), provider.as_fd()];
+    let mut ancillary_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut ancillary_space);
+    if !ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)) {
+        return Err(ProfileError::UnsafeState(
+            "target reservation descriptors did not fit".to_owned(),
+        ));
+    }
+    let payload = [TARGET_RESERVATION_TRANSFER_MARKER];
+    let slices = [IoSlice::new(&payload)];
+    let flags = provider_lease_send_flags(control)?;
+    loop {
+        match sendmsg(control, &slices, &mut ancillary, flags) {
+            Ok(1) => return Ok(()),
+            Ok(_) => {
+                return Err(ProfileError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "target reservation transfer was incomplete",
+                )));
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn send_provider_lock_descriptor(
     control: &std::os::unix::net::UnixStream,
     provider: &File,
@@ -3867,6 +4295,26 @@ fn send_provider_lease_ack(control: &std::os::unix::net::UnixStream) -> Result<(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn send_target_reservation_ack(
+    control: &std::os::unix::net::UnixStream,
+) -> Result<(), ProfileError> {
+    let flags = provider_lease_send_flags(control)?;
+    loop {
+        match rustix::net::send(control, &[TARGET_RESERVATION_ACK_MARKER], flags) {
+            Ok(1) => return Ok(()),
+            Ok(_) => {
+                return Err(ProfileError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "target reservation ACK was incomplete",
+                )));
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn receive_provider_lease_ack(
     control: &std::os::unix::net::UnixStream,
 ) -> Result<(), ProfileError> {
@@ -3889,6 +4337,91 @@ fn receive_provider_lease_ack(
             Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)] // Linux production; macOS exercises the sender in tests.
+fn receive_target_reservation_ack(
+    control: &std::os::unix::net::UnixStream,
+) -> Result<(), ProfileError> {
+    let mut payload = [0_u8; 1];
+    loop {
+        match rustix::net::recv(control, &mut payload[..], rustix::net::RecvFlags::empty()) {
+            Ok((_, 1)) if payload == [TARGET_RESERVATION_ACK_MARKER] => return Ok(()),
+            Ok((_, 0)) => {
+                return Err(ProfileError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "target coordinator closed before ACK",
+                )));
+            }
+            Ok(_) => {
+                return Err(ProfileError::UnsafeState(
+                    "target reservation ACK is invalid".to_owned(),
+                ));
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn receive_target_reservation_descriptors(
+    control: &std::os::unix::net::UnixStream,
+) -> Result<[rustix::fd::OwnedFd; 2], ProfileError> {
+    use std::io::IoSliceMut;
+    use std::mem::MaybeUninit;
+
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+
+    let mut payload = [0_u8; 1];
+    let mut ancillary_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut ancillary_space);
+    let received = loop {
+        let mut slices = [IoSliceMut::new(&mut payload)];
+        #[cfg(target_os = "linux")]
+        let flags = RecvFlags::CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = RecvFlags::empty();
+        match recvmsg(control, &mut slices, &mut ancillary, flags) {
+            Ok(received) => break received,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(ProfileError::Io(io::Error::from(error))),
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let flags_are_invalid = received.flags != rustix::net::ReturnFlags::CMSG_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags_are_invalid = !received.flags.is_empty();
+    if received.bytes != 1 || payload != [TARGET_RESERVATION_TRANSFER_MARKER] || flags_are_invalid {
+        return Err(ProfileError::UnsafeState(
+            "target reservation transfer frame is invalid".to_owned(),
+        ));
+    }
+
+    let mut descriptors = Vec::new();
+    let mut rights_messages = 0_usize;
+    for message in ancillary.drain() {
+        match message {
+            RecvAncillaryMessage::ScmRights(received_descriptors) => {
+                rights_messages += 1;
+                descriptors.extend(received_descriptors);
+            }
+            _ => {
+                return Err(ProfileError::UnsafeState(
+                    "target reservation transfer contained unsupported metadata".to_owned(),
+                ));
+            }
+        }
+    }
+    if rights_messages != 1 || descriptors.len() != 2 {
+        return Err(ProfileError::UnsafeState(
+            "target reservation transfer must contain exactly two descriptors".to_owned(),
+        ));
+    }
+    descriptors.try_into().map_err(|_| {
+        ProfileError::UnsafeState("target reservation descriptors are missing".to_owned())
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4906,24 +5439,31 @@ fn verify_received_provider_lock_ownership(
     provider: &File,
     path: &Path,
 ) -> Result<(), ProfileError> {
+    verify_received_lock_ownership(provider, path, "provider")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_received_lock_ownership(
+    received: &File,
+    path: &Path,
+    label: &str,
+) -> Result<(), ProfileError> {
     let probe = open_existing_private_lock_file(path)?;
     match FileExt::try_lock_exclusive(&probe) {
         Ok(()) => {
-            // No pre-existing B lock existed. Closing the probe releases the
-            // lock it just acquired; the received descriptor is not accepted.
             drop(probe);
-            return Err(ProfileError::UnsafeState(
-                "received provider descriptor was not already locked".to_owned(),
-            ));
+            return Err(ProfileError::UnsafeState(format!(
+                "received {label} descriptor was not already locked"
+            )));
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
         Err(error) => return Err(ProfileError::Io(error)),
     }
 
-    match FileExt::try_lock_exclusive(provider) {
+    match FileExt::try_lock_exclusive(received) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(ProfileError::UnsafeState(
-            "received provider descriptor does not own the active lock".to_owned(),
+            format!("received {label} descriptor does not own the active lock"),
         )),
         Err(error) => Err(ProfileError::Io(error)),
     }
@@ -7668,6 +8208,266 @@ config_file = "{sensitive_path}"
             drop(socket_cleanup);
         }
 
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn complete_target_reservation_promotes_without_a_or_b_reacquire_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("complete-target-reservation-promotion");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (parent, coordinator_channel) = UnixStream::pair()?;
+
+        let parent_awaiting = reservation
+            .send_target_reservation(&parent)
+            .map_err(|failure| (*failure).into_error())?;
+        let promoted = registry
+            .receive_target_reservation(&profile, &coordinator_channel)?
+            .send_ack()
+            .map_err(|failure| (*failure).into_error())?;
+        let parent_acknowledged = parent_awaiting
+            .receive_ack()
+            .map_err(|failure| (*failure).into_error())?;
+        parent_acknowledged.commit();
+
+        let busy = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("promoted reservation must keep A+B continuously locked")?;
+        assert_eq!(busy.code(), "profile_busy");
+        assert_eq!(promoted.profile(), &profile);
+
+        let (coordinator, guardian_channel) = UnixStream::pair()?;
+        let provider_awaiting = promoted
+            .send_provider_lease(&coordinator)
+            .map_err(|failure| (*failure).into_error())?;
+        let guardian = registry
+            .receive_profile_provider_lease(&profile, &guardian_channel)?
+            .send_ack()
+            .map_err(|failure| (*failure).into_error())?;
+        let coordinator = provider_awaiting
+            .receive_ack()
+            .map_err(|failure| (*failure).into_error())?
+            .commit()?
+            .into_coordinator_profile_lease();
+
+        let busy = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("split promoted authority must block a second writer")?;
+        assert_eq!(busy.code(), "profile_busy");
+        drop(coordinator);
+        let busy = registry
+            .lock_profile(&profile)
+            .err()
+            .ok_or("guardian B must survive coordinator A release")?;
+        assert_eq!(busy.code(), "profile_busy");
+        drop(guardian);
+
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn target_reservation_promotion_preserves_one_writer_across_1000_boundary_schedules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("target-reservation-promotion-stress");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+
+        for schedule in 0..1_000_u16 {
+            let assert_contender_blocked = |stage: &str| -> Result<(), Box<dyn std::error::Error>> {
+                let error = registry.lock_profile(&profile).err().ok_or_else(|| {
+                    format!("schedule {schedule} admitted a contender at {stage}")
+                })?;
+                if error.code() != "profile_busy" {
+                    return Err(format!(
+                        "schedule {schedule} returned {} instead of profile_busy at {stage}",
+                        error.code()
+                    )
+                    .into());
+                }
+                Ok(())
+            };
+            let checkpoint = schedule % 10;
+            let reservation = registry
+                .reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+            if checkpoint == 0 {
+                assert_contender_blocked("parent-reserved")?;
+            }
+            let (parent, coordinator_channel) = UnixStream::pair()?;
+            let parent_awaiting = reservation
+                .send_target_reservation(&parent)
+                .map_err(|failure| (*failure).into_error())?;
+            if checkpoint == 1 {
+                assert_contender_blocked("parent-frame-sent")?;
+            }
+            let coordinator_unacknowledged =
+                registry.receive_target_reservation(&profile, &coordinator_channel)?;
+            if checkpoint == 2 {
+                assert_contender_blocked("coordinator-provisional-a-b")?;
+            }
+            let promoted = coordinator_unacknowledged
+                .send_ack()
+                .map_err(|failure| (*failure).into_error())?;
+            if checkpoint == 3 {
+                assert_contender_blocked("coordinator-a-b-ack-sent")?;
+            }
+            let parent_acknowledged = parent_awaiting
+                .receive_ack()
+                .map_err(|failure| (*failure).into_error())?;
+            if checkpoint == 4 {
+                assert_contender_blocked("parent-a-b-ack-received")?;
+            }
+            parent_acknowledged.commit();
+            if checkpoint == 5 {
+                assert_contender_blocked("coordinator-promoted-a-b")?;
+            }
+
+            let (coordinator_channel, guardian_channel) = UnixStream::pair()?;
+            let provider_awaiting = promoted
+                .send_provider_lease(&coordinator_channel)
+                .map_err(|failure| (*failure).into_error())?;
+            if checkpoint == 6 {
+                assert_contender_blocked("guardian-b-frame-sent")?;
+            }
+            let guardian_unacknowledged =
+                registry.receive_profile_provider_lease(&profile, &guardian_channel)?;
+            if checkpoint == 7 {
+                assert_contender_blocked("guardian-provisional-b")?;
+            }
+            let guardian = guardian_unacknowledged
+                .send_ack()
+                .map_err(|failure| (*failure).into_error())?;
+            if checkpoint == 8 {
+                assert_contender_blocked("guardian-b-ack-sent")?;
+            }
+            let coordinator_acknowledged = provider_awaiting
+                .receive_ack()
+                .map_err(|failure| (*failure).into_error())?;
+            if checkpoint == 9 {
+                assert_contender_blocked("coordinator-b-ack-received")?;
+            }
+            let coordinator = coordinator_acknowledged
+                .commit()?
+                .into_coordinator_profile_lease();
+            drop(coordinator);
+            assert_eq!(
+                registry
+                    .lock_profile(&profile)
+                    .err()
+                    .ok_or("guardian B admitted a contender")?
+                    .code(),
+                "profile_busy",
+                "schedule {schedule} lost guardian B"
+            );
+            drop(guardian);
+            drop(registry.lock_profile(&profile)?);
+        }
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lost_target_reservation_ack_retains_sender_and_receiver_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("lost-target-reservation-ack");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let (sender, receiver) = UnixStream::pair()?;
+        let awaiting = reservation
+            .send_target_reservation(&sender)
+            .map_err(|failure| (*failure).into_error())?;
+        let received = registry.receive_target_reservation(&profile, &receiver)?;
+        receiver.shutdown(std::net::Shutdown::Write)?;
+
+        let failure = awaiting
+            .receive_ack()
+            .err()
+            .ok_or("closed coordinator channel must not acknowledge promotion")?;
+        let (awaiting, error) = (*failure).into_parts();
+        assert_eq!(error.code(), "io_error");
+        assert_eq!(
+            registry
+                .lock_profile(&profile)
+                .err()
+                .ok_or("lost ACK released the sender reservation")?
+                .code(),
+            "profile_busy"
+        );
+        drop(awaiting);
+        assert_eq!(
+            registry
+                .lock_profile(&profile)
+                .err()
+                .ok_or("receiver A+B did not survive sender cleanup")?
+                .code(),
+            "profile_busy"
+        );
+        drop(received);
+        drop(receiver);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn target_reservation_transfer_rejects_swapped_a_b_descriptors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::UnixStream;
+
+        let root = temporary_root("swapped-target-reservation-descriptors");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let reservation =
+            registry.reserve_verified_codex_target(&profile, |_, _| Ok(test_identity_adapter()))?;
+        let coordinator = reservation
+            .lease
+            .coordinator
+            .as_ref()
+            .ok_or("target reservation is missing A")?;
+        let provider = reservation
+            .lease
+            .provider
+            .as_ref()
+            .ok_or("target reservation is missing B")?;
+        let (sender, receiver) = UnixStream::pair()?;
+
+        send_target_reservation_descriptors(&sender, provider, coordinator)?;
+        let error = registry
+            .receive_target_reservation(&profile, &receiver)
+            .err()
+            .ok_or("swapped A/B descriptors must fail admission")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        assert_eq!(
+            registry
+                .lock_profile(&profile)
+                .err()
+                .ok_or("swapped descriptor rejection released parent A+B")?
+                .code(),
+            "profile_busy"
+        );
+
+        drop(reservation);
+        drop(lock_profile_after_exec_boundary(&registry, &profile)?);
         fs::remove_dir_all(root)?;
         Ok(())
     }

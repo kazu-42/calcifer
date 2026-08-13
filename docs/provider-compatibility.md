@@ -571,8 +571,10 @@ implemented. The explicit Linux
 ordinary launch switches a user's profile or imports a user's rollout.
 The gate receives no Calcifer profile, conversation registry, credential, or
 user rollout, and incompatibility therefore cannot mutate those states.
-The internal Linux/macOS no-gap target-reservation and guardian lease-transfer
-primitive is implemented. The separate lazy schema-v2 conversation lineage,
+The Linux public failover path consumes the Linux/macOS no-gap target-
+reservation primitive: it transfers A+B to the sealed coordinator and then B
+to the guardian with exact descriptor validation and same-channel ACKs. The
+separate lazy schema-v2 conversation lineage,
 provider-free transition journal, validated user-rollout/fork projection, and
 one-boundary crash recovery driver are also implemented but default-unused.
 The driver persists stop and fork intent before external effects, validates
