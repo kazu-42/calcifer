@@ -141,6 +141,16 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   transcript/trace paths, provider test hooks, and future override families
   before the official CLI starts. This keeps the selected profile authoritative
   and prevents implicit transcript recording.
+- Reauthentication never operates in the live profile home during browser
+  login. It holds both lifetime locks, revalidates the current private identity,
+  and launches official login in a fresh ownership-marked staging home with no
+  old credential. Only a version-gated same-identity candidate can enter the
+  journaled home-local rename transaction. The journal contains local IDs and
+  content revisions only; staged/current credentials are bounded private
+  single-link files. Recovery rolls back only before new visibility, keeps the
+  new file after visibility, and refuses ambiguous, linked, substituted, or
+  unsafe artifacts without following them. Neither failure output nor stable
+  output includes token, scope, path, identity material, or browser URL.
 - On Unix, Calcifer sets process umask `0077` before parsing commands, creating
   state, or spawning coordinator, guardian, login, App Server, or interactive
   provider children. This is process-global and happens before worker threads;

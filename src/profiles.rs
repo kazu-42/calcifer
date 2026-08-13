@@ -13,6 +13,8 @@ use uuid::Uuid;
 use crate::provider_identity::{IdentityError, IdentityKey, IdentityStore, ProviderIdentity};
 use crate::providers::codex::CodexIdentityAdapter;
 
+pub(crate) mod reauth;
+
 const REGISTRY_SCHEMA_VERSION: u8 = 1;
 const REGISTRY_FILE: &str = "profiles.json";
 const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
@@ -449,6 +451,7 @@ impl Registry {
     pub(crate) fn find_by_id(&self, provider: Provider, id: &str) -> Result<Profile, ProfileError> {
         validate_profile_id(id)?;
         self.recover_incomplete_removal()?;
+        self.recover_incomplete_reauth()?;
         self.find_by_id_without_recovery(provider, id)
     }
 
@@ -605,6 +608,7 @@ impl Registry {
 
     pub(crate) fn list(&self) -> Result<Vec<Profile>, ProfileError> {
         self.recover_incomplete_removal()?;
+        self.recover_incomplete_reauth()?;
         let mut profiles = self.load()?.profiles;
         profiles.sort_by(|left, right| {
             left.provider
@@ -617,6 +621,7 @@ impl Registry {
 
     pub(crate) fn find(&self, provider: Provider, alias: &str) -> Result<Profile, ProfileError> {
         self.recover_incomplete_removal()?;
+        self.recover_incomplete_reauth()?;
         self.find_without_recovery(provider, alias)
     }
 
@@ -657,6 +662,7 @@ impl Registry {
         confirmed_profile_id: Option<&str>,
     ) -> Result<Profile, ProfileError> {
         self.recover_incomplete_removal()?;
+        self.recover_incomplete_reauth()?;
         ensure_registration_supported()?;
         let selected = self.find_without_recovery(provider, alias)?;
         if confirmed_profile_id.is_some_and(|expected_id| expected_id != selected.id) {
@@ -1004,6 +1010,7 @@ impl Registry {
         new_alias: &str,
     ) -> Result<(Profile, bool), ProfileError> {
         self.recover_incomplete_removal()?;
+        self.recover_incomplete_reauth()?;
         validate_alias(new_alias)?;
         ensure_registration_supported()?;
 
@@ -1047,6 +1054,7 @@ impl Registry {
         alias: &str,
     ) -> Result<PendingProfile<'_>, ProfileError> {
         self.recover_incomplete_removal()?;
+        self.recover_incomplete_reauth()?;
         validate_alias(alias)?;
         ensure_registration_supported()?;
         self.ensure_root()?;
@@ -2794,8 +2802,6 @@ fn remove_owned_tombstone_at_with_limits(
     max_entries: usize,
     max_depth: usize,
 ) -> Result<(), ProfileError> {
-    use rustix::fs::{AtFlags, Dir, Mode, OFlags, fstat, open, statat, unlinkat};
-
     let tombstone_name = tombstone
         .file_name()
         .and_then(|name| name.to_str())
@@ -2805,6 +2811,30 @@ fn remove_owned_tombstone_at_with_limits(
             "profile removal path is outside its managed provider root".to_owned(),
         ));
     }
+    remove_owned_directory_at_with_limits(
+        provider_root,
+        tombstone_name,
+        expected_provider,
+        expected_tree,
+        expected_mount,
+        max_entries,
+        max_depth,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn remove_owned_directory_at_with_limits(
+    provider_root: &Path,
+    tree_name: &str,
+    expected_provider: FileSystemIdentity,
+    expected_tree: FileSystemIdentity,
+    expected_mount: &RemovalMountIdentity,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<(), ProfileError> {
+    use rustix::fs::{AtFlags, Dir, Mode, OFlags, fstat, open, statat, unlinkat};
+
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let provider_fd = open(provider_root, directory_flags, Mode::empty())
         .map_err(io::Error::from)
@@ -2816,7 +2846,7 @@ fn remove_owned_tombstone_at_with_limits(
         return Err(ProfileError::RemovalRecoveryRequired);
     }
     ensure_same_removal_mount(expected_mount, &removal_mount_identity_fd(&provider_fd)?)?;
-    let tree_fd = open_removal_entry_at(&provider_fd, tombstone_name, true, expected_mount)?;
+    let tree_fd = open_removal_entry_at(&provider_fd, tree_name, true, expected_mount)?;
     let tree_stat = fstat(&tree_fd)
         .map_err(io::Error::from)
         .map_err(ProfileError::Io)?;
@@ -2839,7 +2869,7 @@ fn remove_owned_tombstone_at_with_limits(
         0,
     )?;
 
-    let final_stat = statat(&provider_fd, tombstone_name, AtFlags::SYMLINK_NOFOLLOW)
+    let final_stat = statat(&provider_fd, tree_name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(io::Error::from)
         .map_err(ProfileError::Io)?;
     validate_opened_removal_entry(
@@ -2853,7 +2883,7 @@ fn remove_owned_tombstone_at_with_limits(
             "managed profile tree was replaced during cleanup".to_owned(),
         ));
     }
-    let final_tree_fd = open_removal_entry_at(&provider_fd, tombstone_name, true, expected_mount)?;
+    let final_tree_fd = open_removal_entry_at(&provider_fd, tree_name, true, expected_mount)?;
     let final_opened_stat = fstat(&final_tree_fd)
         .map_err(io::Error::from)
         .map_err(ProfileError::Io)?;
@@ -2868,9 +2898,47 @@ fn remove_owned_tombstone_at_with_limits(
             "managed profile tree was replaced during cleanup".to_owned(),
         ));
     }
-    unlinkat(&provider_fd, tombstone_name, AtFlags::REMOVEDIR)
+    unlinkat(&provider_fd, tree_name, AtFlags::REMOVEDIR)
         .map_err(io::Error::from)
         .map_err(ProfileError::Io)
+}
+
+#[cfg(unix)]
+fn remove_owned_reauth_staging_at(
+    provider_root: &Path,
+    staging: &Path,
+    expected_name: &str,
+    expected_tree: FileSystemIdentity,
+    max_entries: usize,
+) -> Result<(), ProfileError> {
+    if staging.parent() != Some(provider_root)
+        || staging.file_name().and_then(|name| name.to_str()) != Some(expected_name)
+        || !expected_name.starts_with(".reauth-")
+    {
+        return Err(ProfileError::ReauthRecoveryRequired);
+    }
+    let expected_provider = private_directory_identity(provider_root)?;
+    let expected_mount = removal_mount_identity_path(provider_root)?;
+    remove_owned_directory_at_with_limits(
+        provider_root,
+        expected_name,
+        expected_provider,
+        expected_tree,
+        &expected_mount,
+        max_entries,
+        MAX_REMOVAL_TREE_DEPTH,
+    )
+}
+
+#[cfg(not(unix))]
+fn remove_owned_reauth_staging_at(
+    _provider_root: &Path,
+    _staging: &Path,
+    _expected_name: &str,
+    _expected_tree: FileSystemIdentity,
+    _max_entries: usize,
+) -> Result<(), ProfileError> {
+    Err(ProfileError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -3837,6 +3905,8 @@ pub(crate) enum ProfileError {
     MissingDataRoot,
     NotFound(String),
     RegistrationRecoveryRequired,
+    ReauthCommitUncertain,
+    ReauthRecoveryRequired,
     RemovalCommitUncertain(io::Error),
     RemovalRecoveryRequired,
     RegistryCommitUncertain(io::Error),
@@ -3857,6 +3927,8 @@ impl ProfileError {
             Self::MissingDataRoot => "missing_data_root",
             Self::NotFound(_) => "profile_not_found",
             Self::RegistrationRecoveryRequired => "registration_recovery_required",
+            Self::ReauthCommitUncertain => "reauth_commit_uncertain",
+            Self::ReauthRecoveryRequired => "reauth_recovery_required",
             Self::RemovalCommitUncertain(_) => "removal_commit_uncertain",
             Self::RemovalRecoveryRequired => "removal_recovery_required",
             Self::RegistryCommitUncertain(_) => "registry_commit_uncertain",
@@ -3882,6 +3954,8 @@ impl ProfileError {
             Self::MissingDataRoot => "Calcifer could not determine a user data directory. Set CALCIFER_HOME to an absolute path.".to_owned(),
             Self::NotFound(reference) => format!("Profile {reference} was not found."),
             Self::RegistrationRecoveryRequired => "Calcifer could not roll back a partially published profile. Do not retry registration until the managed state has been inspected.".to_owned(),
+            Self::ReauthCommitUncertain => "The refreshed credential became visible but its durability or cleanup could not be confirmed. Inspect the profile with `calcifer auth verify codex@<alias>` before retrying re-authentication.".to_owned(),
+            Self::ReauthRecoveryRequired => "Calcifer found incomplete or ambiguous staged re-authentication state. The visible credential was not guessed or rolled back; inspect the managed profile before retrying.".to_owned(),
             Self::RemovalCommitUncertain(error) => {
                 let _ = error.kind();
                 "The local profile removal reached a commit boundary whose durability could not be confirmed. Run `calcifer auth list` to complete bounded recovery before retrying.".to_owned()

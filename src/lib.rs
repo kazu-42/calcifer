@@ -211,6 +211,17 @@ where
                     Err(error) => render_app_error("auth", &error, cli.json),
                 },
             },
+            AuthCommand::Reauth { profile } => {
+                if cli.json {
+                    return render_app_error("auth", &AppError::InteractiveJsonUnsupported, true);
+                }
+                match profile.provider {
+                    ProviderArgument::Codex => match commands::auth::reauth_codex(&profile.alias) {
+                        Ok(report) => render_auth_report(&report, false),
+                        Err(error) => render_app_error("auth", &error, false),
+                    },
+                }
+            }
             AuthCommand::Rename { profile, new_alias } => match profile.provider {
                 ProviderArgument::Codex => {
                     match commands::auth::rename_codex(&profile.alias, &new_alias) {

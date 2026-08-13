@@ -28,7 +28,7 @@ pub(crate) enum Commands {
     /// Inspect the local environment without reading or changing credentials.
     Doctor,
 
-    /// Register, verify, rename, remove, or list isolated provider profiles.
+    /// Register, verify, re-authenticate, rename, remove, or list isolated profiles.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -243,6 +243,12 @@ pub(crate) enum AuthCommand {
     /// Verify a legacy profile's private provider identity without logging in.
     Verify {
         /// Existing profile to verify, for example codex@work.
+        profile: ProfileReference,
+    },
+
+    /// Refresh one profile through the provider's official login flow.
+    Reauth {
+        /// Existing profile to re-authenticate, for example codex@work.
         profile: ProfileReference,
     },
 

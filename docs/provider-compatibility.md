@@ -121,6 +121,27 @@ against registration. Future automatic selection must rederive and compare the
 binding under the same retained lease. Key loss/replacement, credential drift,
 or ambiguous legacy duplicates stop selection and require explicit recovery.
 
+### Staged Codex reauthentication
+
+`calcifer auth reauth codex@<alias>` delegates browser authentication entirely
+to official `codex login`. Calcifer first version-gates and revalidates the
+currently bound credential while holding the profile's complete lifetime
+lease. It then creates a new private staging `CODEX_HOME` with the same managed
+file credential-store policy and sanitized environment; no old token or
+credential file is copied into that home. The provider-side lease is inherited
+only by the exact login/App Server children, so a selectively surviving child
+keeps competing profile operations busy.
+
+The staged `auth.json` must remain a bounded, private, single-link regular file
+with the supported `chatgpt` projection and an effective `tokens.account_id`
+that derives the same private identity as the existing marker. A different
+account, API-key mode, unsupported Codex version, malformed/oversized file, or
+identity-key failure cannot reach credential visibility. Successful commit
+replaces only the existing profile's credential; configuration, sessions,
+rollouts, identity marker, and Calcifer conversation records are not copied or
+rewritten. The journaled recovery state is provider-private and contains no raw
+scope, token, email, browser URL, or public fingerprint.
+
 Relevant upstream sources:
 
 - [Codex 0.144.4 persisted token model](https://github.com/openai/codex/blob/8c68d4c87dc54d38861f5114e920c3de2efa5876/codex-rs/login/src/token_data.rs#L10-L41);

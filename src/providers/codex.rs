@@ -312,6 +312,22 @@ pub(crate) fn managed_command(executable: &Path, codex_home: &Path) -> Command {
     command
 }
 
+/// Runs the official interactive login while the provider-side profile lease
+/// remains inherited by the exact child. The child owns the browser/terminal
+/// flow; Calcifer supplies only the private managed home and fixed file-store
+/// policy.
+pub(crate) fn run_managed_login(
+    executable: &Path,
+    codex_home: &Path,
+    working_directory: &Path,
+    inherited_provider_lease: Option<&File>,
+) -> io::Result<std::process::ExitStatus> {
+    let mut command = managed_command(executable, codex_home);
+    command.arg("login").current_dir(working_directory);
+    let mut child = spawn_with_optional_inherited_fd(command, inherited_provider_lease)?;
+    wait_for_child(&mut child)
+}
+
 /// Removes provider-owned secrets and routing controls before a process in the
 /// managed Codex launch chain starts.
 pub(crate) fn sanitize_managed_environment(command: &mut Command) {
