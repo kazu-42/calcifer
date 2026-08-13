@@ -27,7 +27,9 @@ The release workflow enforces these boundaries:
   matrix through the public `resume --experimental-supervised --failover-pool`
   command. It requires all 20 expected outcomes, zero unexpected provider
   starts, a p95 duration bucket below five seconds, and proof that its
-  controlled integration regression is rejected. Its uploaded JSON contains
+  controlled integration regression is rejected. Its source/target crash
+  cases must also resume the production durable handoff transaction without a
+  second fork. Its uploaded JSON contains
   only fixed outcome codes, local fixture aliases, bounded counts, recovery
   results, and duration buckets.
 - The repository quality gate runs again before release builds start.

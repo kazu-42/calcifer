@@ -317,7 +317,7 @@ pub(crate) struct ForkCandidate<T> {
 }
 
 impl<T> ForkCandidate<T> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-failover-scorecard"))]
     pub(crate) fn matching(thread_id: String, target: T) -> Self {
         Self {
             thread_id,

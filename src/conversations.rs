@@ -1486,9 +1486,13 @@ impl ConversationRegistry {
         ConversationError::CommitUncertain
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-failover-scorecard"))]
     pub(crate) fn at(root: PathBuf) -> Self {
-        Self { root, fault: None }
+        Self {
+            root,
+            #[cfg(test)]
+            fault: None,
+        }
     }
 
     #[cfg(test)]

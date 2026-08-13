@@ -221,9 +221,14 @@ pub(crate) fn resume_supervised_with_failover(
         .resolve_pool_id(pool_provider, pool_reference)
         .map_err(CodexFailoverError::Definition)?;
     #[cfg(feature = "internal-failover-scorecard")]
-    if let Some(result) =
-        scorecard::run_if_requested(registry, initial_profile, &definitions, &pool_id)
-    {
+    if let Some(result) = scorecard::run_if_requested(
+        registry,
+        initial_profile,
+        &definitions,
+        &pool_id,
+        working_directory,
+        initial_thread_id,
+    ) {
         return result;
     }
     let conversations = ConversationRegistry::from_profiles(registry);

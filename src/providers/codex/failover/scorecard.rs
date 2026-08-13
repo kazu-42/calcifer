@@ -4,11 +4,11 @@
 //! prepares real private profiles and routing definitions through public
 //! commands, then invokes public supervised resume once per fixed scenario.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -16,8 +16,16 @@ use std::process::ExitStatus;
 use serde::Serialize;
 
 use super::{CodexFailoverError, PoolStopKind};
+use crate::conversations::{
+    BindingInput, ConversationLifecycle, ConversationRegistry, GenerationRollout, HandoffPhase,
+    HandoffPreparation, HandoffReason, HandoffTarget, RolloutFingerprint, RolloutLocator,
+    RolloutRoot,
+};
 use crate::profiles::{Profile, Provider, Registry};
 use crate::providers::codex::CodexCompatibilityStatus;
+use crate::providers::codex::handoff_transaction::{
+    ForkCandidate, HandoffExecutionError, HandoffRuntime, HandoffStep, resume_handoff_once,
+};
 use crate::routing::selection::{
     HandoffSelection, ReservationResult, ReservedCandidate, SelectionError, SelectionOutcome,
     SelectionRuntime, SelectionTrigger, select_once,
@@ -106,14 +114,6 @@ impl Scenario {
             Self::CooldownExhaustion => "cooldown_exhaustion",
         }
     }
-
-    const fn recovery_result(self) -> &'static str {
-        match self {
-            Self::SourceCrashRecovery => "source_recovered",
-            Self::TargetCrashRecovery => "target_recovered",
-            _ => "none",
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +128,8 @@ struct FixtureRuntime<'registry> {
     registry: &'registry Registry,
     behavior: RuntimeBehavior,
     provider_start_count: u8,
+    recovery: Option<RecoveryFixture<'registry>>,
+    recovery_result: &'static str,
 }
 
 impl SelectionRuntime for FixtureRuntime<'_> {
@@ -172,10 +174,98 @@ impl SelectionRuntime for FixtureRuntime<'_> {
 
     fn handoff(
         &mut self,
-        _selection: HandoffSelection<Self::Reservation>,
+        selection: HandoffSelection<Self::Reservation>,
     ) -> Result<u64, Self::Error> {
         self.provider_start_count = self.provider_start_count.saturating_add(1);
+        if let Some(recovery) = self.recovery.take() {
+            run_transaction_recovery(&selection, recovery)?;
+            self.recovery_result = recovery.scenario.result();
+        }
         Ok(2)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryFixture<'value> {
+    root: &'value Path,
+    working_directory: &'value Path,
+    source_thread_id: &'value str,
+    scenario: RecoveryScenario,
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryScenario {
+    SourceCrash,
+    TargetCrash,
+}
+
+impl RecoveryScenario {
+    const fn result(self) -> &'static str {
+        match self {
+            Self::SourceCrash => "source_recovered",
+            Self::TargetCrash => "target_recovered",
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecoveryRuntime {
+    inventories: VecDeque<Vec<ForkCandidate<HandoffTarget>>>,
+    stop_count: u8,
+    fork_count: u8,
+    attach_count: u8,
+    fail_stop_after_effect: bool,
+    fail_attach_after_effect: bool,
+}
+
+impl HandoffRuntime for RecoveryRuntime {
+    type Error = ();
+
+    fn stop_and_reap_source(
+        &mut self,
+        _transition: &crate::conversations::HandoffTransition,
+    ) -> Result<(), Self::Error> {
+        self.stop_count = self.stop_count.saturating_add(1);
+        if std::mem::take(&mut self.fail_stop_after_effect) {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn capture_target_baseline(
+        &mut self,
+        _transition: &crate::conversations::HandoffTransition,
+    ) -> Result<Vec<String>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn request_fork(
+        &mut self,
+        _transition: &crate::conversations::HandoffTransition,
+    ) -> Result<(), Self::Error> {
+        self.fork_count = self.fork_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn reconcile_target_inventory(
+        &mut self,
+        _transition: &crate::conversations::HandoffTransition,
+    ) -> Result<Vec<ForkCandidate<HandoffTarget>>, Self::Error> {
+        Ok(self.inventories.pop_front().unwrap_or_default())
+    }
+
+    fn attach_committed_target(
+        &mut self,
+        transition: &crate::conversations::HandoffTransition,
+    ) -> Result<(), Self::Error> {
+        if transition.observed_target.is_none() {
+            return Err(());
+        }
+        self.attach_count = self.attach_count.saturating_add(1);
+        if std::mem::take(&mut self.fail_attach_after_effect) {
+            return Err(());
+        }
+        Ok(())
     }
 }
 
@@ -190,14 +280,34 @@ struct Projection<'value> {
     recovery_result: &'value str,
 }
 
+struct CaseContext<'value> {
+    registry: &'value Registry,
+    source: &'value Profile,
+    definitions: &'value Definitions,
+    pool: &'value EnabledPool,
+    working_directory: &'value Path,
+    source_thread_id: &'value str,
+    recovery_root: &'value Path,
+}
+
 pub(super) fn run_if_requested(
     registry: &Registry,
     source: &Profile,
     definitions: &Definitions,
     pool_id: &str,
+    working_directory: &Path,
+    source_thread_id: &str,
 ) -> Option<Result<ExitStatus, CodexFailoverError>> {
     let mode = env::var_os(MODE_ENV)?;
-    Some(run(registry, source, definitions, pool_id, mode))
+    Some(run(
+        registry,
+        source,
+        definitions,
+        pool_id,
+        working_directory,
+        source_thread_id,
+        mode,
+    ))
 }
 
 fn run(
@@ -205,6 +315,8 @@ fn run(
     source: &Profile,
     definitions: &Definitions,
     pool_id: &str,
+    working_directory: &Path,
+    source_thread_id: &str,
     mode: std::ffi::OsString,
 ) -> Result<ExitStatus, CodexFailoverError> {
     if mode != MODE {
@@ -221,7 +333,22 @@ fn run(
     let pool = definitions
         .enabled_pool_for_source(pool_id, &source.id, Provider::Codex)
         .map_err(CodexFailoverError::Definition)?;
-    let (mut projection, result) = execute_case(registry, source, definitions, &pool, scenario);
+    let recovery_root = report
+        .parent()
+        .ok_or(CodexFailoverError::Protocol)?
+        .join(format!("recovery-{}", scenario.label()));
+    let (mut projection, result) = execute_case(
+        CaseContext {
+            registry,
+            source,
+            definitions,
+            pool: &pool,
+            working_directory,
+            source_thread_id,
+            recovery_root: &recovery_root,
+        },
+        scenario,
+    );
     if scenario == Scenario::StaleUsage
         && env::var(INJECT_ENV).as_deref() == Ok("unexpected_target_start")
     {
@@ -232,12 +359,18 @@ fn run(
 }
 
 fn execute_case<'value>(
-    registry: &Registry,
-    source: &'value Profile,
-    definitions: &Definitions,
-    pool: &EnabledPool,
+    context: CaseContext<'value>,
     scenario: Scenario,
 ) -> (Projection<'value>, Result<ExitStatus, CodexFailoverError>) {
+    let CaseContext {
+        registry,
+        source,
+        definitions,
+        pool,
+        working_directory,
+        source_thread_id,
+        recovery_root,
+    } = context;
     let direct_error = match scenario {
         Scenario::RoundedHundredWithoutReachedType
         | Scenario::StaleUsage
@@ -260,7 +393,7 @@ fn execute_case<'value>(
                 target_alias: None,
                 generation_count: 1,
                 provider_start_count: 1,
-                recovery_result: scenario.recovery_result(),
+                recovery_result: "none",
             },
             Err(error),
         );
@@ -276,6 +409,22 @@ fn execute_case<'value>(
         registry,
         behavior,
         provider_start_count: 1,
+        recovery: match scenario {
+            Scenario::SourceCrashRecovery => Some(RecoveryFixture {
+                root: recovery_root,
+                working_directory,
+                source_thread_id,
+                scenario: RecoveryScenario::SourceCrash,
+            }),
+            Scenario::TargetCrashRecovery => Some(RecoveryFixture {
+                root: recovery_root,
+                working_directory,
+                source_thread_id,
+                scenario: RecoveryScenario::TargetCrash,
+            }),
+            _ => None,
+        },
+        recovery_result: "none",
     };
     let trigger_profile = if scenario == Scenario::MembershipChange {
         "01900000-0000-7000-8000-000000000999"
@@ -347,7 +496,7 @@ fn execute_case<'value>(
                 target_alias,
                 generation_count: 2,
                 provider_start_count: runtime.provider_start_count,
-                recovery_result: scenario.recovery_result(),
+                recovery_result: runtime.recovery_result,
             };
             (projection, Ok(ExitStatus::from_raw(0)))
         }
@@ -376,6 +525,191 @@ fn execute_case<'value>(
             runtime.provider_start_count,
         ),
         Err(error) => direct_projection(source, scenario, error, runtime.provider_start_count),
+    }
+}
+
+fn run_transaction_recovery(
+    selection: &HandoffSelection<()>,
+    fixture: RecoveryFixture<'_>,
+) -> Result<(), ()> {
+    // This private registry is deliberately real, not an in-memory model. The
+    // two scorecard cases cross an external-effect-before-journal boundary,
+    // reconstruct both the registry handle and runtime, and resume through the
+    // production transaction driver before a recovery result can be emitted.
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(fixture.root)
+        .map_err(|_| ())?;
+    let canonical_cwd = fs::canonicalize(fixture.working_directory).map_err(|_| ())?;
+    let conversations = ConversationRegistry::at(fixture.root.to_owned());
+    let source = conversations
+        .adopt(BindingInput {
+            profile_id: selection.source().id.clone(),
+            thread_id: fixture.source_thread_id.to_owned(),
+            canonical_cwd: canonical_cwd.to_string_lossy().into_owned(),
+            codex_version: "0.144.4".to_owned(),
+            lifecycle: ConversationLifecycle::Clean,
+        })
+        .map_err(|_| ())?;
+    conversations
+        .prepare_handoff(HandoffPreparation {
+            expected_source: source,
+            target_profile_id: selection.target().id.clone(),
+            trust_domain_id: selection.trust_domain_id().to_owned(),
+            reason: HandoffReason::ConfirmedUsageExhaustion,
+            source_rollout: recovery_rollout(129),
+        })
+        .map_err(|_| ())?;
+
+    let target_thread_id = "01900000-0000-7000-8000-000000000130".to_owned();
+    let target = HandoffTarget {
+        thread_id: target_thread_id.clone(),
+        canonical_cwd: canonical_cwd.to_string_lossy().into_owned(),
+        codex_version: "0.144.4".to_owned(),
+        rollout: recovery_rollout(130),
+    };
+    let mut first = RecoveryRuntime {
+        fail_stop_after_effect: matches!(fixture.scenario, RecoveryScenario::SourceCrash),
+        ..RecoveryRuntime::default()
+    };
+
+    expect_advanced(
+        resume_handoff_once(&conversations, &mut first),
+        HandoffPhase::SourceStopRequested,
+    )?;
+    if matches!(fixture.scenario, RecoveryScenario::SourceCrash) {
+        let persisted = ConversationRegistry::at(fixture.root.to_owned());
+        if !matches!(
+            resume_handoff_once(&conversations, &mut first),
+            Err(HandoffExecutionError::Runtime(()))
+        ) || persisted
+            .current_handoff()
+            .map_err(|_| ())?
+            .is_none_or(|transition| transition.phase != HandoffPhase::SourceStopRequested)
+        {
+            return Err(());
+        }
+    } else {
+        expect_advanced(
+            resume_handoff_once(&conversations, &mut first),
+            HandoffPhase::SourceStopped,
+        )?;
+    }
+
+    let recovered_conversations = ConversationRegistry::at(fixture.root.to_owned());
+    let mut recovered = RecoveryRuntime {
+        inventories: VecDeque::from([vec![ForkCandidate::matching(target_thread_id, target)]]),
+        ..RecoveryRuntime::default()
+    };
+    if matches!(fixture.scenario, RecoveryScenario::SourceCrash) {
+        expect_advanced(
+            resume_handoff_once(&recovered_conversations, &mut recovered),
+            HandoffPhase::SourceStopped,
+        )?;
+    }
+    expect_advanced(
+        resume_handoff_once(&recovered_conversations, &mut recovered),
+        HandoffPhase::ForkRequested,
+    )?;
+    expect_advanced(
+        resume_handoff_once(&recovered_conversations, &mut recovered),
+        HandoffPhase::ForkObserved,
+    )?;
+    expect_advanced(
+        resume_handoff_once(&recovered_conversations, &mut recovered),
+        HandoffPhase::CommittedUnattached,
+    )?;
+
+    if matches!(fixture.scenario, RecoveryScenario::TargetCrash) {
+        recovered.fail_attach_after_effect = true;
+        let persisted = ConversationRegistry::at(fixture.root.to_owned());
+        if !matches!(
+            resume_handoff_once(&recovered_conversations, &mut recovered),
+            Err(HandoffExecutionError::Runtime(()))
+        ) || persisted
+            .current_handoff()
+            .map_err(|_| ())?
+            .is_none_or(|transition| transition.phase != HandoffPhase::CommittedUnattached)
+        {
+            return Err(());
+        }
+    }
+
+    let final_conversations = ConversationRegistry::at(fixture.root.to_owned());
+    let mut final_runtime = RecoveryRuntime::default();
+    let attached = resume_handoff_once(&final_conversations, &mut final_runtime).map_err(|_| ())?;
+    let HandoffStep::Attached(head) = attached else {
+        return Err(());
+    };
+    let total_forks = first
+        .fork_count
+        .saturating_add(recovered.fork_count)
+        .saturating_add(final_runtime.fork_count);
+    let total_stops = first
+        .stop_count
+        .saturating_add(recovered.stop_count)
+        .saturating_add(final_runtime.stop_count);
+    let total_attaches = first
+        .attach_count
+        .saturating_add(recovered.attach_count)
+        .saturating_add(final_runtime.attach_count);
+    let expected_attaches = if matches!(fixture.scenario, RecoveryScenario::TargetCrash) {
+        2
+    } else {
+        1
+    };
+    let expected_stops = if matches!(fixture.scenario, RecoveryScenario::SourceCrash) {
+        2
+    } else {
+        1
+    };
+    if head.generation != 1
+        || head.profile_id != selection.target().id
+        || head.thread_id != "01900000-0000-7000-8000-000000000130"
+        || total_forks != 1
+        || total_stops != expected_stops
+        || total_attaches != expected_attaches
+        || final_conversations
+            .current_handoff()
+            .map_err(|_| ())?
+            .is_some()
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn expect_advanced(
+    result: Result<HandoffStep, HandoffExecutionError<()>>,
+    expected: HandoffPhase,
+) -> Result<(), ()> {
+    match result.map_err(|_| ())? {
+        HandoffStep::Advanced(actual) if actual == expected => Ok(()),
+        HandoffStep::Advanced(_)
+        | HandoffStep::RequiresExplicitReconciliation(_)
+        | HandoffStep::Attached(_) => Err(()),
+    }
+}
+
+fn recovery_rollout(seed: u64) -> GenerationRollout {
+    GenerationRollout {
+        locator: RolloutLocator {
+            root: RolloutRoot::Sessions,
+            relative_path: format!("2026-08-13-scorecard-{seed}.jsonl"),
+        },
+        fingerprint: RolloutFingerprint {
+            device: 1,
+            inode: seed,
+            length: seed,
+            mode: 0o100600,
+            owner: rustix::process::getuid().as_raw(),
+            link_count: 1,
+            modified_seconds: 1_786_579_200,
+            modified_nanoseconds: 1,
+            changed_seconds: 1_786_579_200,
+            changed_nanoseconds: 2,
+            sha256: format!("{seed:064x}"),
+        },
     }
 }
 
@@ -408,7 +742,7 @@ fn direct_projection<'value>(
             target_alias: None,
             generation_count: 1,
             provider_start_count,
-            recovery_result: scenario.recovery_result(),
+            recovery_result: "none",
         },
         Err(error),
     )

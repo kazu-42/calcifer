@@ -770,6 +770,11 @@ and durable commit, then promotes it through the production supervisor.
 CI also compiles a separate `internal-failover-scorecard` fixture and invokes
 the public guarded-resume command in a fresh private home for a fixed 20-case
 scenario matrix. The default release binary cannot enter this fixture. The
+source-crash and target-crash cases persist a real private conversation
+journal, fail after the idempotent stop or attach effect, reconstruct their
+runtime, and resume through the production transaction driver. They reject a
+replayed fork or an incomplete generation attachment before reporting
+recovery. The
 scorecard accepts only fixed outcome codes, the local aliases `source` and
 `target`, bounded generation/provider-start counts, fixed recovery results, and
 coarse duration buckets. It rejects extra fields, an unexpected provider start,

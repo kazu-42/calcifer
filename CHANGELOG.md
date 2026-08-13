@@ -16,6 +16,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CI and the release workflow now run a fixed, privacy-allowlisted 20-scenario
   guarded-failover scorecard through the public CLI, reject a controlled
   unexpected-provider-start regression, enforce a sub-five-second p95 bucket,
+  exercise durable source/target crash recovery without replaying the fork,
   and bind the release artifact to the exact source commit.
 
 ## [0.1.0-alpha.5] - 2026-08-13
