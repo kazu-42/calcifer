@@ -214,27 +214,35 @@ jobs:
           - os: ubuntu-24.04
             suite: contracts
             scenario: contracts
-            job_timeout_minutes: 25
-          - os: macos-latest
-            suite: contracts
-            scenario: contracts
-            job_timeout_minutes: 25
+            hermetic_support: supported
+            job_timeout_minutes: 45
+            probe_watchdog_seconds: 420
+            probe_expected_count: 4
+            probe_post_cleanup_margin_seconds: 780
           - os: ubuntu-24.04
             suite: official-tui
             scenario: official-tui-normal
+            hermetic_support: supported
             job_timeout_minutes: 45
-          - os: macos-latest
-            suite: official-tui
-            scenario: official-tui-normal
-            job_timeout_minutes: 45
+            probe_watchdog_seconds: 1680
+            probe_expected_count: 1
+            probe_post_cleanup_margin_seconds: 960
           - os: ubuntu-24.04
             suite: official-tui
             scenario: official-tui-recovery
+            hermetic_support: supported
             job_timeout_minutes: 45
+            probe_watchdog_seconds: 1680
+            probe_expected_count: 1
+            probe_post_cleanup_margin_seconds: 960
           - os: macos-latest
-            suite: official-tui
-            scenario: official-tui-recovery
-            job_timeout_minutes: 45
+            suite: unsupported
+            scenario: macos-hermetic-unsupported
+            hermetic_support: unsupported
+            job_timeout_minutes: 2
+            probe_watchdog_seconds: 1
+            probe_expected_count: 1
+            probe_post_cleanup_margin_seconds: 1
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.job_timeout_minutes }}
     env:
@@ -250,14 +258,33 @@ jobs:
       PACKAGE_OFFICIAL_TUI_WATCHDOG_MARGIN_SECONDS: 180
       PACKAGE_OFFICIAL_TUI_JOB_MARGIN_SECONDS: 1020
       PACKAGE_OFFICIAL_TUI_JOB_TIMEOUT_MINUTES: ${{ matrix.job_timeout_minutes }}
+      PACKAGE_PROBE_WATCHDOG_SECONDS: ${{ matrix.probe_watchdog_seconds }}
+      PACKAGE_PROBE_EXPECTED_COUNT: ${{ matrix.probe_expected_count }}
+      PACKAGE_PROBE_POST_CLEANUP_MARGIN_SECONDS: ${{ matrix.probe_post_cleanup_margin_seconds }}
+      PACKAGE_PROBE_JOB_TIMEOUT_MINUTES: ${{ matrix.job_timeout_minutes }}
     steps:
+      - name: Report macOS hermetic package probes as unsupported
+        if: matrix.hermetic_support == 'unsupported'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS:?}" != macOS ]]; then
+            echo "The unsupported hermetic-probe lane ran on an unexpected OS." >&2
+            exit 1
+          fi
+          unsupported_scenarios=(contracts official-tui-normal official-tui-recovery)
+          printf '::notice title=Hermetic pinned Codex probes unsupported on macOS::%s\n' \
+            "${unsupported_scenarios[*]} require a reviewed public OS-owned network boundary; there is no native-network fallback."
       - name: Check out source
+        if: matrix.hermetic_support == 'supported'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Rust
+        if: matrix.hermetic_support == 'supported'
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Prepare checksum-pinned Codex package
+        if: matrix.hermetic_support == 'supported'
         shell: bash
         run: |
           set -euo pipefail
@@ -356,52 +383,8 @@ jobs:
 
           echo "CALCIFER_CODEX_COMPAT_BINARY=${binary}" >> "${GITHUB_ENV:?}"
           retain_scratch=true
-      - name: Run pinned Codex contract probes
-        if: matrix.suite == 'contracts'
-        shell: bash
-        run: |
-          set -euo pipefail
-          export LC_ALL=C
-
-          if [[ ! -f "${CALCIFER_CODEX_COMPAT_BINARY:?}" || -L "${CALCIFER_CODEX_COMPAT_BINARY}" || ! -x "${CALCIFER_CODEX_COMPAT_BINARY}" ]]; then
-            echo "The pinned Codex binary was not a canonical executable file." >&2
-            exit 1
-          fi
-          test_names=(
-            'providers::codex::handoff_compat::tests::packaged_codex_0_144_4_passes_the_complete_handoff_probe'
-            'providers::codex::supervisor::packaged_smoke::packaged_codex_running_turn_obeys_the_pinned_graceful_drain_contract'
-            'providers::codex::supervisor::packaged_smoke::packaged_codex_detached_tool_inherits_no_calcifer_authority'
-            'providers::codex::supervisor::packaged_smoke::packaged_codex_typed_monitor_accepts_usage_and_redacts_provider_failure'
-          )
-          for test_name in "${test_names[@]}"; do
-            discovered="$(
-              cargo +1.96.0 test \
-                --lib \
-                --all-features \
-                --locked \
-                "${test_name}" \
-                -- \
-                --exact \
-                --ignored \
-                --list \
-                --format terse
-            )"
-            if ! grep -Fqx -- "${test_name}: test" <<<"${discovered}"; then
-              echo "Pinned Codex package test was not discovered: ${test_name}" >&2
-              exit 1
-            fi
-            cargo +1.96.0 test \
-              --lib \
-              --all-features \
-              --locked \
-              "${test_name}" \
-              -- \
-              --exact \
-              --ignored \
-              --nocapture
-          done
-      - name: Build and verify the package TUI launcher fixture
-        if: matrix.suite == 'official-tui'
+      - name: Build and verify the package launcher fixture
+        if: matrix.hermetic_support == 'supported'
         shell: bash
         run: |
           set -euo pipefail
@@ -440,24 +423,37 @@ jobs:
             exit 1
           fi
           echo "CALCIFER_PACKAGE_TUI_LAUNCHER=${fixture_binary}" >> "${GITHUB_ENV:?}"
-      - name: Prepare the exact official Codex TUI libtest
-        if: matrix.suite == 'official-tui'
+      - name: Prepare the exact hermetic package libtest
+        if: matrix.hermetic_support == 'supported'
         shell: bash
         env:
-          PACKAGE_OFFICIAL_TUI_SCENARIO: ${{ matrix.scenario }}
+          PACKAGE_PROBE_SCENARIO: ${{ matrix.scenario }}
+          PACKAGE_PROBE_SUITE: ${{ matrix.suite }}
         run: |
           set -euo pipefail
           export LC_ALL=C
 
-          case "${PACKAGE_OFFICIAL_TUI_SCENARIO:?}" in
+          case "${PACKAGE_PROBE_SCENARIO:?}" in
+            contracts)
+              test_names=(
+                'providers::codex::handoff_compat::tests::packaged_codex_0_144_4_passes_the_complete_handoff_probe'
+                'providers::codex::supervisor::packaged_smoke::packaged_codex_running_turn_obeys_the_pinned_graceful_drain_contract'
+                'providers::codex::supervisor::packaged_smoke::packaged_codex_detached_tool_inherits_no_calcifer_authority'
+                'providers::codex::supervisor::packaged_smoke::packaged_codex_typed_monitor_accepts_usage_and_redacts_provider_failure'
+              )
+              ;;
             official-tui-normal)
-              test_name='providers::codex::supervisor::packaged_smoke::packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_and_job_control'
+              test_names=(
+                'providers::codex::supervisor::packaged_smoke::packaged_codex_official_tui_uses_production_coordinator_guardian_session_pty_and_job_control'
+              )
               ;;
             official-tui-recovery)
-              test_name='providers::codex::supervisor::packaged_smoke::packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proofs'
+              test_names=(
+                'providers::codex::supervisor::packaged_smoke::packaged_codex_official_tui_recovers_retained_cleanup_pending_with_four_proofs'
+              )
               ;;
             *)
-              echo "Unknown official TUI scenario: ${PACKAGE_OFFICIAL_TUI_SCENARIO}" >&2
+              echo "Unknown hermetic package scenario: ${PACKAGE_PROBE_SCENARIO}" >&2
               exit 1
               ;;
           esac
@@ -470,14 +466,16 @@ jobs:
             exit 1
           fi
           command -v jq >/dev/null
-          python3 scripts/run_with_watchdog.py validate-budget \
-            --rust-source src/providers/codex/supervisor/packaged_smoke.rs \
-            --rust-constant PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT \
-            --internal-fence-seconds "${PACKAGE_INTERNAL_FENCE_SECONDS:?}" \
-            --watchdog-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS:?}" \
-            --watchdog-margin-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_MARGIN_SECONDS:?}" \
-            --job-timeout-minutes "${PACKAGE_OFFICIAL_TUI_JOB_TIMEOUT_MINUTES:?}" \
-            --job-margin-seconds "${PACKAGE_OFFICIAL_TUI_JOB_MARGIN_SECONDS:?}"
+          if [[ "${PACKAGE_PROBE_SUITE:?}" == official-tui ]]; then
+            python3 scripts/run_with_watchdog.py validate-budget \
+              --rust-source src/providers/codex/supervisor/packaged_smoke.rs \
+              --rust-constant PACKAGE_SUPERVISOR_EXTERNAL_HARD_TIMEOUT \
+              --internal-fence-seconds "${PACKAGE_INTERNAL_FENCE_SECONDS:?}" \
+              --watchdog-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS:?}" \
+              --watchdog-margin-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_MARGIN_SECONDS:?}" \
+              --job-timeout-minutes "${PACKAGE_OFFICIAL_TUI_JOB_TIMEOUT_MINUTES:?}" \
+              --job-margin-seconds "${PACKAGE_OFFICIAL_TUI_JOB_MARGIN_SECONDS:?}"
+          fi
 
           metadata_paths=()
           cleanup_metadata() {
@@ -526,38 +524,35 @@ jobs:
             exit 1
           fi
 
-          # Consume the entire list so libtest cannot observe BrokenPipe.
-          "${test_binary}" \
-            "${test_name}" \
-            --exact \
-            --ignored \
-            --list \
-            --format terse \
-            > "${test_list}"
-          if [[ "$(grep -Fxc -- "${test_name}: test" "${test_list}")" != 1 ]]; then
-            echo "Pinned Codex package test was not discovered: ${test_name}" >&2
-            exit 1
-          fi
-          echo "CALCIFER_PACKAGE_TUI_TEST_BINARY=${test_binary}" >> "${GITHUB_ENV:?}"
-          echo "CALCIFER_PACKAGE_TUI_TEST_NAME=${test_name}" >> "${GITHUB_ENV}"
-      - name: Run official Codex TUI native functional probe
-        if: matrix.suite == 'official-tui' && runner.os != 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          export LC_ALL=C
-
-          python3 scripts/run_with_watchdog.py run \
-            --timeout-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS:?}" \
-            --term-grace-seconds 30 \
-            -- \
-            "${CALCIFER_PACKAGE_TUI_TEST_BINARY:?}" \
-              "${CALCIFER_PACKAGE_TUI_TEST_NAME:?}" \
+          # Consume each complete exact listing so libtest cannot observe
+          # BrokenPipe, then freeze the already validated names beside the
+          # package artifacts for the execution-only step.
+          for test_name in "${test_names[@]}"; do
+            "${test_binary}" \
+              "${test_name}" \
               --exact \
               --ignored \
-              --nocapture
-      - name: Run official Codex TUI in a loopback-only network namespace
-        if: matrix.suite == 'official-tui' && runner.os == 'Linux'
+              --list \
+              --format terse \
+              > "${test_list}"
+            if [[ "$(grep -Fxc -- "${test_name}: test" "${test_list}")" != 1 ]]; then
+              echo "Pinned Codex package test was not discovered: ${test_name}" >&2
+              exit 1
+            fi
+          done
+
+          test_names_file="${CALCIFER_CODEX_PACKAGE_ROOT:?}/probe-test-names"
+          (umask 077; printf '%s\n' "${test_names[@]}" > "${test_names_file}")
+          test_names_link_count="$(python3 -c 'import os, sys; print(os.lstat(sys.argv[1]).st_nlink)' "${test_names_file}")"
+          if [[ ! -f "${test_names_file}" || -L "${test_names_file}" || ! -O "${test_names_file}" || "${test_names_link_count}" != 1 ]]; then
+            echo "The exact package test-name manifest was not a private single-link file." >&2
+            exit 1
+          fi
+          echo "CALCIFER_PACKAGE_TEST_BINARY=${test_binary}" >> "${GITHUB_ENV:?}"
+          echo "CALCIFER_PACKAGE_TEST_NAMES_FILE=${test_names_file}" >> "${GITHUB_ENV}"
+          echo "CALCIFER_PACKAGE_TEST_COUNT=${#test_names[@]}" >> "${GITHUB_ENV}"
+      - name: Run pinned Codex probes in fresh loopback-only namespaces
+        if: matrix.hermetic_support == 'supported' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -569,24 +564,53 @@ jobs:
           command -v ip >/dev/null
           sudo -n true
 
-          # There is deliberately no native-network fallback. The helper
-          # fails unless it proves a loopback-only namespace, drops every
-          # capability, clears inherited environment authority and sockets,
-          # and then execs the prebuilt exact libtest directly.
-          python3 scripts/run_with_watchdog.py run \
-            --timeout-seconds "${PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS:?}" \
-            --term-grace-seconds 30 \
-            -- \
-            python3 scripts/run_loopback_netns.py \
-              --test-binary "${CALCIFER_PACKAGE_TUI_TEST_BINARY:?}" \
-              --test-name "${CALCIFER_PACKAGE_TUI_TEST_NAME:?}" \
-              --codex-binary "${CALCIFER_CODEX_COMPAT_BINARY:?}" \
-              --launcher-binary "${CALCIFER_PACKAGE_TUI_LAUNCHER:?}"
+          cleanup_wait_seconds=$((2 * 30))
+          expected_budget_seconds=$((${PACKAGE_PROBE_EXPECTED_COUNT:?} * (${PACKAGE_PROBE_WATCHDOG_SECONDS:?} + cleanup_wait_seconds) + ${PACKAGE_PROBE_POST_CLEANUP_MARGIN_SECONDS:?}))
+          job_budget_seconds=$((${PACKAGE_PROBE_JOB_TIMEOUT_MINUTES:?} * 60))
+          if [[ "${expected_budget_seconds}" != "${job_budget_seconds}" ]]; then
+            echo "The package probe aggregate watchdog budget drifted from the job timeout." >&2
+            exit 1
+          fi
+          if [[ "${CALCIFER_PACKAGE_TEST_COUNT:?}" != "${PACKAGE_PROBE_EXPECTED_COUNT}" ]]; then
+            echo "The exact package probe count drifted from the aggregate watchdog budget." >&2
+            exit 1
+          fi
+
+          test_names_file="${CALCIFER_PACKAGE_TEST_NAMES_FILE:?}"
+          test_names_link_count="$(python3 -c 'import os, sys; print(os.lstat(sys.argv[1]).st_nlink)' "${test_names_file}")"
+          if [[ ! -f "${test_names_file}" || -L "${test_names_file}" || ! -O "${test_names_file}" || "${test_names_link_count}" != 1 ]]; then
+            echo "The exact package test-name manifest changed before execution." >&2
+            exit 1
+          fi
+
+          # Every invocation crosses a new OS-owned boundary. There is
+          # deliberately no native-network fallback. The helper fails unless
+          # it proves a fresh loopback-only namespace, drops supplementary
+          # groups and every capability, clears inherited environment/socket
+          # authority, revalidates all three executables, and execs the exact
+          # prebuilt libtest directly.
+          probe_count=0
+          while IFS= read -r test_name; do
+            probe_count=$((probe_count + 1))
+            python3 scripts/run_with_watchdog.py run \
+              --timeout-seconds "${PACKAGE_PROBE_WATCHDOG_SECONDS:?}" \
+              --term-grace-seconds 30 \
+              -- \
+              python3 scripts/run_loopback_netns.py \
+                --test-binary "${CALCIFER_PACKAGE_TEST_BINARY:?}" \
+                --test-name "${test_name}" \
+                --codex-binary "${CALCIFER_CODEX_COMPAT_BINARY:?}" \
+                --launcher-binary "${CALCIFER_PACKAGE_TUI_LAUNCHER:?}"
+          done < "${test_names_file}"
+          if [[ "${probe_count}" != "${CALCIFER_PACKAGE_TEST_COUNT:?}" ]]; then
+            echo "The exact package test-name manifest was incomplete." >&2
+            exit 1
+          fi
       # The watchdog bounds only its direct command group. A package process
       # may have created another session, so any failed probe retains its
       # evidence root until the ephemeral runner performs whole-job teardown.
       - name: Remove pinned Codex package scratch after successful probes
-        if: success()
+        if: success() && matrix.hermetic_support == 'supported'
         shell: bash
         run: |
           set -euo pipefail

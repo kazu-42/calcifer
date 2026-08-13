@@ -666,10 +666,10 @@ best-effort scratch cleanup can therefore leave private synthetic files for
 manual removal, but never rolls back by touching a user profile, credential,
 rollout, or Calcifer registry.
 
-Ubuntu 24.04 and macOS CI jobs are configured to download the official architecture-
-specific `0.144.4` release archive, verify a pinned SHA-256 digest and its single
-expected executable, and run three independently budgeted matrix scenarios
-behind one aggregate gate. `contracts` runs the full ignored-by-default handoff
+Ubuntu 24.04 CI jobs download the official architecture-specific `0.144.4`
+release archive, verify a pinned SHA-256 digest and its single expected
+executable, and run three independently budgeted scenarios behind one aggregate
+gate. `contracts` runs the full ignored-by-default handoff
 probe plus #54's live-turn one-`SIGTERM` App drain, official
 `thread/shellCommand` `setsid(2)` descriptor/environment-isolation probe, and
 typed-monitor rate-limit/reset-credit success plus redacted-provider-error
@@ -685,9 +685,11 @@ package parent is configured to check that frame plus EOF. Their test-only role
 dispatcher does not execute the production
 `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-
 anchor role. Two consecutive local normal runs and one local retained-recovery
-run passed on Apple silicon; the Ubuntu 24.04/macOS matrix remains pending. On
-Linux, compilation and exact libtest discovery happen before a mandatory fresh
-network namespace. The root stage enumerates the current namespace through
+run passed on Apple silicon as historical native functional evidence. On Linux,
+package download, checksum verification, compilation, and exact libtest
+discovery happen before probe execution. Every exact contract and official-TUI
+test then enters a mandatory fresh network namespace. The root stage enumerates
+the current namespace through
 kernel interface APIs rather than an inherited sysfs mount. Only `lo` and the
 exact nine upstream fallback-tunnel names are accepted; unknown interfaces fail
 before mutation, while present fallbacks are forced down and proved to have no
@@ -695,8 +697,10 @@ address or route before only loopback is enabled. The root stage then drops to
 the runner UID/GID with no supplementary groups or capabilities and with
 `NoNewPrivs`; the user stage rechecks those facts, the exact environment, and
 absence of inherited socket FDs before directly executing the prebuilt libtest.
-There is no native-network fallback. macOS supplies native functional
-evidence and does not claim a comparable egress boundary. The detached probe is
+The frozen libtest, pinned Codex binary, and launcher identities are revalidated
+on both sides of the privilege boundary. There is no native-network fallback.
+The macOS matrix entry reports all hermetic package scenarios as unsupported and
+executes no provider probe. The detached probe is
 explicitly released before App shutdown, so it is FD/environment isolation
 evidence, not detached-descendant absence evidence. The complete
 handoff probe has a 180-second budget; the ignored
@@ -707,8 +711,10 @@ direct IPv4/IPv6 egress confinement for the official scenarios; it does not
 constrain AF_UNIX, an adversarial same-UID actor, or root, and metadata
 revalidation is drift detection rather than a TOCTOU-free content seal. The #28 compatibility
 loopback sentinel proves that its expected flow performs no configured model
-request, but it
-cannot constrain arbitrary egress from a malicious or compromised executable.
+request. Codex 0.144.4's unconditional announcement prewarm also runs behind
+the namespace: no DNS or non-loopback route exists, so the response cannot
+affect compatibility evidence. The boundary still cannot constrain AF_UNIX or
+same-UID activity from a malicious or compromised executable.
 
 ## Failover requirements
 

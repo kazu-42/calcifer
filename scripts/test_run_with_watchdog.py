@@ -762,14 +762,15 @@ class WatchdogWorkflowTests(unittest.TestCase):
             "each configured MSRV run must execute the library suite exactly once",
         )
 
-    def test_all_six_package_tests_keep_exact_discovery_and_execution(self) -> None:
+    def test_all_six_package_tests_are_prebuilt_and_exactly_discovered(self) -> None:
         workflow = self._workflow()
-        contract_step = workflow.split(
-            "      - name: Run pinned Codex contract probes\n", 1
+        prepare_step = workflow.split(
+            "      - name: Prepare the exact hermetic package libtest\n", 1
         )[1].split(
-            "      - name: Build and verify the package TUI launcher fixture\n", 1
+            "      - name: Run pinned Codex probes in fresh loopback-only namespaces\n",
+            1,
         )[0]
-        contract_tests = (
+        package_tests = (
             "providers::codex::handoff_compat::tests::"
             "packaged_codex_0_144_4_passes_the_complete_handoff_probe",
             "providers::codex::supervisor::packaged_smoke::"
@@ -778,46 +779,31 @@ class WatchdogWorkflowTests(unittest.TestCase):
             "packaged_codex_detached_tool_inherits_no_calcifer_authority",
             "providers::codex::supervisor::packaged_smoke::"
             "packaged_codex_typed_monitor_accepts_usage_and_redacts_provider_failure",
-        )
-        for test_name in contract_tests:
-            self.assertEqual(workflow.count(test_name), 1)
-            self.assertIn(test_name, contract_step)
-        self.assertEqual(contract_step.count("--exact"), 2)
-        self.assertEqual(contract_step.count("--ignored"), 2)
-
-        prepare_tui_step = workflow.split(
-            "      - name: Prepare the exact official Codex TUI libtest\n", 1
-        )[1].split(
-            "      - name: Run official Codex TUI native functional probe\n", 1
-        )[0]
-        normal_tui_test = (
             "providers::codex::supervisor::packaged_smoke::"
             "packaged_codex_official_tui_uses_production_coordinator_guardian_"
-            "session_pty_and_job_control"
-        )
-        recovery_tui_test = (
+            "session_pty_and_job_control",
             "providers::codex::supervisor::packaged_smoke::"
             "packaged_codex_official_tui_recovers_retained_cleanup_pending_"
-            "with_four_proofs"
+            "with_four_proofs",
         )
-        self.assertEqual(workflow.count(normal_tui_test), 1)
-        self.assertEqual(workflow.count(recovery_tui_test), 1)
-        self.assertIn(
-            'case "${PACKAGE_OFFICIAL_TUI_SCENARIO:?}" in', prepare_tui_step
-        )
-        self.assertIn("normal)", prepare_tui_step)
-        self.assertIn("recovery)", prepare_tui_step)
-        self.assertNotIn("for test_name", prepare_tui_step)
-        self.assertIn("--no-run", prepare_tui_step)
-        self.assertIn("--message-format=json", prepare_tui_step)
-        self.assertIn("CALCIFER_PACKAGE_TUI_TEST_BINARY", prepare_tui_step)
-        self.assertIn("CALCIFER_PACKAGE_TUI_TEST_NAME", prepare_tui_step)
-        self.assertEqual(prepare_tui_step.count("--exact"), 1)
-        self.assertEqual(prepare_tui_step.count("--ignored"), 1)
-        first_metadata_create = prepare_tui_step.index(
+        for test_name in package_tests:
+            self.assertEqual(workflow.count(test_name), 1)
+            self.assertIn(test_name, prepare_step)
+        self.assertIn('case "${PACKAGE_PROBE_SCENARIO:?}" in', prepare_step)
+        self.assertIn("contracts)", prepare_step)
+        self.assertIn("official-tui-normal)", prepare_step)
+        self.assertIn("official-tui-recovery)", prepare_step)
+        self.assertIn("for test_name in", prepare_step)
+        self.assertIn("--no-run", prepare_step)
+        self.assertIn("--message-format=json", prepare_step)
+        self.assertIn("CALCIFER_PACKAGE_TEST_BINARY", prepare_step)
+        self.assertIn("CALCIFER_PACKAGE_TEST_NAMES_FILE", prepare_step)
+        self.assertEqual(prepare_step.count("--exact"), 1)
+        self.assertEqual(prepare_step.count("--ignored"), 1)
+        first_metadata_create = prepare_step.index(
             'artifact_json="$(mktemp '
         )
-        metadata_cleanup_trap = prepare_tui_step.index(
+        metadata_cleanup_trap = prepare_step.index(
             "trap cleanup_metadata EXIT"
         )
         self.assertLess(metadata_cleanup_trap, first_metadata_create)
@@ -827,9 +813,9 @@ class WatchdogWorkflowTests(unittest.TestCase):
     ) -> None:
         workflow = self._workflow()
         launcher_step = workflow.split(
-            "      - name: Build and verify the package TUI launcher fixture\n", 1
+            "      - name: Build and verify the package launcher fixture\n", 1
         )[1].split(
-            "      - name: Prepare the exact official Codex TUI libtest\n", 1
+            "      - name: Prepare the exact hermetic package libtest\n", 1
         )[0]
 
         build = launcher_step.index("cargo +1.96.0 build")
@@ -861,44 +847,47 @@ class WatchdogWorkflowTests(unittest.TestCase):
             'CALCIFER_PACKAGE_TUI_LAUNCHER=${built_fixture}', launcher_step
         )
 
-    def test_linux_official_tui_is_fail_closed_inside_loopback_only_netns(
+    def test_every_linux_package_probe_is_fail_closed_inside_a_fresh_netns(
         self,
     ) -> None:
         workflow = self._workflow()
         linux_step_name = (
-            "      - name: Run official Codex TUI in a loopback-only "
-            "network namespace\n"
+            "      - name: Run pinned Codex probes in fresh loopback-only "
+            "namespaces\n"
         )
-        native_step = workflow.split(
-            "      - name: Run official Codex TUI native functional probe\n", 1
-        )[1].split(linux_step_name, 1)[0]
         linux_step = workflow.split(linux_step_name, 1)[1].split(
             "      # The watchdog bounds only", 1
         )[0]
 
         self.assertIn(
-            "if: matrix.suite == 'official-tui' && runner.os != 'Linux'",
-            native_step,
-        )
-        self.assertIn("scripts/run_with_watchdog.py run", native_step)
-        self.assertIn('"${CALCIFER_PACKAGE_TUI_TEST_BINARY:?}"', native_step)
-        self.assertNotIn("cargo ", native_step)
-
-        self.assertIn(
-            "if: matrix.suite == 'official-tui' && runner.os == 'Linux'",
+            "if: matrix.hermetic_support == 'supported' && runner.os == 'Linux'",
             linux_step,
         )
         for command in ("sudo", "unshare", "setpriv", "ip"):
             self.assertIn(f"command -v {command}", linux_step)
         self.assertIn("sudo -n true", linux_step)
         self.assertIn("scripts/run_with_watchdog.py run", linux_step)
+        self.assertIn(
+            '--timeout-seconds "${PACKAGE_PROBE_WATCHDOG_SECONDS:?}"', linux_step
+        )
+        self.assertNotIn("PACKAGE_OFFICIAL_TUI_WATCHDOG_SECONDS", linux_step)
+        self.assertIn("cleanup_wait_seconds=$((2 * 30))", linux_step)
+        self.assertIn(
+            "expected_budget_seconds=$((${PACKAGE_PROBE_EXPECTED_COUNT:?} * "
+            "(${PACKAGE_PROBE_WATCHDOG_SECONDS:?} + cleanup_wait_seconds) + "
+            "${PACKAGE_PROBE_POST_CLEANUP_MARGIN_SECONDS:?}))",
+            linux_step,
+        )
+        self.assertIn(
+            "job_budget_seconds=$((${PACKAGE_PROBE_JOB_TIMEOUT_MINUTES:?} * 60))",
+            linux_step,
+        )
         self.assertIn("scripts/run_loopback_netns.py", linux_step)
+        self.assertIn("while IFS= read -r test_name; do", linux_step)
         self.assertIn(
-            '--test-binary "${CALCIFER_PACKAGE_TUI_TEST_BINARY:?}"', linux_step
+            '--test-binary "${CALCIFER_PACKAGE_TEST_BINARY:?}"', linux_step
         )
-        self.assertIn(
-            '--test-name "${CALCIFER_PACKAGE_TUI_TEST_NAME:?}"', linux_step
-        )
+        self.assertIn('--test-name "${test_name}"', linux_step)
         self.assertIn(
             '--codex-binary "${CALCIFER_CODEX_COMPAT_BINARY:?}"', linux_step
         )
@@ -908,8 +897,9 @@ class WatchdogWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("cargo ", linux_step)
         self.assertNotIn("runner.os != 'Linux'", linux_step)
+        self.assertNotIn("native functional probe", workflow)
 
-    def test_official_tui_scenarios_are_independent_45_minute_matrix_jobs(
+    def test_macos_package_probes_are_explicitly_unsupported_without_native_fallback(
         self,
     ) -> None:
         workflow = self._workflow()
@@ -919,35 +909,53 @@ class WatchdogWorkflowTests(unittest.TestCase):
         self.assertIn(
             "name: Pinned Codex (${{ matrix.scenario }}, ${{ matrix.os }})", matrix
         )
-        self.assertEqual(matrix.count("suite: official-tui"), 4)
-        self.assertEqual(matrix.count("scenario: official-tui-normal"), 2)
-        self.assertEqual(matrix.count("scenario: official-tui-recovery"), 2)
-        self.assertEqual(matrix.count("job_timeout_minutes: 45"), 4)
+        self.assertEqual(matrix.count("hermetic_support: supported"), 3)
+        self.assertEqual(matrix.count("hermetic_support: unsupported"), 1)
+        self.assertEqual(matrix.count("suite: official-tui"), 2)
+        self.assertEqual(matrix.count("scenario: official-tui-normal"), 1)
+        self.assertEqual(matrix.count("scenario: official-tui-recovery"), 1)
+        self.assertEqual(matrix.count("job_timeout_minutes: 45"), 3)
+        self.assertEqual(matrix.count("probe_watchdog_seconds: 420"), 1)
+        self.assertEqual(matrix.count("probe_watchdog_seconds: 1680"), 2)
+        self.assertEqual(matrix.count("probe_watchdog_seconds: 1\n"), 1)
+        self.assertEqual(matrix.count("probe_expected_count: 4"), 1)
+        self.assertEqual(matrix.count("probe_expected_count: 1"), 3)
+        self.assertEqual(matrix.count("probe_post_cleanup_margin_seconds: 780"), 1)
+        self.assertEqual(matrix.count("probe_post_cleanup_margin_seconds: 960"), 2)
+        self.assertIn(
+            "PACKAGE_PROBE_WATCHDOG_SECONDS: "
+            "${{ matrix.probe_watchdog_seconds }}",
+            workflow,
+        )
+        self.assertIn(
+            "PACKAGE_PROBE_EXPECTED_COUNT: ${{ matrix.probe_expected_count }}",
+            workflow,
+        )
+        self.assertIn(
+            "PACKAGE_PROBE_POST_CLEANUP_MARGIN_SECONDS: "
+            "${{ matrix.probe_post_cleanup_margin_seconds }}",
+            workflow,
+        )
+        self.assertIn(
+            "PACKAGE_PROBE_JOB_TIMEOUT_MINUTES: "
+            "${{ matrix.job_timeout_minutes }}",
+            workflow,
+        )
+        self.assertEqual((4 * (420 + 60)) + 780, 45 * 60)
+        self.assertEqual((1 * (1_680 + 60)) + 960, 45 * 60)
         self.assertEqual(matrix.count("os: ubuntu-24.04"), 3)
+        self.assertEqual(matrix.count("os: macos-latest"), 1)
         self.assertNotIn("os: ubuntu-latest", matrix)
+        self.assertIn("scenario: macos-hermetic-unsupported", matrix)
 
-        normal_entries = (
-            "- os: ubuntu-24.04\n"
-            "            suite: official-tui\n"
-            "            scenario: official-tui-normal\n"
-            "            job_timeout_minutes: 45",
-            "- os: macos-latest\n"
-            "            suite: official-tui\n"
-            "            scenario: official-tui-normal\n"
-            "            job_timeout_minutes: 45",
-        )
-        recovery_entries = (
-            "- os: ubuntu-24.04\n"
-            "            suite: official-tui\n"
-            "            scenario: official-tui-recovery\n"
-            "            job_timeout_minutes: 45",
-            "- os: macos-latest\n"
-            "            suite: official-tui\n"
-            "            scenario: official-tui-recovery\n"
-            "            job_timeout_minutes: 45",
-        )
-        for entry in normal_entries + recovery_entries:
-            self.assertIn(entry, matrix)
+        unsupported_step = workflow.split(
+            "      - name: Report macOS hermetic package probes as unsupported\n", 1
+        )[1].split("      - name: Check out source\n", 1)[0]
+        self.assertIn("if: matrix.hermetic_support == 'unsupported'", unsupported_step)
+        for scenario in ("contracts", "official-tui-normal", "official-tui-recovery"):
+            self.assertIn(scenario, unsupported_step)
+        self.assertIn("::notice", unsupported_step)
+        self.assertIn("no native-network fallback", unsupported_step)
 
     def test_pinned_codex_matrix_has_one_stable_required_check_gate(self) -> None:
         workflow = self._workflow()
@@ -969,7 +977,7 @@ class WatchdogWorkflowTests(unittest.TestCase):
         workflow = self._workflow()
         prepare_step = workflow.split(
             "      - name: Prepare checksum-pinned Codex package\n", 1
-        )[1].split("      - name: Run pinned Codex contract probes\n", 1)[0]
+        )[1].split("      - name: Build and verify the package launcher fixture\n", 1)[0]
         created = prepare_step.index('scratch="$(mktemp -d')
         guarded = prepare_step.index("trap cleanup_prepare_failure EXIT")
         registered = prepare_step.index("CALCIFER_CODEX_PACKAGE_ROOT=${scratch}")
@@ -986,7 +994,7 @@ class WatchdogWorkflowTests(unittest.TestCase):
         workflow = self._workflow()
         prepare_step = workflow.split(
             "      - name: Prepare checksum-pinned Codex package\n", 1
-        )[1].split("      - name: Run pinned Codex contract probes\n", 1)[0]
+        )[1].split("      - name: Build and verify the package launcher fixture\n", 1)[0]
 
         self.assertEqual(prepare_step.count("--max-time 300"), 1)
         self.assertEqual(prepare_step.count("--retry 3"), 1)
@@ -1011,7 +1019,7 @@ class WatchdogWorkflowTests(unittest.TestCase):
         )[0]
         prepare_step = package_job.split(
             "      - name: Prepare checksum-pinned Codex package\n", 1
-        )[1].split("      - name: Run pinned Codex contract probes\n", 1)[0]
+        )[1].split("      - name: Build and verify the package launcher fixture\n", 1)[0]
 
         self.assertIn("CODEX_MAX_ARCHIVE_BYTES: 134217728", package_job)
         self.assertIn("CODEX_MAX_EXTRACTED_BYTES: 402653184", package_job)
@@ -1042,7 +1050,7 @@ class WatchdogWorkflowTests(unittest.TestCase):
         cleanup_contract = (
             "      - name: Remove pinned Codex package scratch "
             "after successful probes\n"
-            "        if: success()\n"
+            "        if: success() && matrix.hermetic_support == 'supported'\n"
         )
         self.assertIn(cleanup_contract, workflow)
         self.assertNotIn(

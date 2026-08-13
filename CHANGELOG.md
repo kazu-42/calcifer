@@ -28,6 +28,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Security
 
+- All six checksum-pinned Codex package probes now execute in separate fresh
+  Linux loopback-only network namespaces after release download, checksum
+  verification, and exact test-artifact preparation. The boundary revalidates
+  the libtest, Codex, and launcher across the privilege transition, rejects
+  inherited sockets, and drops supplementary groups, capabilities, and ambient
+  environment authority. macOS is reported as hermetic-unsupported and no
+  longer runs a native-network fallback; Codex 0.144.4's unconditional remote
+  announcement prewarm cannot contribute response content to acceptance.
 - Remote-TUI descriptor isolation now uses a role-bound two-party pre-exec
   gate. The launcher remains held while Guardian and Coordinator independently
   verify forbidden descriptors, then requires one fixed authorization plus EOF

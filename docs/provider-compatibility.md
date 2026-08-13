@@ -473,11 +473,15 @@ scenarios are designed to cross real package-parent-to-coordinator and
 coordinator-to-guardian `exec` boundaries with the completion endpoint; the
 package parent is configured to check the provider-release-gated exact frame
 plus EOF. Two consecutive normal executions and one retained-recovery execution
-passed from that candidate source on Apple silicon; the Ubuntu 24.04/macOS matrix
-remains pending. Linux executes the prebuilt exact libtest in a mandatory fresh
+passed from that candidate source on Apple silicon as historical native
+functional evidence. The supported Ubuntu 24.04 lanes download and verify the
+package and prebuild the exact libtest first; every one of the four contract
+tests and both official-TUI tests then executes in its own mandatory fresh
 loopback-only namespace after clearing direct environment and inherited-socket
-authority and dropping every capability with `NoNewPrivs`; macOS is native
-functional evidence. There is no Linux native-network fallback. This is direct
+authority, dropping supplementary groups and every capability, setting
+`NoNewPrivs`, and revalidating the frozen libtest, Codex, and launcher. macOS
+explicitly reports hermetic execution as unsupported and runs no native-network
+substitute. There is no native-network fallback. This is direct
 IPv4/IPv6 confinement for the trusted checksum-pinned scenario, not a malicious
 binary sandbox or a claim about AF_UNIX and same-UID authority. Their test-only
 role dispatcher does not execute the production
@@ -485,8 +489,10 @@ role dispatcher does not execute the production
 anchor role. The handoff probe
 has a 180-second budget; the ignored schema/fork-only diagnostic uses 120
 seconds. The detached probe is released before App shutdown, so it verifies
-inheritance isolation rather than detached-descendant absence. Windows remains
-unsupported and fails closed. A new Codex release requires a new reviewed
+inheritance isolation rather than detached-descendant absence. The official TUI
+scenario covers Codex 0.144.4's unconditional announcement prewarm; with no DNS
+or non-loopback route, remote announcement content cannot influence acceptance.
+Windows remains unsupported and fails closed. A new Codex release requires a new reviewed
 projection, pinned package, and complete runtime smoke; editing the
 supported-version label alone cannot mint the capability.
 

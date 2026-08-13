@@ -1,8 +1,8 @@
 # ADR 0003: Supervise a profile-owned Codex App Server and official remote TUI
 
-- Status: Accepted design; internal foundations #48/#50/#52 and the default-unused #54 provider implementation are present; pinned Ubuntu 24.04/macOS package acceptance was green at the merged #68 head, with post-merge hardening in progress
+- Status: Accepted design; internal foundations #48/#50/#52 and the default-unused #54 provider implementation are present; the pinned Linux package probes are egress-confined and macOS hermetic execution is explicitly unsupported
 - Date: 2026-07-15
-- Last updated: 2026-07-22
+- Last updated: 2026-08-13
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 - Related decisions: [ADR 0001](0001-cross-profile-conversation-handoff.md), [ADR 0002](0002-private-provider-identity-binding.md)
 
@@ -912,7 +912,7 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
 - Replaces the test-anchor completion assumption with a persistent
   terminal-session anchor, exact fixed completion record plus EOF, and a
   move-only `ProviderNeverStarted`/graceful-drain publication gate.
-- Configures three independently budgeted Ubuntu 24.04/macOS package scenarios behind
+- Configures three independently budgeted Ubuntu 24.04 package scenarios behind
   one aggregate CI gate. `contracts` runs the existing #28 proof plus #54's live-
   turn drain, official `setsid(2)` descriptor/environment isolation, and typed-
   monitor success/redacted-error probes. `official-tui-normal` is designed to
@@ -926,12 +926,16 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   the shared production guardian-bootstrap core through the bounded package-
   only seams described above, while its test-only dispatcher bypasses the
   production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser and
-  persistent shell-anchor role. Linux builds and discovers the libtest before a
-  mandatory fresh loopback-only namespace, drops groups and capabilities, sets
-  `NoNewPrivs`, and rechecks direct inherited authority before exact execution;
-  macOS remains native functional evidence. The detached probe is released
+  persistent shell-anchor role. Linux downloads and verifies the package and
+  builds and discovers the libtest before execution. Each exact contract and
+  official-TUI test receives a mandatory fresh loopback-only namespace, drops
+  groups and capabilities, sets `NoNewPrivs`, and rechecks direct inherited
+  authority plus all frozen executable identities before exact execution. The
+  macOS matrix entry reports all hermetic scenarios as unsupported and runs no
+  native-network substitute. This also prevents Codex 0.144.4's unconditional
+  announcement prewarm response from influencing acceptance. The detached probe is released
   before App shutdown and is not absence evidence. Local Apple-silicon normal
-  passed twice and retained recovery once; matrix readback remains pending.
+  passed twice and retained recovery once as historical native evidence.
 - After the Guardian has minted its complete startup deadline, it durably
   publishes one private package-only arm acknowledgement. The parent observes
   that fixed payload and reanchors its retained-recovery fence to the local
