@@ -218,8 +218,10 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   absence of arbitrary non-child descendants that escaped with `setsid(2)`.
   Issue #55 therefore claims zero residue only for Calcifer-owned direct
   children and recorded known process groups plus identity-checked runtime, FD,
-  and socket evidence. Escaped-session containment is tracked
-  separately by issue #56.
+  and socket evidence. [ADR 0006](adr/0006-platform-owned-descendant-containment.md)
+  records why escaped-session containment remains unsupported without an
+  independently owned Linux broker and why macOS has no reviewed public
+  equivalent.
 - macOS descriptor-observation failures keep the public
   `UnsupportedDescriptor` result. A separate diagnostic envelope carries at
   most one closed, payload-free reason for unsupported kind, unavailable
@@ -327,7 +329,9 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   and an identity-checked empty runtime with zero retained FD and socket
   references.
   These Calcifer-owned direct-child/known-group and identity proofs are the #55
-  zero-residue scope; escaped `setsid(2)` descendants remain issue #56. Exact
+  zero-residue scope; [ADR 0006](adr/0006-platform-owned-descendant-containment.md)
+  concludes that escaped `setsid(2)` descendants cannot be added to that scope
+  in the current same-user rootless deployment. Exact
   retained or otherwise unproved cleanup evidence in the `cfg(test)` package
   harness emits one fixed, redacted subtype and terminates libtest with a fixed
   nonzero `_exit`-equivalent status while its Rust owners remain live. It runs

@@ -379,7 +379,9 @@ The proof is intentionally about the pinned direct App child, not arbitrary
 descendant absence. A tool can escape the App process group with `setsid(2)`;
 neither direct-child wait nor group `ESRCH` proves that such a non-child has
 exited. The provider-release gate therefore must not be described as generic
-whole-tree reap evidence.
+whole-tree reap evidence. [ADR 0006](0006-platform-owned-descendant-containment.md)
+evaluates the stronger platform boundary and leaves it disabled until a
+separately owned Linux broker exists; macOS has no reviewed public equivalent.
 
 Provider cleanup carries the non-copyable drain capability through socket and
 runtime teardown into a non-copyable lifecycle projection. The only other
@@ -829,7 +831,7 @@ never a reconstructed TUI success.
 | Socket integrity | Parent/symlink/collision/mode/replacement/timeout/disconnect/cleanup cases and mode-`0600` readback |
 | Lease integrity | Real exec FD scans, no-gap A/B tests, dedicated transfer/lifecycle reader tests, ambiguous ACK and concurrent-writer tests |
 | Live lifecycle | Every injected failure while guardian lives exactly waits children and joins workers; stuck descendants escalate within bounds |
-| Process containment | Revalidate the real Codex descendant/credential model; on macOS, leader-exit `WNOWAIT` alone must not turn `EPERM` into production containment proof unless a stronger reviewed absence proof excludes an unsignalable live group member, otherwise fail closed |
+| Process containment | Preserve the exact-child/known-group contract in [ADR 0006](0006-platform-owned-descendant-containment.md); same-user Linux cgroup delegation and macOS process groups are not whole-generation authority, so no stronger release is available without an independently owned platform broker |
 | Terminal ownership | Both normal and fallback restore revalidate current foreground ownership immediately before mutation; every anchor/coordinator foreground selection requires exact descriptor/current-group preflight and descriptor/selected-group readback, and any rollback requires exact descriptor/group readback; a reclaim mismatch, third foreground generation, or unproved rollback performs no further mutation and retains authority; production has a wrapper/anchor or generation-bound handoff that excludes shell/new-job races and numeric PGID reuse |
 | Job-control containment | The synthetic same-credential tree proves that a TUI descendant which ignores `SIGTSTP` is contained by process-group `SIGSTOP`; the checksum-pinned `official-tui-normal` scenario requires a stable current-user official-TUI group, group-wide stopped state, no input progress, continuation, and a fresh gate, and passed twice consecutively from the 2026-07-20 Issue #54 candidate source on Apple silicon. Neither is general detached-descendant absence evidence |
 | Guardian loss | Coordinator claims exact wait only for guardian, does not claim grandchild reap on macOS, and retains A indefinitely without `CHILDREN_REAPED` |
