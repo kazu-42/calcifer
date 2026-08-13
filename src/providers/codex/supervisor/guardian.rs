@@ -2449,6 +2449,34 @@ fn drive_active(
             return begin_terminal_exit_drain(bounds, lifecycle, session, post_pump_liveness);
         }
 
+        match session.take_usage_limit() {
+            Ok(Some(_signal)) => {
+                if let Err(error) = lifecycle.emit(
+                    GuardianEvent::UsageExhausted,
+                    bounds.phase_deadline().unwrap_or_else(|_| Instant::now()),
+                ) {
+                    return shutdown_after_lifecycle_error(bounds, lifecycle, session, error);
+                }
+                return begin_session_shutdown(
+                    bounds,
+                    lifecycle,
+                    session,
+                    usage_exhaustion_trigger(),
+                    LifecycleCondition::Healthy,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return begin_session_shutdown(
+                    bounds,
+                    lifecycle,
+                    session,
+                    SessionShutdownTrigger::Failure(SessionOperationError::Monitor(error)),
+                    LifecycleCondition::Healthy,
+                );
+            }
+        }
+
         let command = match receive_bounded_command(bounds, &mut lifecycle) {
             Ok(GuardianControlTurn::Command(command)) => command,
             Ok(GuardianControlTurn::Idle) => continue,
@@ -3211,6 +3239,10 @@ const fn coordinator_stop_trigger() -> SessionShutdownTrigger {
     SessionShutdownTrigger::Cause(SessionTerminationCause::CoordinatorStop)
 }
 
+const fn usage_exhaustion_trigger() -> SessionShutdownTrigger {
+    SessionShutdownTrigger::Cause(SessionTerminationCause::UsageExhaustion)
+}
+
 fn operation_failure_event(error: SessionOperationError) -> (Phase, FailureCode) {
     match error {
         SessionOperationError::RecoveryRequested => (Phase::Protocol, FailureCode::Internal),
@@ -3566,6 +3598,9 @@ impl GuardianRunOutcome {
 fn apply_terminal_disposition(disposition: GuardianExitDisposition) -> ExitCode {
     match disposition {
         GuardianExitDisposition::Code(code) => ExitCode::from(code),
+        GuardianExitDisposition::UsageExhausted => {
+            ExitCode::from(super::protocol::USAGE_EXHAUSTED_EXIT_CODE)
+        }
         GuardianExitDisposition::InternalFailure => ExitCode::from(1),
         GuardianExitDisposition::Signal(signal) => {
             let _ = signal_hook::low_level::emulate_default_handler(i32::from(signal));

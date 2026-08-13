@@ -3822,6 +3822,9 @@ fn guardian_status_matches_exit(status: ExitStatus, disposition: GuardianExitDis
     match disposition {
         GuardianExitDisposition::Code(code) => status.code() == Some(i32::from(code)),
         GuardianExitDisposition::Signal(signal) => status.signal() == Some(i32::from(signal)),
+        GuardianExitDisposition::UsageExhausted => {
+            status.code() == Some(i32::from(super::super::protocol::USAGE_EXHAUSTED_EXIT_CODE))
+        }
         GuardianExitDisposition::InternalFailure => status.code() == Some(1),
     }
 }
@@ -3829,6 +3832,9 @@ fn guardian_status_matches_exit(status: ExitStatus, disposition: GuardianExitDis
 fn project_guardian_exit(disposition: GuardianExitDisposition) -> Result<ExitCode, FixtureError> {
     match disposition {
         GuardianExitDisposition::Code(code) => Ok(ExitCode::from(code)),
+        GuardianExitDisposition::UsageExhausted => Ok(ExitCode::from(
+            super::super::protocol::USAGE_EXHAUSTED_EXIT_CODE,
+        )),
         GuardianExitDisposition::Signal(signal) => {
             signal_hook::low_level::emulate_default_handler(i32::from(signal))
                 .map_err(|_| FixtureError::Process)?;

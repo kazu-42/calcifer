@@ -1415,6 +1415,9 @@ fn guardian_status_matches(status: ExitStatus, disposition: GuardianExitDisposit
     match disposition {
         GuardianExitDisposition::Code(code) => status.code() == Some(i32::from(code)),
         GuardianExitDisposition::Signal(signal) => status.signal() == Some(i32::from(signal)),
+        GuardianExitDisposition::UsageExhausted => {
+            status.code() == Some(i32::from(super::protocol::USAGE_EXHAUSTED_EXIT_CODE))
+        }
         GuardianExitDisposition::InternalFailure => status.code() == Some(1),
     }
 }
@@ -2931,6 +2934,8 @@ mod tests {
     fn verified_guardian_exit_requires_exact_unix_disposition() {
         let exit_zero = ExitStatus::from_raw(0);
         let exit_twenty_three = ExitStatus::from_raw(23 << 8);
+        let exit_usage_exhausted =
+            ExitStatus::from_raw(i32::from(super::super::protocol::USAGE_EXHAUSTED_EXIT_CODE) << 8);
         let signal_hup = ExitStatus::from_raw(1);
         let signal_term = ExitStatus::from_raw(15);
 
@@ -2941,6 +2946,10 @@ mod tests {
         assert!(guardian_status_matches(
             exit_twenty_three,
             GuardianExitDisposition::Code(23)
+        ));
+        assert!(guardian_status_matches(
+            exit_usage_exhausted,
+            GuardianExitDisposition::UsageExhausted
         ));
         assert!(guardian_status_matches(
             signal_hup,
@@ -2966,6 +2975,10 @@ mod tests {
         assert!(!guardian_status_matches(
             exit_twenty_three,
             GuardianExitDisposition::InternalFailure
+        ));
+        assert!(!guardian_status_matches(
+            exit_zero,
+            GuardianExitDisposition::UsageExhausted
         ));
     }
 

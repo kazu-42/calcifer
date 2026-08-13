@@ -146,6 +146,7 @@ pub(super) enum PackagedObservedTerminationCause {
     CoordinatorStop,
     ForwardedHup,
     ForwardedTerm,
+    UsageExhaustion,
 }
 
 #[cfg(test)]
@@ -218,6 +219,7 @@ pub(super) enum PackagedObservedGuardianExit {
     Success,
     NonzeroCode,
     Signal,
+    UsageExhausted,
     InternalFailure,
 }
 
@@ -318,6 +320,9 @@ const fn packaged_observed_termination_marker(
         }
         PackagedObservedTerminationCause::ForwardedTerm => {
             "session-terminal.termination-cause.forwarded-term"
+        }
+        PackagedObservedTerminationCause::UsageExhaustion => {
+            "session-terminal.termination-cause.usage-exhaustion"
         }
     }
 }
@@ -438,6 +443,9 @@ const fn packaged_observed_guardian_exit_marker(
         PackagedObservedGuardianExit::Success => "session-terminal.guardian-exit.success",
         PackagedObservedGuardianExit::NonzeroCode => "session-terminal.guardian-exit.nonzero-code",
         PackagedObservedGuardianExit::Signal => "session-terminal.guardian-exit.signal",
+        PackagedObservedGuardianExit::UsageExhausted => {
+            "session-terminal.guardian-exit.usage-exhausted"
+        }
         PackagedObservedGuardianExit::InternalFailure => {
             "session-terminal.guardian-exit.internal-failure"
         }
@@ -812,6 +820,9 @@ fn observe_packaged_terminal_report(
         Some(SessionTerminationCause::ForwardedTerm) => {
             PackagedObservedTerminationCause::ForwardedTerm
         }
+        Some(SessionTerminationCause::UsageExhaustion) => {
+            PackagedObservedTerminationCause::UsageExhaustion
+        }
     });
     armed.observation.operation_error = Some(match operation_error {
         None => PackagedObservedOperationError::None,
@@ -933,6 +944,7 @@ fn observe_packaged_terminal_report(
         GuardianExitDisposition::Code(0) => PackagedObservedGuardianExit::Success,
         GuardianExitDisposition::Code(_) => PackagedObservedGuardianExit::NonzeroCode,
         GuardianExitDisposition::Signal(_) => PackagedObservedGuardianExit::Signal,
+        GuardianExitDisposition::UsageExhausted => PackagedObservedGuardianExit::UsageExhausted,
         GuardianExitDisposition::InternalFailure => PackagedObservedGuardianExit::InternalFailure,
     });
     let markers = [
@@ -1512,7 +1524,10 @@ impl TerminalGenerationOwner {
         cause: SessionTerminationCause,
     ) -> Result<(), TerminalPumpFailure> {
         match (self.termination_cause, cause) {
-            (None, SessionTerminationCause::CoordinatorStop) => {
+            (
+                None,
+                SessionTerminationCause::CoordinatorStop | SessionTerminationCause::UsageExhaustion,
+            ) => {
                 self.termination_cause = Some(cause);
                 Ok(())
             }
@@ -2537,6 +2552,9 @@ const fn packaged_session_termination_cause_marker(
         }
         Some(SessionTerminationCause::ForwardedTerm) => {
             "guardian-retained.termination-cause.forwarded-term"
+        }
+        Some(SessionTerminationCause::UsageExhaustion) => {
+            "guardian-retained.termination-cause.usage-exhaustion"
         }
     }
 }
@@ -4284,10 +4302,6 @@ impl<State> SessionState<ProductionSessionComponents, State> {
     /// Takes at most one already-observed limit transition. This does not
     /// restart a process or select an account; those policy decisions remain
     /// with the future coordinator failover loop.
-    #[expect(
-        dead_code,
-        reason = "staged production seam for the coordinator limit/failover protocol"
-    )]
     pub(super) fn take_usage_limit(
         &self,
     ) -> Result<Option<SessionUsageLimitSignal>, SessionMonitorError> {
