@@ -687,15 +687,47 @@ Orca queries inactive Codex accounts with a profile-specific home and the same A
 
 ## Claude direction
 
-Claude support is not implemented in Calcifer. Current official Claude Code surfaces support same-profile resume by explicit session ID and expose rate-limit observations to a status-line command after an API response. They do not provide a standalone structured query that can refresh every inactive account on demand, nor a documented reset-credit entitlement count/expiry equivalent to Codex.
+Claude support is not implemented in Calcifer. This boundary was revalidated
+against the official Claude Code documentation on 2026-08-13 and the locally
+installed `claude 2.1.227` public help.
+
+The supported future profile type is a provider-managed interactive login under
+one Calcifer-owned `CLAUDE_CONFIG_DIR`. Calcifer will invoke `claude auth login`,
+verify only the bounded `claude auth status` JSON contract, and launch the
+official CLI with conflicting authentication/provider environment variables
+removed. It will not parse, copy, refresh, print, or persist OAuth tokens.
+`claude setup-token` is not the default local profile flow: the official
+command prints a one-year inference-only token and deliberately does not save
+it. Accepting that token would require a separately reviewed OS credential
+broker and a no-echo input/recovery design.
+
+Credential storage is a separate compatibility lane:
+
+| Platform | Official storage contract | Calcifer decision |
+| --- | --- | --- |
+| Linux | `.credentials.json` below `CLAUDE_CONFIG_DIR`, mode `0600` | Eligible after private-root, exact-mode, rotation, and crash-recovery tests |
+| Windows | `.credentials.json` below `CLAUDE_CONFIG_DIR`, protected by the user-profile ACL | Blocked until Calcifer can create and revalidate an equivalent current-user-only ACL and recovery boundary |
+| macOS | encrypted macOS Keychain; the official authentication page does not promise a `CLAUDE_CONFIG_DIR`-scoped Keychain namespace | Blocked for multiple managed identities; Calcifer will not infer or emulate internal Keychain service/account names |
+
+Current official surfaces support same-profile resume by explicit session ID.
+They do not provide a standalone structured query that Calcifer can use to
+refresh every inactive account's subscription limit on demand, nor a
+documented reset-credit entitlement count/expiry equivalent to Codex. Claude
+usage therefore remains `unknown` / `N/A`; a status-line event is contextual
+telemetry and cannot authorize inactive-profile selection.
 
 The intended design is therefore:
 
 - bind `session_id` to one profile-specific `CLAUDE_CONFIG_DIR` and cwd;
 - resume by explicit ID, not an ambiguous latest-session lookup;
-- collect status-line or SDK rate-limit events with `observed_at` and freshness;
+- use only `claude auth login`, `claude auth logout`, and bounded
+  `claude auth status` JSON for provider-managed credentials;
+- collect status-line or SDK rate-limit events with `observed_at` and freshness
+  only after a separate stable structured-event compatibility gate;
 - treat missing or expired observations as unknown;
 - keep cross-account transcript resume and prompt replay out of automatic failover;
+- remove ambient `ANTHROPIC_*`, `CLAUDE_*`, cloud-provider-selection, and
+  endpoint-routing variables before managed launches;
 - use only provider-supported authentication surfaces and avoid direct undocumented OAuth refresh.
 
-Official references: [Claude Code sessions](https://code.claude.com/docs/en/sessions), [CLI reference](https://code.claude.com/docs/en/cli-reference), and [status-line rate-limit usage](https://code.claude.com/docs/en/statusline#rate-limit-usage).
+Official references: [authentication and credential storage](https://code.claude.com/docs/en/authentication), [environment variables and `CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/env-vars), [Claude Code sessions](https://code.claude.com/docs/en/sessions), [CLI reference](https://code.claude.com/docs/en/cli-reference), and [status-line rate-limit usage](https://code.claude.com/docs/en/statusline#rate-limit-usage).

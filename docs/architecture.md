@@ -997,7 +997,10 @@ completed implementations for:
 - additional Codex version/schema gates beyond the implemented 0.144.4 observation cache;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
 - cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
-- OS credential-store support for Claude setup tokens;
+- Linux provider-managed Claude profile implementation under an isolated
+  `CLAUDE_CONFIG_DIR`, plus separate Windows ACL and macOS documented-Keychain-
+  namespace gates; setup-token ingestion additionally requires an OS
+  credential broker and no-echo recovery design;
 - explicit selector, enablement, and failover pool execution UX (the inert trust-domain/pool definition UX is implemented).
 
 Credential-management support is a separate platform guarantee from the portable diagnostic surface. Each provider and OS combination must pass its permission, credential-store, process, and recovery tests before being marked supported.
