@@ -220,7 +220,10 @@ can be constructed:
    ancestry. Inside a candidate, Calcifer writes, hashes, directly executes,
    rehashes, and removes one fixed built-in probe under an identity-bound mode
    `0700` root. A `noexec` or otherwise non-executable candidate is completely
-   cleaned before the next fixed candidate is tried. If none passes, the gate
+   cleaned before the next fixed candidate is tried. Candidate-local capacity
+   or quota failures while creating, writing, or syncing that probe are also
+   cleaned before the next candidate; unrelated I/O and process failures stay
+   terminal rather than being hidden as fallback. If none passes, the gate
    fails before provider startup with the fixed redacted
    `unsupported_noexec_scratch` diagnosis. A cleanup failure retains its exact
    owner and stops selection rather than silently falling through.

@@ -3148,12 +3148,54 @@ impl fmt::Debug for ScratchRootCreateFailure {
 
 impl std::error::Error for ScratchRootCreateFailure {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScratchProbeFailure {
+    CandidateCapacity,
+    Terminal(CodexHandoffError),
+}
+
+impl ScratchProbeFailure {
+    const fn error(self) -> CodexHandoffError {
+        match self {
+            Self::CandidateCapacity => CodexHandoffError::Transport,
+            Self::Terminal(error) => error,
+        }
+    }
+
+    fn from_errno(error: rustix::io::Errno) -> Self {
+        if matches!(error, rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT) {
+            Self::CandidateCapacity
+        } else {
+            Self::Terminal(CodexHandoffError::Transport)
+        }
+    }
+
+    fn from_io(error: io::Error) -> Self {
+        if matches!(
+            error.raw_os_error(),
+            Some(raw)
+                if raw == rustix::io::Errno::NOSPC.raw_os_error()
+                    || raw == rustix::io::Errno::DQUOT.raw_os_error()
+        ) {
+            Self::CandidateCapacity
+        } else {
+            Self::Terminal(CodexHandoffError::Transport)
+        }
+    }
+}
+
+impl From<CodexHandoffError> for ScratchProbeFailure {
+    fn from(error: CodexHandoffError) -> Self {
+        Self::Terminal(error)
+    }
+}
+
 fn verify_scratch_executability(
     root: &ScratchRoot,
     deadline: Instant,
-) -> Result<bool, CodexHandoffError> {
-    ensure_before_deadline(deadline)?;
-    root.revalidate()?;
+) -> Result<bool, ScratchProbeFailure> {
+    ensure_before_deadline(deadline).map_err(ScratchProbeFailure::from)?;
+    root.revalidate().map_err(ScratchProbeFailure::from)?;
     let descriptor = rustix::fs::openat(
         &root.descriptor,
         SCRATCH_EXECUTABILITY_PROBE_FILE,
@@ -3164,20 +3206,18 @@ fn verify_scratch_executability(
             | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::from_raw_mode(0o700),
     )
-    .map_err(|_| CodexHandoffError::Transport)?;
+    .map_err(ScratchProbeFailure::from_errno)?;
     let mut output = File::from(descriptor);
     output
         .write_all(SCRATCH_EXECUTABILITY_PROBE_BYTES)
-        .map_err(|_| CodexHandoffError::Transport)?;
-    output
-        .sync_all()
-        .map_err(|_| CodexHandoffError::Transport)?;
+        .map_err(ScratchProbeFailure::from_io)?;
+    output.sync_all().map_err(ScratchProbeFailure::from_io)?;
     drop(output);
-    root.sync_all()?;
+    root.sync_all_for_probe()?;
 
     let probe_path = root.path.join(SCRATCH_EXECUTABILITY_PROBE_FILE);
-    let identity = capture_executable(&probe_path, deadline)?;
-    revalidate_executable_until(&identity, Some(deadline))?;
+    let identity = capture_executable(&probe_path, deadline).map_err(ScratchProbeFailure::from)?;
+    revalidate_executable_until(&identity, Some(deadline)).map_err(ScratchProbeFailure::from)?;
     let mut command = Command::new(&identity.canonical_path);
     command.env_clear();
     configure_own_process_group(&mut command);
@@ -3194,11 +3234,11 @@ fn verify_scratch_executability(
                 reaped: false,
             };
             loop {
-                ensure_before_deadline(deadline)?;
+                ensure_before_deadline(deadline).map_err(ScratchProbeFailure::from)?;
                 match child
                     .child
                     .try_wait()
-                    .map_err(|_| CodexHandoffError::Transport)?
+                    .map_err(|_| ScratchProbeFailure::Terminal(CodexHandoffError::Transport))?
                 {
                     Some(status) => {
                         child.reaped = true;
@@ -3209,21 +3249,21 @@ fn verify_scratch_executability(
             }
         }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => false,
-        Err(_) => return Err(CodexHandoffError::Spawn),
+        Err(_) => return Err(ScratchProbeFailure::Terminal(CodexHandoffError::Spawn)),
     };
 
     // The fixed probe is identity-checked on both sides of execution. The
     // containing root is mode 0700 and descriptor-pinned, so no repository or
     // environment path can replace the executed bytes.
-    revalidate_executable_until(&identity, Some(deadline))?;
-    root.revalidate()?;
+    revalidate_executable_until(&identity, Some(deadline)).map_err(ScratchProbeFailure::from)?;
+    root.revalidate().map_err(ScratchProbeFailure::from)?;
     rustix::fs::unlinkat(
         &root.descriptor,
         SCRATCH_EXECUTABILITY_PROBE_FILE,
         rustix::fs::AtFlags::empty(),
     )
-    .map_err(|_| CodexHandoffError::Transport)?;
-    root.sync_all()?;
+    .map_err(ScratchProbeFailure::from_errno)?;
+    root.sync_all_for_probe()?;
     Ok(executed)
 }
 
@@ -3312,7 +3352,7 @@ impl ScratchRoot {
         probe: F,
     ) -> Result<Self, CodexHandoffFailure>
     where
-        F: FnMut(&ScratchRoot, Instant) -> Result<bool, CodexHandoffError>,
+        F: FnMut(&ScratchRoot, Instant) -> Result<bool, ScratchProbeFailure>,
     {
         Self::create_from_candidates_until_with(
             candidates,
@@ -3331,7 +3371,7 @@ impl ScratchRoot {
     ) -> Result<Self, CodexHandoffFailure>
     where
         C: FnMut(&Path) -> Result<Self, ScratchRootCreateFailure>,
-        F: FnMut(&ScratchRoot, Instant) -> Result<bool, CodexHandoffError>,
+        F: FnMut(&ScratchRoot, Instant) -> Result<bool, ScratchProbeFailure>,
     {
         Self::create_from_candidates_until_with_validation(
             candidates,
@@ -3352,7 +3392,7 @@ impl ScratchRoot {
     ) -> Result<ValidatedScratch<T>, CodexHandoffFailure>
     where
         C: FnMut(&Path) -> Result<Self, ScratchRootCreateFailure>,
-        F: FnMut(&ScratchRoot, Instant) -> Result<bool, CodexHandoffError>,
+        F: FnMut(&ScratchRoot, Instant) -> Result<bool, ScratchProbeFailure>,
         V: FnMut(&ScratchRoot, Instant) -> Result<T, CodexHandoffCause>,
     {
         let mut first_infrastructure_error = None;
@@ -3414,6 +3454,7 @@ impl ScratchRoot {
                 Ok(_) => {}
                 Err(cleanup) => {
                     let cause = probe_error
+                        .map(ScratchProbeFailure::error)
                         .or(first_infrastructure_error)
                         .unwrap_or(CodexHandoffError::UnsupportedNoexecScratch)
                         .into();
@@ -3423,8 +3464,13 @@ impl ScratchRoot {
                     ));
                 }
             }
-            if let Some(error) = probe_error {
-                return Err(error.into());
+            if let Some(failure) = probe_error {
+                match failure {
+                    ScratchProbeFailure::CandidateCapacity => {
+                        first_infrastructure_error.get_or_insert(failure.error());
+                    }
+                    ScratchProbeFailure::Terminal(error) => return Err(error.into()),
+                }
             }
         }
         Err(first_infrastructure_error
@@ -3632,6 +3678,16 @@ impl ScratchRoot {
         self.descriptor
             .sync_all()
             .map_err(|_| CodexHandoffError::Transport)
+    }
+
+    fn sync_all_for_probe(&self) -> Result<(), ScratchProbeFailure> {
+        #[cfg(test)]
+        if self.fail_next_sync.replace(false) {
+            return Err(ScratchProbeFailure::Terminal(CodexHandoffError::Transport));
+        }
+        self.descriptor
+            .sync_all()
+            .map_err(ScratchProbeFailure::from_io)
     }
 
     fn sync_parent(&self) -> Result<(), CodexHandoffError> {
@@ -4711,7 +4767,7 @@ mod tests {
             Instant::now() + Duration::from_secs(2),
             |_root, _deadline| {
                 attempts += 1;
-                Err(CodexHandoffError::Transport)
+                Err(ScratchProbeFailure::Terminal(CodexHandoffError::Transport))
             },
         ) {
             Ok(selected) => {
@@ -4729,6 +4785,97 @@ mod tests {
         drop((first, second));
         cleanup_test_scratch(fixture)?;
         Ok(())
+    }
+
+    #[test]
+    fn executable_scratch_selection_retries_candidate_capacity_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let first = fixture.create_directory("candidate-first")?;
+        let second = fixture.create_directory("candidate-second")?;
+        let candidates = [
+            ScratchParentCandidate::private_for_test(first.as_ref()),
+            ScratchParentCandidate::private_for_test(second.as_ref()),
+        ];
+        let mut attempts = 0;
+
+        let selected = ScratchRoot::create_from_candidates_until(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |_root, _deadline| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(ScratchProbeFailure::CandidateCapacity)
+                } else {
+                    Ok(true)
+                }
+            },
+        )?;
+
+        assert_eq!(attempts, 2);
+        assert_eq!(selected.parent_path, second.as_ref());
+        assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
+        cleanup_test_scratch(selected)?;
+        drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn executable_scratch_selection_reports_capacity_after_all_candidates_fail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ScratchRoot::create()?;
+        let first = fixture.create_directory("candidate-first")?;
+        let second = fixture.create_directory("candidate-second")?;
+        let candidates = [
+            ScratchParentCandidate::private_for_test(first.as_ref()),
+            ScratchParentCandidate::private_for_test(second.as_ref()),
+        ];
+        let mut attempts = 0;
+
+        let failure = match ScratchRoot::create_from_candidates_until(
+            &candidates,
+            Instant::now() + Duration::from_secs(2),
+            |_root, _deadline| {
+                attempts += 1;
+                Err(ScratchProbeFailure::CandidateCapacity)
+            },
+        ) {
+            Ok(selected) => {
+                cleanup_test_scratch(selected)?;
+                return Err("an exhausted scratch candidate became authority".into());
+            }
+            Err(failure) => failure,
+        };
+
+        assert_eq!(attempts, 2);
+        assert_eq!(failure.error(), CodexHandoffError::Transport);
+        assert!(!failure.has_retained_ownership());
+        assert_eq!(fs::read_dir(first.as_ref())?.count(), 0);
+        assert_eq!(fs::read_dir(second.as_ref())?.count(), 0);
+        drop((first, second));
+        cleanup_test_scratch(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_probe_retries_only_capacity_and_quota_errors() {
+        assert_eq!(
+            ScratchProbeFailure::from_errno(rustix::io::Errno::NOSPC),
+            ScratchProbeFailure::CandidateCapacity
+        );
+        assert_eq!(
+            ScratchProbeFailure::from_io(io::Error::from_raw_os_error(
+                rustix::io::Errno::DQUOT.raw_os_error(),
+            )),
+            ScratchProbeFailure::CandidateCapacity
+        );
+        assert_eq!(
+            ScratchProbeFailure::from_io(io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            )),
+            ScratchProbeFailure::Terminal(CodexHandoffError::Transport)
+        );
     }
 
     #[test]
