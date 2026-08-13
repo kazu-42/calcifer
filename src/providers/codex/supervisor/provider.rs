@@ -8,6 +8,8 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::fd::AsFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -1403,6 +1405,24 @@ impl PinnedSessionBuild {
         forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
     ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
         self.executable.append_forbidden_descriptors(forbidden)?;
+        self.append_non_executable_forbidden_descriptors(forbidden)
+    }
+
+    /// Builds the pre-exec TUI inventory without rejecting the one sealed
+    /// executable descriptor intentionally held by the internal launcher.
+    pub(super) fn append_remote_tui_pre_exec_forbidden_descriptors<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
+        self.executable
+            .append_remote_tui_pre_exec_forbidden_descriptors(forbidden)?;
+        self.append_non_executable_forbidden_descriptors(forbidden)
+    }
+
+    fn append_non_executable_forbidden_descriptors<'source>(
+        &'source self,
+        forbidden: &mut calcifer_unix_child_fd::CrossProcessDescriptorSet<'source>,
+    ) -> Result<(), calcifer_unix_child_fd::CrossProcessDescriptorIdentityError> {
         match &self.lifetime.lease {
             GuardianLeaseOwner::Production(lease) => {
                 lease.append_forbidden_descriptor(forbidden)?;
@@ -1615,6 +1635,13 @@ impl PinnedSessionBuild {
     ) -> Result<(), ProviderLaunchError> {
         self.revalidate_session_inputs(deadline)?;
         self.executable.revalidate_metadata().map_err(Into::into)
+    }
+
+    /// Borrows the sealed provider image that must survive the internal TUI
+    /// launcher's first exec and close on the final Codex exec.
+    #[cfg(target_os = "linux")]
+    pub(super) fn remote_tui_launch_descriptor(&self) -> Option<BorrowedFd<'_>> {
+        self.executable.launch_descriptor()
     }
 
     fn ensure_authority_available(&self, bit: u8) -> Result<(), ProviderLaunchError> {
@@ -5447,6 +5474,38 @@ mod tests {
         drop(failure);
         assert!(staged.exists());
         assert!(moved.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tui_pre_exec_inventory_excludes_only_the_sealed_launch_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sandbox = Sandbox::new("tui-pre-exec-inventory")?;
+        let stage_parent = sandbox.path().join("stage-parent");
+        let home = sandbox.path().join("home");
+        let workspace = sandbox.path().join("workspace");
+        for directory in [&stage_parent, &home, &workspace] {
+            fs::create_dir(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let executable = fs::canonicalize(std::env::current_exe()?)?;
+        let build = PinnedSessionBuild::from_test_capability(
+            test_launch_authorization(&home, &workspace, THREAD_ID)?,
+            TestCompatibilityCapability::capture(&executable)?,
+            &stage_parent,
+        )?;
+
+        let mut pre_exec = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+        build.append_remote_tui_pre_exec_forbidden_descriptors(&mut pre_exec)?;
+        let mut final_provider = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
+        build.append_forbidden_descriptors(&mut final_provider)?;
+        assert_eq!(final_provider.len(), pre_exec.len() + 1);
+
+        drop((pre_exec, final_provider));
+        build
+            .cleanup(deadline())
+            .map_err(|failure| format!("native pinned-stage cleanup failed: {failure:?}"))?;
         Ok(())
     }
 

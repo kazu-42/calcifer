@@ -28,6 +28,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Security
 
+- Verified Linux Codex compatibility, App Server, and remote-TUI launches now
+  execute one SHA-256-equal native image from a sealed anonymous `memfd` through
+  its retained descriptor. Rename, replacement, same-size substitution, and
+  in-place writes cannot change the launched bytes; the audited App Server and
+  two-stage TUI descriptor boundaries prove that close-on-exec authority cannot
+  reach provider descendants.
+  Missing procfs, scripts, seal failures, and unsupported platforms have no
+  pathname fallback. macOS fails before provider startup until a reviewed
+  public descriptor-exec primitive exists.
 - All six checksum-pinned Codex package probes now execute in separate fresh
   Linux loopback-only network namespaces after release download, checksum
   verification, and exact test-artifact preparation. The boundary revalidates

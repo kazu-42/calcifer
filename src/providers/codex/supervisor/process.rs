@@ -1297,6 +1297,27 @@ impl ManagedGroupChild {
             role,
             command,
             inherited_fd,
+            None,
+            deadline,
+            GroupContainmentPolicy::ProductionStrict,
+        )
+    }
+
+    /// Spawns the reviewed Linux TUI launcher with both its readiness channel
+    /// and sealed provider image as child-only inherited descriptors.
+    #[cfg(target_os = "linux")]
+    pub(super) fn spawn_session_leader_with_inherited_fds(
+        role: ChildRole,
+        command: Command,
+        readiness_fd: BorrowedFd<'_>,
+        executable_fd: BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> Result<Self, SpawnFailure> {
+        Self::spawn_session_leader_with_inherited_fd_policy(
+            role,
+            command,
+            readiness_fd,
+            Some(executable_fd),
             deadline,
             GroupContainmentPolicy::ProductionStrict,
         )
@@ -1313,6 +1334,28 @@ impl ManagedGroupChild {
             role,
             command,
             inherited_fd,
+            None,
+            deadline,
+            GroupContainmentPolicy::SyntheticFixture,
+        )
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(test, feature = "internal-supervisor-fixture")
+    ))]
+    pub(super) fn spawn_fixture_session_leader_with_inherited_fds(
+        role: ChildRole,
+        command: Command,
+        readiness_fd: BorrowedFd<'_>,
+        executable_fd: BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> Result<Self, SpawnFailure> {
+        Self::spawn_session_leader_with_inherited_fd_policy(
+            role,
+            command,
+            readiness_fd,
+            Some(executable_fd),
             deadline,
             GroupContainmentPolicy::SyntheticFixture,
         )
@@ -1322,13 +1365,26 @@ impl ManagedGroupChild {
         role: ChildRole,
         command: Command,
         inherited_fd: BorrowedFd<'_>,
+        executable_fd: Option<BorrowedFd<'_>>,
         deadline: Instant,
         containment_policy: GroupContainmentPolicy,
     ) -> Result<Self, SpawnFailure> {
-        let child = match calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(
-            command,
-            inherited_fd,
-        ) {
+        let spawn = match executable_fd {
+            #[cfg(target_os = "linux")]
+            Some(executable_fd) => {
+                calcifer_unix_child_fd::spawn_with_inherited_readiness_and_executable_fd(
+                    command,
+                    inherited_fd,
+                    executable_fd,
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            Some(_) => unreachable!("executable descriptor inheritance is Linux-only"),
+            None => {
+                calcifer_unix_child_fd::spawn_with_inherited_readiness_fd(command, inherited_fd)
+            }
+        };
+        let child = match spawn {
             Ok(child) => child,
             Err(error) => match error.into_started_child() {
                 Some(child) => {
