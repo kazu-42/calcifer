@@ -2190,17 +2190,20 @@ impl RemovalRegistryBarrier {
 }
 
 fn registry_digest(document: &RegistryDocument) -> Result<String, ProfileError> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
     let bytes = serde_json::to_vec(document)
         .map_err(|_| ProfileError::InvalidRegistry("registry serialization failed".to_owned()))?;
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    Ok(encode_lower_hex(&Sha256::digest(bytes)))
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-    Ok(encoded)
+    encoded
 }
 
 fn effective_removal_journal(
@@ -2631,7 +2634,7 @@ fn validate_owned_removal_tree_inner_with_limits(
         entry_count: u64::try_from(budget.consumed_entries).map_err(|_| {
             ProfileError::UnsafeState("managed profile tree is too large".to_owned())
         })?,
-        manifest_digest: format!("{:x}", manifest.finalize()),
+        manifest_digest: encode_lower_hex(&manifest.finalize()),
     })
 }
 
@@ -5085,6 +5088,11 @@ fn refuse_orphaned_staging(provider_root: &Path) -> Result<(), ProfileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lower_hex_encoding_preserves_leading_and_full_bytes() {
+        assert_eq!(encode_lower_hex(&[0x00, 0x0f, 0x10, 0xff]), "000f10ff");
+    }
 
     #[cfg(unix)]
     #[test]

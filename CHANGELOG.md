@@ -36,6 +36,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   environment authority. macOS is reported as hermetic-unsupported and no
   longer runs a native-network fallback; Codex 0.144.4's unconditional remote
   announcement prewarm cannot contribute response content to acceptance.
+- Remote-TUI descriptor isolation now uses a role-bound two-party pre-exec
+  gate. The launcher remains held while Guardian and Coordinator independently
+  verify forbidden descriptors, then requires one fixed authorization plus EOF
+  before token-and-close-on-exec readiness. Official Codex can retain Linux
+  `PR_SET_DUMPABLE=0` hardening without creating a post-exec procfs race;
+  permission denial and malformed, early, duplicate, or mismatched transitions
+  remain fail-closed.
 - Routing state reuses the managed-profile NOFOLLOW, ownership, mode,
   single-link, and macOS ACL checks; writes use a private same-directory
   temporary, file fsync, atomic rename, and parent-directory fsync. Repository

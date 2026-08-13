@@ -698,6 +698,9 @@ pub(super) fn run_fake_tui(scenario: Scenario) -> Result<ExitCode, FixtureError>
     } else {
         None
     };
+    let readiness = readiness
+        .hold_until_authorized(startup_deadline())
+        .map_err(|_| FixtureError::Process)?;
     if scenario == Scenario::PtyTuiEarlyExit {
         write_marker("tui.early-exit-armed", b"armed\n")?;
         wait_for_exact_marker("test.release-fault", b"release\n")?;
@@ -3109,7 +3112,7 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
                     )
                 }
             }
-            GuardianEvent::ChildStarted { pid, pgid, .. } => {
+            GuardianEvent::ChildStarted { role, pid, pgid } => {
                 if reported_groups.len() == 2
                     || !reported_group_is_safe(&guardian, pid, pgid)
                     || reported_groups.contains(&pgid)
@@ -3127,6 +3130,22 @@ fn run_terminal_coordinator(scenario: Scenario) -> Result<ExitCode, FixtureError
                     )
                 }
                 reported_groups.push(pgid);
+                let command = CoordinatorCommand::ChildDescriptorsVerified { role };
+                if receiver.record_command(command).is_err()
+                    || send_coordinator_command(&mut &lifecycle, command, phase_deadline()).is_err()
+                {
+                    drop(receiver);
+                    drop(terminal_coordinator);
+                    restore_and_retain(
+                        coordinator_lease,
+                        guardian,
+                        lifecycle,
+                        transfer,
+                        snapshot,
+                        None,
+                        RetentionReason::LifecycleLost,
+                    )
+                }
             }
             GuardianEvent::Ready => match receiver.take_verified_ready() {
                 Ok(readiness) => break Some(readiness),
@@ -4021,7 +4040,7 @@ fn run_terminal_guardian(_scenario: Scenario) -> Result<ExitCode, FixtureError> 
             );
         }
     };
-    let (readiness_receiver, readiness_sender) = match tui_readiness_pair() {
+    let (mut readiness_receiver, readiness_sender) = match tui_readiness_pair() {
         Ok(pair) => pair,
         Err(_) => {
             return finish_terminal_guardian(
@@ -4221,7 +4240,11 @@ fn run_terminal_guardian(_scenario: Scenario) -> Result<ExitCode, FixtureError> 
             pid: app_identity.pid(),
             pgid: app_identity.pgid(),
         },
-    ) || app.await_ready(startup_deadline()).is_err()
+    ) || commands.receive(phase_deadline())
+        != Ok(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::AppServer,
+        })
+        || app.await_ready(startup_deadline()).is_err()
     {
         return finish_terminal_guardian(
             &endpoint,
@@ -4285,15 +4308,24 @@ fn run_terminal_guardian(_scenario: Scenario) -> Result<ExitCode, FixtureError> 
     };
     drop(readiness_sender);
     let tui_identity = tui.containment();
-    if !emit_guardian_event(
-        &mut commands,
-        &endpoint,
-        GuardianEvent::ChildStarted {
-            role: ChildRole::Tui,
-            pid: tui_identity.pid(),
-            pgid: tui_identity.pgid(),
-        },
-    ) {
+    if readiness_receiver
+        .receive_pre_exec_hold(startup_deadline())
+        .is_err()
+        || !emit_guardian_event(
+            &mut commands,
+            &endpoint,
+            GuardianEvent::ChildStarted {
+                role: ChildRole::Tui,
+                pid: tui_identity.pid(),
+                pgid: tui_identity.pgid(),
+            },
+        )
+        || commands.receive(phase_deadline())
+            != Ok(CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
+            })
+        || readiness_receiver.authorize_exec().is_err()
+    {
         return finish_terminal_guardian(
             &endpoint,
             &mut commands,
