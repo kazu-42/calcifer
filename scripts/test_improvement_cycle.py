@@ -38,21 +38,25 @@ class ImprovementCycleTests(unittest.TestCase):
                 "created_at": "2026-08-13T10:00:00Z",
                 "status": "completed",
                 "conclusion": "success",
+                "run_attempt": 1,
             },
             {
                 "created_at": "2026-08-12T10:00:00Z",
                 "status": "completed",
                 "conclusion": "failure",
+                "run_attempt": 2,
             },
             {
                 "created_at": "2026-08-11T10:00:00Z",
                 "status": "in_progress",
                 "conclusion": None,
+                "run_attempt": 1,
             },
             {
                 "created_at": "2026-08-01T10:00:00Z",
                 "status": "completed",
                 "conclusion": "failure",
+                "run_attempt": 3,
             },
         ]
         self.releases = [
@@ -89,12 +93,16 @@ class ImprovementCycleTests(unittest.TestCase):
         self.assertEqual(decision.issue_number, 128)
         self.assertEqual(
             decision.marker,
-            "calcifer-improvement-cycle-snapshot:v1 date=2026-08-13",
+            "calcifer-improvement-cycle-snapshot:v2 date=2026-08-13",
         )
         self.assertIn("| Open product issues | 2 |", decision.body)
         self.assertIn("| Open pull requests | 1 |", decision.body)
         self.assertIn(
             "| Main CI, last 7 days | 1 passed / 1 failed / 1 pending |",
+            decision.body,
+        )
+        self.assertIn(
+            "| Same-run CI retries, last 7 days | 1 / 3 (33.3%) |",
             decision.body,
         )
         self.assertIn("[v0.1.0-alpha.4]", decision.body)
@@ -188,6 +196,17 @@ class ImprovementCycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "issue number"):
                 improvement_cycle.load_issue_pages(path)
 
+        invalid_runs = [dict(run) for run in self.runs]
+        del invalid_runs[0]["run_attempt"]
+        with self.assertRaisesRegex(ValueError, "run_attempt"):
+            improvement_cycle.build_decision(
+                repository="kazu-42/calcifer",
+                now=self.now,
+                issues=self.issues,
+                runs=invalid_runs,
+                releases=self.releases,
+            )
+
     def test_cli_writes_body_and_multiline_safe_github_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -233,7 +252,7 @@ class ImprovementCycleTests(unittest.TestCase):
             self.assertEqual(
                 outputs.read_text(encoding="utf-8"),
                 "mode=comment\nissue_number=128\n"
-                "marker=calcifer-improvement-cycle-snapshot:v1 "
+                "marker=calcifer-improvement-cycle-snapshot:v2 "
                 "date=2026-08-13\n",
             )
 

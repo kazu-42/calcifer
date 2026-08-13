@@ -2393,11 +2393,11 @@ case "${1:-}" in
     exec sleep 30
     ;;
   hold-ignore-int)
+    trap '' INT
     printf '%s\n' "$$" > "$FAKE_CODEX_CHILD_PID"
     if [ -n "${FAKE_CODEX_GUARD_PID:-}" ]; then
       printf '%s\n' "$PPID" > "$FAKE_CODEX_GUARD_PID"
     fi
-    trap '' INT
     exec sleep 30
     ;;
   background)
@@ -2420,6 +2420,13 @@ esac
     let mut permissions = std::fs::metadata(&fake_codex)?.permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&fake_codex, permissions)?;
+    let fake_script = std::fs::read_to_string(&fake_codex)?;
+    assert!(
+        fake_script.contains(
+            "hold-ignore-int)\n    trap '' INT\n    printf '%s\\n' \"$$\" > \"$FAKE_CODEX_CHILD_PID\""
+        ),
+        "the SIGINT disposition must be installed before readiness is published"
+    );
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
     let mut path_entries = vec![bin.clone()];
     path_entries.extend(std::env::split_paths(&inherited_path));
