@@ -442,8 +442,11 @@ recorded known process groups plus identity-checked runtime, FD, and socket
 evidence. A child can change session and process group with `setsid(2)`, and a
 generic process-group sweep neither waits such a non-child nor establishes its
 nonexistence. Calcifer therefore does not describe this contract as whole-tree
-reaping. Containment and accounting for descendants that escape with
-`setsid(2)` is tracked separately by issue #56.
+reaping. [ADR 0006](adr/0006-platform-owned-descendant-containment.md)
+records the issue #56 decision: Linux support requires a separately owned
+broker-backed domain, same-user delegation is insufficient, and macOS has no
+reviewed public equivalent. The current capability therefore remains limited
+to the narrower contract.
 
 The synthetic #28 compatibility-probe subprocesses remain separate
 process-group leaders. That probe observes a leader exit with non-reaping

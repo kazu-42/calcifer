@@ -523,8 +523,12 @@ and socket evidence. The checksum-pinned package smoke is intended
 to verify the narrower boundary Calcifer depends on: the official shell-command
 path can create such a detached probe without leaking eight live supervisor
 authority/control descriptors or denied supervisor/authentication environment
-into it. Accounting and containment for descendants that escape with
-`setsid(2)` is tracked separately by issue #56.
+into it. [ADR 0006](adr/0006-platform-owned-descendant-containment.md)
+records the issue #56 platform evaluation: cgroup v2 can supply the required
+kernel operations only behind an independently owned broker, same-user
+rootless delegation is not a security boundary, and macOS has no reviewed
+public equivalent. No current deployment therefore upgrades this contract to
+whole-generation containment.
 
 Ubuntu 24.04 package CI jobs verify the official archive's architecture-specific
 SHA-256 and single executable before running three independently budgeted
