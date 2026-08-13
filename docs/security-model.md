@@ -227,6 +227,18 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   The reason is printed only as a fixed subtype at the existing target-process-
   group stage and contains no numeric process or descriptor identity. It does
   not grant ownership, cleanup, retry, or readiness authority.
+- TUI descriptor observation completes before provider exec. The launcher first
+  proves PID=PGID=SID and controlling-terminal ownership, then sends one fixed
+  hold token and waits. The guardian verifies its forbidden set, publishes the
+  exact child identity, and waits for the coordinator's independently verified,
+  role-bound `ChildDescriptorsVerified` command. Only then may it send one
+  fixed authorization byte and close its write half. The launcher requires the
+  byte plus EOF before publishing the readiness token and immediately execing
+  Codex; the channel remains close-on-exec, so token plus EOF proves the exec
+  boundary. No post-exec `/proc/<pid>/fd` read is trusted or required. This
+  preserves upstream `PR_SET_DUMPABLE=0` hardening; permission denial,
+  identity/liveness drift, a forbidden descriptor, wrong role/order, malformed
+  bytes, timeout, or EOF at the wrong state all fail closed before input exists.
 - At guardian exec entry, lifecycle fd 0, terminal fd 1, and recovery fd 2 are
   each moved into one owned close-on-exec duplicate while the guardian is still
   single-threaded. The boundary requires exactly two references to the original

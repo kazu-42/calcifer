@@ -17,6 +17,8 @@ use super::protocol::{ChildDisposition, ChildRole, StopAction, UnixSignal};
 
 const READINESS_SENTINEL: u8 = b'R';
 const TUI_READINESS_TOKEN: u8 = 1;
+const TUI_PRE_EXEC_HOLD_TOKEN: u8 = 2;
+const TUI_EXEC_AUTHORIZATION_TOKEN: u8 = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 // A Linux attempt walks the process table and target fd tables twice. Give
 // transient churn time to settle without consuming an entire startup budget.
@@ -68,6 +70,9 @@ impl fmt::Debug for VerifiedTuiReadiness {
 pub(super) struct TuiReadinessReceiver {
     stream: UnixStream,
     saw_token: bool,
+    pre_exec_held: bool,
+    exec_authorized: bool,
+    exec_observed: bool,
 }
 
 /// Child-only descriptor authority. It exposes only `AsFd`, which lets the
@@ -104,6 +109,9 @@ pub(super) fn tui_readiness_pair()
         TuiReadinessReceiver {
             stream: receiver,
             saw_token: false,
+            pre_exec_held: false,
+            exec_authorized: false,
+            exec_observed: false,
         },
         TuiReadinessSender { stream: sender },
     ))
@@ -115,6 +123,63 @@ impl TuiReadinessReceiver {
     ) -> Result<calcifer_unix_child_fd::DescriptorIdentity, TuiReadinessError> {
         calcifer_unix_child_fd::descriptor_identity(self.stream.as_fd())
             .map_err(|_| TuiReadinessError::Descriptor)
+    }
+
+    /// Waits until the launcher has established its session and controlling
+    /// terminal but has not yet execed the provider. This is deliberately a
+    /// separate transition from final readiness: descriptor observation must
+    /// complete while the launcher remains inspectable.
+    pub(super) fn receive_pre_exec_hold(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), TuiReadinessError> {
+        if self.pre_exec_held || self.exec_authorized || self.exec_observed || self.saw_token {
+            return Err(TuiReadinessError::Invalid);
+        }
+        loop {
+            wait_for_tui_readiness_input(&self.stream, deadline)?;
+            let mut bytes = [0_u8; 2];
+            match self.stream.read(&mut bytes) {
+                Ok(1) if bytes[0] == TUI_PRE_EXEC_HOLD_TOKEN => {
+                    self.pre_exec_held = true;
+                    return Ok(());
+                }
+                Ok(0) | Ok(1..) => return Err(TuiReadinessError::Invalid),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return Err(TuiReadinessError::Channel),
+            }
+        }
+    }
+
+    /// Releases exactly one held launcher and closes the guardian-to-launcher
+    /// half of the socket. The launcher requires both the fixed byte and EOF,
+    /// so a partial write or retained duplicate writer cannot authorize exec.
+    pub(super) fn authorize_exec(&mut self) -> Result<(), TuiReadinessError> {
+        if !self.pre_exec_held || self.exec_authorized || self.exec_observed || self.saw_token {
+            return Err(TuiReadinessError::Invalid);
+        }
+        self.stream
+            .write_all(&[TUI_EXEC_AUTHORIZATION_TOKEN])
+            .and_then(|()| self.stream.flush())
+            .map_err(|_| TuiReadinessError::Channel)?;
+        self.stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|_| TuiReadinessError::Channel)?;
+        self.exec_authorized = true;
+        Ok(())
+    }
+
+    pub(super) fn receive_after_authorization(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<VerifiedTuiReadiness, TuiReadinessError> {
+        if !self.exec_authorized || self.exec_observed {
+            return Err(TuiReadinessError::Invalid);
+        }
+        let proof = self.receive(deadline)?;
+        self.exec_observed = true;
+        Ok(proof)
     }
 
     /// Waits for exactly `token + EOF`, never extending the caller's absolute
@@ -174,8 +239,45 @@ impl TuiReadinessReceiver {
     }
 }
 
+fn wait_for_tui_readiness_input(
+    stream: &UnixStream,
+    deadline: Instant,
+) -> Result<(), TuiReadinessError> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(TuiReadinessError::Timeout);
+        }
+        let timeout = rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
+            .map_err(|_| TuiReadinessError::Deadline)?;
+        let mut descriptors = [rustix::event::PollFd::new(
+            stream,
+            rustix::event::PollFlags::IN,
+        )];
+        match rustix::event::poll(&mut descriptors, Some(&timeout)) {
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return Err(TuiReadinessError::Channel),
+            Ok(0) => return Err(TuiReadinessError::Timeout),
+            Ok(_) => {}
+        }
+        let events = descriptors[0].revents();
+        if events.intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::NVAL) {
+            return Err(TuiReadinessError::Channel);
+        }
+        if events.intersects(rustix::event::PollFlags::IN | rustix::event::PollFlags::HUP) {
+            return Ok(());
+        }
+    }
+}
+
 /// Launcher-side one-shot publisher acquired before any terminal mutation.
 pub(super) struct InheritedTuiReadiness {
+    stream: UnixStream,
+}
+
+/// Launcher authority minted only after the guardian sends one fixed
+/// authorization token and closes its write half.
+pub(super) struct AuthorizedInheritedTuiReadiness {
     stream: UnixStream,
 }
 
@@ -191,6 +293,7 @@ impl InheritedTuiReadiness {
     /// Emits the sole fixed token and shuts down the write half. Shutdown is
     /// required because the sealed bootstrap descriptor remains open until
     /// the immediately following exec closes it via `FD_CLOEXEC`.
+    #[cfg(test)]
     pub(super) fn publish(mut self) -> Result<(), TuiReadinessError> {
         self.stream
             .write_all(&[TUI_READINESS_TOKEN])
@@ -201,21 +304,68 @@ impl InheritedTuiReadiness {
             .map_err(|_| TuiReadinessError::Channel)
     }
 
-    /// Writes the token without closing the socket. The caller must exec
-    /// immediately: EOF is then generated only when `FD_CLOEXEC` seals the
-    /// bootstrap descriptor at that exec boundary (or when a failed launcher
-    /// exits). This lets the guardian distinguish a silent pre-exec stall from
-    /// an exec attempt without passing the readiness fd to Codex.
-    pub(super) fn publish_before_exec(mut self) -> Result<(), TuiReadinessError> {
+    /// Publishes the pre-exec hold and blocks on the guardian's exact
+    /// authorization boundary. The absolute deadline prevents a failed
+    /// lifecycle peer from retaining a launcher indefinitely.
+    pub(super) fn hold_until_authorized(
+        mut self,
+        deadline: Instant,
+    ) -> Result<AuthorizedInheritedTuiReadiness, TuiReadinessError> {
         self.stream
-            .write_all(&[TUI_READINESS_TOKEN])
+            .write_all(&[TUI_PRE_EXEC_HOLD_TOKEN])
             .and_then(|()| self.stream.flush())
-            .map_err(|_| TuiReadinessError::Channel)
+            .map_err(|_| TuiReadinessError::Channel)?;
+
+        let mut saw_authorization = false;
+        loop {
+            wait_for_tui_readiness_input(&self.stream, deadline)?;
+            let mut bytes = [0_u8; 2];
+            match self.stream.read(&mut bytes) {
+                Ok(0) if saw_authorization => {
+                    return Ok(AuthorizedInheritedTuiReadiness {
+                        stream: self.stream,
+                    });
+                }
+                Ok(0) => return Err(TuiReadinessError::Invalid),
+                Ok(1) if !saw_authorization && bytes[0] == TUI_EXEC_AUTHORIZATION_TOKEN => {
+                    saw_authorization = true;
+                }
+                Ok(_) => return Err(TuiReadinessError::Invalid),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return Err(TuiReadinessError::Channel),
+            }
+        }
     }
 
     #[cfg(test)]
     fn from_stream_for_test(stream: UnixStream) -> Self {
         Self { stream }
+    }
+}
+
+impl AuthorizedInheritedTuiReadiness {
+    /// Fixture-only terminal publisher for a child that remains in the same
+    /// process after authorization instead of crossing an exec boundary.
+    #[cfg(any(test, feature = "internal-supervisor-fixture"))]
+    pub(super) fn publish(mut self) -> Result<(), TuiReadinessError> {
+        self.stream
+            .write_all(&[TUI_READINESS_TOKEN])
+            .and_then(|()| self.stream.flush())
+            .map_err(|_| TuiReadinessError::Channel)?;
+        self.stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|_| TuiReadinessError::Channel)
+    }
+
+    /// Writes the final token without closing the socket. The immediately
+    /// following exec closes the sealed descriptor via `FD_CLOEXEC`, making
+    /// EOF the exact exec boundary observed by the guardian.
+    pub(super) fn publish_before_exec(mut self) -> Result<(), TuiReadinessError> {
+        self.stream
+            .write_all(&[TUI_READINESS_TOKEN])
+            .and_then(|()| self.stream.flush())
+            .map_err(|_| TuiReadinessError::Channel)
     }
 }
 
@@ -352,6 +502,14 @@ impl ShutdownOutcome {
             Self::Clean(_) => None,
             Self::Failed { error, .. } => Some(error),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn clean_tui_for_lifecycle_test(tui: ChildDisposition) -> Self {
+        Self::Clean(ReapedChildren {
+            tui,
+            app_server: ChildDisposition::NotStarted,
+        })
     }
 }
 
@@ -3176,6 +3334,81 @@ mod tests {
                 .receive(deadline)
                 .err()
                 .ok_or("open silent readiness channel must time out")?,
+            TuiReadinessError::Timeout
+        );
+        assert!(Instant::now() >= deadline);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_tui_pre_exec_hold_requires_exact_guardian_authorization() -> Result<(), Box<dyn Error>>
+    {
+        let (mut receiver, sender) = tui_readiness_pair()?;
+        let child = thread::spawn(move || -> Result<(), TuiReadinessError> {
+            let readiness = InheritedTuiReadiness::from_stream_for_test(sender.stream);
+            let authorized = readiness.hold_until_authorized(Instant::now() + TEST_DEADLINE)?;
+            authorized.publish_before_exec()
+        });
+
+        receiver.receive_pre_exec_hold(Instant::now() + TEST_DEADLINE)?;
+        assert!(receiver.try_receive()?.is_none());
+        receiver.authorize_exec()?;
+        let proof = receiver.receive_after_authorization(Instant::now() + TEST_DEADLINE)?;
+        assert_eq!(format!("{proof:?}"), "VerifiedTuiReadiness(<verified>)");
+        assert_eq!(
+            receiver
+                .receive_after_authorization(Instant::now() + TEST_DEADLINE)
+                .err(),
+            Some(TuiReadinessError::Invalid)
+        );
+        child.join().map_err(|_| "pre-exec fixture panicked")??;
+        Ok(())
+    }
+
+    #[test]
+    fn typed_tui_pre_exec_hold_rejects_wrong_authorization_and_peer_eof()
+    -> Result<(), Box<dyn Error>> {
+        for payload in [
+            Vec::new(),
+            vec![TUI_EXEC_AUTHORIZATION_TOKEN.wrapping_add(1)],
+            vec![TUI_EXEC_AUTHORIZATION_TOKEN; 2],
+            vec![TUI_EXEC_AUTHORIZATION_TOKEN, 0],
+        ] {
+            let (child, mut guardian) = UnixStream::pair()?;
+            guardian.write_all(&payload)?;
+            guardian.shutdown(std::net::Shutdown::Write)?;
+            let readiness = InheritedTuiReadiness::from_stream_for_test(child);
+            assert_eq!(
+                readiness
+                    .hold_until_authorized(Instant::now() + TEST_DEADLINE)
+                    .err()
+                    .ok_or("invalid authorization must fail")?,
+                TuiReadinessError::Invalid
+            );
+        }
+
+        let (mut receiver, sender) = tui_readiness_pair()?;
+        drop(sender);
+        assert_eq!(
+            receiver
+                .receive_pre_exec_hold(Instant::now() + TEST_DEADLINE)
+                .err()
+                .ok_or("EOF before the hold token must fail")?,
+            TuiReadinessError::Invalid
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_tui_pre_exec_authorization_obeys_an_absolute_deadline() -> Result<(), Box<dyn Error>> {
+        let (child, _silent_guardian) = UnixStream::pair()?;
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let readiness = InheritedTuiReadiness::from_stream_for_test(child);
+        assert_eq!(
+            readiness
+                .hold_until_authorized(deadline)
+                .err()
+                .ok_or("a silent guardian must not retain the launcher")?,
             TuiReadinessError::Timeout
         );
         assert!(Instant::now() >= deadline);

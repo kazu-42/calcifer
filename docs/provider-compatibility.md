@@ -498,9 +498,20 @@ SID, path, OS error, provider output, or credential material. It is observation
 only: it does not authorize a retry or numeric-ID cleanup and does not weaken
 guardian retention, cleanup ordering, or the exit-86 boundary.
 
-Remote-TUI startup readiness likewise keeps the production
-`TuiReadiness` category while package diagnostics distinguish readiness receive,
-first child liveness, descriptor isolation, and final child liveness. All six
+Remote-TUI startup now holds the exact launcher before provider exec. The
+guardian proves its full forbidden inventory, including the PTY master, before
+publishing `ChildStarted`; the coordinator then proves its independent
+inventory and sends one role-bound `ChildDescriptorsVerified` command. Only
+the matching command lets the guardian authorize exec. The launcher requires
+the fixed authorization byte plus EOF, then publishes the existing token and
+execs Codex so close-on-exec EOF remains the final boundary. Descriptor scans
+therefore finish before Linux provider hardening such as
+`PR_SET_DUMPABLE=0`, without weakening that hardening or treating
+`PermissionDenied` as retryable.
+
+Startup readiness keeps the production `TuiReadiness` category while package
+diagnostics distinguish hold/final-token receive, pre-exec child liveness,
+pre-exec descriptor isolation, and final post-exec child liveness. All six
 `TuiReadinessError` values, all closed `ProcessError` variants at each liveness
 stage, and all thirteen process-group descriptor-scan errors have fixed,
 payload-free markers. The retained failure exposes only that marker to the

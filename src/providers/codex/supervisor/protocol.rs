@@ -34,6 +34,7 @@ const COORDINATOR_SUSPEND: u8 = 6;
 const COORDINATOR_RESUME: u8 = 7;
 const COORDINATOR_TERMINAL_RESTORED: u8 = 8;
 const COORDINATOR_TERMINAL_ARM_ACCEPTED: u8 = 9;
+const COORDINATOR_CHILD_DESCRIPTORS_VERIFIED: u8 = 10;
 
 const GUARDIAN_LEASE_COMMITTED: u8 = 1;
 const GUARDIAN_CHILD_STARTED: u8 = 2;
@@ -53,6 +54,7 @@ const EMPTY_BODY_BYTES: usize = 1;
 const SNAPSHOT_FINGERPRINT_BYTES: usize = 32;
 const TERMINAL_ARMED_BODY_BYTES: usize = 1 + SNAPSHOT_FINGERPRINT_BYTES;
 const SIGNAL_BODY_BYTES: usize = 2;
+const CHILD_ROLE_BODY_BYTES: usize = 2;
 const TERMINAL_SIZE_BODY_BYTES: usize = 5;
 const CHILD_STARTED_BODY_BYTES: usize = 10;
 const FAILED_BODY_BYTES: usize = 3;
@@ -64,6 +66,7 @@ const CHILDREN_REAPED_BODY_BYTES: usize = 14;
 pub(super) enum CoordinatorCommand {
     Start,
     TerminalArmAccepted,
+    ChildDescriptorsVerified { role: ChildRole },
     Stop,
     OpenInputGate,
     Signal { signal: UnixSignal },
@@ -355,7 +358,9 @@ enum TerminalLifecycleState {
     AwaitTerminalArmed,
     AwaitTerminalArmAcceptance,
     AwaitApp,
+    AwaitAppDescriptorVerification,
     AwaitTui,
+    AwaitTuiDescriptorVerification,
     AwaitReady,
     ReadyForGate,
     AwaitGateOpened,
@@ -508,6 +513,18 @@ impl TerminalLifecycleValidator {
         self.state = match (self.state, command) {
             (State::AwaitStart, Command::Start) => State::AwaitTerminalArmed,
             (State::AwaitTerminalArmAcceptance, Command::TerminalArmAccepted) => State::AwaitApp,
+            (
+                State::AwaitAppDescriptorVerification,
+                Command::ChildDescriptorsVerified {
+                    role: ChildRole::AppServer,
+                },
+            ) => State::AwaitTui,
+            (
+                State::AwaitTuiDescriptorVerification,
+                Command::ChildDescriptorsVerified {
+                    role: ChildRole::Tui,
+                },
+            ) => State::AwaitReady,
             (State::ReadyForGate, Command::OpenInputGate) => State::AwaitGateOpened,
             (State::Active, Command::Signal { signal }) => State::AwaitSignalForwarded {
                 signal,
@@ -592,7 +609,7 @@ impl TerminalLifecycleValidator {
                 validate_process_group(pid, pgid)?;
                 self.app_started = true;
                 self.app_process_group = Some(pgid);
-                State::AwaitTui
+                State::AwaitAppDescriptorVerification
             }
             (
                 State::AwaitTui,
@@ -607,7 +624,7 @@ impl TerminalLifecycleValidator {
                     return Err(ProtocolError::InvalidValue);
                 }
                 self.tui_started = true;
-                State::AwaitReady
+                State::AwaitTuiDescriptorVerification
             }
             (State::AwaitReady, Event::Ready) => State::ReadyForGate,
             (State::AwaitGateOpened, Event::InputGateOpened) => {
@@ -959,6 +976,13 @@ pub(super) fn send_coordinator_command<W: Write>(
         CoordinatorCommand::Start => (COORDINATOR_START, EMPTY_BODY_BYTES),
         CoordinatorCommand::TerminalArmAccepted => {
             (COORDINATOR_TERMINAL_ARM_ACCEPTED, EMPTY_BODY_BYTES)
+        }
+        CoordinatorCommand::ChildDescriptorsVerified { role } => {
+            body[1] = encode_child_role(role);
+            (
+                COORDINATOR_CHILD_DESCRIPTORS_VERIFIED,
+                CHILD_ROLE_BODY_BYTES,
+            )
         }
         CoordinatorCommand::Stop => (COORDINATOR_STOP, EMPTY_BODY_BYTES),
         CoordinatorCommand::OpenInputGate => (COORDINATOR_OPEN_INPUT_GATE, EMPTY_BODY_BYTES),
@@ -2013,6 +2037,13 @@ fn receive_coordinator_command<R: Read>(
             frame.require_payload_version()?;
             Ok(CoordinatorCommand::TerminalArmAccepted)
         }
+        COORDINATOR_CHILD_DESCRIPTORS_VERIFIED => {
+            frame.require_exact_len(CHILD_ROLE_BODY_BYTES)?;
+            frame.require_payload_version()?;
+            Ok(CoordinatorCommand::ChildDescriptorsVerified {
+                role: decode_child_role(frame.body[1])?,
+            })
+        }
         _ => Err(ProtocolError::UnknownType),
     }
 }
@@ -2608,6 +2639,22 @@ mod tests {
         let mut wire = Vec::new();
         send_guardian_event(&mut wire, event, deadline())?;
         Ok(wire)
+    }
+
+    fn append_child_descriptor_verification_commands(
+        wire: &mut Vec<u8>,
+    ) -> Result<(), ProtocolError> {
+        wire.extend_from_slice(&encode_coordinator(
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::AppServer,
+            },
+        )?);
+        wire.extend_from_slice(&encode_coordinator(
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
+            },
+        )?);
+        Ok(())
     }
 
     fn raw_frame(direction_and_type: u8, body: &[u8]) -> Vec<u8> {
@@ -3342,6 +3389,12 @@ mod tests {
     fn terminal_control_frames_are_typed_bounded_and_round_trip() -> Result<(), Box<dyn Error>> {
         for command in [
             CoordinatorCommand::TerminalArmAccepted,
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::AppServer,
+            },
+            CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
+            },
             CoordinatorCommand::OpenInputGate,
             CoordinatorCommand::Signal {
                 signal: UnixSignal::Hup,
@@ -3520,11 +3573,52 @@ mod tests {
         validator.accept_event(terminal_armed())?;
         validator.accept_command(CoordinatorCommand::TerminalArmAccepted)?;
         validator.accept_event(app_started())?;
+        validator.accept_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::AppServer,
+        })?;
         validator.accept_event(tui_started())?;
+        validator.accept_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::Tui,
+        })?;
         validator.accept_event(GuardianEvent::Ready)?;
         validator.accept_command(CoordinatorCommand::OpenInputGate)?;
         validator.accept_event(GuardianEvent::InputGateOpened)?;
         Ok(validator)
+    }
+
+    #[test]
+    fn terminal_startup_requires_role_bound_descriptor_verification_commands()
+    -> Result<(), Box<dyn Error>> {
+        let mut validator = TerminalLifecycleValidator::before_start();
+        validator.accept_event(GuardianEvent::LeaseCommitted)?;
+        validator.accept_command(CoordinatorCommand::Start)?;
+        validator.accept_event(terminal_armed())?;
+        validator.accept_command(CoordinatorCommand::TerminalArmAccepted)?;
+        validator.accept_event(app_started())?;
+
+        assert_eq!(
+            validator.accept_event(tui_started()),
+            Err(ProtocolError::UnexpectedState)
+        );
+        assert_eq!(
+            validator.accept_command(CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
+            }),
+            Err(ProtocolError::UnexpectedState)
+        );
+        validator.accept_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::AppServer,
+        })?;
+        validator.accept_event(tui_started())?;
+        assert_eq!(
+            validator.accept_event(GuardianEvent::Ready),
+            Err(ProtocolError::UnexpectedState)
+        );
+        validator.accept_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::Tui,
+        })?;
+        validator.accept_event(GuardianEvent::Ready)?;
+        Ok(())
     }
 
     fn complete_terminal_event(tui: ChildDisposition, session: SessionStatus) -> GuardianEvent {
@@ -3649,9 +3743,15 @@ mod tests {
         receiver.record_command(CoordinatorCommand::Start)?;
         assert_eq!(receiver.receive(deadline())?, terminal_armed());
         receiver.record_command(CoordinatorCommand::TerminalArmAccepted)?;
-        for expected in [app_started(), tui_started(), GuardianEvent::Ready] {
-            assert_eq!(receiver.receive(deadline())?, expected);
-        }
+        assert_eq!(receiver.receive(deadline())?, app_started());
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::AppServer,
+        })?;
+        assert_eq!(receiver.receive(deadline())?, tui_started());
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::Tui,
+        })?;
+        assert_eq!(receiver.receive(deadline())?, GuardianEvent::Ready);
         let readiness = receiver.take_verified_ready()?;
         assert_eq!(format!("{readiness:?}"), "VerifiedReady(<redacted>)");
         assert_eq!(std::mem::size_of_val(&readiness), 0);
@@ -3709,6 +3809,9 @@ mod tests {
         );
         receiver.record_command(CoordinatorCommand::TerminalArmAccepted)?;
         assert_eq!(receiver.receive(deadline())?, app);
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::AppServer,
+        })?;
         assert_eq!(
             receiver.receive(deadline()),
             Err(ProtocolError::InvalidValue)
@@ -3739,9 +3842,15 @@ mod tests {
         receiver.record_command(CoordinatorCommand::Start)?;
         assert_eq!(receiver.receive(deadline())?, terminal_armed());
         receiver.record_command(CoordinatorCommand::TerminalArmAccepted)?;
-        for expected in [app_started(), tui_started(), GuardianEvent::Ready] {
-            assert_eq!(receiver.receive(deadline())?, expected);
-        }
+        assert_eq!(receiver.receive(deadline())?, app_started());
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::AppServer,
+        })?;
+        assert_eq!(receiver.receive(deadline())?, tui_started());
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::Tui,
+        })?;
+        assert_eq!(receiver.receive(deadline())?, GuardianEvent::Ready);
 
         // Advancing with the command without consuming readiness permanently
         // invalidates that proof.
@@ -4112,6 +4221,7 @@ mod tests {
         commands.extend_from_slice(&encode_coordinator(
             CoordinatorCommand::TerminalArmAccepted,
         )?);
+        append_child_descriptor_verification_commands(&mut commands)?;
         commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
         commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::TerminalRestored)?);
         let mut receiver = GuardianCommandReceiver::new_terminal(Cursor::new(commands));
@@ -4154,6 +4264,7 @@ mod tests {
         commands.extend_from_slice(&encode_coordinator(
             CoordinatorCommand::TerminalArmAccepted,
         )?);
+        append_child_descriptor_verification_commands(&mut commands)?;
         commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
         commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::Resize {
             rows: 37,
@@ -4326,6 +4437,7 @@ mod tests {
             commands.extend_from_slice(&encode_coordinator(
                 CoordinatorCommand::TerminalArmAccepted,
             )?);
+            append_child_descriptor_verification_commands(&mut commands)?;
             commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
             commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::Resize {
                 rows: 41,
@@ -4374,6 +4486,7 @@ mod tests {
             commands.extend_from_slice(&encode_coordinator(
                 CoordinatorCommand::TerminalArmAccepted,
             )?);
+            append_child_descriptor_verification_commands(&mut commands)?;
             commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
             commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::Signal { signal })?);
             let mut receiver = GuardianCommandReceiver::new_terminal(Cursor::new(commands));
@@ -4416,6 +4529,7 @@ mod tests {
         commands.extend_from_slice(&encode_coordinator(
             CoordinatorCommand::TerminalArmAccepted,
         )?);
+        append_child_descriptor_verification_commands(&mut commands)?;
         if matches!(
             state,
             RecoveryRaceState::Active | RecoveryRaceState::Suspended
@@ -4693,6 +4807,7 @@ mod tests {
         commands.extend_from_slice(&encode_coordinator(
             CoordinatorCommand::TerminalArmAccepted,
         )?);
+        append_child_descriptor_verification_commands(&mut commands)?;
         commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
         commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::TerminalRestored)?);
         let mut receiver = GuardianCommandReceiver::new_terminal(Cursor::new(commands));
@@ -4923,6 +5038,7 @@ mod tests {
         commands.extend_from_slice(&encode_coordinator(
             CoordinatorCommand::TerminalArmAccepted,
         )?);
+        append_child_descriptor_verification_commands(&mut commands)?;
         commands.extend_from_slice(&encode_coordinator(CoordinatorCommand::OpenInputGate)?);
         let mut receiver = GuardianCommandReceiver::new_terminal(Cursor::new(commands));
         receiver.record_event(GuardianEvent::LeaseCommitted)?;
@@ -5017,8 +5133,20 @@ mod tests {
             return Err(ProtocolError::UnexpectedState);
         }
         receiver.record_command(CoordinatorCommand::TerminalArmAccepted)?;
-        for _ in 0..3 {
-            let _event = receiver.receive(deadline())?;
+        if receiver.receive(deadline())? != app_started() {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::AppServer,
+        })?;
+        if receiver.receive(deadline())? != tui_started() {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        receiver.record_command(CoordinatorCommand::ChildDescriptorsVerified {
+            role: ChildRole::Tui,
+        })?;
+        if receiver.receive(deadline())? != GuardianEvent::Ready {
+            return Err(ProtocolError::UnexpectedState);
         }
         Ok(())
     }
@@ -5030,9 +5158,23 @@ mod tests {
         if receiver.receive(deadline())? != CoordinatorCommand::TerminalArmAccepted {
             return Err(ProtocolError::UnexpectedState);
         }
-        for event in [app_started(), tui_started(), GuardianEvent::Ready] {
-            receiver.record_event(event)?;
+        receiver.record_event(app_started())?;
+        if receiver.receive(deadline())?
+            != (CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::AppServer,
+            })
+        {
+            return Err(ProtocolError::UnexpectedState);
         }
+        receiver.record_event(tui_started())?;
+        if receiver.receive(deadline())?
+            != (CoordinatorCommand::ChildDescriptorsVerified {
+                role: ChildRole::Tui,
+            })
+        {
+            return Err(ProtocolError::UnexpectedState);
+        }
+        receiver.record_event(GuardianEvent::Ready)?;
         Ok(())
     }
 
