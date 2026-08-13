@@ -2677,6 +2677,12 @@ fn apply_coordinator_outcome(outcome: CoordinatorRunOutcome) -> ExitCode {
 
 fn apply_guardian_disposition(disposition: GuardianExitDisposition) -> ExitCode {
     match disposition {
+        GuardianExitDisposition::Code(super::protocol::USAGE_EXHAUSTED_EXIT_CODE) => {
+            // Public failover trusts 75 only when the sealed monitor emitted
+            // the typed UsageExhausted outcome. An ordinary provider exit with
+            // the same numeric code must remain an unrelated failure.
+            ExitCode::from(1)
+        }
         GuardianExitDisposition::Code(code) => ExitCode::from(code),
         GuardianExitDisposition::UsageExhausted => {
             ExitCode::from(super::protocol::USAGE_EXHAUSTED_EXIT_CODE)
@@ -2811,6 +2817,20 @@ fn production_guardian_bounds() -> GuardianBounds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_typed_usage_outcome_reaches_the_public_exhaustion_exit_code() {
+        assert_eq!(
+            apply_guardian_disposition(GuardianExitDisposition::UsageExhausted),
+            ExitCode::from(super::super::protocol::USAGE_EXHAUSTED_EXIT_CODE)
+        );
+        assert_eq!(
+            apply_guardian_disposition(GuardianExitDisposition::Code(
+                super::super::protocol::USAGE_EXHAUSTED_EXIT_CODE
+            )),
+            ExitCode::from(1)
+        );
+    }
 
     enum ScriptedRead {
         Bytes(Vec<u8>),

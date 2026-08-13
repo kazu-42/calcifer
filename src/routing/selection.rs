@@ -33,6 +33,13 @@ impl SelectionReason {
             }
         }
     }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::AuthoritativeExhaustion => "authoritative_exhaustion",
+            Self::RevalidatedUsageLimit => "revalidated_usage_limit",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,6 +192,29 @@ impl<Reservation> HandoffSelection<Reservation> {
 
     pub(crate) fn into_reservation(self) -> Reservation {
         self.reservation
+    }
+
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Profile,
+        Profile,
+        HandoffAuthorization,
+        String,
+        SelectionReason,
+        i64,
+        Reservation,
+    ) {
+        (
+            self.source,
+            self.target,
+            self.authorization,
+            self.pool_id,
+            self.reason,
+            self.trigger_observed_at,
+            self.reservation,
+        )
     }
 }
 

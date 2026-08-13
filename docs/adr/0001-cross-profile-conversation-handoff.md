@@ -1,6 +1,6 @@
 # ADR 0001: Treat conversation lineage as independent from credential profiles
 
-- Status: Accepted for the failover design; private compatibility gate, schema-v2 lineage, Linux/macOS validated rollout capability/no-gap target reservation, pinned same-profile supervisor, and serialized cross-profile transaction/reconciliation kernel implemented internally; public selector and supervised activation pending
+- Status: Accepted and implemented as an explicit experimental Linux path; stable/default promotion and a no-gap handoff into the target guardian remain future hardening
 - Date: 2026-07-15
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 

@@ -14,10 +14,12 @@ Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-ag
 > on-demand usage status are implemented on Unix. Linux additionally exposes
 > an explicit experimental supervised exact-resume path through the pinned App
 > Server, typed monitor, official remote TUI, and foreground terminal anchor.
-> It requires one profile and one canonical thread UUID; it does not select a
-> pool, switch profiles, replay input, or fall back to direct resume. The
-> routing registry still does not select or launch a profile, and automatic
-> failover and cross-profile session handoff remain disabled. macOS production
+> It requires one profile and one canonical thread UUID. An optional explicit
+> `--failover-pool` may traverse one already-enabled same-trust-domain Codex
+> pool after typed exhaustion and fresh structured revalidation, fork the
+> validated rollout into the selected profile, and attach the official TUI.
+> It never replays input or falls back to direct resume. Ordinary `run` and
+> `resume` never opt into this behavior. macOS production
 > supervised launch is unsupported because no reviewed public descriptor-exec
 > primitive can bind the launched image to the verified bytes. Verified Windows
 > credential ACLs are not implemented yet.
@@ -70,6 +72,7 @@ calcifer auth rename codex@work client-a
 # revalidates the current private identity of every member before commit.
 calcifer routing domain create codex accounts codex@client-a codex@personal
 calcifer routing pool create codex@accounts fallback codex@client-a codex@personal
+calcifer routing pool enable codex@fallback
 calcifer routing inspect
 calcifer --json routing inspect
 
@@ -91,6 +94,10 @@ calcifer --json update check --channel preview
 # Start Codex in one immutable profile.
 calcifer run codex@work
 calcifer run codex@personal -- --no-alt-screen
+
+# Linux only: opt one exact tracked generation into one enabled pool.
+calcifer resume --experimental-supervised --failover-pool codex@fallback \
+  codex@work 01900000-0000-7000-8000-000000000001
 
 # Explicitly skip conversation capture when manual recovery is acceptable.
 calcifer run --untracked codex@work
@@ -160,8 +167,9 @@ output without rewriting membership. Every pool is created with
 `activation: "disabled"`. `routing pool enable` is an explicit user-level
 policy change that revalidates every current member before committing
 `activation: "enabled"`; it does not launch a provider or opt an ordinary
-profile-pinned `run`/`resume` into failover. There is still no public `select`
-or automatic-selection command.
+profile-pinned `run`/`resume` into failover. Only the explicit Linux
+`resume --experimental-supervised --failover-pool ...` boundary consumes an
+enabled pool; there is no ambient default-pool or standalone `select` command.
 
 Creating a domain, creating a pool, or replacing members revalidates every
 referenced profile's current private identity in immutable-ID lock order. A
@@ -281,12 +289,15 @@ Normal `run` and profile-specific `resume` remain fail-closed when Calcifer cann
 
 `status` starts the installed official `codex app-server` inside each idle profile and calls the structured `account/rateLimits/read` method. Before that read, it requires the tested Codex `0.144.4` initialize contract and verifies that the server reports the selected canonical `CODEX_HOME`. Untested versions, changed initialize data, a different home, or a changed usage schema fail closed as `unknown`; Calcifer does not send the usage request after an initialize-gate rejection. It displays all returned limit buckets, primary and secondary used/remaining percentages, reset times, workspace credit state, monthly spend control when present, and rate-limit reset-credit count and expirations. It does not scrape the interactive `/status` screen or read token values from `auth.json`.
 
-An active `run` or `resume` holds a split exclusive lease because a second Codex process could race credential refresh and session writes. A launch coordinator owns one half and a provider guardian owns the other; either process surviving a selective crash keeps the profile busy until the exact provider exits. Consequently, status for that active profile is currently `profile_busy` / `unknown`; a list query inspects profiles serially with a per-profile timeout. Active-session monitoring, cached last-known observations, and automatic failover still require a profile-owned usage supervisor. Provider identity is revalidated under the same exclusive lease before any future automatic selection; a changed or externally replaced login fails closed instead of silently rebinding the local alias.
+An active `run` or `resume` holds a split exclusive lease because a second Codex process could race credential refresh and session writes. A launch coordinator owns one half and a provider guardian owns the other; either process surviving a selective crash keeps the profile busy until the exact provider exits. Consequently, status for that active profile is currently `profile_busy` / `unknown`; a list query inspects profiles serially with a per-profile timeout. The experimental Linux supervisor maintains a bounded active observation cache and emits a typed exhaustion outcome, but a switch is considered only when an explicitly selected enabled pool is present and a new structured usage read under the stopped source profile independently confirms exhaustion. Provider identity is revalidated under the same exclusive lease before selecting a target; a changed or externally replaced login fails closed instead of silently rebinding the local alias.
 
-An internal Linux/macOS primitive can now reserve a revalidated target and
-split its lifetime lease with a guardian without an unlock/reacquire gap. It is
-not connected to a public command yet; current `run`, `resume`, `status`, and
-persisted schemas are unchanged.
+An internal Linux/macOS primitive can reserve a revalidated target and split
+its lifetime lease with a guardian without an unlock/reacquire gap. The public
+Linux failover path retains its target reservation through usage validation,
+fork, reconciliation, and durable generation commit; the existing production
+supervisor then reacquires the exact target locks immediately before launch,
+so contention fails closed before a second provider process starts. Ordinary
+`run`, `resume`, and `status` remain unchanged.
 
 Issue #54 also connects the previously synthetic process/PTY kernel to the
 pinned Codex `0.144.4` App Server, typed monitor, readiness relay, and official
@@ -509,57 +520,68 @@ Clap's standard `--help` and `--version` output remains text even when `--json`
 is present. Within schema version 1, existing field names and meanings will
 remain stable; new fields may be added.
 
-## Supervised exact resume and planned routing interface
+## Supervised exact resume and guarded failover
 
-Linux can opt into the production supervisor for one existing thread. This is
-an exact same-profile resume only:
+Linux can opt into the production supervisor for one existing thread. Without
+a pool, this is an exact same-profile resume only:
 
 ```console
 calcifer resume --experimental-supervised codex@work 01900000-0000-7000-8000-000000000001
 ```
 
-The command requires a foreground TTY and rejects `--json`, `--last`, implicit
-workspace selection, every argument after `--`, pool traversal, and
-cross-profile handoff before provider startup. A failure never retries through
-direct resume. The ordinary exact-resume command remains the portable recovery
-path. When the monitored exact thread reports a typed `usageLimitExceeded`
-failure, the supervisor first stops and reaps its exact children and restores
-the terminal, then returns reserved exit code 75. That code is not standalone
-failover authority: automatic selection remains unavailable and a future
-caller must perform a fresh authoritative usage read under the same profile
-lease. Normal and single-wrapper-failure paths restore the terminal before they
+To opt this invocation into guarded failover, name one enabled pool explicitly:
+
+```console
+calcifer resume --experimental-supervised --failover-pool codex@fallback \
+  codex@work 01900000-0000-7000-8000-000000000001
+```
+
+Both forms require a foreground TTY and reject `--json`, `--last`, implicit
+workspace selection, and every argument after `--`. A failure never retries
+through direct resume. When the monitored exact thread reports a typed
+`usageLimitExceeded`, the supervisor stops and reaps the exact process tree and
+restores the terminal before returning its private exhaustion disposition. The
+pool path then marks cached state as requiring revalidation and performs a new
+structured usage read under the same source-profile lease. Numeric exit code
+75 from an ordinary provider exit, rounded 100%, stale data, authentication,
+network, timeout, malformed, or provider failures cannot authorize selection.
+
+Each invocation walks the configured order at most once from the current
+profile, skips fresh authoritative exhaustion and profiles already used since
+the invocation's starting generation, and freshly revalidates identity and
+usage while reserving every candidate. A successful handoff preserves the
+Calcifer conversation ID, creates a new target-profile thread from the
+validated immutable source rollout with the same effective model, provider,
+approval, and sandbox settings, commits the new generation durably, and starts
+the official TUI without replaying the failed turn. A crash leaves a bounded
+transition journal; rerun the same explicit command and starting profile/thread
+to reconcile or attach that transition without minting an unbounded fork
+retry. Exhausted, unknown, busy, or cooldown-only pools stop actionably without
+looping.
+
+Normal and single-wrapper-failure paths restore the terminal before they
 return. If both restoration authorities are forcibly killed while raw mode is
 active, the invoking shell or terminal emulator may need an explicit `reset`;
 reverting or restarting Calcifer cannot restore a dead process's terminal
 state.
 
-The routing definition commands above are implemented, but automatic selection
-and failover remain planned interfaces:
-
-```console
-# Select a default for future processes, or pin one invocation.
-calcifer use codex work
-
-calcifer supervise codex@personal
-```
-
 Arguments after `--` are arguments to the provider adapter's resolved, permission-checked `codex` executable; users do not supply an arbitrary executable. Account/provider-routing flags such as `-c`, `--profile`, `--oss`, `--local-provider`, and remote-routing options are rejected, as are `-C`/`--cd`, dynamic `--enable`/`--disable` feature overrides, and non-UTF-8 arguments that cannot be mediated safely. Calcifer forces profile-local file storage for both CLI and MCP OAuth credentials on every managed invocation. Existing pre-alpha profiles with the previous exact managed config remain usable because the per-invocation overrides are authoritative; new profiles persist both settings. Calcifer does not yet cryptographically verify binary provenance, so users remain responsible for installing the official CLI on a trusted `PATH`. Unimplemented commands fail as unknown commands rather than pretending to succeed.
 
-## What "automatic failover" will mean
+## Guarded failover semantics
 
-"Token limit" can refer to different things. Calcifer's planned selection logic concerns a provider-reported usage allowance or quota window, not a model context window.
+"Token limit" can refer to different things. Calcifer's selection logic concerns a provider-reported usage allowance or quota window, not a model context window.
 
-Failover will follow conservative semantics:
+Failover follows conservative semantics:
 
 - It is disabled by default and limited to a user-created pool of explicitly authorized profiles.
 - A pool cannot cross provider or configured trust-domain boundaries.
 - Only authoritative, fresh `exhausted` state permits selecting another profile. A rounded display value of `0% remaining`, authentication failure, provider error, network failure, unknown output, or stale status cannot authorize a switch.
 - A pool is traversed at most once per invocation and uses cooldown state to prevent loops.
 - Calcifer never hot-swaps credentials in a running process.
-- After the old child has stopped, the supervisor will continue the same user-visible conversation under the selected profile. Internally, the preferred handoff forks the validated source rollout into a new profile-local Codex thread, so the logical conversation stays stable while the provider thread ID changes. Calcifer never automatically replays the last command or prompt; a partially completed turn may already have changed files or external systems.
+- After the old child has stopped, the supervisor continues the same user-visible conversation under the selected profile. Internally, the handoff forks the validated source rollout into a new profile-local Codex thread, so the logical conversation stays stable while the provider thread ID changes. Calcifer never automatically replays the last command or prompt; a partially completed turn may already have changed files or external systems.
 - Before launch, Calcifer shows the local profile alias, provider, trust domain, and selection reason without exposing provider account identifiers.
 
-Same-profile resume delegates the final operation directly to the official CLI in the selected home. Calcifer uses the pinned stable `thread/list` and `thread/read(includeTurns=false)` App Server projections only to capture and validate the opaque thread key; it never persists transcript content. Cross-profile continuation is a required part of the planned failover experience, but its upstream import field is experimental: stable Codex thread lookup is scoped to one `CODEX_HOME`. Calcifer will use a separate version-gated target-profile App Server to fork a validated source rollout into a new target-profile thread, then attach the official TUI over a private local transport. The handoff stays inside one configured trust domain, preserves one writer per rollout, and restores history without resubmitting a turn. See [ADR 0001](docs/adr/0001-cross-profile-conversation-handoff.md).
+Same-profile resume delegates the final operation directly to the official CLI in the selected home. Calcifer uses the pinned stable `thread/list` and `thread/read(includeTurns=false)` App Server projections only to capture and validate the opaque thread key; it never persists transcript content. Cross-profile continuation remains explicitly experimental because its upstream import field is experimental and stable Codex thread lookup is scoped to one `CODEX_HOME`. The guarded path uses a separate version-gated target-profile App Server to fork a validated source rollout into a new target-profile thread, then attaches the official TUI through the production supervisor. The handoff stays inside one configured trust domain, preserves one writer per rollout, and restores history without resubmitting a turn. See [ADR 0001](docs/adr/0001-cross-profile-conversation-handoff.md).
 
 ## Provider direction
 
@@ -570,11 +592,11 @@ Same-profile resume delegates the final operation directly to the official CLI i
 | Codex profile isolation | Implemented on Unix | One `CODEX_HOME` per profile; official Codex login and refresh |
 | Same-profile Codex resume | Implemented on Unix for Codex 0.144.4 | Tracked workspace head, explicit exact thread ID, or official `--last`; no prompt replay |
 | Private Codex identity binding | Implemented for 0.144.4 ChatGPT auth | HMAC equality only; duplicate aliases and credential drift fail closed |
-| Codex usage observation | Implemented with bounded idle refresh and an active-monitor cache projection | Structured App Server response, explicit freshness/compatibility, disposable private cache; the Linux supervised exact-resume path owns a live typed monitor but does not select another profile |
+| Codex usage observation | Implemented with bounded idle refresh, active monitoring, and post-stop revalidation | Structured App Server response, explicit freshness/compatibility, disposable private cache; selection requires a typed active signal followed by a fresh supported read |
 | Reset-credit visibility | Implemented read-only | Count and safe expiry/status detail; opaque IDs are redacted |
-| Pinned supervised Codex integration | Experimental exact same-profile resume is public on Linux; Ubuntu 24.04 runs every exact 0.144.4 package probe inside a fresh loopback-only namespace and executes verified native provider bytes from a sealed close-on-exec `memfd`. macOS hermetic and descriptor-backed execution are explicitly unsupported | `resume --experimental-supervised` enters the sealed production anchor with one explicit profile and canonical thread UUID. Real App Server and remote TUI run through the production coordinator/guardian session, typed monitor, PTY gate, and job-control implementation. Linux has no native-network or pathname-exec fallback; macOS runs no weaker substitute. Pool selection and cross-profile handoff are not reachable from this command |
-| Opt-in profile pools | Private default-disabled registry implemented on Unix; selection unavailable | Immutable profile IDs, same provider and trust domain, live whole-pool identity validation, bounded atomic updates |
-| Cross-profile conversation handoff | Internal Linux/macOS target reservation and same-profile supervisor integration implemented | Transition journal, target fork, pool selection, crash recovery, and user-visible switching remain disabled; the planned version-gated fork creates a target-profile thread in one logical conversation |
+| Pinned supervised Codex integration | Experimental exact resume and explicit guarded pool failover are public on Linux; Ubuntu 24.04 runs every exact 0.144.4 package probe inside a fresh loopback-only namespace and executes verified native provider bytes from a sealed close-on-exec `memfd`. macOS hermetic and descriptor-backed execution are explicitly unsupported | `resume --experimental-supervised` enters the sealed production anchor with one explicit profile and canonical thread UUID; `--failover-pool` additionally enables one bounded pool traversal after typed exhaustion and fresh revalidation. Linux has no native-network or pathname-exec fallback; macOS runs no weaker substitute |
+| Opt-in profile pools | Private default-disabled registry on Unix; explicitly consumed by Linux supervised failover | Immutable profile IDs, same provider and trust domain, live whole-pool identity validation, bounded atomic updates, one-pass traversal and cooldown |
+| Cross-profile conversation handoff | Experimental public Linux path | Version-gated fork-by-path, durable lineage/transition journal, bounded crash reconciliation, source preservation, exact settings validation, and no prompt replay |
 | Claude provider-managed profiles | Linux lifecycle implemented | `auth add/list/verify/reauth/rename/remove` and `run` use the exact 2.1.227 status schema, an isolated `CLAUDE_CONFIG_DIR`, conflicting environment removal, `0600` single-link credential validation, and journaled atomic rotation; Windows awaits ACL proof and macOS awaits a documented config-scoped Keychain isolation contract |
 | Claude setup-token ingestion | Deferred | The official command prints but does not store the inference-only token; Calcifer requires a reviewed OS credential broker and no-echo recovery path first |
 | Claude subscription OAuth replication | Not planned | No token copying, undocumented OAuth endpoint, or Keychain-name emulation |
@@ -735,9 +757,9 @@ The current and next slices keep Codex profile isolation with no shared runtime 
 1. **Implemented:** private Unix registry, profile-name validation, ownership markers, and atomic metadata writes.
 2. **Implemented:** `auth add/list/verify/remove`, private Codex identity binding, `run`, same-profile `resume`, profile leases, and structured on-demand status.
 3. **Implemented:** exact same-profile thread capture, crash reconciliation, no-argument cold restore, and journaled local profile removal. Safe reauth/re-key flows remain.
-4. Add observation caching and adaptive refresh without aggressive polling; the on-demand status version/schema gate is implemented.
-5. Add explicit same-trust-domain pools and fail-closed automatic selection.
-6. Activate version-gated cross-profile conversation handoff as the default successful failover path. The no-gap Linux/macOS target reservation, schema-v2 transition journal, validated rollout projections, and one-boundary crash-recovery transaction kernel remain internal. Linux now has an explicit exact same-profile supervised-resume UX; authoritative usage selection, pool traversal, and target-fork activation remain pending. Preserve one profile-local writer per lineage generation.
+4. **Implemented:** bounded observation caching, active monitoring, and authoritative post-failure revalidation without aggressive polling.
+5. **Implemented experimentally on Linux:** explicit same-trust-domain pools and fail-closed one-pass selection behind `--experimental-supervised --failover-pool`.
+6. **Implemented experimentally on Linux:** version-gated cross-profile fork, durable logical-conversation generations, bounded crash reconciliation, and official-TUI continuation without turn replay. Preserve one profile-local writer per lineage generation while hardening the opt-in path before any stable/default promotion.
 7. Add Claude only through provider-supported authentication and usage-observation surfaces.
 
 Detailed gates and non-goals are tracked in [docs/roadmap.md](docs/roadmap.md).

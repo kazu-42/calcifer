@@ -380,8 +380,9 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   This is deterministic recovery-phase evidence, not Codex-version compatibility
   evidence. All seven cases passed three consecutive local runs on the exact
   tree; cross-platform CI readback remains pending.
-  Public failover UX remains disabled until its cross-profile transaction and
-  selector integration gates are complete.
+  Public failover remains explicit and experimental: only the Linux
+  `--experimental-supervised --failover-pool` boundary activates the reviewed
+  selector and transaction gates.
 - The public wrapper, coordinator, and guardian catch `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT`; caught dispositions reset to child defaults on each `exec`, so terminal cancellation still reaches Codex while every wrapper remains attached if Codex handles the signal and continues.
 - Bounded metadata-only App Servers for status and thread capture inherit only
   the provider-side lease. On Unix the multithreaded parent never clears
@@ -752,7 +753,7 @@ same-UID activity from a malicious or compromised executable.
 
 ## Failover requirements
 
-A profile pool is user-created, provider-specific, and bound to one trust domain. The implemented private user-level registry stores only immutable local profile IDs, local aliases, provider, revision, membership, and the fixed `disabled` activation. Every membership change revalidates the whole affected domain or pool under sorted profile leases and fails before commit on missing/unverified/drifted/duplicate identity or provider/trust-domain mismatch. Inspection exposes no private identity or provider account material. Repository-local `routing`, `routing_pools`, and `trust_domains` configuration is rejected by launch preflight, and repository files are never an input to the routing store. Automatic failover remains unavailable; the only future switching signal is fresh, authoritative, version-supported exhaustion state. See [ADR 0004](adr/0004-private-routing-registry.md).
+A profile pool is user-created, provider-specific, and bound to one trust domain. The implemented private user-level registry stores only immutable local profile IDs, local aliases, provider, revision, membership, and explicit activation. Every membership change revalidates the whole affected domain or pool under sorted profile leases and fails before commit on missing/unverified/drifted/duplicate identity or provider/trust-domain mismatch. Inspection exposes no private identity or provider account material. Repository-local `routing`, `routing_pools`, and `trust_domains` configuration is rejected by launch preflight, and repository files are never an input to the routing store. The experimental Linux failover boundary requires one explicitly named enabled pool per invocation; only fresh, authoritative, version-supported exhaustion after typed active failure and post-stop revalidation can authorize switching. See [ADR 0004](adr/0004-private-routing-registry.md).
 
 The selector must distinguish:
 
@@ -768,15 +769,18 @@ A successful switch continues the same logical conversation. Credential profile 
 
 The target App Server imports that history through a version-gated provider API and must return the expected lineage plus a distinct rollout contained under the target profile before activation. The separate handoff-only fork projection requires a new canonical thread ID, exact `forkedFromId`, matching canonical cwd and CLI version, target-profile containment, safe target metadata, and a source-distinct inode; it does not relax the ordinary same-profile root-thread projection. Calcifer verifies that the source rollout content is unchanged and never copies credentials into a shared runtime home. The prepared transition is synced before the non-idempotent fork request, so crash recovery adopts only one uniquely matching target fork and otherwise fails closed. Source ownership is released only after the target generation is committed and attached.
 
-The rollout capability, target-reservation/guardian lease-transfer primitives,
-and serialized transaction/reconciliation kernel described above are
-implemented, but no production command calls them yet. The transaction driver
-holds the separate handoff coordinator across one selected external boundary,
-uses only short conversation-registry transactions, persists stop/fork intent
-before effects, and resumes from the durable phase. Target guardian lifecycle
-and ambiguous ACK ownership remain inside the supervised runtime adapter; the
-selector must supply that adapter without changing the global lease order
-before automatic switching can be enabled.
+The rollout capability, target-reservation primitive, and serialized
+transaction/reconciliation kernel described above are consumed by the explicit
+Linux failover command. The transaction driver holds the separate handoff
+coordinator across one selected external boundary, uses only short
+conversation-registry transactions, persists fork intent before the
+non-idempotent request, and resumes from the durable phase. The current public
+adapter retains the target reservation through fork and durable commit, then
+drops it immediately before the existing production supervisor reacquires the
+same target locks and revalidates exact profile/thread/cwd. A contender can
+therefore cause an actionable attach failure but cannot authorize a second
+provider writer. Direct no-gap transfer of the retained provider descriptor
+into that guardian remains a stable-promotion hardening item.
 
 The supervisor may subscribe to thread events for usage monitoring, but it never answers approvals or any other server-initiated request. Only the attached official TUI may respond, and no new turn is admitted while that TUI is absent. Source effective execution settings are fixed at fork time; target authentication and provider routing cannot be replaced by a remote-client override.
 
@@ -789,9 +793,9 @@ retains an exclusive single-writer lease; the internal supervisor may project
 the latest fully validated read from that already-live, profile-owned App
 Server into the disposable cache, but status never starts another credential
 writer. Cache expiry, capped backoff, and bounded idle-refresh planning are
-implemented. Public automatic failover still requires the guarded selector and
-explicit pool execution path; cached state may only prefilter and never replaces
-fresh target revalidation under the selected profile lease.
+implemented. The explicit pool execution path uses cached state only to
+prefilter; it never replaces fresh target revalidation under the selected
+profile lease.
 
 The typed monitor retains Codex thread and turn UUIDs only for bounded in-memory
 target matching and one-shot routing. Those UUIDs are provider identifiers, so
@@ -806,9 +810,9 @@ A recognized active `usageLimitExceeded` event is projected across the
 supervisor protocol as a payload-free terminal cause. Reserved shell exit code
 75 is emitted only after the exact children are reaped and terminal recovery is
 complete. The code is intentionally insufficient selection authority: a
-natural provider exit can use the same numeric code, so the future parent
-selector must additionally revalidate a fresh authoritative exhaustion view
-before it can traverse a configured pool.
+natural provider exit can use the same numeric code, so the public pool path
+remaps an ordinary provider code 75 and separately revalidates a fresh
+authoritative exhaustion view before traversing the configured pool.
 
 Immediately before launch, Calcifer reports the local profile alias, provider, trust domain, and selection reason. It does not display email or stable provider account, workspace, or organization identifiers, and repository-local configuration cannot suppress this notice.
 

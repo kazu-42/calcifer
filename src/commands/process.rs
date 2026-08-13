@@ -96,6 +96,7 @@ pub(crate) fn resume_codex(
 pub(crate) fn resume_supervised_codex(
     alias: &str,
     session_id: &str,
+    failover_pool: Option<(Option<Provider>, &str)>,
     provider_args: &[OsString],
 ) -> Result<ExitStatus, AppError> {
     validate_provider_arguments(provider_args)?;
@@ -109,22 +110,43 @@ pub(crate) fn resume_supervised_codex(
         let profile = registry.find(Provider::Codex, alias)?;
         let executable = resolve_codex()?;
         let launch_context = verify_current_repository_config()?;
-        eprintln!(
-            "Calcifer: supervised exact resume for {} (experimental, no failover).",
-            profile.reference()
-        );
-        crate::providers::codex::spawn_supervised_exact_resume(
-            &registry,
-            &profile,
-            launch_context.working_directory(),
-            session_id,
-            &executable,
-        )
-        .map_err(AppError::from)
+        match failover_pool {
+            Some((pool_provider, pool_reference)) => {
+                eprintln!(
+                    "Calcifer: supervised exact resume for {} with guarded pool {} (experimental).",
+                    profile.reference(),
+                    pool_reference
+                );
+                crate::providers::codex::resume_supervised_with_failover(
+                    &registry,
+                    &profile,
+                    launch_context.working_directory(),
+                    session_id,
+                    &executable,
+                    pool_provider,
+                    pool_reference,
+                )
+                .map_err(AppError::from)
+            }
+            None => {
+                eprintln!(
+                    "Calcifer: supervised exact resume for {} (experimental, no failover).",
+                    profile.reference()
+                );
+                crate::providers::codex::spawn_supervised_exact_resume(
+                    &registry,
+                    &profile,
+                    launch_context.working_directory(),
+                    session_id,
+                    &executable,
+                )
+                .map_err(AppError::from)
+            }
+        }
     }
     #[cfg(not(all(feature = "production-supervisor", target_os = "linux")))]
     {
-        let _ = (alias, session_id);
+        let _ = (alias, session_id, failover_pool);
         Err(AppError::SupervisedUnsupportedPlatform)
     }
 }

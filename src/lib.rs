@@ -339,6 +339,7 @@ where
         Commands::Resume {
             untracked,
             experimental_supervised,
+            failover_pool,
             profile,
             session_id,
             provider_args,
@@ -346,6 +347,7 @@ where
             if cli.json {
                 return render_app_error("resume", &AppError::InteractiveJsonUnsupported, true);
             }
+            let failover_pool = failover_pool.map(definition_value);
             let result = match (experimental_supervised, profile) {
                 (true, Some(profile)) => match profile.provider {
                     ProviderArgument::Claude => Err(AppError::ProviderArgumentRejected),
@@ -353,6 +355,9 @@ where
                         Some(session_id) => commands::process::resume_supervised_codex(
                             &profile.alias,
                             session_id,
+                            failover_pool
+                                .as_ref()
+                                .map(|(provider, value)| (*provider, value.as_str())),
                             &provider_args,
                         ),
                         None => Err(AppError::ProviderArgumentRejected),
@@ -929,6 +934,48 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(arguments).is_err());
         }
+    }
+
+    #[test]
+    fn experimental_failover_requires_supervision_and_accepts_one_pool_reference() {
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let parsed = Cli::try_parse_from([
+            "calcifer",
+            "resume",
+            "--experimental-supervised",
+            "--failover-pool",
+            "codex@fallback",
+            "codex@work",
+            thread_id,
+        ]);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        match parsed.command {
+            Commands::Resume {
+                experimental_supervised,
+                failover_pool: Some(pool),
+                ..
+            } => {
+                assert!(experimental_supervised);
+                assert_eq!(pool.provider, Some(ProviderArgument::Codex));
+                assert_eq!(pool.value, "fallback");
+            }
+            _ => panic!("failover resume parsed as a different command"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "calcifer",
+                "resume",
+                "--failover-pool",
+                "codex@fallback",
+                "codex@work",
+                thread_id,
+            ])
+            .is_err()
+        );
     }
 
     #[test]
