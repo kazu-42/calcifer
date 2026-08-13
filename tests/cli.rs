@@ -526,6 +526,231 @@ fn json_help_and_version_remain_text() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
+fn profile_reauth_rejects_json_before_provider_or_storage_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = calcifer()
+        .env_clear()
+        .args(["--json", "auth", "reauth", "codex@work"])
+        .output()?;
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr)?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(error["schema_version"], 1);
+    assert_eq!(error["command"], "auth");
+    assert_eq!(error["ok"], false);
+    assert_eq!(error["error"]["code"], "interactive_json_unsupported");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_reauth_stages_same_identity_and_preserves_all_other_profile_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sandbox = std::env::temp_dir().join(format!(
+        "calcifer-profile-reauth-{}-{nonce}",
+        std::process::id()
+    ));
+    let bin = sandbox.join("bin");
+    let root = sandbox.join("state");
+    let provider_log = sandbox.join("provider.log");
+    std::fs::create_dir_all(&bin)?;
+    let fake_codex = bin.join("codex");
+    std::fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+set -eu
+case "$(umask)" in
+  0077|077) ;;
+  *) exit 98 ;;
+esac
+[ "${CALCIFER_HOME+x}" != "x" ]
+[ "${OPENAI_API_KEY+x}" != "x" ]
+[ "${CODEX_ACCESS_TOKEN+x}" != "x" ]
+[ "${CODEX_AUTHAPI_BASE_URL+x}" != "x" ]
+[ "${CoDeX_TeSt_Future_Auth_Hook+x}" != "x" ]
+if [ "${FAKE_CODEX_EXPECT_PRESERVED_ENV:-}" = "1" ]; then
+  [ "${HTTPS_PROXY:-}" = "http://127.0.0.1:17842" ]
+  [ "${CODEX_CA_CERTIFICATE:-}" = "/synthetic/enterprise-ca.pem" ]
+  [ "${TERM:-}" = "xterm-calcifer-test" ]
+fi
+printf 'pwd=%s home=%s args=%s\n' "$PWD" "${CODEX_HOME:-unset}" "$*" >> "$FAKE_CODEX_LOG"
+if [ "${1:-}" = "-c" ]; then
+  [ "${2:-}" = 'cli_auth_credentials_store="file"' ]
+  [ "${3:-}" = "-c" ]
+  [ "${4:-}" = 'mcp_oauth_credentials_store="file"' ]
+  shift 4
+fi
+case "${1:-}" in
+  login)
+    [ ! -e "$CODEX_HOME/auth.json" ]
+    found_file_store=0
+    while IFS= read -r config_line; do
+      if [ "$config_line" = 'cli_auth_credentials_store = "file"' ]; then
+        found_file_store=1
+      fi
+    done < "$CODEX_HOME/config.toml"
+    [ "$found_file_store" = "1" ]
+    if [ "${FAKE_CODEX_LOGIN_EXIT:-0}" != "0" ]; then
+      exit "$FAKE_CODEX_LOGIN_EXIT"
+    fi
+    umask 077
+    printf '{"auth_mode":"chatgpt","tokens":{"account_id":"%s","access_token":"%s"}}\n' \
+      "$FAKE_CODEX_LOGIN_SCOPE" "$FAKE_CODEX_LOGIN_TOKEN" > "$CODEX_HOME/auth.json"
+    ;;
+  app-server)
+    IFS= read -r initialize
+    case "$initialize" in
+      *'"method":"initialize"'*'"experimentalApi":false'*) ;;
+      *) exit 93 ;;
+    esac
+    printf '{"id":0,"result":{"userAgent":"calcifer/0.144.4 (test)","platformFamily":"unix","platformOs":"test","codexHome":"%s"}}\n' "$CODEX_HOME"
+    IFS= read -r initialized || exit 0
+    ;;
+  *) exit 94 ;;
+esac
+"#,
+    )?;
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700))?;
+    let path = std::env::join_paths([bin.as_path()])?;
+
+    let add = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .env("FAKE_CODEX_LOGIN_SCOPE", "account-a")
+        .env("FAKE_CODEX_LOGIN_TOKEN", "old-private-token")
+        .args(["auth", "add", "codex", "work"])
+        .output()?;
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let profile_id = profile_remove_test_profile_id(&root, "work")?;
+    let profile = root.join("profiles").join("codex").join(&profile_id);
+    let home = profile.join("home");
+    let session = home.join("sessions").join("preserved.jsonl");
+    std::fs::create_dir(home.join("sessions"))?;
+    std::fs::write(&session, b"session-private-sentinel")?;
+    std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600))?;
+    let auth_relative = std::path::PathBuf::from("profiles")
+        .join("codex")
+        .join(&profile_id)
+        .join("home")
+        .join("auth.json");
+    let before = snapshot_profile_remove_test_tree(&root)?
+        .into_iter()
+        .filter(|(path, _)| path != &auth_relative)
+        .collect::<Vec<_>>();
+
+    let reauth = calcifer_with_ambient_codex_auth_overrides()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .env("FAKE_CODEX_LOGIN_SCOPE", "account-a")
+        .env("FAKE_CODEX_LOGIN_TOKEN", "new-private-token")
+        .args(["auth", "reauth", "codex@work"])
+        .output()?;
+    assert!(
+        reauth.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reauth.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(reauth.stdout.clone())?,
+        "Re-authenticated codex@work through the official Codex login flow.\n"
+    );
+    assert!(reauth.stderr.is_empty());
+    let auth_after_success = std::fs::read(home.join("auth.json"))?;
+    assert!(
+        auth_after_success
+            .windows(b"new-private-token".len())
+            .any(|bytes| bytes == b"new-private-token")
+    );
+    assert!(
+        !auth_after_success
+            .windows(b"old-private-token".len())
+            .any(|bytes| bytes == b"old-private-token")
+    );
+    let after = snapshot_profile_remove_test_tree(&root)?
+        .into_iter()
+        .filter(|(path, _)| path != &auth_relative)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after, before,
+        "reauth must preserve all non-credential state"
+    );
+
+    let mismatch = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .env("FAKE_CODEX_LOGIN_SCOPE", "account-b")
+        .env("FAKE_CODEX_LOGIN_TOKEN", "mismatch-private-token")
+        .args(["auth", "reauth", "codex@work"])
+        .output()?;
+    assert_eq!(mismatch.status.code(), Some(1));
+    assert!(mismatch.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr).contains("no longer matches"),
+        "{}",
+        String::from_utf8_lossy(&mismatch.stderr)
+    );
+    assert_eq!(std::fs::read(home.join("auth.json"))?, auth_after_success);
+
+    let cancelled = calcifer()
+        .env("PATH", &path)
+        .env("CALCIFER_HOME", &root)
+        .env("FAKE_CODEX_LOG", &provider_log)
+        .env("FAKE_CODEX_LOGIN_SCOPE", "account-a")
+        .env("FAKE_CODEX_LOGIN_TOKEN", "cancelled-private-token")
+        .env("FAKE_CODEX_LOGIN_EXIT", "23")
+        .args(["auth", "reauth", "codex@work"])
+        .output()?;
+    assert_eq!(cancelled.status.code(), Some(1));
+    assert!(cancelled.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&cancelled.stderr).contains("did not complete successfully"));
+    assert_eq!(std::fs::read(home.join("auth.json"))?, auth_after_success);
+
+    let rendered = [reauth.stdout, mismatch.stderr, cancelled.stderr].concat();
+    for private in [
+        "old-private-token",
+        "new-private-token",
+        "mismatch-private-token",
+        "cancelled-private-token",
+        "account-a",
+        "account-b",
+        &root.display().to_string(),
+    ] {
+        assert!(!String::from_utf8_lossy(&rendered).contains(private));
+    }
+    let provider_log = String::from_utf8(std::fs::read(&provider_log)?)?;
+    assert!(provider_log.contains(&format!(".reauth-{profile_id}-")));
+    assert!(provider_log.contains(
+        "args=-c cli_auth_credentials_store=\"file\" -c mcp_oauth_credentials_store=\"file\" login"
+    ));
+    for line in provider_log
+        .lines()
+        .filter(|line| line.contains(&format!(".reauth-{profile_id}-")))
+    {
+        let cwd = line
+            .strip_prefix("pwd=")
+            .and_then(|line| line.split_once(" home="))
+            .map(|(cwd, _)| cwd)
+            .ok_or("provider log must contain a bounded cwd projection")?;
+        assert!(!std::path::Path::new(cwd).starts_with(&root));
+    }
+
+    std::fs::remove_dir_all(sandbox)?;
+    Ok(())
+}
+
+#[test]
 fn doctor_json_has_a_stable_envelope() -> Result<(), Box<dyn std::error::Error>> {
     let output = calcifer().args(["--json", "doctor"]).output()?;
     let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;

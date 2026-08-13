@@ -141,6 +141,27 @@ The public registry proves only local profile provenance. Separately, each new s
 
 Profiles created before this binding remain valid for explicit `run`, `resume`, and status. `calcifer auth verify codex@<alias>` acquires the profile lease, performs the exact `0.144.4` initialize/home/version gate without an account request, parses the same bounded auth projection, and serializes its uniqueness check and marker publication under the registry lock. It never opens a login flow or rewrites credentials. A future selector must use the lease-retaining revalidation API: missing markers, key loss/replacement, unsupported adapters/auth modes, malformed auth, and fingerprint drift stop the whole selection attempt. See [ADR 0002](adr/0002-private-provider-identity-binding.md).
 
+`calcifer auth reauth codex@<alias>` is a same-profile credential transaction,
+not an identity rebind. It acquires both lifetime locks in coordinator/provider
+order, refetches the immutable registry row, and revalidates the current marker
+before creating staging. Official `codex login` receives a fresh private
+`.reauth-<profile-id>-<nonce>/home`, the managed file-store configuration,
+sanitized environment, neutral cwd, and an inherited provider-side lease; it
+never receives the old credential. A second version-gated adapter derives the
+staged opaque identity, and unequal identity stops before visibility.
+
+After equality, Calcifer writes a create-only private credential temporary and
+a bounded private journal containing only local transaction identifiers and
+old/new content revisions. The home-local rename sequence hides the old
+`auth.json` as an exact backup and makes the new file visible. Recovery uses the
+journal plus exact revisions: before visibility it removes only the staged
+candidate; after visibility it keeps the new file and removes the old backup.
+If the old path was hidden but the new temporary remains, recovery completes
+the new publication. Mismatched, linked, malformed, oversized, replaced, or
+unsafe state returns `reauth_recovery_required` without guessing. Directory
+durability or cleanup uncertainty after visibility returns
+`reauth_commit_uncertain`; it never repeats browser login automatically.
+
 ## Implemented private routing and guarded selection kernel
 
 `routing.json` and `routing.lock` live only under Calcifer's validated private

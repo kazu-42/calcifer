@@ -25,6 +25,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   bounded private sidecar, same-filesystem tombstones, immutable-ID registry
   visibility, deterministic crash recovery, and stable secret-free human/JSON
   output.
+- Interactive `auth reauth codex@<alias>` through official `codex login` in a
+  fresh private staging home, with complete lifetime locking, current and
+  staged adapter gates, same-identity enforcement, credential-only replacement,
+  crash convergence, and stable alias-only success output. JSON mode is
+  rejected before provider launch.
 
 ### Security
 
@@ -81,6 +86,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Codex state, provider tokens, the installation identity key, unrelated
   profiles, and immutable conversation lineage are preserved; local unlinking
   is explicitly not advertised as secure erasure.
+- Reauthentication never copies the old credential into staging or implements
+  provider OAuth endpoints. Its private journal binds exact old/new revisions;
+  recovery removes the candidate only before visibility and never restores an
+  old backup after the new credential is visible. Mismatched identities,
+  unsafe staging nodes, hard links, malformed/oversized credentials, and
+  uncertain commit state fail closed without emitting provider-derived data.
 
 ## [0.1.0-alpha.4] - 2026-07-15
 

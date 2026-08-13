@@ -5,7 +5,7 @@ use crate::error::AppError;
 use crate::executable::resolve_codex;
 use crate::profiles::{Profile, Provider, Registry};
 use crate::provider_identity::IdentityError;
-use crate::providers::codex::{managed_command, verify_codex_identity_adapter};
+use crate::providers::codex::{managed_command, run_managed_login, verify_codex_identity_adapter};
 
 const IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -78,6 +78,15 @@ impl AuthReport {
                 || "No profile identity was verified.".to_owned(),
                 |profile| format!("Verified the private identity for {}.", profile.reference()),
             ),
+            "reauth" => self.profiles.first().map_or_else(
+                || "No profile was re-authenticated.".to_owned(),
+                |profile| {
+                    format!(
+                        "Re-authenticated {} through the official Codex login flow.",
+                        profile.reference()
+                    )
+                },
+            ),
             _ if self.profiles.is_empty() => "No profiles are registered.".to_owned(),
             _ => self
                 .profiles
@@ -149,6 +158,56 @@ pub(crate) fn verify_codex(alias: &str) -> Result<AuthReport, AppError> {
         ok: true,
         action: "verify",
         profiles: vec![verified.profile().clone()],
+    })
+}
+
+pub(crate) fn reauth_codex(alias: &str) -> Result<AuthReport, AppError> {
+    let executable = resolve_codex()?;
+    let registry = Registry::discover()?;
+    let neutral_working_directory = registry.neutral_working_directory()?;
+    let pending = registry.begin_codex_reauthentication(alias, |home, provider_lease| {
+        verify_codex_identity_adapter(
+            &executable,
+            home,
+            &neutral_working_directory,
+            IDENTITY_PROBE_TIMEOUT,
+            provider_lease,
+        )
+        .map_err(|_| crate::profiles::ProfileError::from(IdentityError::Unsupported))
+    })?;
+    let staging_home = pending.home();
+    let status = run_managed_login(
+        &executable,
+        &staging_home,
+        &neutral_working_directory,
+        pending.provider_lock_for_child()?,
+    );
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            pending.abort()?;
+            return Err(AppError::Io(error));
+        }
+    };
+    if !status.success() {
+        pending.abort()?;
+        return Err(AppError::ProviderLoginFailed);
+    }
+    let adapter = verify_codex_identity_adapter(
+        &executable,
+        &staging_home,
+        &neutral_working_directory,
+        IDENTITY_PROBE_TIMEOUT,
+        pending.provider_lock_for_child()?,
+    )
+    .map_err(|_| crate::profiles::ProfileError::from(IdentityError::Unsupported))?;
+    let profile = pending.commit(adapter)?;
+    Ok(AuthReport {
+        schema_version: 1,
+        command: "auth",
+        ok: true,
+        action: "reauth",
+        profiles: vec![profile],
     })
 }
 

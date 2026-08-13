@@ -7,7 +7,7 @@
 Calcifer is a pre-alpha, local-first Rust wrapper for running official coding-agent CLIs with isolated account profiles and structured usage visibility.
 
 > [!WARNING]
-> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, confirmed crash-safe local removal, a private default-disabled trust-domain/pool registry, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. The routing registry does not select or launch a profile. A pinned, default-unused Linux/macOS supervisor implementation is present internally, but its cross-platform acceptance evidence is incomplete. On 2026-07-20, the final Issue #54 candidate source passed two consecutive checksum-pinned Codex 0.144.4 normal-session runs (145.61 s and 144.97 s), one retained-cleanup recovery run (170.60 s), and three consecutive deterministic seven-checkpoint recovery runs (11.54 s, 11.21 s, and 11.50 s) on Apple silicon. Those native runs are historical functional evidence, not a hermetic gate. The Ubuntu 24.04 package lanes now put every exact contract and official-TUI probe in a fresh loopback-only network namespace; macOS hermetic package execution is explicitly unsupported and has no native-network fallback. The official scenarios exercise the real App Server and remote TUI through the coordinator, guardian, provider session, PTY, and job-control implementations under a test-owned terminal harness. Their guardian helper enters the shared production guardian-bootstrap core through bounded package-only seams, and their completion endpoint crosses real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries before the parent checks the provider-release-gated exact record and EOF. The test-only role dispatcher does not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-anchor role, so these scenarios make no parser coverage claim. No public supervised command uses this path. Automatic failover, cross-profile session handoff, reauthentication, and verified Windows credential ACLs are not implemented yet.
+> **Status: functional pre-alpha.** Codex profile registration with private provider-identity deduplication, staged same-identity reauthentication, confirmed crash-safe local removal, a private default-disabled trust-domain/pool registry, pinned launches, same-profile resume, and on-demand usage status are implemented on Unix. The routing registry does not select or launch a profile. A pinned, default-unused Linux/macOS supervisor implementation is present internally, but its cross-platform acceptance evidence is incomplete. On 2026-07-20, the final Issue #54 candidate source passed two consecutive checksum-pinned Codex 0.144.4 normal-session runs (145.61 s and 144.97 s), one retained-cleanup recovery run (170.60 s), and three consecutive deterministic seven-checkpoint recovery runs (11.54 s, 11.21 s, and 11.50 s) on Apple silicon. Those native runs are historical functional evidence, not a hermetic gate. The Ubuntu 24.04 package lanes now put every exact contract and official-TUI probe in a fresh loopback-only network namespace; macOS hermetic package execution is explicitly unsupported and has no native-network fallback. The official scenarios exercise the real App Server and remote TUI through the coordinator, guardian, provider session, PTY, and job-control implementations under a test-owned terminal harness. Their guardian helper enters the shared production guardian-bootstrap core through bounded package-only seams, and their completion endpoint crosses real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries before the parent checks the provider-release-gated exact record and EOF. The test-only role dispatcher does not execute the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser or persistent shell-anchor role, so these scenarios make no parser coverage claim. No public supervised command uses this path. Automatic failover, cross-profile session handoff, and verified Windows credential ACLs are not implemented yet.
 
 Calcifer is intended to make routine selection among accounts that you already own or are authorized to use feel boring: authenticate each profile through the provider's official CLI, keep each profile isolated, and start every new CLI process with an explicit profile.
 
@@ -44,6 +44,10 @@ calcifer auth list
 
 # Bind a profile created by an earlier Calcifer release without logging in again.
 calcifer auth verify codex@work
+
+# Refresh an existing profile through official browser login. The effective
+# account/workspace identity must remain the same.
+calcifer auth reauth codex@work
 
 # Change only a local display alias; no browser or provider process is used.
 calcifer auth rename codex@work client-a
@@ -85,6 +89,19 @@ calcifer resume
 ```
 
 Each registration gets a private, opaque directory and a complete profile-specific `CODEX_HOME`. The official CLI writes authentication, project trust, and session state there, so exiting Calcifer does not discard the conversation. Before publication, Calcifer version-gates the installed Codex `0.144.4` adapter and derives an installation-private HMAC fingerprint from the effective ChatGPT account/workspace scope in the provider-owned credential file. A second local alias for the same scope is rejected without displaying or storing the raw scope outside `auth.json`; different scopes are not claimed to guarantee independent provider quota. Profiles created by earlier releases remain usable for explicit operations and become failover-eligible only after an explicit, non-interactive `auth verify` succeeds. Calcifer accepts supported Codex project-trust updates semantically while continuing to require profile-local file storage for both Codex account and MCP OAuth credentials and reject profile/provider routing overrides, including MCP OAuth callback URL and port overrides. Managed Codex role configuration is currently unsupported: both a top-level `agents` table and any auto-discovered `CODEX_HOME/agents` node fail closed because role files can add indirect complete configuration layers. `calcifer resume codex@work` remains the explicit official `codex resume --last` convenience; bare `calcifer resume` resolves Calcifer's exact tracked workspace thread and never falls back to `--last`.
+
+`auth reauth` holds the complete profile lifetime lease, revalidates the current
+private identity, and runs official `codex login` in a new owner-private staging
+`CODEX_HOME` from Calcifer's neutral working directory. The old credential is
+never copied into staging. The staged credential is accepted only after the
+same version gate and opaque identity equality check, then replaces only the
+profile-local `auth.json` through a private journaled same-directory
+transaction. The profile UUID, alias, managed home, configuration, sessions,
+rollouts, conversation lineage, and identity marker remain unchanged. A
+different account, cancelled browser flow, unsafe file, or unsupported format
+leaves the old credential visible. Recovery keeps a new credential once it has
+become visible and never restores the old backup. `--json auth reauth` is
+rejected before provider launch because the official flow owns the terminal.
 
 Profile aliases are mutable local display metadata. `auth rename` atomically
 changes only the alias in Calcifer's private registry while holding the same

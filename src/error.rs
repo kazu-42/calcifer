@@ -54,7 +54,7 @@ impl AppError {
             Self::ProjectConfig(error) => error.safe_message().to_owned(),
             Self::Routing(error) => error.safe_message().to_owned(),
             Self::ProviderArgumentRejected => "Calcifer rejected a provider argument that could bypass the selected managed account or provider.".to_owned(),
-            Self::ProviderLoginFailed => "The official Codex login command did not complete successfully. No profile was registered.".to_owned(),
+            Self::ProviderLoginFailed => "The official Codex login command did not complete successfully. No managed profile credential was changed.".to_owned(),
             Self::Update(error) => error.safe_message().to_owned(),
         }
     }
