@@ -608,6 +608,39 @@ impl ConversationRegistry {
         self.read(|document| resolve_head_document(document, &canonical_cwd))
     }
 
+    /// Returns the bounded set of profiles used at or after one known lineage
+    /// generation. A restarted public failover invocation uses its explicitly
+    /// named starting generation to reconstruct cooldown without permanently
+    /// excluding profiles used by older, completed invocations.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) fn conversation_profile_ids_from_generation(
+        &self,
+        conversation_id: &str,
+        first_generation: u32,
+    ) -> Result<std::collections::BTreeSet<String>, ConversationError> {
+        validate_uuid(conversation_id, "conversation id")?;
+        self.read(|document| {
+            let conversation = document
+                .conversations
+                .iter()
+                .find(|conversation| conversation.conversation_id == conversation_id)
+                .ok_or(ConversationError::NotFound)?;
+            if !conversation
+                .generations
+                .iter()
+                .any(|generation| generation.generation == first_generation)
+            {
+                return Err(ConversationError::NotFound);
+            }
+            Ok(conversation
+                .generations
+                .iter()
+                .filter(|generation| generation.generation >= first_generation)
+                .map(|generation| generation.profile_id.clone())
+                .collect())
+        })
+    }
+
     /// Finds one exact immutable binding without consulting mutable workspace
     /// selection or launch state. Explicit recovery already names the profile,
     /// thread, and cwd, so it may use this only to retain persisted lifecycle
@@ -820,6 +853,59 @@ impl ConversationRegistry {
     #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34 recovery.
     pub(crate) fn current_handoff(&self) -> Result<Option<HandoffTransition>, ConversationError> {
         self.read(|document| Ok(document.active_transition.clone()))
+    }
+
+    /// Reads the active transition together with its immutable source
+    /// generation. This is the restart boundary for a public handoff: the
+    /// workspace head may already point at a committed target, so recovery
+    /// must not infer the source from mutable head state or from a user-supplied
+    /// historical generation.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) fn current_handoff_context(
+        &self,
+    ) -> Result<Option<(HandoffTransition, HeadBinding)>, ConversationError> {
+        self.read(|document| {
+            let Some(transition) = document.active_transition.clone() else {
+                return Ok(None);
+            };
+            let conversation = document
+                .conversations
+                .iter()
+                .find(|conversation| conversation.conversation_id == transition.conversation_id)
+                .ok_or_else(|| {
+                    ConversationError::RegistryInvalid(
+                        "handoff source conversation is missing".to_owned(),
+                    )
+                })?;
+            let source = conversation
+                .generations
+                .iter()
+                .find(|generation| generation.generation == transition.source_generation)
+                .ok_or_else(|| {
+                    ConversationError::RegistryInvalid(
+                        "handoff source generation is missing".to_owned(),
+                    )
+                })?;
+            if source.profile_id != transition.source_profile_id
+                || source.canonical_cwd != transition.canonical_cwd
+            {
+                return Err(ConversationError::RegistryInvalid(
+                    "handoff source binding conflicts with the transition".to_owned(),
+                ));
+            }
+            Ok(Some((
+                transition,
+                HeadBinding {
+                    conversation_id: conversation.conversation_id.clone(),
+                    generation: source.generation,
+                    profile_id: source.profile_id.clone(),
+                    thread_id: source.thread_id.clone(),
+                    canonical_cwd: source.canonical_cwd.clone(),
+                    codex_version: source.codex_version.clone(),
+                    lifecycle: conversation.last_safe_lifecycle,
+                },
+            )))
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // Wired by issue #34.
@@ -3527,6 +3613,11 @@ mod tests {
             trust_domain,
             21,
         ))?;
+        let (recoverable, recoverable_source) = registry
+            .current_handoff_context()?
+            .ok_or("active handoff context is missing")?;
+        assert_eq!(recoverable, first);
+        assert_eq!(recoverable_source, source);
         assert_eq!(
             registry
                 .resolve_head(&workspace)
@@ -3574,6 +3665,18 @@ mod tests {
         let first_target = registry.commit_handoff(&first.transition_id)?;
         assert_eq!(first_target.generation, 1);
         assert_eq!(first_target.thread_id, first_target_thread.to_string());
+        let (committed, committed_source) = registry
+            .current_handoff_context()?
+            .ok_or("committed handoff context is missing")?;
+        assert_eq!(committed.phase, HandoffPhase::CommittedUnattached);
+        assert_eq!(committed_source.conversation_id, source.conversation_id);
+        assert_eq!(committed_source.generation, source.generation);
+        assert_eq!(committed_source.profile_id, source.profile_id);
+        assert_eq!(committed_source.thread_id, source.thread_id);
+        assert_eq!(
+            committed_source.lifecycle,
+            ConversationLifecycle::Interrupted
+        );
         assert_eq!(
             registry
                 .current_handoff()?
@@ -3593,6 +3696,7 @@ mod tests {
             first_target
         );
         assert_eq!(registry.resolve_head(&workspace)?, first_target);
+        assert!(registry.current_handoff_context()?.is_none());
 
         let mut second_preparation =
             handoff_preparation(&first_target, Uuid::new_v4(), trust_domain, 41);
@@ -3622,6 +3726,15 @@ mod tests {
                 .map(|generation| generation.generation)
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
+        );
+        assert_eq!(
+            registry.conversation_profile_ids_from_generation(&source.conversation_id, 1)?,
+            [
+                first_target.profile_id.clone(),
+                second_target.profile_id.clone()
+            ]
+            .into_iter()
+            .collect()
         );
 
         fs::remove_dir_all(root)?;

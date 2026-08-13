@@ -18,6 +18,11 @@ use serde_json::{Value, json};
     feature = "production-supervisor",
     any(target_os = "linux", target_os = "macos")
 ))]
+mod failover;
+#[cfg(all(
+    feature = "production-supervisor",
+    any(target_os = "linux", target_os = "macos")
+))]
 mod handoff_compat;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod handoff_transaction;
@@ -54,6 +59,8 @@ pub(crate) use rollout_handoff::{
 ))]
 pub(crate) use supervisor::run_internal_fixture;
 
+#[cfg(all(feature = "production-supervisor", target_os = "linux"))]
+pub(crate) use failover::{CodexFailoverError, resume_supervised_with_failover};
 #[cfg(all(feature = "production-supervisor", target_os = "linux"))]
 pub(crate) use supervisor::spawn_supervised_exact_resume;
 #[cfg(all(
@@ -165,6 +172,7 @@ pub(crate) const SUPPORTED_CODEX_STATUS_VERSIONS: &[&str] = &["0.144.4"];
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CodexThreadMetadata {
     pub(crate) thread_id: String,
+    pub(crate) parent_thread_id: Option<String>,
     pub(crate) canonical_cwd: PathBuf,
     pub(crate) cli_version: String,
     pub(crate) updated_at: i64,
@@ -199,6 +207,20 @@ pub(crate) struct CodexThreadRead {
     pub(crate) codex_version: String,
     pub(crate) metadata: CodexThreadMetadata,
     pub(crate) lifecycle: CodexThreadLifecycle,
+}
+
+/// A handoff-only exact thread projection. Unlike ordinary root-thread reads,
+/// this may retain one validated provider parent ID and requires the complete
+/// effective settings returned by the pinned App Server.
+#[cfg(all(
+    feature = "production-supervisor",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) struct CodexHandoffThreadRead {
+    pub(crate) thread: CodexThreadRead,
+    pub(crate) settings: remote::EffectiveThreadSettings,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1306,6 +1328,78 @@ pub(crate) fn read_thread_metadata(
     })
 }
 
+/// Reads one exact source generation for transactional handoff.
+///
+/// The ordinary inventory intentionally accepts root threads only. This
+/// handoff-only path additionally accepts one canonical, source-distinct
+/// parent ID so a previously forked generation can fail over again. The
+/// returned settings are the complete pinned response projection and must be
+/// reproduced by the target fork before it can be committed.
+#[cfg(all(
+    feature = "production-supervisor",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn read_handoff_thread(
+    codex_executable: &Path,
+    codex_home: &Path,
+    neutral_working_directory: &Path,
+    canonical_cwd: &Path,
+    thread_id: &str,
+    timeout: Duration,
+    inherited_provider_lease: Option<&File>,
+) -> Result<CodexHandoffThreadRead, CodexThreadError> {
+    validate_canonical_uuid(thread_id)?;
+    let canonical_cwd = fs::canonicalize(canonical_cwd).map_err(|_| CodexThreadError::Protocol)?;
+    if !canonical_cwd.is_dir() {
+        return Err(CodexThreadError::Protocol);
+    }
+    let deadline = thread_deadline(codex_executable, timeout)?;
+    let (mut process, codex_version) = initialize_thread_client(
+        codex_executable,
+        codex_home,
+        neutral_working_directory,
+        deadline,
+        inherited_provider_lease,
+    )?;
+    process
+        .send(&json!({
+            "id": 1,
+            "method": "thread/read",
+            "params": {
+                "threadId": thread_id,
+                "includeTurns": false
+            }
+        }))
+        .map_err(map_thread_transport)?;
+    let result = process.receive_thread_result(1, deadline)?;
+    let settings = remote::parse_thread_settings(&result)
+        .map_err(|_| CodexThreadError::Protocol)?
+        .ok_or(CodexThreadError::Protocol)?;
+    let response: WireThreadReadResponse =
+        serde_json::from_value(result).map_err(|_| CodexThreadError::Protocol)?;
+    let metadata = validate_thread_projection_inner(
+        response.thread,
+        &canonical_cwd,
+        codex_home,
+        &codex_version,
+        None,
+        true,
+    )?;
+    if metadata.thread_id != thread_id || metadata.archived {
+        return Err(CodexThreadError::Protocol);
+    }
+    let lifecycle = inspect_rollout_lifecycle(&metadata, &canonical_cwd)?;
+    Ok(CodexHandoffThreadRead {
+        thread: CodexThreadRead {
+            codex_version,
+            metadata,
+            lifecycle,
+        },
+        settings,
+    })
+}
+
 fn thread_deadline(
     codex_executable: &Path,
     timeout: Duration,
@@ -1410,15 +1504,38 @@ fn validate_thread_projection(
     expected_version: &str,
     expected_archived: Option<bool>,
 ) -> Result<CodexThreadMetadata, CodexThreadError> {
+    validate_thread_projection_inner(
+        wire,
+        expected_cwd,
+        codex_home,
+        expected_version,
+        expected_archived,
+        false,
+    )
+}
+
+fn validate_thread_projection_inner(
+    wire: WireThread,
+    expected_cwd: &Path,
+    codex_home: &Path,
+    expected_version: &str,
+    expected_archived: Option<bool>,
+    allow_parent: bool,
+) -> Result<CodexThreadMetadata, CodexThreadError> {
     validate_canonical_uuid(&wire.id)?;
-    if wire.parent_thread_id.is_some()
-        || wire.ephemeral
+    if wire.ephemeral
         || wire.updated_at < 0
         || wire.recency_at.is_some_and(|timestamp| timestamp < 0)
         || wire.cli_version != expected_version
         || wire.source.as_str() != Some("cli")
     {
         return Err(CodexThreadError::Protocol);
+    }
+    if let Some(parent) = wire.parent_thread_id.as_deref() {
+        validate_canonical_uuid(parent)?;
+        if !allow_parent || parent == wire.id {
+            return Err(CodexThreadError::Protocol);
+        }
     }
     let canonical_cwd = fs::canonicalize(&wire.cwd).map_err(|_| CodexThreadError::CwdMismatch)?;
     if canonical_cwd != expected_cwd {
@@ -1432,6 +1549,7 @@ fn validate_thread_projection(
     }
     Ok(CodexThreadMetadata {
         thread_id: wire.id,
+        parent_thread_id: wire.parent_thread_id,
         canonical_cwd,
         cli_version: wire.cli_version,
         updated_at: wire.updated_at,
@@ -1700,13 +1818,15 @@ fn validate_session_meta_value(
         .and_then(Value::as_str)
         .ok_or(CodexThreadError::SessionSchema)?;
     let canonical_cwd = fs::canonicalize(cwd).map_err(|_| CodexThreadError::SessionSchema)?;
+    let parent_matches = match metadata.parent_thread_id.as_deref() {
+        Some(expected) => payload.get("parent_thread_id").and_then(Value::as_str) == Some(expected),
+        None => payload.get("parent_thread_id").is_none_or(Value::is_null),
+    };
     if id != metadata.thread_id
         || canonical_cwd != expected_cwd
         || cli_version != metadata.cli_version
         || source != "cli"
-        || payload
-            .get("parent_thread_id")
-            .is_some_and(|parent| !parent.is_null())
+        || !parent_matches
     {
         return Err(CodexThreadError::SessionSchema);
     }

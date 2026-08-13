@@ -564,10 +564,11 @@ catalog with a private `classified\n` node and rejects aliases, prefixes,
 extensions, links, wrong modes, oversized files, and payload-bearing files.
 Successful official-TUI startup writes none of these failure markers.
 
-This compatibility gate and the internal handoff transaction/reconciliation
-kernel described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md)
-are implemented. No command currently switches a user's profile or imports a
-user's rollout.
+This compatibility gate and the handoff transaction/reconciliation kernel
+described in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md) are
+implemented. The explicit Linux
+`resume --experimental-supervised --failover-pool` command consumes them; no
+ordinary launch switches a user's profile or imports a user's rollout.
 The gate receives no Calcifer profile, conversation registry, credential, or
 user rollout, and incompatibility therefore cannot mutate those states.
 The internal Linux/macOS no-gap target-reservation and guardian lease-transfer
@@ -578,10 +579,9 @@ The driver persists stop and fork intent before external effects, validates
 same-domain source provenance, adopts exactly one matching post-crash target,
 permits zero candidates one durable retry, and never offers a replay action.
 The authoritative one-pass selection kernel and lease-retaining candidate
-revalidation runtime are implemented but default-unused. The Linux exact
-same-profile supervised resume does not call them. Public failover wiring and
-target-fork activation remain prerequisites before automatic handoff is
-enabled.
+revalidation runtime are consumed only when that explicit command names an
+enabled same-trust-domain pool. Exact supervised resume without the option
+remains same-profile.
 
 Relevant upstream sources:
 
@@ -674,8 +674,9 @@ Context-window exhaustion, session budgets, unauthorized responses, 5xx errors, 
 Same-profile `calcifer resume` still delegates the final restore to the official
 CLI inside the selected `CODEX_HOME`. Its pinned metadata adapter never
 constructs a prompt or parses transcript message/tool payloads. Experimental
-cross-profile `thread/fork.path` and remote-TUI resume remain disabled behind
-their separate Phase 4.5 runtime/schema gate.
+cross-profile `thread/fork.path` and target-TUI resume are enabled only behind
+the explicit Linux Phase 4.5 runtime/schema gate; incompatibility stops without
+a direct-mode or fresh-thread fallback.
 
 ## What Orca currently does
 

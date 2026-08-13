@@ -1,6 +1,6 @@
 # ADR 0003: Supervise a profile-owned Codex App Server and official remote TUI
 
-- Status: Accepted and partially implemented; Linux exposes exact same-profile supervised resume, while pool selection and cross-profile handoff remain disabled; the pinned Linux package probes are egress-confined and macOS hermetic execution is explicitly unsupported
+- Status: Accepted and implemented experimentally on Linux for exact resume and explicit guarded pool failover; the pinned Linux package probes are egress-confined and macOS hermetic execution is explicitly unsupported
 - Date: 2026-07-15
 - Last updated: 2026-08-13
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
@@ -1101,6 +1101,27 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
 Before Slice 4, all new code was internal and default-unused. No later slice may
 silently delegate to direct mode or activate failover without its separately
 reviewed selection and handoff proofs.
+
+### Slice 5: explicit guarded failover (implemented on Linux)
+
+- Add `--failover-pool <uuid|codex@alias>` only to the explicit supervised
+  exact-resume form; require an enabled pool and retain ordinary resume behavior
+  when it is absent.
+- Treat only the sealed typed `usageLimitExceeded` disposition as the active
+  signal, stop/reap and restore the terminal, then require a new structured
+  exhaustion read under the exact source-profile lease.
+- Traverse the configured pool once with generation-scoped cooldown, fresh
+  identity/usage revalidation, and retained target reservation.
+- Fork the validated source rollout into the target profile with exact source
+  execution settings, commit one durable logical-conversation generation, and
+  attach the official target TUI without replaying the failed turn.
+- Resume a crash-durable transition only when the user repeats the same
+  explicit starting profile/thread and pool; preserve the bounded one-retry
+  reconciliation contract.
+- Keep the feature Linux-only, opt-in, and experimental. Direct no-gap transfer
+  of the retained target provider descriptor into the production guardian is a
+  stable-promotion hardening gate; the current reacquisition gap fails closed on
+  contention before provider launch.
 
 ## Pinned upstream boundary
 

@@ -675,17 +675,18 @@ Fresh observations expire after a fixed TTL. Expired evidence is `stale`; an exp
 
 The verified upstream versions, exact fields, and source links are recorded in [Provider compatibility notes](provider-compatibility.md).
 
-## Planned supervised failover and conversation handoff
+## Experimental supervised failover and conversation handoff
 
 The staged process topology, separate lifecycle/lease-transfer channels,
 readiness contract, macOS guardian-loss constraint, and public release gates
 are specified in [ADR 0003](adr/0003-supervised-codex-session.md).
 Its fake-child process and readiness-gated PTY foundations are implemented, and
-the pinned same-profile App Server/monitor/TUI integration is reachable through
-an explicit Linux exact-resume command. The lineage journal and one-boundary
-handoff/recovery driver remain internal. The one-pass pool selector and its
-lease-retaining Codex candidate runtime are also implemented; public failover
-wiring and the cross-profile interactive UX remain planned.
+the pinned App Server/monitor/TUI integration is reachable through an explicit
+Linux exact-resume command. Adding `--failover-pool` activates the lineage
+journal, one-boundary handoff/recovery driver, one-pass selector, retained
+candidate reservation, version-gated fork, durable generation commit, and
+official target-TUI attachment. The path is opt-in and experimental; no normal
+launch inherits a pool.
 
 ```text
 resolve pinned profile or explicit pool
@@ -901,8 +902,9 @@ The current process launcher:
   restore-before-stop plus a fresh gate; the checksum-pinned
   `official-tui-normal` scenario covers resize and group-wide stop/continue with
   the official TUI and passed twice from that candidate source on Apple silicon;
-  the Linux public exact-resume entry reaches the same sealed production anchor,
-  while automatic selection remains a separate release gate;
+  the Linux public exact-resume entry reaches the same sealed production anchor;
+  explicit `--failover-pool` additionally gates one reviewed selection and
+  cross-profile transaction, while ordinary launches never inherit it;
 - preserve ordinary child exit codes; the terminal fixture additionally
   preserves nonzero and terminating-signal disposition only after exact waits,
   restoration, recovery disarm, and final guardian proof;
@@ -990,16 +992,16 @@ Before the first stable release, the project still needs reviewed decisions or
 completed implementations for:
 
 - deliberate all-profile re-key recovery after identity-key loss;
-- active-session selection/failover UX on top of the Linux public exact-resume
-  integration in [ADR 0003](adr/0003-supervised-codex-session.md), a reviewed
+- stable/default promotion criteria for the explicit Linux failover UX, a
+  no-gap target reservation transfer into the production guardian, a reviewed
   macOS descriptor-exec primitive, and a separate Windows terminal and
   process-authority design;
 - additional Codex version/schema gates beyond the implemented 0.144.4 observation cache;
 - cross-platform exact-thread capture ACLs and future Codex session-schema adapters;
-- cross-profile conversation handoff implementation following [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
+- cross-platform cross-profile conversation handoff beyond the experimental Linux path in [ADR 0001](adr/0001-cross-profile-conversation-handoff.md);
 - separate Windows ACL and macOS documented-Keychain-namespace gates for
   provider-managed Claude profiles; setup-token ingestion additionally requires
   an OS credential broker and no-echo recovery design;
-- explicit selector, enablement, and failover pool execution UX (the inert trust-domain/pool definition UX is implemented).
+- optional future stable/default selector UX; the current path always requires an explicit enabled pool per invocation.
 
 Credential-management support is a separate platform guarantee from the portable diagnostic surface. Each provider and OS combination must pass its permission, credential-store, process, and recovery tests before being marked supported.

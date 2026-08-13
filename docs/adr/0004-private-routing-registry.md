@@ -1,6 +1,6 @@
 # ADR 0004: Private default-disabled routing registry
 
-- Status: accepted and implemented on Unix; explicit activation and the internal guarded selector are implemented, while public selection remains unavailable
+- Status: accepted and implemented on Unix; explicit activation is consumed only by the experimental Linux supervised failover option
 - Date: 2026-08-06
 - Related: [Issue 31](https://github.com/kazu-42/calcifer/issues/31), [Issue 36](https://github.com/kazu-42/calcifer/issues/36), [ADR 0001](0001-cross-profile-conversation-handoff.md), [ADR 0002](0002-private-provider-identity-binding.md)
 

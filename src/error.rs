@@ -10,6 +10,8 @@ use crate::routing::RoutingError;
 
 #[derive(Debug)]
 pub(crate) enum AppError {
+    #[cfg(all(feature = "production-supervisor", target_os = "linux"))]
+    CodexFailover(crate::providers::codex::CodexFailoverError),
     ConfirmationRequired,
     Conversation(ConversationError),
     Executable(ExecutableError),
@@ -31,6 +33,8 @@ pub(crate) enum AppError {
 impl AppError {
     pub(crate) const fn code(&self) -> &'static str {
         match self {
+            #[cfg(all(feature = "production-supervisor", target_os = "linux"))]
+            Self::CodexFailover(error) => error.code(),
             Self::ConfirmationRequired => "confirmation_required",
             Self::Conversation(error) => error.code(),
             Self::Executable(error) => error.code(),
@@ -48,6 +52,8 @@ impl AppError {
 
     pub(crate) fn safe_message(&self) -> String {
         match self {
+            #[cfg(all(feature = "production-supervisor", target_os = "linux"))]
+            Self::CodexFailover(error) => error.safe_message().to_owned(),
             Self::ConfirmationRequired => "Profile removal requires an explicit TTY confirmation or `--yes`. No local profile state was changed.".to_owned(),
             Self::Conversation(error) => error.safe_message().to_owned(),
             Self::Executable(error) => error.safe_message().to_owned(),
@@ -114,5 +120,12 @@ impl From<UpdateError> for AppError {
 impl From<io::Error> for AppError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+#[cfg(all(feature = "production-supervisor", target_os = "linux"))]
+impl From<crate::providers::codex::CodexFailoverError> for AppError {
+    fn from(error: crate::providers::codex::CodexFailoverError) -> Self {
+        Self::CodexFailover(error)
     }
 }

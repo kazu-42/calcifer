@@ -11,8 +11,8 @@ use uuid::Uuid;
     about = "Manage isolated profiles for official coding-agent CLIs",
     long_about = "Calcifer is a pre-alpha local profile manager for official coding-agent CLIs.\n\
                   The current functional slice supports isolated Codex profiles, explicit resume,\n\
-                  structured per-profile usage reads, and experimental Linux supervised exact resume.\n\
-                  Automatic failover is not implemented yet.",
+                  structured per-profile usage reads, and experimental Linux supervised exact resume\n\
+                  with an explicitly enabled guarded failover pool.",
     arg_required_else_help = true
 )]
 pub(crate) struct Cli {
@@ -80,6 +80,10 @@ pub(crate) enum Commands {
         /// On Linux, use the pinned foreground supervisor for one exact same-profile thread.
         #[arg(long, requires_all = ["profile", "session_id"])]
         experimental_supervised: bool,
+
+        /// Traverse this enabled Codex pool once after authoritative exhaustion.
+        #[arg(long, requires = "experimental_supervised")]
+        failover_pool: Option<DefinitionReference>,
 
         /// Provider and local profile alias; omit to resume this workspace's tracked head.
         profile: Option<ProfileReference>,

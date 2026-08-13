@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::json::decode_unique_json;
 
@@ -2443,6 +2443,54 @@ impl EffectiveThreadSettings {
     pub(crate) const fn sandbox_network_access(&self) -> EffectiveNetworkAccess {
         self.sandbox_network_access
     }
+
+    /// Projects only the reviewed `ThreadForkParams` settings accepted by the
+    /// pinned 0.144.4 experimental API. The fork response is compared with
+    /// this complete effective projection, so provider defaults cannot
+    /// silently weaken or broaden the source thread's settings.
+    pub(crate) fn fork_params(&self, source_path: &Path) -> Option<Value> {
+        if self.approvals_reviewer != EffectiveApprovalsReviewer::User || !source_path.is_absolute()
+        {
+            return None;
+        }
+        let path = source_path.to_str()?;
+        let approval_policy = match self.approval_policy {
+            EffectiveApprovalPolicy::Untrusted => json!("untrusted"),
+            EffectiveApprovalPolicy::OnRequest => json!("on-request"),
+            EffectiveApprovalPolicy::Never => json!("never"),
+            EffectiveApprovalPolicy::Granular {
+                sandbox_approval,
+                rules,
+                skill_approval,
+                request_permissions,
+                mcp_elicitations,
+            } => json!({
+                "granular": {
+                    "sandbox_approval": sandbox_approval,
+                    "rules": rules,
+                    "skill_approval": skill_approval,
+                    "request_permissions": request_permissions,
+                    "mcp_elicitations": mcp_elicitations
+                }
+            }),
+        };
+        let sandbox = match self.sandbox_type {
+            EffectiveSandboxType::DangerFullAccess => "danger-full-access",
+            EffectiveSandboxType::ReadOnly => "read-only",
+            EffectiveSandboxType::ExternalSandbox => "external-sandbox",
+            EffectiveSandboxType::WorkspaceWrite => "workspace-write",
+        };
+        Some(json!({
+            "threadId": "",
+            "path": path,
+            "cwd": self.cwd,
+            "model": self.model,
+            "modelProvider": self.model_provider,
+            "approvalPolicy": approval_policy,
+            "sandbox": sandbox,
+            "ephemeral": false
+        }))
+    }
 }
 
 fn inspect_message(
@@ -2606,7 +2654,7 @@ fn validate_jsonrpc_error_body(error: &Value) -> Result<(), ReadinessProxyError>
     Ok(())
 }
 
-fn parse_thread_settings(
+pub(super) fn parse_thread_settings(
     result: &Value,
 ) -> Result<Option<EffectiveThreadSettings>, ReadinessProxyError> {
     let Some(result) = result.as_object() else {
@@ -3767,6 +3815,42 @@ mod tests {
             sandbox_type: EffectiveSandboxType::ReadOnly,
             sandbox_network_access: EffectiveNetworkAccess::Restricted,
         }
+    }
+
+    #[test]
+    fn fork_params_preserve_the_complete_supported_source_policy() {
+        let Some(params) = observed_settings().fork_params(Path::new("/managed/source.jsonl"))
+        else {
+            panic!("supported settings should project to fork params");
+        };
+        assert_eq!(
+            params,
+            json!({
+                "threadId": "",
+                "path": "/managed/source.jsonl",
+                "cwd": TARGET_CWD,
+                "model": TARGET_MODEL,
+                "modelProvider": TARGET_MODEL_PROVIDER,
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "ephemeral": false
+            })
+        );
+
+        let auto_review = EffectiveThreadSettings {
+            approvals_reviewer: EffectiveApprovalsReviewer::AutoReview,
+            ..observed_settings()
+        };
+        assert!(
+            auto_review
+                .fork_params(Path::new("/managed/source.jsonl"))
+                .is_none()
+        );
+        assert!(
+            observed_settings()
+                .fork_params(Path::new("relative.jsonl"))
+                .is_none()
+        );
     }
 
     fn resume_result() -> Value {
