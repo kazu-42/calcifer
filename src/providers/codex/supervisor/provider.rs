@@ -5490,11 +5490,19 @@ mod tests {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
         let executable = fs::canonicalize(std::env::current_exe()?)?;
-        let build = PinnedSessionBuild::from_test_capability(
-            test_launch_authorization(&home, &workspace, THREAD_ID)?,
-            TestCompatibilityCapability::capture(&executable)?,
+        // Unlike the small shell fixtures used by nearby tests, this proof
+        // pins the full all-features libtest so the Linux memfd contains a
+        // native two-exec image. Keep capture and both copies under one
+        // hosted-runner-sized budget instead of the generic 2s fixture seam.
+        let capability = TestCompatibilityCapability::capture_and_pin_authorized(
+            &executable,
             &stage_parent,
+            Duration::from_secs(60),
         )?;
+        let build = PinnedSessionBuild::from_compatibility(
+            test_launch_authorization(&home, &workspace, THREAD_ID)?,
+            capability,
+        );
 
         let mut pre_exec = calcifer_unix_child_fd::CrossProcessDescriptorSet::new();
         build.append_remote_tui_pre_exec_forbidden_descriptors(&mut pre_exec)?;
