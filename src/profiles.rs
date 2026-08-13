@@ -381,6 +381,7 @@ struct RemovalJournal {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RemovalRoots {
+    provider: Provider,
     data_root: FileSystemIdentity,
     profiles_root: FileSystemIdentity,
     provider_root: FileSystemIdentity,
@@ -681,7 +682,7 @@ impl Registry {
             .iter()
             .position(|profile| profile == &selected)
             .ok_or_else(|| ProfileError::NotFound(selected.reference()))?;
-        let roots = self.validate_removal_roots(None)?;
+        let roots = self.validate_removal_roots(selected.provider, None)?;
         let original = self.profile_path(&selected)?;
         let tree = validate_owned_removal_tree(&self.root, &roots, &original, &selected.id, None)?;
 
@@ -715,7 +716,7 @@ impl Registry {
         }
         self.inject_removal_fault(RemovalFaultPoint::TombstoneRename)?;
         fs::rename(&original, &tombstone)?;
-        self.validate_removal_roots(Some(&journal))?;
+        self.validate_removal_roots(journal.profile.provider, Some(&journal))?;
         validate_owned_removal_tree(
             &self.root,
             &roots,
@@ -837,7 +838,7 @@ impl Registry {
         let journal = effective_journal.ok_or(ProfileError::RemovalRecoveryRequired)?;
         self.validate_removal_artifact_set(&journal, &tombstones, &temporaries)?;
 
-        let roots = self.validate_removal_roots(Some(&journal))?;
+        let roots = self.validate_removal_roots(journal.profile.provider, Some(&journal))?;
         let original = self.profile_path(&journal.profile)?;
         let tombstone = self.tombstone_path(&journal.profile)?;
         let original_exists = path_exists(&original)?;
@@ -887,7 +888,7 @@ impl Registry {
         let current_tombstones = self.removal_tombstones()?;
         let current_temporaries = self.removal_temporaries()?;
         self.validate_removal_artifact_set(&journal, &current_tombstones, &current_temporaries)?;
-        let roots = self.validate_removal_roots(Some(&journal))?;
+        let roots = self.validate_removal_roots(journal.profile.provider, Some(&journal))?;
         let original_exists = path_exists(&original)?;
         let tombstone_exists = path_exists(&tombstone)?;
         if original_exists && tombstone_exists {
@@ -933,7 +934,7 @@ impl Registry {
                         Some(journal.tree_snapshot()),
                     )?;
                     fs::rename(&tombstone, &original)?;
-                    self.validate_removal_roots(Some(&journal))?;
+                    self.validate_removal_roots(journal.profile.provider, Some(&journal))?;
                     validate_owned_removal_tree(
                         &self.root,
                         &roots,
@@ -1689,16 +1690,18 @@ impl Registry {
 
     fn validate_removal_roots(
         &self,
+        provider: Provider,
         expected: Option<&RemovalJournal>,
     ) -> Result<RemovalRoots, ProfileError> {
         let profiles_root = self.root.join("profiles");
-        let provider_root = profiles_root.join("codex");
+        let provider_root = profiles_root.join(provider.as_str());
         let data_mount = removal_mount_identity_path(&self.root)?;
         let profiles_mount = removal_mount_identity_path(&profiles_root)?;
         let provider_mount = removal_mount_identity_path(&provider_root)?;
         ensure_same_removal_mount(&data_mount, &profiles_mount)?;
         ensure_same_removal_mount(&data_mount, &provider_mount)?;
         let roots = RemovalRoots {
+            provider,
             data_root: private_directory_identity(&self.root)?,
             profiles_root: private_directory_identity(&profiles_root)?,
             provider_root: private_directory_identity(&provider_root)?,
@@ -1832,27 +1835,29 @@ impl Registry {
         Ok(())
     }
 
-    fn removal_tombstones(&self) -> Result<Vec<(String, PathBuf)>, ProfileError> {
-        let provider_root = self.root.join("profiles/codex");
-        match fs::symlink_metadata(&provider_root) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(ProfileError::Io(error)),
-            Ok(_) => verify_private_directory(&provider_root)?,
-        }
+    fn removal_tombstones(&self) -> Result<Vec<(Provider, String, PathBuf)>, ProfileError> {
         let mut tombstones = Vec::new();
-        for entry in fs::read_dir(&provider_root)? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
-            let Some(id) = name.strip_prefix(".removing-") else {
-                continue;
-            };
-            validate_profile_id(id).map_err(|_| ProfileError::RemovalRecoveryRequired)?;
-            tombstones.push((id.to_owned(), entry.path()));
-            if tombstones.len() > 1 {
-                return Err(ProfileError::RemovalRecoveryRequired);
+        for provider in [Provider::Claude, Provider::Codex] {
+            let provider_root = self.root.join("profiles").join(provider.as_str());
+            match fs::symlink_metadata(&provider_root) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(ProfileError::Io(error)),
+                Ok(_) => verify_private_directory(&provider_root)?,
+            }
+            for entry in fs::read_dir(&provider_root)? {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+                let Some(id) = name.strip_prefix(".removing-") else {
+                    continue;
+                };
+                validate_profile_id(id).map_err(|_| ProfileError::RemovalRecoveryRequired)?;
+                tombstones.push((provider, id.to_owned(), entry.path()));
+                if tombstones.len() > 1 {
+                    return Err(ProfileError::RemovalRecoveryRequired);
+                }
             }
         }
         Ok(tombstones)
@@ -1890,10 +1895,12 @@ impl Registry {
     fn validate_removal_artifact_set(
         &self,
         journal: &RemovalJournal,
-        tombstones: &[(String, PathBuf)],
+        tombstones: &[(Provider, String, PathBuf)],
         _temporaries: &[PathBuf],
     ) -> Result<(), ProfileError> {
-        if tombstones.iter().any(|(id, _)| id != &journal.profile.id) {
+        if tombstones.iter().any(|(provider, id, _)| {
+            *provider != journal.profile.provider || id != &journal.profile.id
+        }) {
             return Err(ProfileError::RemovalRecoveryRequired);
         }
         Ok(())
@@ -1918,7 +1925,7 @@ impl Registry {
         journal: &RemovalJournal,
         tombstone: &Path,
     ) -> Result<(), ProfileError> {
-        let roots = self.validate_removal_roots(Some(journal))?;
+        let roots = self.validate_removal_roots(journal.profile.provider, Some(journal))?;
         validate_partial_owned_tombstone(
             &self.root,
             &roots,
@@ -1937,7 +1944,7 @@ impl Registry {
                 .map_err(|_| ProfileError::RemovalRecoveryRequired)?,
         )
         .map_err(removal_commit_error)?;
-        self.validate_removal_roots(Some(journal))?;
+        self.validate_removal_roots(journal.profile.provider, Some(journal))?;
         self.inject_removal_fault(RemovalFaultPoint::ProviderRootSyncAfterCleanup)
             .and_then(|()| sync_directory(&self.provider_root(journal.profile.provider)?))
             .map_err(|error| match error {
@@ -2548,7 +2555,13 @@ fn validate_owned_removal_tree_inner_with_limits(
     let expected_name = profile_id;
     let expected_tombstone = format!(".removing-{profile_id}");
     let name = path.file_name().and_then(|name| name.to_str());
-    if path.parent() != Some(data_root.join("profiles/codex").as_path())
+    if path.parent()
+        != Some(
+            data_root
+                .join("profiles")
+                .join(roots.provider.as_str())
+                .as_path(),
+        )
         || !path.starts_with(data_root)
         || !matches!(name, Some(value) if value == expected_name || value == expected_tombstone)
     {
@@ -8880,7 +8893,7 @@ config_file = "{sensitive_path}"
         for name in [COORDINATOR_LOCK_FILE, PROVIDER_LOCK_FILE] {
             verify_private_single_link_regular_file(&profile_directory.join(name))?;
         }
-        let roots = registry.validate_removal_roots(None)?;
+        let roots = registry.validate_removal_roots(Provider::Codex, None)?;
         validate_owned_removal_tree(&root, &roots, &profile_directory, &profile.id, None)?;
         drop(lease);
 
@@ -10091,7 +10104,7 @@ config_file = "{sensitive_path}"
         let root = temporary_root("remove-entry-budget");
         let registry = Registry::at(root.clone());
         let profile = register_test_profile(&registry, "work")?;
-        let roots = registry.validate_removal_roots(None)?;
+        let roots = registry.validate_removal_roots(Provider::Codex, None)?;
         let profile_directory = registry.profile_directory(&profile)?;
         let snapshot =
             validate_owned_removal_tree(&root, &roots, &profile_directory, &profile.id, None)?;
@@ -10155,7 +10168,7 @@ config_file = "{sensitive_path}"
         let nested = profile_directory.join("home/one/two");
         secure_create_dir_all(&nested)?;
         write_private_file(&nested.join("sentinel"), b"must-survive")?;
-        let roots = registry.validate_removal_roots(None)?;
+        let roots = registry.validate_removal_roots(Provider::Codex, None)?;
         let identity = private_directory_identity(&profile_directory)?;
 
         let error = validate_owned_removal_tree_inner_with_limits(
@@ -10292,7 +10305,7 @@ config_file = "{sensitive_path}"
             "same-device bind mounts must still have distinct mount identities"
         );
 
-        let roots = registry.validate_removal_roots(None)?;
+        let roots = registry.validate_removal_roots(Provider::Codex, None)?;
         let validation_error =
             validate_owned_removal_tree(&root, &roots, &profile_directory, &profile.id, None)
                 .err()
