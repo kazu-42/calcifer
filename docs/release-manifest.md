@@ -76,9 +76,13 @@ gzip stream, every declared entry body, and the deterministic zero-padded tar
 tail. It streams and hashes the executable inside each archive instead of
 trusting a descriptor produced by the build job.
 
-`SHA256SUMS` covers the five archives and the manifest, in bytewise filename
-order. The manifest does not contain its own digest; consumers verify its local
-bytes against `SHA256SUMS` and the corresponding GitHub release-asset digest.
+`SHA256SUMS` covers the five archives, the manifest, and—when present—the
+complete five-file `<archive>.sig` set, in bytewise filename order. Alpha.4 is
+the compatibility baseline without signatures. A later v1 bundle may contain
+either zero signatures or exactly one sidecar for every canonical archive;
+partial, duplicate, or unexpected signature sets fail closed. The manifest
+does not contain its own digest; consumers verify its local bytes against
+`SHA256SUMS` and the corresponding GitHub release-asset digest.
 No download URL appears in the manifest. Consumers resolve an allowlisted asset
 name only within the already selected GitHub Release.
 
@@ -144,8 +148,9 @@ channel and an unsupported compile target are successful, explicit states. The
 checker never falls back to a different architecture, libc, or Windows ABI.
 
 For a selected release, the checker requires `immutable: true`, exactly the five
-canonical archives plus this manifest and `SHA256SUMS`, uploaded state, bounded
-sizes, canonical release/download URLs, and SHA-256 release-asset digests. It
+canonical archives plus this manifest and `SHA256SUMS`, with either zero or all
+five canonical Minisign sidecars, uploaded state, bounded sizes, canonical
+release/download URLs, and SHA-256 release-asset digests. It
 downloads only the manifest and checksum assets. Their response bytes must
 match the release-asset size/digest, the manifest must be canonical single-line
 JSON in the exact v1 schema, and `SHA256SUMS` must be canonical, complete, and

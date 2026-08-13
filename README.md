@@ -618,7 +618,9 @@ Starting with `v0.1.0-alpha.3`, Calcifer publishes pre-release archives for
 Linux glibc 2.35+ on x86-64/ARM64, macOS Intel/Apple silicon, and Windows x86-64 on the
 [GitHub Releases page](https://github.com/kazu-42/calcifer/releases). Every
 release includes SHA-256 checksums and GitHub artifact attestations minted by
-the release workflow over the assembled release assets.
+the release workflow over the assembled release assets. Starting with the next
+release after alpha.4, every platform archive also has a Minisign sidecar made
+inside the protected `release-signing` environment.
 The binaries are not yet code-signed or notarized.
 
 The Linux binary can run on the supported glibc baseline, but destructive
@@ -642,6 +644,18 @@ calcifer --json update check --channel preview
 The checker validates release metadata plus the downloaded manifest and
 checksum bytes. It intentionally leaves archive download, archive-byte digest
 verification, and installation as separate explicit operations.
+
+The supported package-manager paths are intentionally explicit and do not
+create profile state during installation:
+
+```console
+brew install kazu-42/tap/calcifer-preview
+cargo binstall --only-signed --no-discover-github-token --disable-telemetry \
+  --disable-strategies quick-install,compile calcifer@=<exact-version>
+```
+
+Use an exact preview version with cargo-binstall. Upgrades and rollbacks add
+`--force`; neither binary rollback nor uninstall rolls back profile state.
 
 ## Development
 

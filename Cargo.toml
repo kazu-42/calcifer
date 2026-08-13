@@ -10,7 +10,29 @@ homepage = "https://github.com/kazu-42/calcifer"
 readme = "README.md"
 keywords = ["cli", "codex", "claude", "profiles", "automation"]
 categories = ["command-line-utilities", "development-tools"]
-publish = false
+publish = ["crates-io"]
+include = [
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/SECURITY.md",
+    "/build.rs",
+    "/src/**",
+]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix}"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext}"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install", "compile"]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.signing]
+algorithm = "minisign"
+pubkey = "RWScrwKKsqmN5v9pAGdgdW0jNSHokfmerI53KJiE2gRNmcaNS36gOtC6"
 
 [features]
 default = ["production-supervisor"]

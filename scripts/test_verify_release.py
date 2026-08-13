@@ -61,6 +61,15 @@ class VerifyReleaseTests(unittest.TestCase):
         )
         (self.dist / "SHA256SUMS").write_text(checksums, encoding="ascii")
 
+    def write_signatures(self) -> None:
+        for target in release_manifest.SUPPORTED_TARGETS:
+            archive_name = release_manifest.archive_name(self.version, target)
+            (self.dist / f"{archive_name}.sig").write_text(
+                f"synthetic minisign signature for {archive_name}\n",
+                encoding="ascii",
+            )
+        self.write_checksums()
+
     def release_document(self, *, stage: str = "draft") -> dict[str, object]:
         assets = []
         for index, path in enumerate(sorted(self.dist.iterdir()), start=1):
@@ -132,6 +141,34 @@ class VerifyReleaseTests(unittest.TestCase):
             source_commit=self.source_commit,
             tag_ref_digest=self.tag_ref_digest,
         )
+
+    def test_accepts_only_a_complete_signature_set(self) -> None:
+        self.write_signatures()
+        self.verify(self.release_document())
+
+        next(self.dist.glob("*.sig")).unlink()
+        self.write_checksums()
+        with self.assertRaisesRegex(ValueError, "signature set"):
+            self.verify(self.release_document())
+
+    def test_rejects_unexpected_or_oversized_signature(self) -> None:
+        self.write_signatures()
+        (self.dist / "unexpected.sig").write_text("signature\n", encoding="ascii")
+        self.write_checksums()
+        with self.assertRaisesRegex(ValueError, "asset name set"):
+            self.verify(self.release_document())
+
+        (self.dist / "unexpected.sig").unlink()
+        signature = next(self.dist.glob("*.sig"))
+        signature.write_bytes(b"")
+        self.write_checksums()
+        with self.assertRaisesRegex(ValueError, "asset is empty"):
+            self.verify(self.release_document())
+
+        signature.write_bytes(b"x" * (verify_release.MAX_SIGNATURE_BYTES + 1))
+        self.write_checksums()
+        with self.assertRaisesRegex(ValueError, "signature is too large"):
+            self.verify(self.release_document())
 
     def test_rejects_semantically_invalid_manifest_with_matching_checksums(self) -> None:
         manifest_path = self.dist / release_manifest.MANIFEST_NAME

@@ -23,6 +23,7 @@ const RELEASES_PER_PAGE: usize = 100;
 const MAX_RELEASE_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_CHECKSUM_BYTES: usize = 4 * 1024;
+const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_RELEASE_ASSETS: usize = 16;
 const MAX_REDIRECTS: usize = 3;
@@ -515,6 +516,7 @@ fn verify_selected_release(
         return Err(UpdateError::Schema);
     }
     let expected_names = expected_asset_names(&release.version);
+    let signed_names = signed_asset_names(&release.version);
     let mut assets = BTreeMap::new();
     for asset in &release.assets {
         validate_api_asset(asset, release)?;
@@ -522,7 +524,8 @@ fn verify_selected_release(
             return Err(UpdateError::Schema);
         }
     }
-    if assets.keys().cloned().collect::<BTreeSet<_>>() != expected_names {
+    let actual_names = assets.keys().cloned().collect::<BTreeSet<_>>();
+    if actual_names != expected_names && actual_names != signed_names {
         return Err(UpdateError::Integrity);
     }
 
@@ -532,7 +535,7 @@ fn verify_selected_release(
     let checksum_bytes = download_asset(transport, checksum_asset, MAX_CHECKSUM_BYTES)?;
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest, release, channel)?;
-    let mut expected_checksum_names = expected_names.clone();
+    let mut expected_checksum_names = actual_names;
     expected_checksum_names.remove(CHECKSUM_NAME);
     let checksums = parse_checksums(&checksum_bytes, &expected_checksum_names)?;
 
@@ -586,6 +589,14 @@ fn expected_asset_names(version: &Version) -> BTreeSet<String> {
     names
 }
 
+fn signed_asset_names(version: &Version) -> BTreeSet<String> {
+    let mut names = expected_asset_names(version);
+    for target in SUPPORTED_TARGETS {
+        names.insert(format!("{}.sig", archive_name(version, target)));
+    }
+    names
+}
+
 fn archive_name(version: &Version, target: &str) -> String {
     let extension = if target == "x86_64-pc-windows-msvc" {
         ".zip"
@@ -616,6 +627,7 @@ fn validate_api_asset(asset: &ReleaseAsset, release: &SelectedRelease) -> Result
     let size_limit = match asset.name.as_str() {
         MANIFEST_NAME => MAX_MANIFEST_BYTES as u64,
         CHECKSUM_NAME => MAX_CHECKSUM_BYTES as u64,
+        name if name.ends_with(".sig") => MAX_SIGNATURE_BYTES,
         _ => MAX_ARCHIVE_BYTES,
     };
     if asset.size == 0 || asset.size > size_limit {
@@ -1501,6 +1513,105 @@ mod tests {
         assert!(human.contains("was not locally verified"));
         assert!(human.contains("selected archive not downloaded"));
         assert_eq!(transport.request_count(), 3);
+    }
+
+    #[test]
+    fn complete_archive_signature_set_is_accepted_but_partial_set_is_rejected() {
+        let fixture = fixture("0.2.0-alpha.1", true);
+        let parsed =
+            parse_version("0.2.0-alpha.1").unwrap_or_else(|_| panic!("invalid fixture version"));
+        let mut releases: Vec<serde_json::Value> = serde_json::from_slice(&fixture.release_body)
+            .unwrap_or_else(|_| panic!("fixture release JSON is invalid"));
+        let release = releases
+            .first_mut()
+            .unwrap_or_else(|| panic!("fixture release is absent"));
+        let assets = release["assets"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("fixture assets are absent"));
+        let mut base_checksum_names = expected_asset_names(&parsed);
+        base_checksum_names.remove(CHECKSUM_NAME);
+        let mut checksum_entries = parse_checksums(&fixture.checksums, &base_checksum_names)
+            .unwrap_or_else(|_| panic!("fixture checksums are invalid"));
+        for (index, target) in SUPPORTED_TARGETS.iter().enumerate() {
+            let name = format!("{}.sig", archive_name(&parsed, target));
+            let digest = format!("{:064x}", index + 100);
+            assets.push(api_asset(
+                20 + index as u64,
+                &parsed,
+                &name,
+                &[],
+                Some((300, digest.clone())),
+            ));
+            checksum_entries.insert(name, digest);
+        }
+        let checksums = checksum_entries
+            .iter()
+            .map(|(name, digest)| format!("{digest}  {name}\n"))
+            .collect::<String>()
+            .into_bytes();
+        replace_asset_bytes(&mut releases, CHECKSUM_NAME, &checksums);
+        let mut expected_checksums = signed_asset_names(&parsed);
+        expected_checksums.remove(CHECKSUM_NAME);
+        assert_eq!(
+            parse_checksums(&checksums, &expected_checksums).map(|entries| entries.len()),
+            Ok(expected_checksums.len())
+        );
+        let actual_names = releases[0]["assets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("fixture assets are absent"))
+            .iter()
+            .filter_map(|asset| asset["name"].as_str().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_names, signed_asset_names(&parsed));
+        let release_body = serde_json::to_vec(&releases)
+            .unwrap_or_else(|_| panic!("fixture release serialization failed"));
+        let transport = FakeTransport::new(vec![
+            (
+                fixture.list_url.clone(),
+                Ok(ok_response(release_body.clone())),
+            ),
+            (
+                fixture.manifest_url.clone(),
+                Ok(ok_response(fixture.manifest.clone())),
+            ),
+            (
+                fixture.checksum_url.clone(),
+                Ok(ok_response(checksums.clone())),
+            ),
+        ]);
+        let result = check_with(
+            &transport,
+            Channel::Preview,
+            "0.1.0-alpha.3",
+            "aarch64-apple-darwin",
+        );
+        assert!(
+            result.is_ok(),
+            "complete signature set failed after {} requests: {result:?}",
+            transport.request_count()
+        );
+
+        let mut partial: Vec<serde_json::Value> = serde_json::from_slice(&release_body)
+            .unwrap_or_else(|_| panic!("fixture release JSON is invalid"));
+        partial[0]["assets"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("fixture assets are absent"))
+            .pop();
+        let transport = FakeTransport::new(vec![(
+            fixture.list_url,
+            Ok(ok_response(serde_json::to_vec(&partial).unwrap_or_else(
+                |_| panic!("fixture release serialization failed"),
+            ))),
+        )]);
+        assert_eq!(
+            error_code(check_with(
+                &transport,
+                Channel::Preview,
+                "0.1.0-alpha.3",
+                "aarch64-apple-darwin",
+            )),
+            "update_integrity_error"
+        );
     }
 
     #[test]

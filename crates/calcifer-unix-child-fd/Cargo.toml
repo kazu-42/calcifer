@@ -5,7 +5,8 @@ edition = "2024"
 rust-version = "1.85"
 description = "Internal child-only Unix descriptor inheritance for Calcifer"
 license = "MIT"
-publish = false
+repository = "https://github.com/kazu-42/calcifer"
+publish = ["crates-io"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"

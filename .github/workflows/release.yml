@@ -11,7 +11,10 @@ on:
       - Makefile
       - scripts/package_release.py
       - scripts/publish_release.py
+      - scripts/generate_homebrew_formula.py
       - scripts/release_manifest.py
+      - scripts/test_binstall_metadata.py
+      - scripts/test_generate_homebrew_formula.py
       - scripts/test_package_release.py
       - scripts/test_publish_release.py
       - scripts/test_release_manifest.py
@@ -389,12 +392,115 @@ jobs:
           retention-days: 14
           compression-level: 0
 
+  sign:
+    name: Sign release archives
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs:
+      - validate
+      - bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download unsigned release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: dist
+      - name: Install checksum-pinned Minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/minisign-0.12-linux.tar.gz"
+          curl --fail --location --silent --show-error \
+            https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz \
+            --output "${archive}"
+          printf '%s  %s\n' \
+            '9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73' \
+            "${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}" \
+            minisign-linux/x86_64/minisign
+          install -m 0755 \
+            "${RUNNER_TEMP}/minisign-linux/x86_64/minisign" \
+            "${RUNNER_TEMP}/minisign"
+      - name: Sign and verify every archive
+        shell: bash
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+          TAG_REF_DIGEST: ${{ needs.validate.outputs.tag_ref_digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "${MINISIGN_PRIVATE_KEY}" ]]; then
+            echo "The protected release-signing environment did not provide MINISIGN_PRIVATE_KEY." >&2
+            exit 1
+          fi
+          private_key="${RUNNER_TEMP}/calcifer-minisign.key"
+          printf '%s\n' "${MINISIGN_PRIVATE_KEY}" > "${private_key}"
+          unset MINISIGN_PRIVATE_KEY
+          minisign="${RUNNER_TEMP}/minisign"
+          public_key='RWScrwKKsqmN5v9pAGdgdW0jNSHokfmerI53KJiE2gRNmcaNS36gOtC6'
+          archives=(
+            "calcifer-v${VERSION}-aarch64-apple-darwin.tar.gz"
+            "calcifer-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+            "calcifer-v${VERSION}-x86_64-apple-darwin.tar.gz"
+            "calcifer-v${VERSION}-x86_64-pc-windows-msvc.zip"
+            "calcifer-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          for archive in "${archives[@]}"; do
+            "${minisign}" -S -W \
+              -s "${private_key}" \
+              -m "dist/${archive}" \
+              -x "dist/${archive}.sig"
+            "${minisign}" -Vm "dist/${archive}" \
+              -x "dist/${archive}.sig" \
+              -P "${public_key}"
+          done
+          rm -f "${private_key}"
+
+          checksum_assets=(
+            "calcifer-release-manifest-v1.json"
+            "${archives[@]}"
+          )
+          for archive in "${archives[@]}"; do
+            checksum_assets+=("${archive}.sig")
+          done
+          (
+            cd dist
+            printf '%s\n' "${checksum_assets[@]}" \
+              | LC_ALL=C sort \
+              | xargs sha256sum > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
+          python3 scripts/verify_release.py \
+            --dist dist \
+            --version "${VERSION}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --tag-ref-digest "${TAG_REF_DIGEST}" \
+            --local-only
+      - name: Upload signed release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-release-bundle
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
   publish:
     name: Stage draft GitHub Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs:
       - validate
-      - bundle
+      - sign
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -409,8 +515,41 @@ jobs:
       - name: Download release bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-bundle
+          name: signed-release-bundle
           path: dist
+      - name: Install checksum-pinned Minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/minisign-0.12-linux.tar.gz"
+          curl --fail --location --silent --show-error \
+            https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz \
+            --output "${archive}"
+          printf '%s  %s\n' \
+            '9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73' \
+            "${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}" \
+            minisign-linux/x86_64/minisign
+      - name: Reverify every archive signature
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          minisign="${RUNNER_TEMP}/minisign-linux/x86_64/minisign"
+          public_key='RWScrwKKsqmN5v9pAGdgdW0jNSHokfmerI53KJiE2gRNmcaNS36gOtC6'
+          archives=(
+            "calcifer-v${VERSION}-aarch64-apple-darwin.tar.gz"
+            "calcifer-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+            "calcifer-v${VERSION}-x86_64-apple-darwin.tar.gz"
+            "calcifer-v${VERSION}-x86_64-pc-windows-msvc.zip"
+            "calcifer-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          for archive in "${archives[@]}"; do
+            "${minisign}" -Vm "dist/${archive}" \
+              -x "dist/${archive}.sig" \
+              -P "${public_key}"
+          done
       - name: Verify release bundle locally
         shell: bash
         env:
@@ -553,7 +692,7 @@ jobs:
             echo "A maintainer must use local admin gh authentication to verify repository controls and publish."
             echo
             echo '```console'
-            echo "gh run download ${GITHUB_RUN_ID} --repo ${GITHUB_REPOSITORY} --name release-bundle --dir dist"
+            echo "gh run download ${GITHUB_RUN_ID} --repo ${GITHUB_REPOSITORY} --name signed-release-bundle --dir dist"
             echo "python3 scripts/publish_release.py --dist dist --tag ${TAG}"
             echo "python3 scripts/publish_release.py --dist dist --tag ${TAG} --publish"
             echo '```'

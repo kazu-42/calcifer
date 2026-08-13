@@ -30,7 +30,13 @@ The release workflow enforces these boundaries:
   baseline and reject binaries whose highest required GLIBC symbol is newer.
 - Archive names and archive metadata are deterministic. A canonical versioned
   manifest records the archive and in-archive binary SHA-256 for every target,
-  and `SHA256SUMS` covers all five archives plus that manifest.
+  and `SHA256SUMS` covers all five archives, all five Minisign sidecars, and
+  that manifest for newly signed releases.
+- A tag-only job in the protected `release-signing` environment downloads a
+  checksum-pinned Minisign 0.12 binary, signs all five archives with the
+  protected key, verifies every signature with the public key embedded in
+  Cargo metadata, and rejects an absent or partial signature set. Pull requests
+  and manual dry runs cannot access the signing key.
 - Before any write to a GitHub Release draft, the privileged job independently
   rebuilds the canonical manifest, validates every archive body and checksum,
   and verifies its expected peeled `source_commit` and raw `tag_ref_digest`.
@@ -72,8 +78,10 @@ The manifest contract is documented in [release-manifest.md](release-manifest.md
 | macOS Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` | `.zip` |
 
-The archives are not code-signed or notarized yet. GitHub artifact attestations
-provide provenance, not an operating-system code-signing identity.
+The archives are Minisign-signed starting with the next release after alpha.4,
+but the executables are not operating-system code-signed or notarized. GitHub
+artifact attestations provide workflow provenance, not an operating-system
+code-signing identity.
 
 Linux artifacts are built natively on Ubuntu 22.04 to avoid accidentally
 requiring Ubuntu 24.04's glibc 2.39. A future musl/static artifact can extend
@@ -206,7 +214,7 @@ the normal CI checks and the separate `Release` PR run to be green.
    ```console
    release_dir="$(mktemp -d)"
    gh run download "$run_id" --repo kazu-42/calcifer \
-     --name release-bundle --dir "$release_dir"
+     --name signed-release-bundle --dir "$release_dir"
    unset GH_TOKEN GITHUB_TOKEN
    gh auth status --hostname github.com
    python3 scripts/publish_release.py \
@@ -222,7 +230,9 @@ the normal CI checks and the separate `Release` PR run to be green.
 7. As an independent readback, download the now-public assets into another
    clean directory. The local verifier rejects a missing, duplicate, or
    unexpected asset and validates the canonical manifest and `SHA256SUMS`.
-   Then verify both provenance layers for every one of the seven assets: the
+   Verify each archive's Minisign sidecar with public key
+   `RWScrwKKsqmN5v9pAGdgdW0jNSHokfmerI53KJiE2gRNmcaNS36gOtC6`. Then verify
+   both provenance layers for every one of the twelve assets: the
    release-workflow artifact attestation and the immutable-release asset
    attestation. Finally verify the release attestation itself.
 
@@ -238,6 +248,11 @@ the normal CI checks and the separate `Release` PR run to be green.
      --source-commit "$release_commit" \
      --tag-ref-digest "$tag_ref_digest" \
      --local-only
+   for signature in "$verify_dir"/*.sig; do
+     archive="${signature%.sig}"
+     minisign -Vm "$archive" -x "$signature" \
+       -P RWScrwKKsqmN5v9pAGdgdW0jNSHokfmerI53KJiE2gRNmcaNS36gOtC6
+   done
    for asset in "$verify_dir"/*; do
      gh attestation verify "$asset" \
        --hostname github.com \
@@ -332,6 +347,29 @@ and the update/deletion semantics in
 [Available rules for rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets).
 
 ## Install and uninstall
+
+The first-party Homebrew preview tap is the simplest macOS/Linux path:
+
+```console
+brew install kazu-42/tap/calcifer-preview
+brew upgrade kazu-42/tap/calcifer-preview
+brew pin calcifer-preview
+brew unpin calcifer-preview
+```
+
+Signed cargo-binstall is supported on all five release targets. The exact
+version is mandatory so update and rollback remain deliberate; discovery,
+telemetry, QuickInstall, and source compilation are disabled:
+
+```console
+cargo binstall --only-signed --no-discover-github-token --disable-telemetry \
+  --disable-strategies quick-install,compile calcifer@=0.1.0-alpha.5
+```
+
+For an upgrade or rollback, add `--force` and replace the exact version. A
+missing or invalid signature must stop before replacing the installed binary.
+The embedded Minisign public key is versioned through crates.io metadata; key
+rotation therefore requires a new immutable package version.
 
 On Linux or macOS, extract the archive for the current architecture and copy the
 binary into a user-owned directory on `PATH`:

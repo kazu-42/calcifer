@@ -54,6 +54,40 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertNotIn('"commit"', tag_gate)
         self.assertIn("must be an annotated Git tag object", tag_gate)
 
+    def test_tag_release_signs_the_complete_archive_set_in_protected_environment(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        sign_start = workflow.index("  sign:\n")
+        publish_start = workflow.index("  publish:\n", sign_start)
+        sign_job = workflow[sign_start:publish_start]
+        publish_job = workflow[publish_start:]
+
+        self.assertIn("environment: release-signing", sign_job)
+        self.assertIn("MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}", sign_job)
+        self.assertIn("9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73", sign_job)
+        self.assertIn('"${minisign}" -S -W', sign_job)
+        self.assertIn('"${minisign}" -Vm', sign_job)
+        self.assertIn("name: signed-release-bundle", sign_job)
+        self.assertIn("      - sign\n", publish_job)
+        self.assertIn("name: signed-release-bundle", publish_job)
+        self.assertIn(
+            "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73",
+            publish_job,
+        )
+        self.assertIn('"${minisign}" -Vm', publish_job)
+
+    def test_release_contract_changes_include_distribution_generators(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  pull_request:\n")
+        end = workflow.index("  push:\n", start)
+        pull_request_trigger = workflow[start:end]
+
+        for path in (
+            "scripts/generate_homebrew_formula.py",
+            "scripts/test_generate_homebrew_formula.py",
+            "scripts/test_binstall_metadata.py",
+        ):
+            self.assertIn(f"      - {path}\n", pull_request_trigger)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,8 @@ edition = "2024"
 rust-version = "1.85"
 description = "Internal fd-bound macOS ACL inspection for Calcifer"
 license = "MIT"
-publish = false
+repository = "https://github.com/kazu-42/calcifer"
+publish = ["crates-io"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
