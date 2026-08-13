@@ -20,6 +20,7 @@ except ModuleNotFoundError as error:
 MAX_RELEASE_JSON_BYTES = 1024 * 1024
 MAX_RELEASE_ATTESTATION_JSON_BYTES = 4 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 64 * 1024
+MAX_SIGNATURE_BYTES = 16 * 1024
 CHECKSUM_PATTERN = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9.+_-]*)\n$")
 STAGES = ("draft", "published")
 RELEASE_PREDICATE_TYPE = "https://in-toto.io/attestation/release/v0.2"
@@ -45,6 +46,13 @@ def _expected_asset_names(version: str) -> set[str]:
     }
 
 
+def _expected_signature_names(version: str) -> set[str]:
+    return {
+        f"{release_manifest.archive_name(version, target)}.sig"
+        for target in release_manifest.SUPPORTED_TARGETS
+    }
+
+
 def verify_local_bundle(
     *,
     dist: Path,
@@ -58,9 +66,14 @@ def verify_local_bundle(
         raise ValueError("release bundle directory must be a regular directory")
     dist = dist.resolve(strict=True)
     expected_names = _expected_asset_names(version)
+    signature_names = _expected_signature_names(version)
     actual_names = {entry.name for entry in dist.iterdir()}
-    if actual_names != expected_names:
+    if actual_names not in (expected_names, expected_names | signature_names):
+        if actual_names <= expected_names | signature_names:
+            raise ValueError("local release signature set must be absent or complete")
         raise ValueError("local release asset name set does not match the release contract")
+
+    expected_names = actual_names
 
     sizes: dict[str, int] = {}
     for name in sorted(expected_names):
@@ -68,6 +81,8 @@ def verify_local_bundle(
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"local release asset is not a regular file: {name}")
         size = path.stat().st_size
+        if size == 0:
+            raise ValueError(f"local release asset is empty: {name}")
         if (
             name == release_manifest.MANIFEST_NAME
             and size > release_manifest.MAX_MANIFEST_BYTES
@@ -75,8 +90,15 @@ def verify_local_bundle(
             raise ValueError("release manifest exceeds the 64 KiB limit")
         if name == release_manifest.CHECKSUM_NAME and size > MAX_CHECKSUM_BYTES:
             raise ValueError("checksum file exceeds the 64 KiB limit")
+        if name in signature_names and size > MAX_SIGNATURE_BYTES:
+            raise ValueError(f"release signature is too large: {name}")
         if (
-            name not in (release_manifest.MANIFEST_NAME, release_manifest.CHECKSUM_NAME)
+            name
+            not in (
+                release_manifest.MANIFEST_NAME,
+                release_manifest.CHECKSUM_NAME,
+                *signature_names,
+            )
             and size > release_manifest.MAX_ARCHIVE_BYTES
         ):
             raise ValueError(f"release archive is too large: {name}")

@@ -132,6 +132,14 @@ def archive_name(version: str, target: str) -> str:
     return f"calcifer-v{version}-{target}{extension}"
 
 
+def signature_names(version: str) -> frozenset[str]:
+    """Return the complete optional Minisign sidecar set for one release."""
+
+    return frozenset(
+        f"{archive_name(version, target)}.sig" for target in SUPPORTED_TARGETS
+    )
+
+
 def _read_and_hash_stream(
     stream: BinaryIO,
     *,
@@ -894,7 +902,8 @@ def validate_manifest(
         version=version,
         source_commit=source_commit,
         tag_ref_digest=tag_ref_digest,
-        metadata_names=frozenset({MANIFEST_NAME, CHECKSUM_NAME}),
+        metadata_names=frozenset({MANIFEST_NAME, CHECKSUM_NAME})
+        | signature_names(version),
     )
     if actual != expected:
         raise ValueError(
