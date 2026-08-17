@@ -135,13 +135,17 @@ class VerifySignedBinstallRunnerTests(unittest.TestCase):
         self.assertNotIn("CARGO_REGISTRY_TOKEN", recorded)
 
     def test_explicit_token_is_injected_into_child_env(self) -> None:
-        recorded: dict[str, str] = {}
+        binstall_envs: list[dict[str, str]] = []
+        probe_envs: list[dict[str, str]] = []
 
         def fake_run(
             command: list[str], *, env: dict[str, str], capture_output: bool = False
         ) -> verify_signed_binstall.CommandResult:
             del capture_output
-            recorded.update(env)
+            if Path(command[0]).name.startswith("cargo-binstall"):
+                binstall_envs.append(dict(env))
+            else:
+                probe_envs.append(dict(env))
             joined = " ".join(command)
             if "0.1.0-alpha.4" in joined:
                 return verify_signed_binstall.CommandResult(76, "", "no version")
@@ -167,8 +171,15 @@ class VerifySignedBinstallRunnerTests(unittest.TestCase):
                 github_token="ghs_explicit",
                 runner=fake_run,
             )
-        self.assertEqual(recorded.get("GITHUB_TOKEN"), "ghs_explicit")
-        self.assertNotIn("GH_TOKEN", recorded)
+        self.assertTrue(binstall_envs)
+        self.assertTrue(probe_envs)
+        for env in binstall_envs:
+            self.assertEqual(env.get("GITHUB_TOKEN"), "ghs_explicit")
+            self.assertNotIn("GH_TOKEN", env)
+        for env in probe_envs:
+            self.assertNotIn("GITHUB_TOKEN", env)
+            self.assertNotIn("GH_TOKEN", env)
+            self.assertNotIn("GH_API_TOKEN", env)
 
 
 if __name__ == "__main__":

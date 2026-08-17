@@ -141,13 +141,17 @@ def run_verification(
         raise SystemExit(f"cargo-binstall is not a file: {cargo_binstall}")
     install_root.mkdir(parents=True, exist_ok=True)
     calcifer_home = Path(tempfile.mkdtemp(prefix="calcifer-binstall-home-"))
-    env = sanitized_environ(os.environ)
-    env["CALCIFER_HOME"] = str(calcifer_home)
+    binstall_env = sanitized_environ(os.environ)
+    binstall_env["CALCIFER_HOME"] = str(calcifer_home)
     if github_token:
         # cargo-binstall 1.21 reads GITHUB_TOKEN for some GitHub API calls
         # even when --github-token is also passed. This is an explicit
         # injection, not discovery from git credentials.
-        env["GITHUB_TOKEN"] = github_token
+        binstall_env["GITHUB_TOKEN"] = github_token
+    # The installed Calcifer binary must never see GitHub credentials.
+    probe_env = sanitized_environ(os.environ)
+    probe_env.pop("GH_API_TOKEN", None)
+    probe_env["CALCIFER_HOME"] = str(calcifer_home)
     try:
         before = snapshot_tree(calcifer_home)
         installed = installed_binary(install_root)
@@ -159,13 +163,13 @@ def run_verification(
                     version=version,
                     github_token=github_token,
                 ),
-                env=env,
+                env=binstall_env,
             ),
             "signed cargo-binstall",
         )
         if not installed.is_file():
             raise SystemExit(f"signed install did not write {installed}")
-        _probe_installed(installed, env, version, runner)
+        _probe_installed(installed, probe_env, version, runner)
         after_install = snapshot_tree(calcifer_home)
         if after_install != before:
             raise SystemExit("CALCIFER_HOME changed during install or doctor")
@@ -180,7 +184,7 @@ def run_verification(
                     extra=("--force",),
                     github_token=github_token,
                 ),
-                env=env,
+                env=binstall_env,
             ),
             "signed cargo-binstall --force",
         )
@@ -195,7 +199,7 @@ def run_verification(
                 extra=("--force",),
                 github_token=github_token,
             ),
-            env=env,
+            env=binstall_env,
         )
         if missing.returncode == 0:
             raise SystemExit("missing version unexpectedly installed")
@@ -206,7 +210,7 @@ def run_verification(
             unreadable = Path(tempfile.mkdtemp(prefix="calcifer-binstall-unread-"))
             os.chmod(unreadable, 0)
             try:
-                unread_env = dict(env)
+                unread_env = dict(probe_env)
                 unread_env["CALCIFER_HOME"] = str(unreadable)
                 _probe_installed(installed, unread_env, version, runner)
             finally:
