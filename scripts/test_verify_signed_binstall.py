@@ -134,6 +134,42 @@ class VerifySignedBinstallRunnerTests(unittest.TestCase):
         self.assertNotIn("GITHUB_TOKEN", recorded)
         self.assertNotIn("CARGO_REGISTRY_TOKEN", recorded)
 
+    def test_explicit_token_is_injected_into_child_env(self) -> None:
+        recorded: dict[str, str] = {}
+
+        def fake_run(
+            command: list[str], *, env: dict[str, str], capture_output: bool = False
+        ) -> verify_signed_binstall.CommandResult:
+            del capture_output
+            recorded.update(env)
+            joined = " ".join(command)
+            if "0.1.0-alpha.4" in joined:
+                return verify_signed_binstall.CommandResult(76, "", "no version")
+            if "--json" in command:
+                return verify_signed_binstall.CommandResult(
+                    0, '{"schema_version":1,"command":"doctor"}\n', ""
+                )
+            return verify_signed_binstall.CommandResult(0, "calcifer 0.1.0-alpha.5\n", "")
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            binary = root / "cargo-binstall"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(binary, 0o755)
+            installed = root / "install" / "bin" / "calcifer"
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(b"ok")
+            os.chmod(installed, 0o755)
+            verify_signed_binstall.run_verification(
+                cargo_binstall=binary,
+                install_root=root / "install",
+                version="0.1.0-alpha.5",
+                github_token="ghs_explicit",
+                runner=fake_run,
+            )
+        self.assertEqual(recorded.get("GITHUB_TOKEN"), "ghs_explicit")
+        self.assertNotIn("GH_TOKEN", recorded)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -143,6 +143,11 @@ def run_verification(
     calcifer_home = Path(tempfile.mkdtemp(prefix="calcifer-binstall-home-"))
     env = sanitized_environ(os.environ)
     env["CALCIFER_HOME"] = str(calcifer_home)
+    if github_token:
+        # cargo-binstall 1.21 reads GITHUB_TOKEN for some GitHub API calls
+        # even when --github-token is also passed. This is an explicit
+        # injection, not discovery from git credentials.
+        env["GITHUB_TOKEN"] = github_token
     try:
         before = snapshot_tree(calcifer_home)
         installed = installed_binary(install_root)
