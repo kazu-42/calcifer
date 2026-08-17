@@ -15651,6 +15651,28 @@ fn package_live_input_transcript_retries_only_a_concurrent_snapshot_change()
 }
 
 #[test]
+fn package_live_input_transcript_retries_absent_file_until_the_exact_payload()
+-> Result<(), Box<dyn Error>> {
+    let expected = PACKAGE_SUPERVISOR_INITIAL_INPUT;
+    let mut reads = VecDeque::from([
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Ok(expected.to_vec()),
+    ]);
+    wait_for_package_input_transcript_with_reader(
+        expected,
+        Instant::now() + Duration::from_secs(1),
+        || {
+            reads
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("test read sequence was exhausted"))?
+        },
+    )?;
+    assert!(reads.is_empty());
+    Ok(())
+}
+
+#[test]
 fn package_private_read_retries_only_same_inode_append_progress() -> Result<(), Box<dyn Error>> {
     let scratch = PackageScratch::create()?;
     let path = scratch.root.join("live-read-classification");
@@ -16644,11 +16666,14 @@ fn wait_for_package_input_transcript_with_reader(
                 PackageInputTranscriptProgress::Pending => {}
             },
             // `input.live` is append-only and observed concurrently with the
-            // guardian's post-forward commit. A stable descriptor whose
-            // length or mtime changed during one bounded read is expected
-            // progress, not an identity failure. Unsafe metadata and all
-            // other I/O errors remain immediately fatal.
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            // guardian's post-forward commit. The file may not exist yet, and
+            // a stable descriptor whose length or mtime changed during one
+            // bounded read is expected progress, not an identity failure.
+            // Unsafe metadata and all other I/O errors remain immediately
+            // fatal.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error.into());
             }
