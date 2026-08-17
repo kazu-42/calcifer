@@ -56,6 +56,11 @@ class SignedBinstallWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("python3 scripts/verify_signed_binstall.py", workflow)
         self.assertIn("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", workflow)
+        exe_check = workflow.index("cargo-binstall.exe")
+        unix_check = workflow.index(
+            'calcifer-cargo-binstall/cargo-binstall" ]]; then\n'
+        )
+        self.assertLess(exe_check, unix_check)
         script = (
             REPOSITORY_ROOT / "scripts" / "verify_signed_binstall.py"
         ).read_text(encoding="utf-8")
