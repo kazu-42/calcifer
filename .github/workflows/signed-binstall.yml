@@ -1,0 +1,129 @@
+name: Signed cargo-binstall
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/signed-binstall.yml
+      - scripts/verify_signed_binstall.py
+      - scripts/test_verify_signed_binstall.py
+      - scripts/test_binstall_verification_workflow.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-binstall-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BINSTALL_VERSION: 1.21.1
+  CALCIFER_VERSION: 0.1.0-alpha.5
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: cargo-binstall-x86_64-unknown-linux-gnu.tgz
+            sha256: d8ff7fd6567cf80d438c6c143484a81e84bd237e2507aa0f85b5707beced0bbc
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: cargo-binstall-aarch64-unknown-linux-gnu.tgz
+            sha256: 1ff106d1e20182f7da77265f60e24e419f81b85fe6264cf4df9bdcdf5bb021bd
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: cargo-binstall-x86_64-pc-windows-msvc.zip
+            sha256: 27aee4e73cd8b1d479730cb9cdbd89b1114453a135689d4ee1a7e7f913f0ffe1
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned cargo-binstall
+        shell: bash
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          ARCHIVE_SHA256: ${{ matrix.sha256 }}
+        run: |
+          set -euo pipefail
+          scratch="${RUNNER_TEMP:?}/calcifer-cargo-binstall"
+          mkdir -p "${scratch}"
+          archive="${scratch}/${ARCHIVE}"
+          curl \
+            --fail \
+            --location \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --tlsv1.2 \
+            --connect-timeout 20 \
+            --max-time 120 \
+            --retry 3 \
+            --retry-delay 2 \
+            --show-error \
+            --silent \
+            --output "${archive}" \
+            "https://github.com/cargo-bins/cargo-binstall/releases/download/v${CARGO_BINSTALL_VERSION}/${ARCHIVE}"
+          actual="$(python3 - "${archive}" <<'PY'
+          import hashlib, pathlib, sys
+
+          path = pathlib.Path(sys.argv[1])
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          print(digest)
+          PY
+          )"
+          if [[ "${actual}" != "${ARCHIVE_SHA256}" ]]; then
+            echo "Pinned cargo-binstall checksum mismatch." >&2
+            echo "expected ${ARCHIVE_SHA256}" >&2
+            echo "actual   ${actual}" >&2
+            echo "size     $(wc -c < "${archive}")" >&2
+            exit 1
+          fi
+          case "${ARCHIVE}" in
+            *.tgz)
+              tar -xzf "${archive}" -C "${scratch}" cargo-binstall
+              ;;
+            *.zip)
+              python3 - "${archive}" "${scratch}" <<'PY'
+          import sys, zipfile
+          archive, dest = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(archive) as bundle:
+              bundle.extract("cargo-binstall.exe", dest)
+          PY
+              ;;
+            *)
+              echo "Unsupported cargo-binstall archive ${ARCHIVE}" >&2
+              exit 1
+              ;;
+          esac
+          echo "${scratch}" >> "${GITHUB_PATH}"
+      - name: Verify signed cargo-binstall
+        shell: bash
+        env:
+          GH_API_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          github_token="${GH_API_TOKEN:?}"
+          unset GH_TOKEN GITHUB_TOKEN CARGO_REGISTRY_TOKEN || true
+          # Git Bash treats `cargo-binstall` as executable when only
+          # `cargo-binstall.exe` exists. Prefer the real file.
+          if [[ -f "${RUNNER_TEMP:?}/calcifer-cargo-binstall/cargo-binstall.exe" ]]; then
+            binstall="${RUNNER_TEMP}/calcifer-cargo-binstall/cargo-binstall.exe"
+          elif [[ -f "${RUNNER_TEMP}/calcifer-cargo-binstall/cargo-binstall" ]]; then
+            binstall="${RUNNER_TEMP}/calcifer-cargo-binstall/cargo-binstall"
+          else
+            echo "Pinned cargo-binstall executable is missing." >&2
+            ls -la "${RUNNER_TEMP}/calcifer-cargo-binstall" >&2 || true
+            exit 1
+          fi
+          python3 scripts/verify_signed_binstall.py \
+            --cargo-binstall "${binstall}" \
+            --install-root "${RUNNER_TEMP:?}/calcifer-signed-root" \
+            --version "${CALCIFER_VERSION}" \
+            --github-token "${github_token}"
