@@ -36,6 +36,18 @@ class VerifySignedBinstallTests(unittest.TestCase):
         joined = " ".join(command)
         self.assertNotIn("--skip-signatures", joined)
         self.assertNotIn("quick-install,compile,compile", joined)
+        self.assertNotIn("--github-token", joined)
+
+    def test_explicit_github_token_is_a_flag_not_an_env_var(self) -> None:
+        command = verify_signed_binstall.binstall_command(
+            binary=Path("cargo-binstall"),
+            install_root=Path("/tmp/root"),
+            version="0.1.0-alpha.5",
+            github_token="ghs_test",
+        )
+        self.assertIn("--no-discover-github-token", command)
+        token_at = command.index("--github-token")
+        self.assertEqual(command[token_at + 1], "ghs_test")
 
     def test_sanitized_environ_drops_github_and_registry_tokens(self) -> None:
         cleaned = verify_signed_binstall.sanitized_environ(

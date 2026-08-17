@@ -55,6 +55,8 @@ class SignedBinstallWorkflowContractTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("python3 scripts/verify_signed_binstall.py", workflow)
+        self.assertIn('--github-token "${github_token}"', workflow)
+        self.assertIn('github_token="${GITHUB_TOKEN:-}"', workflow)
         self.assertIn("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", workflow)
         exe_check = workflow.index("cargo-binstall.exe")
         unix_check = workflow.index(
@@ -66,6 +68,7 @@ class SignedBinstallWorkflowContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("--only-signed", script)
         self.assertIn("quick-install,compile", script)
+        self.assertIn("--no-discover-github-token", script)
 
 
 if __name__ == "__main__":

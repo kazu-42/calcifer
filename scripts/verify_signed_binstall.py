@@ -47,15 +47,19 @@ def binstall_command(
     install_root: Path,
     version: str,
     extra: tuple[str, ...] = (),
+    github_token: str | None = None,
 ) -> list[str]:
-    return [
+    command = [
         str(binary),
         *SIGNED_FLAGS,
         "--root",
         str(install_root),
         *extra,
-        f"calcifer@={version}",
     ]
+    if github_token:
+        command.extend(["--github-token", github_token])
+    command.append(f"calcifer@={version}")
+    return command
 
 
 def sanitized_environ(environ: Mapping[str, str]) -> dict[str, str]:
@@ -130,6 +134,7 @@ def run_verification(
     cargo_binstall: Path,
     install_root: Path,
     version: str,
+    github_token: str | None = None,
     runner: Runner = default_runner,
 ) -> None:
     if not cargo_binstall.is_file():
@@ -147,6 +152,7 @@ def run_verification(
                     binary=cargo_binstall,
                     install_root=install_root,
                     version=version,
+                    github_token=github_token,
                 ),
                 env=env,
             ),
@@ -167,6 +173,7 @@ def run_verification(
                     install_root=install_root,
                     version=version,
                     extra=("--force",),
+                    github_token=github_token,
                 ),
                 env=env,
             ),
@@ -181,6 +188,7 @@ def run_verification(
                 install_root=install_root,
                 version="0.1.0-alpha.4",
                 extra=("--force",),
+                github_token=github_token,
             ),
             env=env,
         )
@@ -223,11 +231,20 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_VERSION,
         help="Exact Calcifer crate version to install",
     )
+    parser.add_argument(
+        "--github-token",
+        default=None,
+        help=(
+            "Optional explicit GitHub token for public release API rate limits. "
+            "This is not credential discovery; GH_TOKEN/GITHUB_TOKEN are still stripped."
+        ),
+    )
     args = parser.parse_args(argv)
     run_verification(
         cargo_binstall=args.cargo_binstall,
         install_root=args.install_root,
         version=args.version,
+        github_token=args.github_token,
     )
     return 0
 
