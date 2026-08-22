@@ -22,8 +22,9 @@ retained-recovery package scenarios are configured to exercise the production
 coordinator, guardian, provider-session, PTY, and signal/job-control
 implementations under a test-owned terminal harness. On 2026-07-20, the final
 Issue #54 candidate source passed the normal scenario twice and retained
-recovery once on Apple silicon; the required Ubuntu 24.04/macOS matrix readback
-remains pending. They perform selected-profile admission through
+recovery once on Apple silicon. Ubuntu 24.04 CI now runs those official-TUI
+jobs independently behind the aggregate Pinned Codex Package gate; macOS
+reports hermetic package probes as unsupported. They perform selected-profile admission through
 the production A-to-B lease path, and their guardian helper enters the shared
 production guardian-bootstrap core with only a package-specific post-admission
 loopback rewrite and fixed observation root. The package parent is designed to
@@ -379,7 +380,8 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
   requires the identity-checked private compatibility stage parent to be empty.
   This is deterministic recovery-phase evidence, not Codex-version compatibility
   evidence. All seven cases passed three consecutive local runs on the exact
-  tree; cross-platform CI readback remains pending.
+  tree. The Linux Test job now runs that non-ignored fixture; merge
+  `51240fe7d231d80c7e3e0fb70806fe22f17ceb2b` passed it on `ci.yml` attempt 1.
   Public failover remains explicit and experimental: only the Linux
   `--experimental-supervised --failover-pool` boundary activates the reviewed
   selector and transaction gates.

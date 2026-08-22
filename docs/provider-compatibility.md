@@ -413,7 +413,9 @@ official-TUI scenarios are configured to exercise the production coordinator,
 guardian, provider-session, PTY, input-gate, resize, and group-wide stop/continue
 implementations under a test-owned outer-terminal harness. The normal scenario
 passed twice consecutively and retained recovery once on the exact local Apple-
-silicon tree; Ubuntu 24.04/macOS matrix readback remains pending. They use the production same-
+silicon tree. Ubuntu 24.04 CI now runs `official-tui-normal` and
+`official-tui-recovery` independently; macOS reports hermetic package probes as
+unsupported. They use the production same-
 profile A-to-B admission path across their coordinator and guardian helpers, and
 the guardian helper enters the shared production guardian-bootstrap core through
 a package-only post-admission loopback rewrite and fixed observation root. The
@@ -456,7 +458,9 @@ with exactly one validated loopback inference call. Its fourth namespace proof
 also requires the identity-checked private compatibility stage parent to be
 empty. This is deterministic recovery-phase evidence, not Codex-version
 compatibility evidence. All seven cases passed three consecutive local runs on
-the 2026-07-20 Issue #54 candidate source; cross-platform CI readback remains pending.
+the 2026-07-20 Issue #54 candidate source. The Linux Test job now runs that
+non-ignored fixture; merge `51240fe7d231d80c7e3e0fb70806fe22f17ceb2b` passed it
+on `ci.yml` attempt 1.
 
 `PinnedAppGracefulDrain` proves only the reviewed behavior of the direct Codex
 `0.144.4` App child. It is not proof that every arbitrary detached descendant is

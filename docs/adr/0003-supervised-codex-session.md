@@ -2,7 +2,7 @@
 
 - Status: Accepted and implemented experimentally on Linux for exact resume and explicit guarded pool failover; the pinned Linux package probes are egress-confined and macOS hermetic execution is explicitly unsupported
 - Date: 2026-07-15
-- Last updated: 2026-08-13
+- Last updated: 2026-08-22
 - Upstream baseline: Codex CLI 0.144.4 (`8c68d4c87dc54d38861f5114e920c3de2efa5876`)
 - Related decisions: [ADR 0001](0001-cross-profile-conversation-handoff.md), [ADR 0002](0002-private-provider-identity-binding.md)
 
@@ -69,7 +69,8 @@ package scenarios are configured to exercise the production coordinator,
 guardian, provider-session, PTY, input-gate, resize, and stop/resume job-control
 implementations under a test-owned terminal harness. The normal scenario passed
 twice consecutively and retained recovery once from the 2026-07-20 Issue #54
-candidate source on Apple silicon; Ubuntu 24.04/macOS matrix readback remains pending. Both scenarios perform selected-profile
+candidate source on Apple silicon. Ubuntu 24.04 CI now runs those official-TUI
+jobs independently; macOS reports hermetic package probes as unsupported. Both scenarios perform selected-profile
 admission through the production A-to-B lease path, and their guardian helper
 enters the shared production guardian-bootstrap core. A package-only post-
 admission loopback rewrite and fixed observation root are the two bootstrap
@@ -844,7 +845,7 @@ never a reconstructed TUI success.
 | Guardian loss | Coordinator claims exact wait only for guardian, does not claim grandchild reap on macOS, and retains A indefinitely without `CHILDREN_REAPED` |
 | Retained recovery | A credential-free deterministic fixture stops at all seven closed production checkpoints, proves checkpoint observation alone has no authority, consumes exactly one generation-bound request, and requires the four independent deletion proofs; all seven cases passed three consecutive local runs |
 | Exit/signals | 0/nonzero/signal semantics, HUP/INT/QUIT/TERM forwarding, WINCH, suspend/continue, and terminal restoration |
-| Compatibility | Existing #28 packaged 0.144.4 proof; #54 live-turn drain, `setsid(2)` FD/environment-isolation, and typed-monitor success/error contracts; independently budgeted official normal-session and retained-recovery coordinator/guardian/PTY scenarios; exact build revalidation and schema/sequence drift rejection; local Apple-silicon normal twice and retained recovery once green, Ubuntu 24.04/macOS CI pending |
+| Compatibility | Existing #28 packaged 0.144.4 proof; #54 live-turn drain, `setsid(2)` FD/environment-isolation, and typed-monitor success/error contracts; independently budgeted official normal-session and retained-recovery coordinator/guardian/PTY scenarios; exact build revalidation and schema/sequence drift rejection; local Apple-silicon normal twice and retained recovery once green; Ubuntu 24.04 official-TUI jobs green on merge `51240fe7d231d80c7e3e0fb70806fe22f17ceb2b` attempt 1; macOS hermetic package probes remain explicitly unsupported |
 | Regression/platform | Two serial Rust 1.85 executions of the library unit suite and `tests/supervisor.rs` on Linux/macOS; stable all-feature Linux/macOS/Windows matrix; direct run/resume/status unchanged; supervised mode remains unsupported on Windows and unreviewed Unix |
 
 Process-death tests executed inside a container require a functioning PID 1
@@ -1079,8 +1080,9 @@ not evidence that exact child wait authority can be reconstructed from PIDs.
   identity-checked private compatibility stage parent to be empty. Production
   builds parse neither fixture selector nor compatibility override. This is
   recovery-phase evidence, not Codex-version compatibility evidence. All seven
-  cases passed three consecutive local runs; cross-platform CI readback remains
-  pending.
+  cases passed three consecutive local runs. The Linux Test job now runs that
+  non-ignored fixture; merge `51240fe7d231d80c7e3e0fb70806fe22f17ceb2b` passed it
+  on `ci.yml` attempt 1.
 - Remains reachable only through internal test entrypoints.
 
 ### Slice 4: explicit public exact resume (implemented on Linux)
