@@ -61,7 +61,9 @@ const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
 const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const OBJ_DONT_REPARSE: u32 = 0x0000_1000;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000D_u32 as i32;
-const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_0280_u32 as i32;
+const STATUS_STOPPED_ON_SYMLINK: i32 = 0x8000_002D_u32 as i32;
+const STATUS_REPARSE_POINT_NOT_RESOLVED: i32 = 0xC000_0280_u32 as i32;
+const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_050B_u32 as i32;
 const ERROR_NO_MORE_FILES: i32 = 18;
 const ERROR_MORE_DATA: i32 = 234;
 const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
@@ -372,7 +374,7 @@ pub fn open_nofollow_child(
             &mut io_status,
         );
     }
-    if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+    if is_reparse_status(status) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "managed path is a reparse point",
@@ -416,7 +418,10 @@ impl DirectoryEntry {
 }
 
 /// Lists children through an already-opened directory handle.
-pub fn read_directory_entries(parent: BorrowedHandle<'_>) -> io::Result<Vec<DirectoryEntry>> {
+pub fn read_directory_entries(
+    parent: BorrowedHandle<'_>,
+    max_entries: usize,
+) -> io::Result<Vec<DirectoryEntry>> {
     let mut entries = Vec::new();
     let mut buffer = vec![0_u8; 16 * 1024];
     let mut class = FileFullDirectoryRestartInfo;
@@ -447,7 +452,7 @@ pub fn read_directory_entries(parent: BorrowedHandle<'_>) -> io::Result<Vec<Dire
                 _ => return Err(error),
             }
         }
-        append_directory_entries(&buffer, &mut entries)?;
+        append_directory_entries(&buffer, &mut entries, max_entries)?;
         class = FileFullDirectoryInfo;
     }
     Ok(entries)
@@ -562,7 +567,17 @@ fn validate_relative_child_name(name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-fn append_directory_entries(buffer: &[u8], entries: &mut Vec<DirectoryEntry>) -> io::Result<()> {
+fn is_reparse_status(status: i32) -> bool {
+    status == STATUS_REPARSE_POINT_ENCOUNTERED
+        || status == STATUS_REPARSE_POINT_NOT_RESOLVED
+        || status == STATUS_STOPPED_ON_SYMLINK
+}
+
+fn append_directory_entries(
+    buffer: &[u8],
+    entries: &mut Vec<DirectoryEntry>,
+    max_entries: usize,
+) -> io::Result<()> {
     let mut offset = 0_usize;
     loop {
         let next_entry_offset = read_u32_at(buffer, offset)?;
@@ -606,6 +621,15 @@ fn append_directory_entries(buffer: &[u8], entries: &mut Vec<DirectoryEntry>) ->
         };
         let name = OsString::from_wide(units);
         if name != "." && name != ".." {
+            if entries.len() >= max_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "windows directory listing exceeded the traversal budget",
+                ));
+            }
+            entries
+                .try_reserve(1)
+                .map_err(|_| directory_listing_overflow())?;
             entries.push(DirectoryEntry { name, attributes });
         }
         if next_entry_offset == 0 {
@@ -1006,7 +1030,7 @@ mod tests {
         apply_current_user_only(child_file.as_handle())?;
         drop(child_file);
 
-        let names = read_directory_entries(parent_dir.as_handle())?;
+        let names = read_directory_entries(parent_dir.as_handle(), 16)?;
         assert!(names.iter().any(|entry| entry.name == "child.bin"));
 
         let child = open_nofollow_child(parent_dir.as_handle(), OsStr::new("child.bin"), false)?;

@@ -2883,8 +2883,11 @@ fn validate_owned_removal_tree_inner_with_limits(
     pending.push((root_directory, PathBuf::new(), 0_usize));
     let mut budget = RemovalTraversalBudget::new(max_entries, max_depth);
     while let Some((directory, relative, depth)) = pending.pop() {
-        let mut entries = calcifer_windows_acl::read_directory_entries(directory.as_handle())
-            .map_err(windows_removal_open_error)?;
+        let mut entries = calcifer_windows_acl::read_directory_entries(
+            directory.as_handle(),
+            budget.remaining_entries,
+        )
+        .map_err(windows_removal_open_error)?;
         entries.sort_by(|left, right| {
             left.name
                 .as_encoded_bytes()
@@ -3305,8 +3308,11 @@ fn remove_owned_windows_directory_entries(
 ) -> Result<(), ProfileError> {
     use std::os::windows::io::AsHandle;
 
-    let entries = calcifer_windows_acl::read_directory_entries(directory.as_handle())
-        .map_err(windows_removal_open_error)?;
+    let entries = calcifer_windows_acl::read_directory_entries(
+        directory.as_handle(),
+        budget.remaining_entries,
+    )
+    .map_err(windows_removal_open_error)?;
     for entry in entries {
         budget.consume_entry()?;
         if entry.is_reparse_point() {
