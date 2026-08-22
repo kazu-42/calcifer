@@ -48,7 +48,11 @@ class BinstallMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["signing"]["pubkey"], PUBLIC_KEY)
 
     def test_internal_runtime_crates_are_publishable_dependencies(self) -> None:
-        for crate in ("calcifer-unix-child-fd", "calcifer-macos-acl"):
+        for crate in (
+            "calcifer-unix-child-fd",
+            "calcifer-macos-acl",
+            "calcifer-windows-acl",
+        ):
             document = tomllib.loads(
                 (REPOSITORY_ROOT / "crates" / crate / "Cargo.toml").read_text(
                     encoding="utf-8"

@@ -5187,7 +5187,28 @@ fn verify_deletable_macos_flags_stat(_stat: &rustix::fs::Stat) -> Result<(), Pro
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsHandle;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(ProfileError::UnsafeState(
+            "managed directory is not a real directory".to_owned(),
+        ));
+    }
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    calcifer_windows_acl::verify_current_user_only(directory.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -5242,7 +5263,17 @@ fn prepare_new_private_file(path: &Path, file: &File) -> Result<(), ProfileError
     verify_private_regular_file_handle(path, file)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn prepare_new_private_file(path: &Path, file: &File) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    calcifer_windows_acl::apply_current_user_only(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })?;
+    verify_private_regular_file_handle(path, file)
+}
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 fn prepare_new_private_file(path: &Path, _file: &File) -> Result<(), ProfileError> {
     verify_private_regular_file(path)
 }
@@ -5552,7 +5583,23 @@ pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileErro
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ProfileError::UnsafeState(
+            "managed file is not a regular file".to_owned(),
+        ));
+    }
+    let file = OpenOptions::new().read(true).open(path)?;
+    calcifer_windows_acl::verify_current_user_only(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
