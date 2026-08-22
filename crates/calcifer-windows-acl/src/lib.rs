@@ -228,10 +228,9 @@ fn verify_single_current_user_allow_ace(
     expected_sid: *mut c_void,
 ) -> io::Result<()> {
     let mut size_info = AclSizeInfo {
+        ace_count: 0,
         acl_bytes_in_use: 0,
         acl_bytes_free: 0,
-        ace_count: 0,
-        acl_revision: 0,
     };
     let info_size = u32::try_from(size_of::<AclSizeInfo>()).map_err(|_| {
         io::Error::new(
