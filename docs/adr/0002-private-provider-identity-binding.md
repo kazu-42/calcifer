@@ -29,8 +29,9 @@ keys.
 Calcifer binds each supported Codex profile to a provider-private equality
 token before publishing a new registration.
 
-1. Identity support is Unix-only until an equivalent Windows current-user-only
-   ACL implementation is verified.
+1. Identity files use Unix owner-only modes or a verified Windows
+   current-user-only DACL. Windows profile registration remains fail-closed
+   until journaled removal recovery is wired.
 2. The provider module performs the existing App Server
    initialize/home/version gate and returns an unforgeable in-crate capability
    for the exact 0.144.4 identity adapter. Other production modules cannot

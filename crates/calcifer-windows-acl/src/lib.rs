@@ -7,13 +7,21 @@
 #![cfg(windows)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::ffi::c_void;
+use std::ffi::{OsStr, OsString, c_void};
+use std::fs::File;
 use std::io;
 use std::mem::size_of;
-use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle, RawHandle,
+};
 use std::ptr::{self, NonNull};
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, FALSE, HANDLE, LocalFree};
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, FALSE, HANDLE, LocalFree, UNICODE_STRING,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
@@ -25,13 +33,64 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FlushFileBuffers, GetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, FILE_FULL_DIR_INFO, FileDispositionInfo, FileDispositionInfoEx,
+    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FlushFileBuffers,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, SetFileInformationByHandle,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
 const INHERITED_ACE: u8 = 0x10;
 const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const DELETE: u32 = 0x0001_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+const FILE_OPEN: u32 = 0x0000_0001;
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const OBJ_DONT_REPARSE: u32 = 0x0000_1000;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000D_u32 as i32;
+const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_0280_u32 as i32;
+const ERROR_NO_MORE_FILES: i32 = 18;
+const ERROR_MORE_DATA: i32 = 234;
+const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
+const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn RtlNtStatusToDosError(status: i32) -> u32;
+}
+
+/// Volume serial, file index, attributes, and link count for an open node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenedIdentity {
+    pub volume_serial: u64,
+    pub file_index: u64,
+    pub attributes: u32,
+    pub link_count: u32,
+    pub file_size: u64,
+}
+
+impl OpenedIdentity {
+    pub const fn is_directory(self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+
+    pub const fn is_reparse_point(self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+}
 
 #[repr(C)]
 struct AclSizeInfo {
@@ -228,13 +287,25 @@ pub fn verify_current_user_only(handle: BorrowedHandle<'_>) -> io::Result<()> {
 
 /// Returns `(volume serial, file index)` for an open node.
 pub fn volume_file_identity(handle: BorrowedHandle<'_>) -> io::Result<(u64, u64)> {
+    let identity = inspect(handle)?;
+    Ok((identity.volume_serial, identity.file_index))
+}
+
+/// Reads handle-bound identity without following a reparse point that is already open.
+pub fn inspect(handle: BorrowedHandle<'_>) -> io::Result<OpenedIdentity> {
     let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
     let ok = unsafe { GetFileInformationByHandle(handle.as_raw_handle() as HANDLE, &mut info) };
     if ok == FALSE {
         return Err(io::Error::last_os_error());
     }
     let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-    Ok((u64::from(info.dwVolumeSerialNumber), index))
+    Ok(OpenedIdentity {
+        volume_serial: u64::from(info.dwVolumeSerialNumber),
+        file_index: index,
+        attributes: info.dwFileAttributes,
+        link_count: info.nNumberOfLinks,
+        file_size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+    })
 }
 
 /// Flushes metadata for an open directory or file handle.
@@ -244,6 +315,339 @@ pub fn flush(handle: BorrowedHandle<'_>) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Opens `name` relative to an already-opened parent without following reparse points.
+pub fn open_nofollow_child(
+    parent: BorrowedHandle<'_>,
+    name: &OsStr,
+    directory: bool,
+) -> io::Result<File> {
+    validate_relative_child_name(name)?;
+    let wide: Vec<u16> = name.encode_wide().collect();
+    let byte_len = u16::try_from(wide.len().saturating_mul(2)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "windows relative name is too long",
+        )
+    })?;
+    let mut object_name = UNICODE_STRING {
+        Length: byte_len,
+        MaximumLength: byte_len,
+        Buffer: wide.as_ptr().cast_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let create_options = if directory {
+        FILE_DIRECTORY_FILE
+            | FILE_SYNCHRONOUS_IO_NONALERT
+            | FILE_OPEN_FOR_BACKUP_INTENT
+            | FILE_OPEN_REPARSE_POINT
+    } else {
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT
+    };
+    let access = GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let mut status = nt_create_relative(
+        parent,
+        &mut object_name,
+        OBJ_DONT_REPARSE,
+        access,
+        share,
+        create_options,
+        &mut handle,
+        &mut io_status,
+    );
+    if status == STATUS_INVALID_PARAMETER {
+        handle = ptr::null_mut();
+        io_status = IO_STATUS_BLOCK::default();
+        status = nt_create_relative(
+            parent,
+            &mut object_name,
+            0,
+            access,
+            share,
+            create_options,
+            &mut handle,
+            &mut io_status,
+        );
+    }
+    if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed path is a reparse point",
+        ));
+    }
+    if status < 0 {
+        return Err(ntstatus_error(status));
+    }
+    let file = owned_file(handle)?;
+    let identity = inspect(file.as_handle())?;
+    if identity.is_reparse_point() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed path is a reparse point",
+        ));
+    }
+    if directory != identity.is_directory() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed path type changed during relative open",
+        ));
+    }
+    Ok(file)
+}
+
+/// One child observed through an already-opened directory handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    pub name: OsString,
+    pub attributes: u32,
+}
+
+impl DirectoryEntry {
+    pub const fn is_directory(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+
+    pub const fn is_reparse_point(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+}
+
+/// Lists children through an already-opened directory handle.
+pub fn read_directory_entries(parent: BorrowedHandle<'_>) -> io::Result<Vec<DirectoryEntry>> {
+    let mut entries = Vec::new();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut class = FileFullDirectoryRestartInfo;
+    loop {
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                parent.as_raw_handle() as HANDLE,
+                class,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "windows directory listing overflowed",
+                    )
+                })?,
+            )
+        };
+        if ok == FALSE {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(ERROR_NO_MORE_FILES) => break,
+                Some(ERROR_MORE_DATA) if buffer.len() < 256 * 1024 => {
+                    buffer.resize(buffer.len().saturating_mul(2), 0);
+                    class = FileFullDirectoryRestartInfo;
+                    entries.clear();
+                    continue;
+                }
+                _ => return Err(error),
+            }
+        }
+        append_directory_entries(&buffer, &mut entries)?;
+        class = FileFullDirectoryInfo;
+    }
+    Ok(entries)
+}
+
+/// Marks an opened node for deletion without following a reparse target.
+pub fn mark_for_delete(handle: BorrowedHandle<'_>) -> io::Result<()> {
+    #[repr(C)]
+    struct DispositionEx {
+        flags: u32,
+    }
+    let mut posix = DispositionEx {
+        flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    let posix_ok = unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle() as HANDLE,
+            FileDispositionInfoEx,
+            ptr::from_mut(&mut posix).cast(),
+            size_of::<DispositionEx>() as u32,
+        )
+    };
+    if posix_ok != FALSE {
+        return Ok(());
+    }
+    #[repr(C)]
+    struct Disposition {
+        delete_file: u8,
+    }
+    let mut basic = Disposition { delete_file: 1 };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle() as HANDLE,
+            FileDispositionInfo,
+            ptr::from_mut(&mut basic).cast(),
+            size_of::<Disposition>() as u32,
+        )
+    };
+    if ok == FALSE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn nt_create_relative(
+    parent: BorrowedHandle<'_>,
+    object_name: &mut UNICODE_STRING,
+    attributes: u32,
+    access: u32,
+    share: u32,
+    create_options: u32,
+    handle: &mut HANDLE,
+    io_status: &mut IO_STATUS_BLOCK,
+) -> i32 {
+    let object_attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle() as HANDLE,
+        ObjectName: object_name,
+        Attributes: attributes,
+        SecurityDescriptor: ptr::null(),
+        SecurityQualityOfService: ptr::null(),
+    };
+    unsafe {
+        NtCreateFile(
+            handle,
+            access,
+            &object_attributes,
+            io_status,
+            ptr::null(),
+            0,
+            share,
+            FILE_OPEN,
+            create_options,
+            ptr::null(),
+            0,
+        )
+    }
+}
+
+fn owned_file(handle: HANDLE) -> io::Result<File> {
+    if handle.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "windows relative open returned an empty handle",
+        ));
+    }
+    Ok(File::from(unsafe {
+        OwnedHandle::from_raw_handle(handle as RawHandle)
+    }))
+}
+
+fn ntstatus_error(status: i32) -> io::Error {
+    io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
+}
+
+fn validate_relative_child_name(name: &OsStr) -> io::Result<()> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "windows relative name is reserved",
+        ));
+    }
+    if name
+        .encode_wide()
+        .any(|unit| unit == 0 || unit == u16::from(b'\\') || unit == u16::from(b'/'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "windows relative name is not a single component",
+        ));
+    }
+    Ok(())
+}
+
+fn append_directory_entries(buffer: &[u8], entries: &mut Vec<DirectoryEntry>) -> io::Result<()> {
+    let mut offset = 0_usize;
+    loop {
+        let next_entry_offset = read_u32_at(buffer, offset)?;
+        let attributes = read_u32_at(
+            buffer,
+            offset
+                .checked_add(std::mem::offset_of!(FILE_FULL_DIR_INFO, FileAttributes))
+                .ok_or_else(directory_listing_overflow)?,
+        )?;
+        let name_len_offset = offset
+            .checked_add(std::mem::offset_of!(FILE_FULL_DIR_INFO, FileNameLength))
+            .ok_or_else(directory_listing_overflow)?;
+        let name_bytes = usize::try_from(read_u32_at(buffer, name_len_offset)?)
+            .map_err(|_| directory_listing_overflow())?;
+        if name_bytes % 2 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "windows directory listing name was not UTF-16",
+            ));
+        }
+        let name_start = offset
+            .checked_add(std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName))
+            .ok_or_else(directory_listing_overflow)?;
+        let name_end = name_start
+            .checked_add(name_bytes)
+            .ok_or_else(directory_listing_overflow)?;
+        if name_start % 2 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "windows directory listing name was unaligned",
+            ));
+        }
+        let name_slice = buffer.get(name_start..name_end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "windows directory listing name was truncated",
+            )
+        })?;
+        let units = unsafe {
+            std::slice::from_raw_parts(name_slice.as_ptr().cast::<u16>(), name_bytes / 2)
+        };
+        let name = OsString::from_wide(units);
+        if name != "." && name != ".." {
+            entries.push(DirectoryEntry { name, attributes });
+        }
+        if next_entry_offset == 0 {
+            return Ok(());
+        }
+        let next = offset
+            .checked_add(
+                usize::try_from(next_entry_offset).map_err(|_| directory_listing_overflow())?,
+            )
+            .ok_or_else(directory_listing_overflow)?;
+        if next <= offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "windows directory listing was not advancing",
+            ));
+        }
+        offset = next;
+    }
+}
+
+fn directory_listing_overflow() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "windows directory listing overflowed",
+    )
+}
+
+fn read_u32_at(buffer: &[u8], offset: usize) -> io::Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(directory_listing_overflow)?;
+    let bytes: [u8; 4] = buffer
+        .get(offset..end)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "windows directory listing was truncated",
+            )
+        })?
+        .try_into()
+        .map_err(|_| directory_listing_overflow())?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 fn verify_single_current_user_allow_ace(
@@ -298,8 +702,6 @@ fn verify_single_current_user_allow_ace(
     let mask = unsafe { ace.cast::<u32>().add(1).read_unaligned() };
     // SDDL `FA` may be stored as GENERIC_ALL or as mapped FILE_ALL_ACCESS.
     const GENERIC_ALL: u32 = 0x1000_0000;
-    const DELETE: u32 = 0x0001_0000;
-    const WRITE_DAC: u32 = 0x0004_0000;
     const READ_CONTROL: u32 = 0x0002_0000;
     let has_owner_control = mask == GENERIC_ALL
         || mask == FILE_ALL_ACCESS
@@ -415,6 +817,7 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::fs::{self, OpenOptions};
     use std::os::windows::io::AsHandle;
     use std::path::PathBuf;
@@ -570,6 +973,65 @@ mod tests {
         flush(directory.as_handle())?;
         drop(directory);
         fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    fn create_junction(link: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+        let status = std::process::Command::new("cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("mklink /J failed"))
+        }
+    }
+
+    #[test]
+    fn relative_open_lists_and_deletes_a_child_without_following_a_junction() -> io::Result<()> {
+        let parent = temp_path("relative-parent");
+        fs::create_dir(&parent)?;
+        let parent_dir = open_directory_with_acl_rights(&parent)?;
+        apply_current_user_only(parent_dir.as_handle())?;
+
+        let child_path = parent.join("child.bin");
+        fs::write(&child_path, b"owned-child")?;
+        let child_file = open_with_acl_rights(&child_path)?;
+        apply_current_user_only(child_file.as_handle())?;
+        drop(child_file);
+
+        let names = read_directory_entries(parent_dir.as_handle())?;
+        assert!(names.iter().any(|entry| entry.name == "child.bin"));
+
+        let child = open_nofollow_child(parent_dir.as_handle(), OsStr::new("child.bin"), false)?;
+        verify_current_user_only(child.as_handle())?;
+        let identity = inspect(child.as_handle())?;
+        assert!(!identity.is_directory());
+        assert!(!identity.is_reparse_point());
+        assert_eq!(identity.link_count, 1);
+        mark_for_delete(child.as_handle())?;
+        drop(child);
+
+        let outside = temp_path("junction-target");
+        fs::create_dir(&outside)?;
+        let sentinel = outside.join("must-survive.bin");
+        fs::write(&sentinel, b"outside-must-survive")?;
+        let junction = parent.join("trap");
+        create_junction(&junction, &outside)?;
+        let error = open_nofollow_child(parent_dir.as_handle(), OsStr::new("trap"), true)
+            .expect_err("a directory junction must not be opened as a managed child");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&sentinel)?, b"outside-must-survive");
+
+        drop(parent_dir);
+        fs::remove_dir_all(parent)?;
+        fs::remove_dir_all(outside)?;
         Ok(())
     }
 }
