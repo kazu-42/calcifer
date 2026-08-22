@@ -445,4 +445,103 @@ mod tests {
         fs::remove_file(&path)?;
         Ok(())
     }
+
+    fn apply_sddl(handle: BorrowedHandle<'_>, sddl: &str) -> io::Result<()> {
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide(sddl).as_ptr(),
+                u32::from(SDDL_REVISION_1),
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        if converted == FALSE {
+            return Err(io::Error::last_os_error());
+        }
+        let descriptor = LocalPtr::from_raw(descriptor).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "test SDDL descriptor was empty")
+        })?;
+        let mut dacl_present = FALSE;
+        let mut dacl_defaulted = FALSE;
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let got_dacl = unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.as_ptr(),
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        };
+        if got_dacl == FALSE || dacl.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "test SDDL DACL was missing",
+            ));
+        }
+        let status = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(())
+    }
+
+    fn open_directory_with_acl_rights(path: &std::path::Path) -> io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const WRITE_OWNER: u32 = 0x0008_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER)
+            .open(path)
+    }
+
+    #[test]
+    fn apply_strips_inherited_everyone_from_a_child_file() -> io::Result<()> {
+        let parent = temp_path("everyone-parent");
+        fs::create_dir(&parent)?;
+        let parent_dir = open_directory_with_acl_rights(&parent)?;
+        apply_sddl(parent_dir.as_handle(), "D:P(A;OICI;FA;;;WD)")?;
+        drop(parent_dir);
+
+        let child = parent.join("child.bin");
+        fs::write(&child, b"inherited")?;
+        let file = open_with_acl_rights(&child)?;
+        verify_current_user_only(file.as_handle()).expect_err(
+            "a child of an inheritable Everyone directory must not already be current-user-only",
+        );
+        apply_current_user_only(file.as_handle())?;
+        verify_current_user_only(file.as_handle())?;
+        drop(file);
+        fs::remove_dir_all(parent)?;
+        Ok(())
+    }
+
+    #[test]
+    fn apply_and_verify_round_trip_on_a_new_directory() -> io::Result<()> {
+        let path = temp_path("dir-round-trip");
+        fs::create_dir(&path)?;
+        let directory = open_directory_with_acl_rights(&path)?;
+        apply_current_user_only(directory.as_handle())?;
+        verify_current_user_only(directory.as_handle())?;
+        drop(directory);
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
 }
