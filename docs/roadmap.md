@@ -8,7 +8,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Read-only human and JSON `doctor` output
 - [x] Linux, macOS, Windows, formatting, Clippy, and MSRV CI
 - [x] Architecture, security, contribution, and disclosure documentation
-- [ ] First checksummed and provenance-attested pre-release binary
+- [x] First checksummed and provenance-attested pre-release binary (`v0.1.0-alpha.5`; see [releasing.md](releasing.md). Bit-for-bit linker reproducibility across runners is still not claimed.)
 - [x] Credential-free strict-channel update check for immutable manifest-v1 releases
 
 ## Phase 1: secure local registry
@@ -17,15 +17,15 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Opaque profile IDs and normalized display-name validation
 - [x] Per-profile ownership marker and staging cleanup boundary
 - [x] Unix `0700`/`0600`, symlink/type checks, and atomic registry writes
-- [ ] Windows current-user-only ACL creation and validation
-- [ ] Owner-UID checks and hardened directory-relative filesystem operations (implemented for destructive profile removal; remaining storage paths still require migration)
+- [ ] Windows current-user-only ACL creation and validation (issue #141)
+- [ ] Owner-UID checks and hardened directory-relative filesystem operations (implemented for destructive profile removal; remaining storage paths still require migration; issue #142)
 - [x] OS advisory locks for the current single-profile operations
-- [ ] Deterministic multi-profile/session lock ordering
-- [ ] Redaction and crash-injection test harnesses
+- [ ] Deterministic multi-profile/session lock ordering (issue #143)
+- [ ] Redaction and crash-injection test harnesses (issue #144)
 
 ## Phase 2: Codex profile isolation
 
-- [ ] Complete `auth add/list/show/rename/remove/reauth codex` (`add`, `list`, staged same-identity `reauth`, atomic alias-only `rename`, and confirmed crash-safe local `remove` are implemented; `show` remains)
+- [ ] Complete `auth add/list/show/rename/remove/reauth codex` (`add`, `list`, staged same-identity `reauth`, atomic alias-only `rename`, and confirmed crash-safe local `remove` are implemented; `show` remains, issue #145)
 - [x] Keep profile registry schema v1 rollback-compatible while using a bounded transient removal barrier, fail-closed mount proof, and immutable-ID lineage during local deletion
 - [x] Official `codex login` in a profile-specific `CODEX_HOME`
 - [x] Version-scoped private provider identity verification before profile publication
@@ -33,7 +33,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Official staged same-identity reauthentication with complete lifetime lease, bounded private journal, crash convergence, and no old-credential rollback after new visibility
 - [x] File-backed credential-store configuration scoped to the managed home
 - [x] Revalidate managed auth/config and reject account/provider-routing argument overrides
-- [ ] Complete adapter-selected executable hardening and process supervision (direct argv, owner/parent-mode checks, crash-tolerant split launch leases, and ordinary exit codes are implemented; complete signal semantics remain)
+- [ ] Complete adapter-selected executable hardening and process supervision (direct argv, owner/parent-mode checks, crash-tolerant split launch leases, and ordinary exit codes are implemented; complete signal semantics remain, issue #146)
 - [x] No writes to the user's global `~/.codex`
 - [x] Same-profile lifetime lease; different profiles may run concurrently
 - [x] Same-profile `resume` by exact thread ID or official `--last`
@@ -76,8 +76,8 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [x] Extract a bounded, observe-only readiness relay with separate synthetic-fork and exact-resume policies; keep it internal and opaque after readiness (issue #48 and [ADR 0003](adr/0003-supervised-codex-session.md))
 - [x] Prove the default-unused coordinator/guardian authority, bounded lifecycle channel, guardian-direct fake process groups, exact reap, worker join, private runtime cleanup, descriptor non-inheritance, and retained-A crash behavior (issue #50)
 - [x] Add the pinned real guardian-owned App Server/TUI lifecycle, persistent typed monitor, PTY input gate, signals, persistent shell anchor, completion protocol, and fail-closed terminal disposition. At issue #54 delivery Linux exposed only exact same-profile resume; the later explicit pool slice reuses that same sealed supervisor (issue #54 and [ADR 0003](adr/0003-supervised-codex-session.md))
-- [ ] Run and pass the non-ignored credential-free deterministic recovery fixture at all seven closed production checkpoints: startup queued, ready, active, suspended, retained quiescing, retained restore pending, and retained cleanup pending. The checkpoint must remain observation-only until the sole generation-bound `CFRCR` request; the first four cases expect failed-clean with zero inference calls and the retained three expect completed-clean with exactly one validated loopback call. Every case must pass the same four independent deletion proofs; the fourth namespace proof additionally requires the identity-checked private compatibility stage parent to be empty. The sealed `cfg(test)` compatibility seam and strict owner-private provider wrapper are recovery-phase evidence, not official Codex compatibility evidence
-- [ ] Run and pass the checksum-pinned official `0.144.4` `official-tui-normal` and `official-tui-recovery` scenarios on this exact tree in their independent Ubuntu 24.04 jobs. Both are designed to exercise the production coordinator/guardian session and shared guardian-bootstrap core through bounded package-only seams, pass the completion endpoint across real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries, and check the provider-release-only `CFCMP\x01\r\n` frame plus EOF at the parent. `CFCMP` is not owner, session, or shell success by itself. The test-only dispatcher bypasses the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser and persistent shell-anchor role, so these scenarios make no parser coverage claim. One aggregate gate must require `contracts`, `official-tui-normal`, `official-tui-recovery`, and the explicit macOS hermetic-unsupported report
+- [x] Run and pass the non-ignored credential-free deterministic recovery fixture at all seven closed production checkpoints: startup queued, ready, active, suspended, retained quiescing, retained restore pending, and retained cleanup pending. The checkpoint must remain observation-only until the sole generation-bound `CFRCR` request; the first four cases expect failed-clean with zero inference calls and the retained three expect completed-clean with exactly one validated loopback call. Every case must pass the same four independent deletion proofs; the fourth namespace proof additionally requires the identity-checked private compatibility stage parent to be empty. The sealed `cfg(test)` compatibility seam and strict owner-private provider wrapper are recovery-phase evidence, not official Codex compatibility evidence (issue #140; merge `51240fe7d231d80c7e3e0fb70806fe22f17ceb2b`, main `ci.yml` run 32550585795 attempt 1)
+- [x] Run and pass the checksum-pinned official `0.144.4` `official-tui-normal` and `official-tui-recovery` scenarios on this exact tree in their independent Ubuntu 24.04 jobs. Both are designed to exercise the production coordinator/guardian session and shared guardian-bootstrap core through bounded package-only seams, pass the completion endpoint across real package-parent-to-coordinator and coordinator-to-guardian `exec` boundaries, and check the provider-release-only `CFCMP\x01\r\n` frame plus EOF at the parent. `CFCMP` is not owner, session, or shell success by itself. The test-only dispatcher bypasses the production `CALCIFER_INTERNAL_CODEX_SUPERVISOR_ROLE` dispatcher/parser and persistent shell-anchor role, so these scenarios make no parser coverage claim. One aggregate gate must require `contracts`, `official-tui-normal`, `official-tui-recovery`, and the explicit macOS hermetic-unsupported report (issue #149; same merge SHA and attempt-1 run)
 - [x] Put all six pinned Codex package probes, including the four contract probes and Codex 0.144.4 announcement prewarm, behind one fresh Linux loopback-only namespace per exact test after package/build preparation. Retain no native fallback; revalidate the frozen libtest, Codex, and launcher across the privilege boundary, and report macOS as unsupported until a reviewed public OS-owned containment primitive exists (issue #70)
 - [x] Execute every verified Linux compatibility/App Server/TUI image from one sealed close-on-exec `memfd`, include that authority in descriptor-isolation proofs, and retain no staged/configured-path fallback. macOS fails before provider startup because no reviewed public descriptor-exec equivalent is available (issue #64 and [ADR 0005](adr/0005-descriptor-backed-provider-exec.md))
 - [x] Evaluate platform-owned containment for escaped `setsid(2)` descendants in issue #56 and [ADR 0006](adr/0006-platform-owned-descendant-containment.md). Linux cgroup v2 has the necessary kill/empty primitives only behind an independently owned broker; same-user rootless delegation is insufficient, and macOS has no reviewed public equivalent. Keep issue #55's zero-residue claim limited to Calcifer-owned direct children and known process groups plus identity-checked runtime, FD, and socket evidence
@@ -96,8 +96,8 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [x] Revalidate Anthropic's current public documentation and CLI surface (2026-08-13; see provider compatibility notes)
 - [x] Choose provider-managed `claude auth login` under isolated `CLAUDE_CONFIG_DIR` as the supported profile contract; keep setup-token ingestion behind a future OS credential-broker gate
 - [x] Implement and recovery-test Linux provider-managed profiles with exact `0600` credential-file validation and journaled atomic rotation
-- [ ] Keep Windows profile registration disabled until current-user-only ACL creation and recovery are verified
-- [ ] Keep macOS multi-profile registration disabled until Anthropic documents a config-directory-scoped Keychain namespace or another supported isolation mechanism
+- [ ] Keep Windows profile registration disabled until current-user-only ACL creation and recovery are verified (issue #147, blocked by #141)
+- [ ] Keep macOS multi-profile registration disabled until Anthropic documents a config-directory-scoped Keychain namespace or another supported isolation mechanism (issue #148)
 - [x] Sanitize conflicting Claude authentication environment variables in the sealed Linux adapter boundary
 - [x] Keep direct subscription OAuth replication and undocumented refresh/Keychain conventions out of scope
 - [x] Treat macOS, Linux, and Windows credential behavior as separate compatibility lanes

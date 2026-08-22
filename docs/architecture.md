@@ -344,9 +344,10 @@ descriptor-backed launch capability.
 Independently budgeted checksum-pinned normal-session and retained-recovery
 package scenarios are configured to exercise the production coordinator,
 guardian, provider-session, PTY, input-gate, resize, and stop/resume job-control
-implementations under a test-owned outer-terminal harness. The normal scenario
-passed twice consecutively and retained recovery once on the exact local
-Apple-silicon tree; Ubuntu 24.04/macOS CI readback remains pending. Selected-
+implementations under a test-owned outer-terminal harness. Ubuntu 24.04 CI
+runs `official-tui-normal` and `official-tui-recovery` as independent jobs
+behind the aggregate Pinned Codex Package gate; macOS reports hermetic package
+probes as unsupported and performs no native-network fallback. Selected-
 profile admission uses the
 production A-to-B lease path across the coordinator and guardian helpers, and
 the guardian helper enters the shared production guardian-bootstrap core. Its
@@ -604,9 +605,10 @@ checkpoints expect failed-clean with zero inference calls; the three retained
 checkpoints expect completed-clean with exactly one validated loopback inference
 call. Its fourth namespace proof also requires the identity-checked private
 compatibility stage parent to be empty. This is deterministic recovery-phase
-evidence, not Codex-version compatibility evidence. All seven cases passed three
-consecutive local runs from that candidate source; cross-platform CI readback remains
-pending.
+evidence, not Codex-version compatibility evidence. The seven-checkpoint
+fixture is non-ignored on the Linux Test job; merge
+`51240fe7d231d80c7e3e0fb70806fe22f17ceb2b` passed that job on `ci.yml` attempt 1
+(run 32550585795).
 
 The package generation records one internal monotonic fence before spawn. Its
 cleanup path polls for normal completion, sends the one recovery request, wakes
