@@ -5628,6 +5628,12 @@ const WINDOWS_GENERIC_WRITE: u32 = 0x4000_0000;
 const WINDOWS_WRITE_DAC: u32 = 0x0004_0000;
 #[cfg(windows)]
 const WINDOWS_WRITE_OWNER: u32 = 0x0008_0000;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_WRITE: u32 = 0x0000_0002;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_DELETE: u32 = 0x0000_0004;
 
 #[cfg(windows)]
 fn open_windows_directory_for_acl(path: &Path) -> Result<File, ProfileError> {
@@ -5639,6 +5645,7 @@ fn open_windows_directory_for_acl(path: &Path) -> Result<File, ProfileError> {
         .access_mode(
             WINDOWS_GENERIC_READ | WINDOWS_GENERIC_WRITE | WINDOWS_WRITE_DAC | WINDOWS_WRITE_OWNER,
         )
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE)
         .open(path)
         .map_err(ProfileError::Io)
 }
@@ -5695,6 +5702,8 @@ fn private_open_options() -> OpenOptions {
     options.access_mode(
         WINDOWS_GENERIC_READ | WINDOWS_GENERIC_WRITE | WINDOWS_WRITE_DAC | WINDOWS_WRITE_OWNER,
     );
+    options
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE);
     options
 }
 
@@ -6106,6 +6115,7 @@ fn open_windows_file_for_acl(path: &Path) -> Result<File, ProfileError> {
         .access_mode(
             WINDOWS_GENERIC_READ | WINDOWS_GENERIC_WRITE | WINDOWS_WRITE_DAC | WINDOWS_WRITE_OWNER,
         )
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE)
         .open(path)
         .map_err(ProfileError::Io)
 }
