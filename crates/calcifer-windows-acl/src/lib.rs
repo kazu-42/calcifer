@@ -32,10 +32,9 @@ const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
 
 #[repr(C)]
 struct AclSizeInfo {
+    ace_count: u32,
     acl_bytes_in_use: u32,
     acl_bytes_free: u32,
-    ace_count: u32,
-    acl_revision: u32,
 }
 
 #[repr(C)]
@@ -410,11 +409,25 @@ mod tests {
         ))
     }
 
+    fn open_with_acl_rights(path: &std::path::Path) -> io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const WRITE_OWNER: u32 = 0x0008_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER)
+            .open(path)
+    }
+
     #[test]
     fn apply_and_verify_round_trip_on_a_new_file() -> io::Result<()> {
         let path = temp_path("round-trip");
         fs::write(&path, b"calcifer-windows-acl")?;
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let file = open_with_acl_rights(&path)?;
         apply_current_user_only(file.as_handle())?;
         verify_current_user_only(file.as_handle())?;
         fs::remove_file(&path)?;
@@ -425,7 +438,7 @@ mod tests {
     fn verify_rejects_an_unprotected_inherited_dacl() -> io::Result<()> {
         let path = temp_path("inherited");
         fs::write(&path, b"calcifer-windows-acl")?;
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let file = open_with_acl_rights(&path)?;
         let error = verify_current_user_only(file.as_handle()).expect_err(
             "a default NTFS DACL must not already be a protected current-user-only ACL",
         );

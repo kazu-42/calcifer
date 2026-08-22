@@ -5228,7 +5228,20 @@ fn private_open_options() -> OpenOptions {
     options
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn private_open_options() -> OpenOptions {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    let mut options = OpenOptions::new();
+    options.access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER);
+    options
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn private_open_options() -> OpenOptions {
     OpenOptions::new()
 }
