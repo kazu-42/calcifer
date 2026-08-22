@@ -5978,7 +5978,7 @@ mod tests {
         let error = Registry::at(root.clone())
             .recover_incomplete_removal()
             .expect_err("Windows removal recovery must stay fail-closed");
-        assert_eq!(error.code(), "unsupported_platform");
+        assert_eq!(error.code(), "removal_recovery_required");
         assert_eq!(fs::read(&temporary)?, sentinel);
         fs::remove_dir_all(root)?;
         Ok(())
