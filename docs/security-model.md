@@ -505,8 +505,9 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 Provider identity binding is supported on Unix and on Windows, and only for the
 tested Codex `0.144.4` managed ChatGPT auth projection. Windows identity files
 use the same protected current-user-only DACL as other managed files. Windows
-`auth add` still fails closed until journaled profile removal recovery exists;
-Calcifer never creates a normally accessible fallback key there.
+Codex `auth add` uses that ACL plus journaled removal recovery. Claude Windows
+profiles and Windows reauthentication stay fail-closed. Calcifer never creates
+a normally accessible fallback key.
 
 One 256-bit installation key is generated from the OS CSPRNG and stored as a
 private, owner-checked, single-link regular file. A non-provider UUID key ID

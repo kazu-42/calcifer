@@ -107,7 +107,7 @@ impl CodexIdentityAdapter {
         "0.144.4"
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, any(unix, windows)))]
     pub(crate) const fn for_test() -> Self {
         Self::v0_144_4()
     }

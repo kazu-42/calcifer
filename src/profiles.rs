@@ -1160,7 +1160,7 @@ impl Registry {
     ///
     /// Login and account-only App Server probes must not discover repository
     /// configuration through an ancestor of a user-selected `CALCIFER_HOME`.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn neutral_working_directory(&self) -> Result<PathBuf, ProfileError> {
         let runtime_root = managed_runtime_root()?;
         let neutral = runtime_root.join("neutral");
@@ -1169,7 +1169,7 @@ impl Registry {
         Ok(neutral)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     pub(crate) fn neutral_working_directory(&self) -> Result<PathBuf, ProfileError> {
         Err(ProfileError::UnsupportedPlatform)
     }
@@ -3678,6 +3678,8 @@ impl PendingProfile<'_> {
     }
 
     pub(crate) fn commit(mut self, adapter: CodexIdentityAdapter) -> Result<Profile, ProfileError> {
+        #[cfg(windows)]
+        seal_windows_private_directory(&self.home())?;
         verify_managed_codex_home(&self.home())?;
         let document = self.registry.load()?;
         let store = IdentityStore::new(&self.registry.root);
@@ -4964,7 +4966,7 @@ impl ProfileError {
                 let _ = error.kind();
                 "The profile registry became visible but its durability could not be confirmed. Run `calcifer auth list` before retrying; Calcifer preserved the profile credentials.".to_owned()
             }
-            Self::UnsupportedPlatform => "Managed profiles are not supported on this platform yet because private ACL creation has not been verified.".to_owned(),
+            Self::UnsupportedPlatform => "Managed profiles are not supported on this platform yet.".to_owned(),
             Self::UnsafeState(reason) => format!("Calcifer refused unsafe profile storage: {reason}."),
         }
     }
@@ -5056,14 +5058,14 @@ fn require_absolute_root(path: PathBuf) -> Result<PathBuf, ProfileError> {
     Ok(path)
 }
 
-/// Resolves the existing portion of a managed Unix root exactly once.
+/// Resolves the existing portion of a managed root exactly once.
 ///
 /// User-selected roots may legitimately be reached through aliases such as
 /// macOS `/var` or a symlinked home directory. Calcifer stores the physical
 /// path and appends only components that do not exist yet. Operational storage
 /// checks can therefore reject every symlink ancestor instead of performing
 /// path-based ACL checks on a mutable symlink object.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn canonicalize_managed_root(path: &Path) -> Result<PathBuf, ProfileError> {
     let normalized = require_absolute_root(path.to_path_buf())?;
     let mut candidate = normalized.as_path();
@@ -5166,13 +5168,23 @@ fn unix_timestamp() -> Result<i64, ProfileError> {
         .map_err(|_| ProfileError::UnsafeState("system clock is out of range".to_owned()))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ensure_registration_supported() -> Result<(), ProfileError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn ensure_registration_supported() -> Result<(), ProfileError> {
+    Err(ProfileError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+fn ensure_reauth_supported() -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_reauth_supported() -> Result<(), ProfileError> {
     Err(ProfileError::UnsupportedPlatform)
 }
 
@@ -5295,6 +5307,13 @@ pub(crate) fn managed_runtime_root() -> Result<PathBuf, ProfileError> {
             "managed runtime directory has an unexpected owner".to_owned(),
         ));
     }
+    Ok(runtime_root)
+}
+
+#[cfg(windows)]
+pub(crate) fn managed_runtime_root() -> Result<PathBuf, ProfileError> {
+    let runtime_root = canonicalize_managed_root(&env::temp_dir())?.join("calcifer");
+    ensure_private_subdirectory(&runtime_root)?;
     Ok(runtime_root)
 }
 
@@ -5679,6 +5698,57 @@ pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> 
     calcifer_windows_acl::verify_current_user_only(directory.as_handle()).map_err(|_| {
         ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
     })
+}
+
+#[cfg(windows)]
+fn seal_windows_private_directory(path: &Path) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let directory = open_windows_directory_for_acl(path)?;
+    calcifer_windows_acl::apply_current_user_only(directory.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })?;
+    let mut budget = RemovalTraversalBudget::new(MAX_REMOVAL_TREE_ENTRIES, MAX_REMOVAL_TREE_DEPTH);
+    seal_windows_private_directory_entries(&directory, &mut budget, 0)
+}
+
+#[cfg(windows)]
+fn seal_windows_private_directory_entries(
+    directory: &File,
+    budget: &mut RemovalTraversalBudget,
+    depth: usize,
+) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let entries = calcifer_windows_acl::read_directory_entries(
+        directory.as_handle(),
+        budget.remaining_entries,
+    )
+    .map_err(windows_removal_open_error)?;
+    for entry in entries {
+        budget.consume_entry()?;
+        if entry.is_reparse_point() {
+            return Err(ProfileError::UnsafeState(
+                "managed profile tree contains unsafe state".to_owned(),
+            ));
+        }
+        let child = calcifer_windows_acl::open_nofollow_child(
+            directory.as_handle(),
+            &entry.name,
+            entry.is_directory(),
+        )
+        .map_err(windows_removal_open_error)?;
+        calcifer_windows_acl::apply_current_user_only(child.as_handle()).map_err(|_| {
+            ProfileError::UnsafeState(
+                "managed path has unsupported extended permissions".to_owned(),
+            )
+        })?;
+        if entry.is_directory() {
+            let child_depth = budget.child_depth(depth)?;
+            seal_windows_private_directory_entries(&child, budget, child_depth)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -6783,16 +6853,69 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_registration_stays_unsupported_after_owned_tree_removal()
+    fn windows_codex_registration_commits_and_journaled_remove_cleans_up()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = windows_temporary_root("windows-registration-closed");
-        secure_create_dir(&root)?;
-        let error = Registry::at(root.clone())
-            .begin_codex_registration("work")
-            .err()
-            .ok_or("Windows auth add must stay fail-closed")?;
-        assert_eq!(error.code(), "unsupported_platform");
+        let root = windows_temporary_root("windows-codex-register");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        assert!(profile_directory.is_dir());
+        assert_eq!(registry.remove(Provider::Codex, "work", None)?, profile);
+        assert!(!profile_directory.exists());
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_commit_seals_provider_created_auth_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::windows::io::AsHandle;
+
+        let root = windows_temporary_root("windows-seal-provider-auth");
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_codex_registration("work")?;
+        let auth = pending.home().join("auth.json");
+        let document = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "account_id": Uuid::new_v4().to_string() }
+        });
+        fs::write(&auth, serde_json::to_vec(&document)?)?;
+        let unsealed = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&auth)?;
+        calcifer_windows_acl::verify_current_user_only(unsealed.as_handle())
+            .expect_err("a provider-created auth.json must not already be current-user-only");
+        drop(unsealed);
+
+        let profile = pending.commit(test_identity_adapter())?;
+        let sealed = registry.profile_home(&profile)?.join("auth.json");
+        super::verify_private_regular_file(&sealed)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claude_registration_and_codex_reauth_stay_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root("windows-claude-reauth-closed");
+        let registry = Registry::at(root.clone());
+        let claude = registry
+            .begin_claude_registration("work")
+            .err()
+            .ok_or("Claude Windows registration must stay fail-closed")?;
+        assert_eq!(claude.code(), "unsupported_platform");
+        let reauth = registry
+            .begin_codex_reauthentication("work", |_, _| Ok(test_identity_adapter()))
+            .err()
+            .ok_or("Windows Codex reauth must stay fail-closed")?;
+        assert_eq!(reauth.code(), "unsupported_platform");
+        if root.exists() {
+            fs::remove_dir_all(root)?;
+        }
         Ok(())
     }
 
@@ -6867,13 +6990,13 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn write_test_codex_auth(home: &Path) -> Result<(), ProfileError> {
         let account_scope = Uuid::new_v4().to_string();
         write_test_codex_auth_for_scope(home, &account_scope)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn write_test_codex_auth_for_scope(
         home: &Path,
         account_scope: &str,
@@ -7035,12 +7158,12 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const fn test_identity_adapter() -> CodexIdentityAdapter {
         CodexIdentityAdapter::for_test()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn register_test_profile(registry: &Registry, alias: &str) -> Result<Profile, ProfileError> {
         let pending = registry.begin_codex_registration(alias)?;
         write_test_codex_auth(&pending.home())?;

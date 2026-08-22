@@ -211,7 +211,7 @@ impl Registry {
     ) -> Result<PendingCodexReauth<'_>, ProfileError> {
         self.recover_incomplete_removal()?;
         self.recover_incomplete_reauth()?;
-        ensure_registration_supported()?;
+        ensure_reauth_supported()?;
         let selected = self.find_without_recovery(Provider::Codex, alias)?;
         let (profile, lease) = self.lock_profile_current(&selected, Some(alias))?;
         let profile_directory = self.profile_directory(&profile)?;
@@ -272,7 +272,7 @@ impl Registry {
         }
         self.recover_incomplete_removal()?;
         self.recover_incomplete_reauth()?;
-        ensure_registration_supported()?;
+        ensure_reauth_supported()?;
         let selected = self.find_without_recovery(Provider::Claude, alias)?;
         let (profile, lease) = self.lock_profile_current(&selected, Some(alias))?;
         let profile_directory = self.profile_directory(&profile)?;

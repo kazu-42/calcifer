@@ -17,7 +17,7 @@ Calcifer is being built in narrow, reviewable slices. Dates are intentionally om
 - [x] Opaque profile IDs and normalized display-name validation
 - [x] Per-profile ownership marker and staging cleanup boundary
 - [x] Unix `0700`/`0600`, symlink/type checks, and atomic registry writes
-- [ ] Windows current-user-only ACL creation and validation (issue #141)
+- [x] Windows current-user-only ACL creation and validation (issue #141)
 - [ ] Owner-UID checks and hardened directory-relative filesystem operations (implemented for destructive profile removal; remaining storage paths still require migration; issue #142)
 - [x] OS advisory locks for the current single-profile operations
 - [ ] Deterministic multi-profile/session lock ordering (issue #143)
@@ -96,7 +96,7 @@ Calcifer will not ship automatic failover by scraping an unstable human string a
 - [x] Revalidate Anthropic's current public documentation and CLI surface (2026-08-13; see provider compatibility notes)
 - [x] Choose provider-managed `claude auth login` under isolated `CLAUDE_CONFIG_DIR` as the supported profile contract; keep setup-token ingestion behind a future OS credential-broker gate
 - [x] Implement and recovery-test Linux provider-managed profiles with exact `0600` credential-file validation and journaled atomic rotation
-- [ ] Keep Windows profile registration disabled until current-user-only ACL creation and recovery are verified (issue #147, blocked by #141)
+- [ ] Keep Claude Windows profile registration disabled until Claude-specific recovery is enabled (issue #147)
 - [ ] Keep macOS multi-profile registration disabled until Anthropic documents a config-directory-scoped Keychain namespace or another supported isolation mechanism (issue #148)
 - [x] Sanitize conflicting Claude authentication environment variables in the sealed Linux adapter boundary
 - [x] Keep direct subscription OAuth replication and undocumented refresh/Keychain conventions out of scope
