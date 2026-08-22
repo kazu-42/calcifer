@@ -784,7 +784,13 @@ impl Registry {
             return Ok(());
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let _artifacts_absent = preflight?;
+            return self.recover_stale_windows_removal_temporaries();
+        }
+
+        #[cfg(all(not(unix), not(windows)))]
         {
             let _artifacts_absent = preflight?;
             return Err(ProfileError::UnsupportedPlatform);
@@ -792,6 +798,30 @@ impl Registry {
 
         #[cfg(unix)]
         self.recover_incomplete_removal_unix()
+    }
+
+    #[cfg(windows)]
+    fn recover_stale_windows_removal_temporaries(&self) -> Result<(), ProfileError> {
+        if self.read_removal_barrier()?.is_some() || self.read_removal_journal()?.is_some() {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        if !self.removal_tombstones()?.is_empty() {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        private_directory_identity(&self.root)?;
+        let _removal_lock = self.lock_removal_exclusive()?;
+        let _registry_lock = self.lock_exclusive()?;
+        if self.read_removal_barrier()?.is_some() || self.read_removal_journal()?.is_some() {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        if !self.removal_tombstones()?.is_empty() {
+            return Err(ProfileError::RemovalRecoveryRequired);
+        }
+        let temporaries = self.removal_temporaries()?;
+        if temporaries.is_empty() {
+            return Ok(());
+        }
+        self.remove_stale_removal_temporary(&temporaries)
     }
 
     #[cfg(unix)]
@@ -1966,7 +1996,7 @@ impl Registry {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn remove_stale_removal_temporary(&self, temporaries: &[PathBuf]) -> Result<(), ProfileError> {
         if temporaries.len() != 1 {
             return Err(ProfileError::RemovalRecoveryRequired);
@@ -2518,7 +2548,20 @@ fn private_directory_identity(path: &Path) -> Result<FileSystemIdentity, Profile
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn private_directory_identity(path: &Path) -> Result<FileSystemIdentity, ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    verify_private_directory(path)?;
+    let directory = open_windows_directory_for_acl(path)?;
+    let (device, inode) = calcifer_windows_acl::volume_file_identity(directory.as_handle())
+        .map_err(|_| {
+            ProfileError::UnsafeState("managed directory identity could not be read".to_owned())
+        })?;
+    Ok(FileSystemIdentity { device, inode })
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn private_directory_identity(path: &Path) -> Result<FileSystemIdentity, ProfileError> {
     verify_private_directory(path)?;
     Err(ProfileError::UnsupportedPlatform)
@@ -5399,7 +5442,20 @@ pub(crate) fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> 
     open_verified_private_lock_file(path, true)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let mut options = private_open_options();
+    let file = options.read(true).write(true).create(true).open(path)?;
+    calcifer_windows_acl::apply_current_user_only(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })?;
+    verify_private_regular_file(path)?;
+    Ok(file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn open_private_lock_file(path: &Path) -> Result<File, ProfileError> {
     let mut options = private_open_options();
     let file = options.read(true).write(true).create(true).open(path)?;
@@ -5814,7 +5870,15 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), ProfileError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn sync_directory(path: &Path) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let directory = open_windows_directory_for_acl(path)?;
+    calcifer_windows_acl::flush(directory.as_handle()).map_err(ProfileError::Io)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn sync_directory(_path: &Path) -> Result<(), ProfileError> {
     Ok(())
 }
@@ -5980,6 +6044,28 @@ mod tests {
             .expect_err("Windows removal recovery must stay fail-closed");
         assert_eq!(error.code(), "removal_recovery_required");
         assert_eq!(fs::read(&temporary)?, sentinel);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_private_journal_temporary_is_removed_on_windows_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = env::temp_dir().join(format!(
+            "calcifer-windows-stale-temp-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        super::secure_create_dir(&root)?;
+        let temporary = root.join(format!(".{REMOVAL_JOURNAL_FILE}.{}.tmp", Uuid::new_v4()));
+        drop(super::create_new_private_file(&temporary)?);
+
+        Registry::at(root.clone()).recover_incomplete_removal()?;
+        assert!(
+            !temporary.exists(),
+            "the stale private journal temporary must be removed"
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
