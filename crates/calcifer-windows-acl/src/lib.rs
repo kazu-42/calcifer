@@ -16,11 +16,11 @@ use std::ptr::{self, NonNull};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, FALSE, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_KERNEL_OBJECT, SetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, CopySid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-    GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    ACL, AclSizeInformation, CopySid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+    GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
     GetSecurityDescriptorOwner, GetTokenInformation, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY, TokenUser,
 };
@@ -138,7 +138,7 @@ pub fn apply_current_user_only(handle: BorrowedHandle<'_>) -> io::Result<()> {
     }
     let mut dacl_present = FALSE;
     let mut dacl_defaulted = FALSE;
-    let mut dacl: *mut c_void = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
     let got_dacl = unsafe {
         GetSecurityDescriptorDacl(
             descriptor.as_ptr(),
@@ -156,7 +156,7 @@ pub fn apply_current_user_only(handle: BorrowedHandle<'_>) -> io::Result<()> {
     let status = unsafe {
         SetSecurityInfo(
             handle.as_raw_handle() as HANDLE,
-            SE_KERNEL_OBJECT,
+            SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION
                 | DACL_SECURITY_INFORMATION
                 | PROTECTED_DACL_SECURITY_INFORMATION,
@@ -176,12 +176,12 @@ pub fn apply_current_user_only(handle: BorrowedHandle<'_>) -> io::Result<()> {
 pub fn verify_current_user_only(handle: BorrowedHandle<'_>) -> io::Result<()> {
     let expected = current_user_sid()?;
     let mut owner: *mut c_void = ptr::null_mut();
-    let mut dacl: *mut c_void = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
     let mut security: *mut c_void = ptr::null_mut();
     let status = unsafe {
         GetSecurityInfo(
             handle.as_raw_handle() as HANDLE,
-            SE_KERNEL_OBJECT,
+            SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
             ptr::null_mut(),
@@ -225,7 +225,7 @@ pub fn verify_current_user_only(handle: BorrowedHandle<'_>) -> io::Result<()> {
 }
 
 fn verify_single_current_user_allow_ace(
-    dacl: *mut c_void,
+    dacl: *mut ACL,
     expected_sid: *mut c_void,
 ) -> io::Result<()> {
     let mut size_info = AclSizeInfo {
