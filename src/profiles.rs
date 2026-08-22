@@ -6913,7 +6913,9 @@ mod tests {
             .err()
             .ok_or("Windows Codex reauth must stay fail-closed")?;
         assert_eq!(reauth.code(), "unsupported_platform");
-        fs::remove_dir_all(root)?;
+        if root.exists() {
+            fs::remove_dir_all(root)?;
+        }
         Ok(())
     }
 
