@@ -5983,42 +5983,58 @@ fn verify_received_lock_ownership(
     }
 }
 
+fn lock_busy_or_io(error: io::Error, reference: &str) -> ProfileError {
+    if error.kind() == io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+    {
+        ProfileError::Busy(reference.to_owned())
+    } else {
+        ProfileError::Io(error)
+    }
+}
+
 fn lock_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
     let file = open_private_lock_file(path)?;
-    FileExt::try_lock_exclusive(&file).map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            ProfileError::Busy(reference.to_owned())
-        } else {
-            ProfileError::Io(error)
-        }
-    })?;
+    FileExt::try_lock_exclusive(&file).map_err(|error| lock_busy_or_io(error, reference))?;
     Ok(file)
 }
 
 #[cfg(unix)]
 fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
     let file = open_existing_private_lock_file(path)?;
-    FileExt::try_lock_exclusive(&file).map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            ProfileError::Busy(reference.to_owned())
-        } else {
-            ProfileError::Io(error)
-        }
-    })?;
+    FileExt::try_lock_exclusive(&file).map_err(|error| lock_busy_or_io(error, reference))?;
     Ok(file)
 }
 
 #[cfg(windows)]
 fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
+    use std::os::windows::io::AsHandle;
+
     verify_private_single_link_regular_file(path)?;
     let file = open_windows_file_for_acl(path)?;
-    FileExt::try_lock_exclusive(&file).map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            ProfileError::Busy(reference.to_owned())
-        } else {
-            ProfileError::Io(error)
-        }
+    calcifer_windows_acl::verify_current_user_only(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
     })?;
+    let opened = calcifer_windows_acl::inspect(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed file identity could not be read".to_owned())
+    })?;
+    let visible = open_windows_file_for_acl(path)?;
+    let visible_identity = calcifer_windows_acl::inspect(visible.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed file identity could not be read".to_owned())
+    })?;
+    if opened.volume_serial != visible_identity.volume_serial
+        || opened.file_index != visible_identity.file_index
+        || opened.is_reparse_point()
+        || visible_identity.is_reparse_point()
+        || opened.is_directory()
+        || opened.link_count != 1
+        || visible_identity.link_count != 1
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed lock changed while it was opened".to_owned(),
+        ));
+    }
+    FileExt::try_lock_exclusive(&file).map_err(|error| lock_busy_or_io(error, reference))?;
     Ok(file)
 }
 
