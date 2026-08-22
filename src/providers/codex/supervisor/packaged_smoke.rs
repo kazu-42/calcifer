@@ -12039,6 +12039,12 @@ impl OfficialTuiPackageHarness {
             harness.coordinator = Some(child);
             harness.generation_cleanup = Some(PackageGenerationCleanupEvidence::default());
             harness.generation_deadline_fence = Some(generation_deadline_fence);
+            if harness.provider_target == PackageProviderTarget::DeterministicFixture
+                && harness.recovery_checkpoint.is_some()
+            {
+                let report = harness.root()?.join("supervisor-report");
+                harness.observe_guardian_startup_arm(&report)?;
+            }
             setup_phase = PackageHarnessSetupPhase::InitialPtyWrite;
             write_package_pty_input(
                 harness.master()?,
@@ -12446,6 +12452,7 @@ impl OfficialTuiPackageHarness {
                     PACKAGE_SUPERVISOR_EXIT_INPUT,
                 ]
                 .concat();
+                let mut transcript_existed = false;
                 let initial_gate = self
                     .coordinator
                     .as_mut()
@@ -12494,6 +12501,7 @@ impl OfficialTuiPackageHarness {
                         &report.join("input.live"),
                         PACKAGE_SUPERVISOR_INITIAL_INPUT,
                         deadline,
+                        &mut transcript_existed,
                     ),
                 )?;
                 let inference = self
@@ -12541,6 +12549,7 @@ impl OfficialTuiPackageHarness {
                         &report.join("input.live"),
                         &complete_input_transcript,
                         deadline,
+                        &mut transcript_existed,
                     ),
                 )?;
             }
@@ -12608,6 +12617,7 @@ impl OfficialTuiPackageHarness {
             return Err("pre-ready input crossed the production input gate".into());
         }
         record_package_exercise_phase(&report, PackageExercisePhase::PreReadyInputBlocked);
+        let mut transcript_existed = true;
 
         // Codex 0.144.x runs terminal capability probes after raw mode and
         // intentionally discards unrelated input observed during that
@@ -12627,6 +12637,7 @@ impl OfficialTuiPackageHarness {
             &report.join("input.live"),
             PACKAGE_SUPERVISOR_INITIAL_INPUT,
             exercise_deadline(IO_TIMEOUT)?,
+            &mut transcript_existed,
         )?;
         record_package_exercise_phase(&report, PackageExercisePhase::InitialInputObserved);
 
@@ -12798,6 +12809,7 @@ impl OfficialTuiPackageHarness {
             &report.join("input.live"),
             &complete_input_transcript,
             exercise_deadline(IO_TIMEOUT)?,
+            &mut transcript_existed,
         )?;
         record_package_exercise_phase(&report, PackageExercisePhase::ExitInputObserved);
 
@@ -15660,6 +15672,7 @@ fn package_live_input_transcript_retries_only_a_concurrent_snapshot_change()
     wait_for_package_input_transcript_with_reader(
         expected,
         Instant::now() + Duration::from_secs(1),
+        &mut false,
         || {
             reads
                 .pop_front()
@@ -15673,6 +15686,7 @@ fn package_live_input_transcript_retries_only_a_concurrent_snapshot_change()
         wait_for_package_input_transcript_with_reader(
             expected,
             Instant::now() + Duration::from_secs(1),
+            &mut false,
             || {
                 unsafe_reads = unsafe_reads.saturating_add(1);
                 Err(std::io::Error::new(
@@ -15700,6 +15714,7 @@ fn package_live_input_transcript_retries_absent_file_until_the_exact_payload()
     wait_for_package_input_transcript_with_reader(
         expected,
         Instant::now() + Duration::from_secs(1),
+        &mut false,
         || {
             reads
                 .pop_front()
@@ -15722,10 +15737,12 @@ fn package_live_input_transcript_rejects_not_found_after_the_file_existed()
         Ok(expected.to_vec()),
     ]);
     let mut observed = 0_u8;
+    let mut transcript_existed = false;
     let error = require_rejected_test_result(
         wait_for_package_input_transcript_with_reader(
             expected,
             Instant::now() + Duration::from_secs(1),
+            &mut transcript_existed,
             || {
                 observed = observed.saturating_add(1);
                 reads
@@ -15741,6 +15758,29 @@ fn package_live_input_transcript_rejects_not_found_after_the_file_existed()
         .ok_or("vanished transcript did not preserve NotFound")?;
     assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
     assert_eq!(reads.len(), 1);
+    assert!(transcript_existed);
+
+    let mut later_reads = 0_u8;
+    let later = require_rejected_test_result(
+        wait_for_package_input_transcript_with_reader(
+            expected,
+            Instant::now() + Duration::from_secs(1),
+            &mut transcript_existed,
+            || {
+                later_reads = later_reads.saturating_add(1);
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+        ),
+        "a later wait retried NotFound after an earlier wait had seen the file",
+    )?;
+    assert_eq!(later_reads, 1);
+    assert_eq!(
+        later
+            .downcast_ref::<std::io::Error>()
+            .ok_or("later wait did not preserve NotFound")?
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
     Ok(())
 }
 
@@ -16717,22 +16757,26 @@ fn wait_for_package_input_transcript(
     path: &Path,
     expected: &[u8],
     deadline: Instant,
+    observed_existing_file: &mut bool,
 ) -> Result<(), Box<dyn Error>> {
-    wait_for_package_input_transcript_with_reader(expected, deadline, || {
-        read_private_bounded(path, 128 * 1024)
-    })
+    wait_for_package_input_transcript_with_reader(
+        expected,
+        deadline,
+        observed_existing_file,
+        || read_private_bounded(path, 128 * 1024),
+    )
 }
 
 fn wait_for_package_input_transcript_with_reader(
     expected: &[u8],
     deadline: Instant,
+    observed_existing_file: &mut bool,
     mut read: impl FnMut() -> std::io::Result<Vec<u8>>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut observed_existing_file = false;
     loop {
         match read() {
             Ok(bytes) => {
-                observed_existing_file = true;
+                *observed_existing_file = true;
                 match classify_package_input_transcript(&bytes, expected) {
                     PackageInputTranscriptProgress::Exact => return Ok(()),
                     PackageInputTranscriptProgress::Diverged => {
@@ -16752,7 +16796,7 @@ fn wait_for_package_input_transcript_with_reader(
             // immediately fatal.
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound && !observed_existing_file => {}
+                if error.kind() == std::io::ErrorKind::NotFound && !*observed_existing_file => {}
             Err(error) => {
                 return Err(error.into());
             }
