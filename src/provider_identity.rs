@@ -396,12 +396,12 @@ fn normalize_key_error(error: IdentityError) -> IdentityError {
     IdentityError::KeyUnavailable
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const fn ensure_identity_supported() -> Result<(), IdentityError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 const fn ensure_identity_supported() -> Result<(), IdentityError> {
     Err(IdentityError::Unsupported)
 }
@@ -467,11 +467,30 @@ fn atomic_publish_private_with_sync(
 }
 
 fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), IdentityError> {
-    let mut options = private_open_options();
-    let mut file = options.write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    verify_identity_file(path)
+    #[cfg(windows)]
+    {
+        let mut file =
+            crate::profiles::create_new_private_file(path).map_err(identity_io_or_invalid)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        return verify_identity_file(path);
+    }
+    #[cfg(not(windows))]
+    {
+        let mut options = private_open_options();
+        let mut file = options.write(true).create_new(true).open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        verify_identity_file(path)
+    }
+}
+
+#[cfg(windows)]
+fn identity_io_or_invalid(error: crate::profiles::ProfileError) -> IdentityError {
+    match error {
+        crate::profiles::ProfileError::Io(error) => IdentityError::Io(error),
+        _ => IdentityError::Invalid,
+    }
 }
 
 #[cfg(unix)]
@@ -503,7 +522,12 @@ fn verify_identity_directory(path: &Path) -> Result<(), IdentityError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_identity_directory(path: &Path) -> Result<(), IdentityError> {
+    crate::profiles::verify_private_directory(path).map_err(identity_io_or_invalid)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn verify_identity_directory(path: &Path) -> Result<(), IdentityError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -528,7 +552,12 @@ fn verify_identity_file(path: &Path) -> Result<(), IdentityError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_identity_file(path: &Path) -> Result<(), IdentityError> {
+    crate::profiles::verify_private_regular_file(path).map_err(identity_io_or_invalid)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn verify_identity_file(path: &Path) -> Result<(), IdentityError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -543,7 +572,12 @@ fn sync_directory(path: &Path) -> Result<(), IdentityError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), IdentityError> {
+    crate::profiles::sync_directory(path).map_err(identity_io_or_invalid)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn sync_directory(_path: &Path) -> Result<(), IdentityError> {
     Ok(())
 }
@@ -605,7 +639,7 @@ mod tests {
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn private_fingerprint_is_stable_without_persisting_provider_scope()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -641,7 +675,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn missing_key_is_not_recreated_over_existing_bindings()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -660,7 +694,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn malformed_auth_is_redacted_and_never_publishes_a_marker()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -856,6 +890,12 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(path)
     }
 
+    #[cfg(windows)]
+    fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+        crate::profiles::secure_create_dir(path)
+            .map_err(|error| std::io::Error::other(error.code()))
+    }
+
     #[cfg(unix)]
     fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
@@ -870,7 +910,17 @@ mod tests {
         file.sync_all()
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut file = crate::profiles::create_new_private_file(path)
+            .map_err(|error| std::io::Error::other(error.code()))?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+
+    #[cfg(any(unix, windows))]
     fn write_auth(home: &std::path::Path, scope: &str) -> std::io::Result<()> {
         let document = serde_json::json!({
             "auth_mode": "chatgpt",
@@ -889,7 +939,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(unix), not(windows)))]
 mod non_unix_tests {
     use std::path::Path;
 
