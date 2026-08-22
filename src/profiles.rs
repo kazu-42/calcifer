@@ -658,7 +658,7 @@ impl Registry {
     /// metadata lock. The registry rename that removes the immutable profile ID
     /// is the public visibility point. Credentials are recursively unlinked only
     /// after readback proves that visibility point completed.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn remove(
         &self,
         provider: Provider,
@@ -667,6 +667,7 @@ impl Registry {
     ) -> Result<Profile, ProfileError> {
         self.recover_incomplete_removal()?;
         self.recover_incomplete_reauth()?;
+        #[cfg(unix)]
         ensure_registration_supported()?;
         let selected = self.find_without_recovery(provider, alias)?;
         if confirmed_profile_id.is_some_and(|expected_id| expected_id != selected.id) {
@@ -710,6 +711,13 @@ impl Registry {
         self.save_removal_barrier(&barrier)?;
         self.write_removal_journal(&journal)?;
 
+        // Windows cannot rename or unlink a tree while this process still holds
+        // the lifetime lock files. The barrier and removal lock already exclude
+        // concurrent recover/remove; dropping A/B here lets the tombstone walk
+        // proceed. Unix unlinks open names, so it keeps the lease until return.
+        #[cfg(windows)]
+        drop(_profile_lease);
+
         let tombstone = self.tombstone_path(&selected)?;
         if path_exists(&tombstone)? {
             return Err(ProfileError::RemovalRecoveryRequired);
@@ -751,7 +759,7 @@ impl Registry {
         Ok(selected)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     pub(crate) fn remove(
         &self,
         _provider: Provider,
@@ -787,7 +795,7 @@ impl Registry {
         #[cfg(windows)]
         {
             let _artifacts_absent = preflight?;
-            return self.recover_stale_windows_removal_temporaries();
+            return self.recover_incomplete_removal_journaled();
         }
 
         #[cfg(all(not(unix), not(windows)))]
@@ -797,35 +805,11 @@ impl Registry {
         }
 
         #[cfg(unix)]
-        self.recover_incomplete_removal_unix()
+        self.recover_incomplete_removal_journaled()
     }
 
-    #[cfg(windows)]
-    fn recover_stale_windows_removal_temporaries(&self) -> Result<(), ProfileError> {
-        if self.read_removal_barrier()?.is_some() || self.read_removal_journal()?.is_some() {
-            return Err(ProfileError::RemovalRecoveryRequired);
-        }
-        if !self.removal_tombstones()?.is_empty() {
-            return Err(ProfileError::RemovalRecoveryRequired);
-        }
-        private_directory_identity(&self.root)?;
-        let _removal_lock = self.lock_removal_exclusive()?;
-        let _registry_lock = self.lock_exclusive()?;
-        if self.read_removal_barrier()?.is_some() || self.read_removal_journal()?.is_some() {
-            return Err(ProfileError::RemovalRecoveryRequired);
-        }
-        if !self.removal_tombstones()?.is_empty() {
-            return Err(ProfileError::RemovalRecoveryRequired);
-        }
-        let temporaries = self.removal_temporaries()?;
-        if temporaries.is_empty() {
-            return Ok(());
-        }
-        self.remove_stale_removal_temporary(&temporaries)
-    }
-
-    #[cfg(unix)]
-    fn recover_incomplete_removal_unix(&self) -> Result<(), ProfileError> {
+    #[cfg(any(unix, windows))]
+    fn recover_incomplete_removal_journaled(&self) -> Result<(), ProfileError> {
         // Wait for a live remover to finish, then take one consistent artifact
         // snapshot while it cannot unlink the journal between verification and
         // open. Release this gate before taking a profile lease to preserve the
@@ -1815,7 +1799,7 @@ impl Registry {
         Ok(roots)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn lock_removal_tree(
         &self,
         path: &Path,
@@ -2007,7 +1991,7 @@ impl Registry {
         sync_directory(&self.root)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn finish_visible_removal(
         &self,
         _removal_lock: &RegistryLock,
@@ -5651,6 +5635,12 @@ const WINDOWS_GENERIC_WRITE: u32 = 0x4000_0000;
 const WINDOWS_WRITE_DAC: u32 = 0x0004_0000;
 #[cfg(windows)]
 const WINDOWS_WRITE_OWNER: u32 = 0x0008_0000;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_WRITE: u32 = 0x0000_0002;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_DELETE: u32 = 0x0000_0004;
 
 #[cfg(windows)]
 fn open_windows_directory_for_acl(path: &Path) -> Result<File, ProfileError> {
@@ -5662,6 +5652,7 @@ fn open_windows_directory_for_acl(path: &Path) -> Result<File, ProfileError> {
         .access_mode(
             WINDOWS_GENERIC_READ | WINDOWS_GENERIC_WRITE | WINDOWS_WRITE_DAC | WINDOWS_WRITE_OWNER,
         )
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE)
         .open(path)
         .map_err(ProfileError::Io)
 }
@@ -5718,6 +5709,8 @@ fn private_open_options() -> OpenOptions {
     options.access_mode(
         WINDOWS_GENERIC_READ | WINDOWS_GENERIC_WRITE | WINDOWS_WRITE_DAC | WINDOWS_WRITE_OWNER,
     );
+    options
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE);
     options
 }
 
@@ -6006,28 +5999,58 @@ fn verify_received_lock_ownership(
     }
 }
 
+fn lock_busy_or_io(error: io::Error, reference: &str) -> ProfileError {
+    if error.kind() == io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+    {
+        ProfileError::Busy(reference.to_owned())
+    } else {
+        ProfileError::Io(error)
+    }
+}
+
 fn lock_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
     let file = open_private_lock_file(path)?;
-    FileExt::try_lock_exclusive(&file).map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            ProfileError::Busy(reference.to_owned())
-        } else {
-            ProfileError::Io(error)
-        }
-    })?;
+    FileExt::try_lock_exclusive(&file).map_err(|error| lock_busy_or_io(error, reference))?;
     Ok(file)
 }
 
 #[cfg(unix)]
 fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
     let file = open_existing_private_lock_file(path)?;
-    FileExt::try_lock_exclusive(&file).map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            ProfileError::Busy(reference.to_owned())
-        } else {
-            ProfileError::Io(error)
-        }
+    FileExt::try_lock_exclusive(&file).map_err(|error| lock_busy_or_io(error, reference))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    verify_private_single_link_regular_file(path)?;
+    let file = open_windows_file_for_acl(path)?;
+    calcifer_windows_acl::verify_current_user_only(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
     })?;
+    let opened = calcifer_windows_acl::inspect(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed file identity could not be read".to_owned())
+    })?;
+    let visible = open_windows_file_for_acl(path)?;
+    let visible_identity = calcifer_windows_acl::inspect(visible.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed file identity could not be read".to_owned())
+    })?;
+    if opened.volume_serial != visible_identity.volume_serial
+        || opened.file_index != visible_identity.file_index
+        || opened.is_reparse_point()
+        || visible_identity.is_reparse_point()
+        || opened.is_directory()
+        || opened.link_count != 1
+        || visible_identity.link_count != 1
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed lock changed while it was opened".to_owned(),
+        ));
+    }
+    FileExt::try_lock_exclusive(&file).map_err(|error| lock_busy_or_io(error, reference))?;
     Ok(file)
 }
 
@@ -6099,6 +6122,7 @@ fn open_windows_file_for_acl(path: &Path) -> Result<File, ProfileError> {
         .access_mode(
             WINDOWS_GENERIC_READ | WINDOWS_GENERIC_WRITE | WINDOWS_WRITE_DAC | WINDOWS_WRITE_OWNER,
         )
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE)
         .open(path)
         .map_err(ProfileError::Io)
 }
@@ -6714,6 +6738,60 @@ mod tests {
         assert_eq!(error.code(), "unsafe_profile_state");
         assert_eq!(fs::read(nested.join("sentinel"))?, b"must-survive");
 
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn windows_registered_profile(
+        test_name: &str,
+    ) -> Result<(PathBuf, Registry, Profile), Box<dyn std::error::Error>> {
+        let (root, _, _, profile_id, _) = windows_owned_profile_tree(test_name)?;
+        let registry = Registry::at(root.clone());
+        let profile = Profile {
+            id: profile_id,
+            alias: "work".to_owned(),
+            provider: Provider::Codex,
+            created_at: unix_timestamp()?,
+        };
+        registry.save(&RegistryDocument {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            profiles: vec![profile.clone()],
+        })?;
+        Ok((root, registry, profile))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_journaled_remove_unlinks_an_owned_profile() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (root, registry, profile) = windows_registered_profile("windows-journaled-remove")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        assert_eq!(registry.remove(Provider::Codex, "work", None)?, profile);
+        assert!(
+            !profile_directory.exists(),
+            "the removed profile directory must be gone"
+        );
+        assert!(
+            !root.join(REMOVAL_JOURNAL_FILE).exists(),
+            "the removal journal must be consumed"
+        );
+        assert!(registry.load()?.profiles.is_empty());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_registration_stays_unsupported_after_owned_tree_removal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root("windows-registration-closed");
+        secure_create_dir(&root)?;
+        let error = Registry::at(root.clone())
+            .begin_codex_registration("work")
+            .err()
+            .ok_or("Windows auth add must stay fail-closed")?;
+        assert_eq!(error.code(), "unsupported_platform");
         fs::remove_dir_all(root)?;
         Ok(())
     }
