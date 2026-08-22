@@ -97,6 +97,7 @@ version = "0.1.0-alpha.5"
 dependencies = [
  "calcifer-macos-acl",
  "calcifer-unix-child-fd",
+ "calcifer-windows-acl",
  "clap",
  "exacl",
  "fs2",
@@ -128,6 +129,13 @@ name = "calcifer-unix-child-fd"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "calcifer-windows-acl"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -51,8 +51,17 @@ path = "tests/supervisor.rs"
 required-features = ["internal-supervisor-fixture"]
 
 [workspace]
-members = ["crates/calcifer-macos-acl", "crates/calcifer-unix-child-fd"]
-default-members = [".", "crates/calcifer-macos-acl", "crates/calcifer-unix-child-fd"]
+members = [
+    "crates/calcifer-macos-acl",
+    "crates/calcifer-unix-child-fd",
+    "crates/calcifer-windows-acl",
+]
+default-members = [
+    ".",
+    "crates/calcifer-macos-acl",
+    "crates/calcifer-unix-child-fd",
+    "crates/calcifer-windows-acl",
+]
 resolver = "3"
 
 [dependencies]
@@ -88,6 +97,9 @@ tungstenite = { version = "0.30.0", optional = true, default-features = false, f
 [target.'cfg(target_os = "macos")'.dependencies]
 calcifer-macos-acl = { version = "0.1.0", path = "crates/calcifer-macos-acl" }
 exacl = "0.13.0"
+
+[target.'cfg(windows)'.dependencies]
+calcifer-windows-acl = { version = "0.1.0", path = "crates/calcifer-windows-acl" }
 
 [lints.rust]
 unsafe_code = "forbid"

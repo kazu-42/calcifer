@@ -5187,7 +5187,28 @@ fn verify_deletable_macos_flags_stat(_stat: &rustix::fs::Stat) -> Result<(), Pro
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsHandle;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(ProfileError::UnsafeState(
+            "managed directory is not a real directory".to_owned(),
+        ));
+    }
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    calcifer_windows_acl::verify_current_user_only(directory.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -5207,7 +5228,20 @@ fn private_open_options() -> OpenOptions {
     options
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn private_open_options() -> OpenOptions {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    let mut options = OpenOptions::new();
+    options.access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER);
+    options
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn private_open_options() -> OpenOptions {
     OpenOptions::new()
 }
@@ -5242,7 +5276,17 @@ fn prepare_new_private_file(path: &Path, file: &File) -> Result<(), ProfileError
     verify_private_regular_file_handle(path, file)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn prepare_new_private_file(path: &Path, file: &File) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    calcifer_windows_acl::apply_current_user_only(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })?;
+    verify_private_regular_file_handle(path, file)
+}
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 fn prepare_new_private_file(path: &Path, _file: &File) -> Result<(), ProfileError> {
     verify_private_regular_file(path)
 }
@@ -5552,7 +5596,23 @@ pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileErro
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ProfileError::UnsafeState(
+            "managed file is not a regular file".to_owned(),
+        ));
+    }
+    let file = OpenOptions::new().read(true).open(path)?;
+    calcifer_windows_acl::verify_current_user_only(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -5787,7 +5847,53 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    #[test]
+    fn unverified_windows_directory_recovery_preserves_a_journal_temporary() {
+        let root = env::temp_dir().join(format!(
+            "calcifer-windows-removal-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("temporary root must be created");
+        let temporary = root.join(format!(".{REMOVAL_JOURNAL_FILE}.{}.tmp", Uuid::new_v4()));
+        let sentinel = b"windows-removal-artifact-must-survive";
+        fs::write(&temporary, sentinel).expect("temporary journal must be written");
+
+        let error = Registry::at(root.clone())
+            .recover_incomplete_removal()
+            .expect_err("a default NTFS directory must fail closed before removal recovery");
+
+        assert_eq!(error.code(), "unsafe_profile_state");
+        assert_eq!(
+            fs::read(&temporary).expect("temporary journal must remain readable"),
+            sentinel
+        );
+        fs::remove_dir_all(root).expect("temporary root must be removed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_new_private_file_applies_a_current_user_only_acl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::io::AsHandle;
+
+        let root = env::temp_dir().join(format!(
+            "calcifer-windows-private-file-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&root)?;
+        let path = root.join("private.bin");
+        let file = super::create_new_private_file(&path)?;
+        calcifer_windows_acl::verify_current_user_only(file.as_handle())?;
+        drop(file);
+        super::verify_private_regular_file(&path)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
     #[test]
     fn unsupported_platform_recovery_preserves_a_journal_temporary() {
         let root = env::temp_dir().join(format!(
