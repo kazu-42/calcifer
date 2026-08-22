@@ -55,7 +55,6 @@ const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 const FILE_OPEN: u32 = 0x0000_0001;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
-const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
 const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -340,13 +339,13 @@ pub fn open_nofollow_child(
     };
     let mut handle = ptr::null_mut();
     let mut io_status = IO_STATUS_BLOCK::default();
+    // FILE_SYNCHRONOUS_IO_NONALERT is omitted: rustc/Go both open reparse
+    // points without a synchronous CreateOptions bit, and combining the two
+    // can return STATUS_INVALID_PARAMETER.
     let create_options = if directory {
-        FILE_DIRECTORY_FILE
-            | FILE_SYNCHRONOUS_IO_NONALERT
-            | FILE_OPEN_FOR_BACKUP_INTENT
-            | FILE_OPEN_REPARSE_POINT
+        FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT
     } else {
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT
     };
     let access = GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
     let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -423,15 +422,17 @@ pub fn read_directory_entries(
     max_entries: usize,
 ) -> io::Result<Vec<DirectoryEntry>> {
     let mut entries = Vec::new();
-    let mut buffer = vec![0_u8; 16 * 1024];
+    // GetFileInformationByHandleEx requires FILE_FULL_DIR_INFO alignment.
+    let mut words = vec![0_u64; 16 * 1024 / 8];
     let mut class = FileFullDirectoryRestartInfo;
     loop {
+        let byte_len = words.len().saturating_mul(8);
         let ok = unsafe {
             GetFileInformationByHandleEx(
                 parent.as_raw_handle() as HANDLE,
                 class,
-                buffer.as_mut_ptr().cast(),
-                u32::try_from(buffer.len()).map_err(|_| {
+                words.as_mut_ptr().cast(),
+                u32::try_from(byte_len).map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "windows directory listing overflowed",
@@ -443,8 +444,8 @@ pub fn read_directory_entries(
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(ERROR_NO_MORE_FILES) => break,
-                Some(ERROR_MORE_DATA) if buffer.len() < 256 * 1024 => {
-                    buffer.resize(buffer.len().saturating_mul(2), 0);
+                Some(ERROR_MORE_DATA) if byte_len < 256 * 1024 => {
+                    words.resize(words.len().saturating_mul(2), 0);
                     class = FileFullDirectoryRestartInfo;
                     entries.clear();
                     continue;
@@ -452,7 +453,8 @@ pub fn read_directory_entries(
                 _ => return Err(error),
             }
         }
-        append_directory_entries(&buffer, &mut entries, max_entries)?;
+        let buffer = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), byte_len) };
+        append_directory_entries(buffer, &mut entries, max_entries)?;
         class = FileFullDirectoryInfo;
     }
     Ok(entries)
