@@ -2519,7 +2519,30 @@ fn append_macos_mount_field(
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn removal_mount_identity_path(path: &Path) -> Result<RemovalMountIdentity, ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let directory = open_windows_directory_for_acl(path)?;
+    let identity = calcifer_windows_acl::inspect(directory.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("platform cannot prove the managed mount boundary".to_owned())
+    })?;
+    if identity.is_reparse_point() || !identity.is_directory() {
+        return Err(ProfileError::UnsafeState(
+            "platform cannot prove the managed mount boundary".to_owned(),
+        ));
+    }
+    Ok(windows_mount_identity(identity.volume_serial))
+}
+
+#[cfg(windows)]
+fn windows_mount_identity(volume_serial: u64) -> RemovalMountIdentity {
+    RemovalMountIdentity {
+        token: volume_serial.to_le_bytes().to_vec(),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn removal_mount_identity_path(_path: &Path) -> Result<RemovalMountIdentity, ProfileError> {
     Err(ProfileError::UnsupportedPlatform)
 }
@@ -2581,12 +2604,57 @@ fn verify_private_single_link_regular_file(path: &Path) -> Result<(), ProfileErr
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_private_single_link_regular_file(path: &Path) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    verify_private_regular_file(path)?;
+    let file = open_windows_file_for_acl(path)?;
+    let identity = calcifer_windows_acl::inspect(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed file identity could not be read".to_owned())
+    })?;
+    if identity.is_reparse_point() || identity.is_directory() || identity.link_count != 1 {
+        return Err(ProfileError::UnsafeState(
+            "managed file ownership is unsafe".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn verify_private_single_link_regular_file(path: &Path) -> Result<(), ProfileError> {
     verify_private_regular_file(path)
 }
 
-#[cfg(unix)]
+fn validate_removal_tree_location(
+    data_root: &Path,
+    roots: &RemovalRoots,
+    path: &Path,
+    profile_id: &str,
+) -> Result<(), ProfileError> {
+    validate_profile_id(profile_id)
+        .map_err(|_| ProfileError::UnsafeState("profile removal ID is invalid".to_owned()))?;
+    let expected_name = profile_id;
+    let expected_tombstone = format!(".removing-{profile_id}");
+    let name = path.file_name().and_then(|name| name.to_str());
+    if path.parent()
+        != Some(
+            data_root
+                .join("profiles")
+                .join(roots.provider.as_str())
+                .as_path(),
+        )
+        || !path.starts_with(data_root)
+        || !matches!(name, Some(value) if value == expected_name || value == expected_tombstone)
+    {
+        return Err(ProfileError::UnsafeState(
+            "profile removal path is outside its managed provider root".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
 fn validate_owned_removal_tree(
     data_root: &Path,
     roots: &RemovalRoots,
@@ -2605,7 +2673,7 @@ fn validate_owned_removal_tree(
     Ok(snapshot)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn validate_partial_owned_tombstone(
     data_root: &Path,
     roots: &RemovalRoots,
@@ -2617,7 +2685,7 @@ fn validate_partial_owned_tombstone(
         .map(|snapshot| snapshot.root)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn validate_owned_removal_tree_inner(
     data_root: &Path,
     roots: &RemovalRoots,
@@ -2653,25 +2721,7 @@ fn validate_owned_removal_tree_inner_with_limits(
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
-    validate_profile_id(profile_id)
-        .map_err(|_| ProfileError::UnsafeState("profile removal ID is invalid".to_owned()))?;
-    let expected_name = profile_id;
-    let expected_tombstone = format!(".removing-{profile_id}");
-    let name = path.file_name().and_then(|name| name.to_str());
-    if path.parent()
-        != Some(
-            data_root
-                .join("profiles")
-                .join(roots.provider.as_str())
-                .as_path(),
-        )
-        || !path.starts_with(data_root)
-        || !matches!(name, Some(value) if value == expected_name || value == expected_tombstone)
-    {
-        return Err(ProfileError::UnsafeState(
-            "profile removal path is outside its managed provider root".to_owned(),
-        ));
-    }
+    validate_removal_tree_location(data_root, roots, path, profile_id)?;
     let identity = private_directory_identity(path)?;
     if identity.device != roots.provider_root.device
         || expected.is_some_and(|expected| expected != identity)
@@ -2793,6 +2843,196 @@ fn validate_owned_removal_tree_inner_with_limits(
     })
 }
 
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn validate_owned_removal_tree_inner_with_limits(
+    data_root: &Path,
+    roots: &RemovalRoots,
+    path: &Path,
+    profile_id: &str,
+    expected: Option<FileSystemIdentity>,
+    require_marker: bool,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<RemovalTreeSnapshot, ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    validate_removal_tree_location(data_root, roots, path, profile_id)?;
+    let root_directory = open_windows_directory_for_acl(path)?;
+    let root_opened =
+        verify_windows_removal_node(root_directory.as_handle(), true, roots.provider_root.device)?;
+    let identity = windows_file_system_identity(root_opened)?;
+    if identity.device != roots.provider_root.device
+        || expected.is_some_and(|expected| expected != identity)
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree was replaced".to_owned(),
+        ));
+    }
+    ensure_same_removal_mount(
+        &roots.provider_mount,
+        &windows_mount_identity(root_opened.volume_serial),
+    )?;
+
+    let mut manifest = Sha256::new();
+    manifest.update(b"calcifer-removal-tree-manifest-v1\0");
+    update_windows_removal_manifest(&mut manifest, Path::new(""), &root_opened)?;
+
+    let mut pending = Vec::new();
+    try_reserve_removal_slot(&mut pending)?;
+    pending.push((root_directory, PathBuf::new(), 0_usize));
+    let mut budget = RemovalTraversalBudget::new(max_entries, max_depth);
+    while let Some((directory, relative, depth)) = pending.pop() {
+        let mut entries = calcifer_windows_acl::read_directory_entries(
+            directory.as_handle(),
+            budget.remaining_entries,
+        )
+        .map_err(windows_removal_open_error)?;
+        entries.sort_by(|left, right| {
+            left.name
+                .as_encoded_bytes()
+                .cmp(right.name.as_encoded_bytes())
+        });
+        let mut child_directories = Vec::new();
+        for entry in entries {
+            budget.consume_entry()?;
+            if entry.is_reparse_point() {
+                return Err(ProfileError::UnsafeState(
+                    "managed profile tree contains unsafe state".to_owned(),
+                ));
+            }
+            let child_relative = if relative.as_os_str().is_empty() {
+                PathBuf::from(&entry.name)
+            } else {
+                relative.join(&entry.name)
+            };
+            let child = calcifer_windows_acl::open_nofollow_child(
+                directory.as_handle(),
+                &entry.name,
+                entry.is_directory(),
+            )
+            .map_err(windows_removal_open_error)?;
+            let opened = verify_windows_removal_node(
+                child.as_handle(),
+                entry.is_directory(),
+                roots.provider_root.device,
+            )?;
+            ensure_same_removal_mount(
+                &roots.provider_mount,
+                &windows_mount_identity(opened.volume_serial),
+            )?;
+            update_windows_removal_manifest(&mut manifest, &child_relative, &opened)?;
+            if entry.is_directory() {
+                let child_depth = budget.child_depth(depth)?;
+                try_reserve_removal_slot(&mut child_directories)?;
+                child_directories.push((child, child_relative, child_depth));
+            }
+        }
+        for child in child_directories.into_iter().rev() {
+            try_reserve_removal_slot(&mut pending)?;
+            pending.push(child);
+        }
+    }
+
+    let marker = path.join(OWNER_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => {
+            verify_private_single_link_regular_file(&marker)?;
+            let marker_metadata = fs::metadata(&marker)?;
+            if marker_metadata.len() != profile_id.len() as u64 {
+                return Err(ProfileError::UnsafeState(
+                    "profile ownership marker does not match its registry entry".to_owned(),
+                ));
+            }
+            let mut marker_value = String::new();
+            File::open(marker)?.read_to_string(&mut marker_value)?;
+            if marker_value != profile_id {
+                return Err(ProfileError::UnsafeState(
+                    "profile ownership marker does not match its registry entry".to_owned(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !require_marker => {}
+        Err(error) => return Err(ProfileError::Io(error)),
+    }
+    Ok(RemovalTreeSnapshot {
+        root: identity,
+        entry_count: u64::try_from(budget.consumed_entries).map_err(|_| {
+            ProfileError::UnsafeState("managed profile tree is too large".to_owned())
+        })?,
+        manifest_digest: encode_lower_hex(&manifest.finalize()),
+    })
+}
+
+#[cfg(windows)]
+fn update_windows_removal_manifest(
+    manifest: &mut Sha256,
+    relative_path: &Path,
+    identity: &calcifer_windows_acl::OpenedIdentity,
+) -> Result<(), ProfileError> {
+    let path = relative_path.as_os_str().as_encoded_bytes();
+    let path_len = u64::try_from(path.len()).map_err(|_| {
+        ProfileError::UnsafeState("managed profile entry name is too large".to_owned())
+    })?;
+    manifest.update(path_len.to_le_bytes());
+    manifest.update(path);
+    manifest.update([if identity.is_directory() { 1 } else { 2 }]);
+    manifest.update(identity.volume_serial.to_le_bytes());
+    manifest.update(identity.file_index.to_le_bytes());
+    manifest.update(u64::from(identity.link_count).to_le_bytes());
+    manifest.update(identity.file_size.to_le_bytes());
+    manifest.update(identity.attributes.to_le_bytes());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_windows_removal_node(
+    handle: std::os::windows::io::BorrowedHandle<'_>,
+    directory: bool,
+    expected_volume: u64,
+) -> Result<calcifer_windows_acl::OpenedIdentity, ProfileError> {
+    calcifer_windows_acl::verify_current_user_only(handle).map_err(|_| {
+        ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
+    })?;
+    let identity = calcifer_windows_acl::inspect(handle).map_err(|_| {
+        ProfileError::UnsafeState("managed directory identity could not be read".to_owned())
+    })?;
+    if identity.is_reparse_point()
+        || identity.is_directory() != directory
+        || identity.volume_serial != expected_volume
+        || (!directory && identity.link_count != 1)
+    {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree contains unsafe state".to_owned(),
+        ));
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn windows_file_system_identity(
+    identity: calcifer_windows_acl::OpenedIdentity,
+) -> Result<FileSystemIdentity, ProfileError> {
+    if identity.volume_serial == 0 || identity.file_index == 0 {
+        return Err(ProfileError::UnsafeState(
+            "managed filesystem identity is invalid".to_owned(),
+        ));
+    }
+    Ok(FileSystemIdentity {
+        device: identity.volume_serial,
+        inode: identity.file_index,
+    })
+}
+
+#[cfg(windows)]
+fn windows_removal_open_error(error: io::Error) -> ProfileError {
+    if error.kind() == io::ErrorKind::InvalidData {
+        ProfileError::UnsafeState("managed profile tree contains unsafe state".to_owned())
+    } else {
+        ProfileError::Io(error)
+    }
+}
+
 #[cfg(unix)]
 fn update_removal_manifest(
     manifest: &mut Sha256,
@@ -2827,7 +3067,7 @@ fn update_removal_manifest(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn validate_owned_removal_tree(
     _data_root: &Path,
     _roots: &RemovalRoots,
@@ -2967,6 +3207,144 @@ fn remove_owned_tombstone_at_with_limits(
         max_entries,
         max_depth,
     )
+}
+
+#[cfg(windows)]
+fn remove_owned_tombstone_at(
+    provider_root: &Path,
+    tombstone: &Path,
+    expected_provider: FileSystemIdentity,
+    expected_tree: FileSystemIdentity,
+    expected_mount: &RemovalMountIdentity,
+    max_entries: usize,
+) -> Result<(), ProfileError> {
+    remove_owned_tombstone_at_with_limits(
+        provider_root,
+        tombstone,
+        expected_provider,
+        expected_tree,
+        expected_mount,
+        max_entries,
+        MAX_REMOVAL_TREE_DEPTH,
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn remove_owned_tombstone_at_with_limits(
+    provider_root: &Path,
+    tombstone: &Path,
+    expected_provider: FileSystemIdentity,
+    expected_tree: FileSystemIdentity,
+    expected_mount: &RemovalMountIdentity,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let tombstone_name = tombstone
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ProfileError::UnsafeState("invalid removal tombstone name".to_owned()))?;
+    if tombstone.parent() != Some(provider_root) || !tombstone_name.starts_with(".removing-") {
+        return Err(ProfileError::UnsafeState(
+            "profile removal path is outside its managed provider root".to_owned(),
+        ));
+    }
+    let provider = open_windows_directory_for_acl(provider_root)?;
+    let provider_opened =
+        verify_windows_removal_node(provider.as_handle(), true, expected_provider.device)?;
+    if windows_file_system_identity(provider_opened)? != expected_provider {
+        return Err(ProfileError::RemovalRecoveryRequired);
+    }
+    ensure_same_removal_mount(
+        expected_mount,
+        &windows_mount_identity(provider_opened.volume_serial),
+    )?;
+    let tree = calcifer_windows_acl::open_nofollow_child(
+        provider.as_handle(),
+        tombstone_name.as_ref(),
+        true,
+    )
+    .map_err(windows_removal_open_error)?;
+    let tree_opened =
+        verify_windows_removal_node(tree.as_handle(), true, expected_provider.device)?;
+    if windows_file_system_identity(tree_opened)? != expected_tree {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree was replaced".to_owned(),
+        ));
+    }
+    let mut budget = RemovalTraversalBudget::new(max_entries, max_depth);
+    remove_owned_windows_directory_entries(
+        &tree,
+        expected_provider.device,
+        expected_mount,
+        &mut budget,
+        0,
+    )?;
+    let final_tree = calcifer_windows_acl::open_nofollow_child(
+        provider.as_handle(),
+        tombstone_name.as_ref(),
+        true,
+    )
+    .map_err(windows_removal_open_error)?;
+    let final_opened =
+        verify_windows_removal_node(final_tree.as_handle(), true, expected_provider.device)?;
+    if windows_file_system_identity(final_opened)? != expected_tree {
+        return Err(ProfileError::UnsafeState(
+            "managed profile tree was replaced during cleanup".to_owned(),
+        ));
+    }
+    calcifer_windows_acl::mark_for_delete(final_tree.as_handle()).map_err(ProfileError::Io)
+}
+
+#[cfg(windows)]
+fn remove_owned_windows_directory_entries(
+    directory: &File,
+    expected_volume: u64,
+    expected_mount: &RemovalMountIdentity,
+    budget: &mut RemovalTraversalBudget,
+    depth: usize,
+) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    let entries = calcifer_windows_acl::read_directory_entries(
+        directory.as_handle(),
+        budget.remaining_entries,
+    )
+    .map_err(windows_removal_open_error)?;
+    for entry in entries {
+        budget.consume_entry()?;
+        if entry.is_reparse_point() {
+            return Err(ProfileError::UnsafeState(
+                "managed profile tree contains unsafe state".to_owned(),
+            ));
+        }
+        let child = calcifer_windows_acl::open_nofollow_child(
+            directory.as_handle(),
+            &entry.name,
+            entry.is_directory(),
+        )
+        .map_err(windows_removal_open_error)?;
+        let opened =
+            verify_windows_removal_node(child.as_handle(), entry.is_directory(), expected_volume)?;
+        ensure_same_removal_mount(
+            expected_mount,
+            &windows_mount_identity(opened.volume_serial),
+        )?;
+        if entry.is_directory() {
+            let child_depth = budget.child_depth(depth)?;
+            remove_owned_windows_directory_entries(
+                &child,
+                expected_volume,
+                expected_mount,
+                budget,
+                child_depth,
+            )?;
+        }
+        calcifer_windows_acl::mark_for_delete(child.as_handle()).map_err(ProfileError::Io)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3284,7 +3662,7 @@ fn removal_entry_kind(stat: &rustix::fs::Stat) -> RemovalEntryKind {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn validate_partial_owned_tombstone(
     _data_root: &Path,
     _roots: &RemovalRoots,
@@ -5264,6 +5642,8 @@ fn verify_deletable_macos_flags_stat(_stat: &rustix::fs::Stat) -> Result<(), Pro
 #[cfg(windows)]
 const WINDOWS_FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 #[cfg(windows)]
+const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
 const WINDOWS_GENERIC_READ: u32 = 0x8000_0000;
 #[cfg(windows)]
 const WINDOWS_GENERIC_WRITE: u32 = 0x4000_0000;
@@ -5278,7 +5658,7 @@ fn open_windows_directory_for_acl(path: &Path) -> Result<File, ProfileError> {
 
     OpenOptions::new()
         .read(true)
-        .custom_flags(WINDOWS_FILE_FLAG_BACKUP_SEMANTICS)
+        .custom_flags(WINDOWS_FILE_FLAG_BACKUP_SEMANTICS | WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT)
         .access_mode(
             WINDOWS_GENERIC_READ | WINDOWS_GENERIC_WRITE | WINDOWS_WRITE_DAC | WINDOWS_WRITE_OWNER,
         )
@@ -5297,6 +5677,14 @@ pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> 
         ));
     }
     let directory = open_windows_directory_for_acl(path)?;
+    let identity = calcifer_windows_acl::inspect(directory.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed directory identity could not be read".to_owned())
+    })?;
+    if identity.is_reparse_point() || !identity.is_directory() {
+        return Err(ProfileError::UnsafeState(
+            "managed directory is not a real directory".to_owned(),
+        ));
+    }
     calcifer_windows_acl::verify_current_user_only(directory.as_handle()).map_err(|_| {
         ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
     })
@@ -5702,6 +6090,20 @@ pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileErro
 }
 
 #[cfg(windows)]
+fn open_windows_file_for_acl(path: &Path) -> Result<File, ProfileError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT)
+        .access_mode(
+            WINDOWS_GENERIC_READ | WINDOWS_GENERIC_WRITE | WINDOWS_WRITE_DAC | WINDOWS_WRITE_OWNER,
+        )
+        .open(path)
+        .map_err(ProfileError::Io)
+}
+
+#[cfg(windows)]
 pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     use std::os::windows::io::AsHandle;
 
@@ -5711,7 +6113,15 @@ pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileErro
             "managed file is not a regular file".to_owned(),
         ));
     }
-    let file = OpenOptions::new().read(true).open(path)?;
+    let file = open_windows_file_for_acl(path)?;
+    let identity = calcifer_windows_acl::inspect(file.as_handle()).map_err(|_| {
+        ProfileError::UnsafeState("managed file identity could not be read".to_owned())
+    })?;
+    if identity.is_reparse_point() || identity.is_directory() {
+        return Err(ProfileError::UnsafeState(
+            "managed file is not a regular file".to_owned(),
+        ));
+    }
     calcifer_windows_acl::verify_current_user_only(file.as_handle()).map_err(|_| {
         ProfileError::UnsafeState("managed path has unsupported extended permissions".to_owned())
     })
@@ -6066,6 +6476,244 @@ mod tests {
             !temporary.exists(),
             "the stale private journal temporary must be removed"
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn windows_temporary_root(test_name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "calcifer-{test_name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ))
+    }
+
+    #[cfg(windows)]
+    fn write_windows_private(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = super::create_new_private_file(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn windows_owned_profile_tree(
+        test_name: &str,
+    ) -> Result<(PathBuf, PathBuf, PathBuf, String, RemovalRoots), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root(test_name);
+        secure_create_dir_all(&root.join("profiles").join("codex"))?;
+        let profile_id = Uuid::new_v4().to_string();
+        let profile_directory = root.join("profiles").join("codex").join(&profile_id);
+        secure_create_dir(&profile_directory)?;
+        secure_create_dir(&profile_directory.join("home"))?;
+        write_windows_private(&profile_directory.join(OWNER_MARKER), profile_id.as_bytes())?;
+        write_windows_private(
+            &profile_directory.join("home").join("auth.json"),
+            b"synthetic-auth",
+        )?;
+        let registry = Registry::at(root.clone());
+        let roots = registry.validate_removal_roots(Provider::Codex, None)?;
+        Ok((
+            root,
+            profile_directory,
+            registry.provider_root(Provider::Codex)?,
+            profile_id,
+            roots,
+        ))
+    }
+
+    #[cfg(windows)]
+    fn create_windows_junction(
+        link: &Path,
+        target: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let status = std::process::Command::new("cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("mklink /J failed".into())
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_removal_mount_identity_is_stable_within_one_volume()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root("windows-mount-identity");
+        secure_create_dir(&root)?;
+        let child = root.join("child");
+        secure_create_dir(&child)?;
+        assert_eq!(
+            removal_mount_identity_path(&root)?,
+            removal_mount_identity_path(&child)?
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_removal_tree_validates_current_user_acl_nodes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (root, profile_directory, _, profile_id, roots) =
+            windows_owned_profile_tree("windows-owned-tree")?;
+        let snapshot =
+            validate_owned_removal_tree(&root, &roots, &profile_directory, &profile_id, None)?;
+        assert_eq!(
+            snapshot,
+            validate_owned_removal_tree(
+                &root,
+                &roots,
+                &profile_directory,
+                &profile_id,
+                Some(snapshot.clone()),
+            )?
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_removal_tree_rejects_a_junction_without_touching_its_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (root, profile_directory, _, profile_id, roots) =
+            windows_owned_profile_tree("windows-owned-junction")?;
+        let outside = windows_temporary_root("windows-owned-junction-outside");
+        fs::create_dir(&outside)?;
+        let sentinel = outside.join("must-survive.bin");
+        fs::write(&sentinel, b"outside-must-survive")?;
+        create_windows_junction(&profile_directory.join("home").join("trap"), &outside)?;
+        let registry_before = fs::read(
+            root.join("profiles")
+                .join("codex")
+                .join(&profile_id)
+                .join(OWNER_MARKER),
+        )?;
+
+        let error =
+            validate_owned_removal_tree(&root, &roots, &profile_directory, &profile_id, None)
+                .err()
+                .ok_or("a directory junction must fail owned-tree validation")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        assert_eq!(fs::read(&sentinel)?, b"outside-must-survive");
+        assert_eq!(
+            fs::read(profile_directory.join(OWNER_MARKER))?,
+            registry_before
+        );
+
+        fs::remove_dir_all(root)?;
+        fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_tombstone_unlinks_handle_relative_children()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (root, profile_directory, provider_root, profile_id, roots) =
+            windows_owned_profile_tree("windows-owned-tombstone")?;
+        let snapshot =
+            validate_owned_removal_tree(&root, &roots, &profile_directory, &profile_id, None)?;
+        let tombstone = provider_root.join(format!(".removing-{profile_id}"));
+        fs::rename(&profile_directory, &tombstone)?;
+        remove_owned_tombstone_at(
+            &provider_root,
+            &tombstone,
+            roots.provider_root,
+            snapshot.root,
+            &roots.provider_mount,
+            MAX_REMOVAL_TREE_ENTRIES,
+        )?;
+        assert!(
+            !tombstone.exists(),
+            "the validated tombstone must be unlinked"
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_removal_entry_budget_rejects_before_cleanup_and_preserves_every_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (root, profile_directory, provider_root, profile_id, roots) =
+            windows_owned_profile_tree("windows-entry-budget")?;
+        let snapshot =
+            validate_owned_removal_tree(&root, &roots, &profile_directory, &profile_id, None)?;
+        let auth = profile_directory.join("home/auth.json");
+        let auth_before = fs::read(&auth)?;
+
+        let validation_error = validate_owned_removal_tree_inner_with_limits(
+            &root,
+            &roots,
+            &profile_directory,
+            &profile_id,
+            Some(snapshot.root),
+            true,
+            1,
+            MAX_REMOVAL_TREE_DEPTH,
+        )
+        .err()
+        .ok_or("validation must enforce its streaming entry budget")?;
+        assert_eq!(validation_error.code(), "unsafe_profile_state");
+        assert_eq!(fs::read(&auth)?, auth_before);
+
+        let tombstone = provider_root.join(format!(".removing-{profile_id}"));
+        fs::rename(&profile_directory, &tombstone)?;
+        let cleanup_error = remove_owned_tombstone_at_with_limits(
+            &provider_root,
+            &tombstone,
+            roots.provider_root,
+            snapshot.root,
+            &roots.provider_mount,
+            1,
+            MAX_REMOVAL_TREE_DEPTH,
+        )
+        .err()
+        .ok_or("cleanup must enforce its streaming entry budget")?;
+        assert_eq!(cleanup_error.code(), "unsafe_profile_state");
+        assert_eq!(fs::read(tombstone.join("home/auth.json"))?, auth_before);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_removal_depth_budget_rejects_a_child_before_queuing_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (root, profile_directory, _, profile_id, roots) =
+            windows_owned_profile_tree("windows-depth-budget")?;
+        let nested = profile_directory.join("home/one/two");
+        secure_create_dir_all(&nested)?;
+        write_windows_private(&nested.join("sentinel"), b"must-survive")?;
+        let identity = private_directory_identity(&profile_directory)?;
+
+        let error = validate_owned_removal_tree_inner_with_limits(
+            &root,
+            &roots,
+            &profile_directory,
+            &profile_id,
+            Some(identity),
+            true,
+            MAX_REMOVAL_TREE_ENTRIES,
+            1,
+        )
+        .err()
+        .ok_or("validation must reject a directory beyond its depth budget")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        assert_eq!(fs::read(nested.join("sentinel"))?, b"must-survive");
+
         fs::remove_dir_all(root)?;
         Ok(())
     }

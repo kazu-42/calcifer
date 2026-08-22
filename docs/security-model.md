@@ -502,10 +502,11 @@ Calcifer is not a sandbox and does not make an untrusted repository safe.
 
 ### Private provider identity binding
 
-Provider identity binding is supported only on Unix and only for the tested
-Codex `0.144.4` managed ChatGPT auth projection. Windows fails closed until a
-current-user-only ACL implementation exists; Calcifer never creates a normally
-accessible fallback key there.
+Provider identity binding is supported on Unix and on Windows, and only for the
+tested Codex `0.144.4` managed ChatGPT auth projection. Windows identity files
+use the same protected current-user-only DACL as other managed files. Windows
+`auth add` still fails closed until journaled profile removal recovery exists;
+Calcifer never creates a normally accessible fallback key there.
 
 One 256-bit installation key is generated from the OS CSPRNG and stored as a
 private, owner-checked, single-link regular file. A non-provider UUID key ID
