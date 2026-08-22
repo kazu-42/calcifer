@@ -24,6 +24,9 @@ use windows_sys::Win32::Security::{
     GetSecurityDescriptorOwner, GetTokenInformation, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY, TokenUser,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FlushFileBuffers, GetFileInformationByHandle,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
@@ -221,6 +224,26 @@ pub fn verify_current_user_only(handle: BorrowedHandle<'_>) -> io::Result<()> {
         ));
     }
     verify_single_current_user_allow_ace(dacl, expected.as_ptr())
+}
+
+/// Returns `(volume serial, file index)` for an open node.
+pub fn volume_file_identity(handle: BorrowedHandle<'_>) -> io::Result<(u64, u64)> {
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let ok = unsafe { GetFileInformationByHandle(handle.as_raw_handle() as HANDLE, &mut info) };
+    if ok == FALSE {
+        return Err(io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((u64::from(info.dwVolumeSerialNumber), index))
+}
+
+/// Flushes metadata for an open directory or file handle.
+pub fn flush(handle: BorrowedHandle<'_>) -> io::Result<()> {
+    let ok = unsafe { FlushFileBuffers(handle.as_raw_handle() as HANDLE) };
+    if ok == FALSE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn verify_single_current_user_allow_ace(
@@ -540,6 +563,11 @@ mod tests {
         let directory = open_directory_with_acl_rights(&path)?;
         apply_current_user_only(directory.as_handle())?;
         verify_current_user_only(directory.as_handle())?;
+        let first = volume_file_identity(directory.as_handle())?;
+        let second = volume_file_identity(directory.as_handle())?;
+        assert_eq!(first, second);
+        assert_ne!(first.1, 0);
+        flush(directory.as_handle())?;
         drop(directory);
         fs::remove_dir_all(path)?;
         Ok(())
