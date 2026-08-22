@@ -4815,7 +4815,7 @@ fn ensure_registration_supported() -> Result<(), ProfileError> {
 }
 
 #[cfg(unix)]
-fn secure_create_dir(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn secure_create_dir(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::DirBuilderExt;
 
     verify_safe_creation_parent(path)?;
@@ -4828,7 +4828,7 @@ fn secure_create_dir(path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(windows)]
-fn secure_create_dir(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn secure_create_dir(path: &Path) -> Result<(), ProfileError> {
     use std::os::windows::io::AsHandle;
 
     fs::create_dir(path)?;
