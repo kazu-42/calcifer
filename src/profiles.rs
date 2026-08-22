@@ -711,6 +711,13 @@ impl Registry {
         self.save_removal_barrier(&barrier)?;
         self.write_removal_journal(&journal)?;
 
+        // Windows cannot rename or unlink a tree while this process still holds
+        // the lifetime lock files. The barrier and removal lock already exclude
+        // concurrent recover/remove; dropping A/B here lets the tombstone walk
+        // proceed. Unix unlinks open names, so it keeps the lease until return.
+        #[cfg(windows)]
+        drop(_profile_lease);
+
         let tombstone = self.tombstone_path(&selected)?;
         if path_exists(&tombstone)? {
             return Err(ProfileError::RemovalRecoveryRequired);

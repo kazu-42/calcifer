@@ -67,6 +67,7 @@ const ERROR_NO_MORE_FILES: i32 = 18;
 const ERROR_MORE_DATA: i32 = 234;
 const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
 const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
@@ -467,7 +468,9 @@ pub fn mark_for_delete(handle: BorrowedHandle<'_>) -> io::Result<()> {
         flags: u32,
     }
     let mut posix = DispositionEx {
-        flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     };
     let posix_ok = unsafe {
         SetFileInformationByHandle(
