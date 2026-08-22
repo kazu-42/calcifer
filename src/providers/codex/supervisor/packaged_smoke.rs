@@ -9151,6 +9151,32 @@ fn retained_drive_prepare_fails_closed_when_cleanup_reserve_no_longer_fits()
 }
 
 #[test]
+fn retained_drive_prepare_failure_keeps_the_installed_cleanup_fence() -> Result<(), Box<dyn Error>>
+{
+    let origin = Instant::now();
+    let armed_at = origin
+        .checked_add(Duration::from_secs(1))
+        .ok_or("armed_at overflowed")?;
+    let fence = PackageGenerationDeadlineFence::starting_at_for_target(
+        origin,
+        PackageProviderTarget::DeterministicFixture,
+    )?
+    .after_guardian_startup_armed(armed_at)?;
+    let too_late = fence
+        .cleanup_fence
+        .checked_sub(Duration::from_secs(1))
+        .ok_or("too_late underflowed")?;
+    let original = fence;
+    let mut installed = Some(fence);
+    assert_eq!(
+        install_prepared_retained_drive_deadline(&mut installed, too_late),
+        Err(PackageCleanupFailure::Deadline)
+    );
+    assert_eq!(installed, Some(original));
+    Ok(())
+}
+
+#[test]
 fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci()
 -> Result<(), Box<dyn Error>> {
     if std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV)
@@ -11605,6 +11631,22 @@ impl PackageGenerationDeadlineFence {
     }
 }
 
+fn install_prepared_retained_drive_deadline(
+    installed: &mut Option<PackageGenerationDeadlineFence>,
+    now: Instant,
+) -> Result<(), PackageCleanupFailure> {
+    let Some(fence) = *installed else {
+        return Err(PackageCleanupFailure::Deadline);
+    };
+    match fence.prepare_retained_drive_deadline(now) {
+        Ok(prepared) => {
+            *installed = Some(prepared);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl PackageCleanupDeadlines {
     fn within_generation(
         fence: PackageGenerationDeadlineFence,
@@ -12035,15 +12077,11 @@ impl OfficialTuiPackageHarness {
                     | RecoveryCheckpoint::RetainedCleanupPending
             )
         {
-            let fence = self
-                .generation_deadline_fence
-                .take()
-                .ok_or("package generation deadline fence was missing")?;
-            self.generation_deadline_fence = Some(
-                fence
-                    .prepare_retained_drive_deadline(Instant::now())
-                    .map_err(|_| "package retained drive had no safe budget after trigger")?,
-            );
+            install_prepared_retained_drive_deadline(
+                &mut self.generation_deadline_fence,
+                Instant::now(),
+            )
+            .map_err(|_| "package retained drive had no safe budget after trigger")?;
         }
         let fence = self
             .generation_deadline_fence
@@ -15673,6 +15711,40 @@ fn package_live_input_transcript_retries_absent_file_until_the_exact_payload()
 }
 
 #[test]
+fn package_live_input_transcript_rejects_not_found_after_the_file_existed()
+-> Result<(), Box<dyn Error>> {
+    let expected = PACKAGE_SUPERVISOR_INITIAL_INPUT;
+    let prefix = expected[..expected.len().saturating_sub(1)].to_vec();
+    let mut reads = VecDeque::from([
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Ok(prefix),
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Ok(expected.to_vec()),
+    ]);
+    let mut observed = 0_u8;
+    let error = require_rejected_test_result(
+        wait_for_package_input_transcript_with_reader(
+            expected,
+            Instant::now() + Duration::from_secs(1),
+            || {
+                observed = observed.saturating_add(1);
+                reads
+                    .pop_front()
+                    .ok_or_else(|| std::io::Error::other("test read sequence was exhausted"))?
+            },
+        ),
+        "a vanished live transcript was retried after it had already been observed",
+    )?;
+    assert_eq!(observed, 3);
+    let io_error = error
+        .downcast_ref::<std::io::Error>()
+        .ok_or("vanished transcript did not preserve NotFound")?;
+    assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(reads.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn package_private_read_retries_only_same_inode_append_progress() -> Result<(), Box<dyn Error>> {
     let scratch = PackageScratch::create()?;
     let path = scratch.root.join("live-read-classification");
@@ -16656,24 +16728,31 @@ fn wait_for_package_input_transcript_with_reader(
     deadline: Instant,
     mut read: impl FnMut() -> std::io::Result<Vec<u8>>,
 ) -> Result<(), Box<dyn Error>> {
+    let mut observed_existing_file = false;
     loop {
         match read() {
-            Ok(bytes) => match classify_package_input_transcript(&bytes, expected) {
-                PackageInputTranscriptProgress::Exact => return Ok(()),
-                PackageInputTranscriptProgress::Diverged => {
-                    return Err("package terminal input diverged from the exact transcript".into());
+            Ok(bytes) => {
+                observed_existing_file = true;
+                match classify_package_input_transcript(&bytes, expected) {
+                    PackageInputTranscriptProgress::Exact => return Ok(()),
+                    PackageInputTranscriptProgress::Diverged => {
+                        return Err(
+                            "package terminal input diverged from the exact transcript".into()
+                        );
+                    }
+                    PackageInputTranscriptProgress::Pending => {}
                 }
-                PackageInputTranscriptProgress::Pending => {}
-            },
+            }
             // `input.live` is append-only and observed concurrently with the
-            // guardian's post-forward commit. The file may not exist yet, and
-            // a stable descriptor whose length or mtime changed during one
-            // bounded read is expected progress, not an identity failure.
-            // Unsafe metadata and all other I/O errors remain immediately
-            // fatal.
+            // guardian's post-forward commit. Absence is pending only before
+            // the first successful open. After that, NotFound means the
+            // create-once inode was replaced. A stable descriptor whose
+            // length or mtime changed during one bounded read is expected
+            // progress. Unsafe metadata and all other I/O errors remain
+            // immediately fatal.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::NotFound => {}
+                if error.kind() == std::io::ErrorKind::NotFound && !observed_existing_file => {}
             Err(error) => {
                 return Err(error.into());
             }
