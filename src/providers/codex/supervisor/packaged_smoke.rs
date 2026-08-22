@@ -558,6 +558,12 @@ const PACKAGE_SUPERVISOR_OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(15
 const PACKAGE_DETERMINISTIC_PRE_RELAY_STARTUP_RESERVE: Duration = Duration::from_secs(15);
 const PACKAGE_DETERMINISTIC_RELAY_START_TIMEOUT: Duration = Duration::from_secs(30);
 const PACKAGE_DETERMINISTIC_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(45);
+// Retained checkpoints still have to drive initial-gate through PTY input
+// observation after the parent calls trigger. Guardian arm can happen early
+// in spawn, so a late trigger must be allowed to push recovery_start later
+// by this bounded reserve when the cleanup fence still fits. This is not a
+// new outer timeout and does not change the 105s generation fence.
+const PACKAGE_DETERMINISTIC_RETAINED_DRIVE_RESERVE: Duration = Duration::from_secs(20);
 // After the parent observes the Guardian's durable, private startup-arm
 // acknowledgement, retained recovery reserves this separately named
 // package-only handoff/report margin beyond the Guardian's complete startup
@@ -9055,6 +9061,122 @@ fn deterministic_package_cleanup_budget_is_short_bounded_and_target_specific()
 }
 
 #[test]
+fn retained_drive_budget_survives_late_trigger_after_early_guardian_arm()
+-> Result<(), Box<dyn Error>> {
+    let origin = Instant::now();
+    let armed_at = origin
+        .checked_add(Duration::from_secs(1))
+        .ok_or("armed_at overflowed")?;
+    let trigger_at = origin
+        .checked_add(Duration::from_secs(40))
+        .ok_or("trigger_at overflowed")?;
+    let fence = PackageGenerationDeadlineFence::starting_at_for_target(
+        origin,
+        PackageProviderTarget::DeterministicFixture,
+    )?
+    .after_guardian_startup_armed(armed_at)?;
+
+    let remaining_before = fence
+        .recovery_start
+        .checked_duration_since(trigger_at)
+        .ok_or("late trigger was already past the unrepaired recovery start")?;
+    assert!(
+        remaining_before < PACKAGE_DETERMINISTIC_RETAINED_DRIVE_RESERVE,
+        "the fixture must still reproduce the hosted last-checkpoint starvation"
+    );
+
+    let prepared = fence.prepare_retained_drive_deadline(trigger_at)?;
+    let remaining = prepared
+        .recovery_checkpoint_deadline(trigger_at)?
+        .checked_duration_since(trigger_at)
+        .ok_or("prepared retained drive deadline was not after trigger")?;
+    assert!(
+        remaining >= PACKAGE_DETERMINISTIC_RETAINED_DRIVE_RESERVE,
+        "late trigger starved the retained PTY-input observation window"
+    );
+    assert!(
+        prepared
+            .recovery_start
+            .checked_add(prepared.cleanup_budget.cleanup_reserve()?)
+            .ok_or("prepared cleanup end overflowed")?
+            <= prepared.cleanup_fence
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_drive_prepare_keeps_an_already_sufficient_recovery_start() -> Result<(), Box<dyn Error>>
+{
+    let origin = Instant::now();
+    let armed_at = origin
+        .checked_add(Duration::from_secs(1))
+        .ok_or("armed_at overflowed")?;
+    let trigger_at = armed_at;
+    let fence = PackageGenerationDeadlineFence::starting_at_for_target(
+        origin,
+        PackageProviderTarget::DeterministicFixture,
+    )?
+    .after_guardian_startup_armed(armed_at)?;
+    let original_recovery_start = fence.recovery_start;
+    let prepared = fence.prepare_retained_drive_deadline(trigger_at)?;
+    assert_eq!(prepared.recovery_start, original_recovery_start);
+    assert_eq!(
+        prepared.external_fence,
+        origin + PACKAGE_DETERMINISTIC_EXTERNAL_HARD_TIMEOUT
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_drive_prepare_fails_closed_when_cleanup_reserve_no_longer_fits()
+-> Result<(), Box<dyn Error>> {
+    let origin = Instant::now();
+    let armed_at = origin
+        .checked_add(Duration::from_secs(1))
+        .ok_or("armed_at overflowed")?;
+    let fence = PackageGenerationDeadlineFence::starting_at_for_target(
+        origin,
+        PackageProviderTarget::DeterministicFixture,
+    )?
+    .after_guardian_startup_armed(armed_at)?;
+    let too_late = fence
+        .cleanup_fence
+        .checked_sub(Duration::from_secs(1))
+        .ok_or("too_late underflowed")?;
+    assert_eq!(
+        fence.prepare_retained_drive_deadline(too_late),
+        Err(PackageCleanupFailure::Deadline)
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_drive_prepare_failure_keeps_the_installed_cleanup_fence() -> Result<(), Box<dyn Error>>
+{
+    let origin = Instant::now();
+    let armed_at = origin
+        .checked_add(Duration::from_secs(1))
+        .ok_or("armed_at overflowed")?;
+    let fence = PackageGenerationDeadlineFence::starting_at_for_target(
+        origin,
+        PackageProviderTarget::DeterministicFixture,
+    )?
+    .after_guardian_startup_armed(armed_at)?;
+    let too_late = fence
+        .cleanup_fence
+        .checked_sub(Duration::from_secs(1))
+        .ok_or("too_late underflowed")?;
+    let original = fence;
+    let mut installed = Some(fence);
+    assert_eq!(
+        install_prepared_retained_drive_deadline(&mut installed, too_late),
+        Err(PackageCleanupFailure::Deadline)
+    );
+    assert_eq!(installed, Some(original));
+    Ok(())
+}
+
+#[test]
 fn unproven_package_cleanup_exits_with_a_fixed_diagnostic_instead_of_hanging_ci()
 -> Result<(), Box<dyn Error>> {
     if std::env::var_os(PACKAGE_UNPROVEN_CLEANUP_EXIT_HELPER_ENV)
@@ -11437,6 +11559,37 @@ impl PackageGenerationDeadlineFence {
         Ok(self)
     }
 
+    fn prepare_retained_drive_deadline(
+        mut self,
+        now: Instant,
+    ) -> Result<Self, PackageCleanupFailure> {
+        if now < self.origin || now >= self.cleanup_fence {
+            return Err(PackageCleanupFailure::Deadline);
+        }
+        let desired = now
+            .checked_add(PACKAGE_DETERMINISTIC_RETAINED_DRIVE_RESERVE)
+            .ok_or(PackageCleanupFailure::Deadline)?;
+        let candidate = if desired > self.recovery_start {
+            desired
+        } else {
+            self.recovery_start
+        };
+        if now >= candidate {
+            return Err(PackageCleanupFailure::Deadline);
+        }
+        if candidate > self.recovery_start {
+            if candidate
+                .checked_add(self.cleanup_budget.cleanup_reserve()?)
+                .filter(|cleanup_end| *cleanup_end <= self.cleanup_fence)
+                .is_none()
+            {
+                return Err(PackageCleanupFailure::Deadline);
+            }
+            self.recovery_start = candidate;
+        }
+        Ok(self)
+    }
+
     fn recovery_checkpoint_deadline(self, now: Instant) -> Result<Instant, PackageCleanupFailure> {
         if now < self.origin || now >= self.recovery_start {
             return Err(PackageCleanupFailure::Deadline);
@@ -11475,6 +11628,22 @@ impl PackageGenerationDeadlineFence {
                 authority: PackageExerciseDeadlineAuthority::GenerationFence,
             })
         }
+    }
+}
+
+fn install_prepared_retained_drive_deadline(
+    installed: &mut Option<PackageGenerationDeadlineFence>,
+    now: Instant,
+) -> Result<(), PackageCleanupFailure> {
+    let Some(fence) = *installed else {
+        return Err(PackageCleanupFailure::Deadline);
+    };
+    match fence.prepare_retained_drive_deadline(now) {
+        Ok(prepared) => {
+            *installed = Some(prepared);
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -11870,6 +12039,12 @@ impl OfficialTuiPackageHarness {
             harness.coordinator = Some(child);
             harness.generation_cleanup = Some(PackageGenerationCleanupEvidence::default());
             harness.generation_deadline_fence = Some(generation_deadline_fence);
+            if harness.provider_target == PackageProviderTarget::DeterministicFixture
+                && harness.recovery_checkpoint.is_some()
+            {
+                let report = harness.root()?.join("supervisor-report");
+                harness.observe_guardian_startup_arm(&report)?;
+            }
             setup_phase = PackageHarnessSetupPhase::InitialPtyWrite;
             write_package_pty_input(
                 harness.master()?,
@@ -11900,6 +12075,20 @@ impl OfficialTuiPackageHarness {
             .ok_or("package recovery checkpoint was not selected")?;
         let report = self.root()?.join("supervisor-report");
         self.observe_guardian_startup_arm(&report)?;
+        if self.provider_target == PackageProviderTarget::DeterministicFixture
+            && matches!(
+                checkpoint,
+                RecoveryCheckpoint::RetainedQuiescing
+                    | RecoveryCheckpoint::RetainedRestorePending
+                    | RecoveryCheckpoint::RetainedCleanupPending
+            )
+        {
+            install_prepared_retained_drive_deadline(
+                &mut self.generation_deadline_fence,
+                Instant::now(),
+            )
+            .map_err(|_| "package retained drive had no safe budget after trigger")?;
+        }
         let fence = self
             .generation_deadline_fence
             .ok_or("package generation deadline fence was missing")?;
@@ -12263,6 +12452,7 @@ impl OfficialTuiPackageHarness {
                     PACKAGE_SUPERVISOR_EXIT_INPUT,
                 ]
                 .concat();
+                let mut transcript_existed = false;
                 let initial_gate = self
                     .coordinator
                     .as_mut()
@@ -12311,6 +12501,7 @@ impl OfficialTuiPackageHarness {
                         &report.join("input.live"),
                         PACKAGE_SUPERVISOR_INITIAL_INPUT,
                         deadline,
+                        &mut transcript_existed,
                     ),
                 )?;
                 let inference = self
@@ -12358,6 +12549,7 @@ impl OfficialTuiPackageHarness {
                         &report.join("input.live"),
                         &complete_input_transcript,
                         deadline,
+                        &mut transcript_existed,
                     ),
                 )?;
             }
@@ -12425,6 +12617,7 @@ impl OfficialTuiPackageHarness {
             return Err("pre-ready input crossed the production input gate".into());
         }
         record_package_exercise_phase(&report, PackageExercisePhase::PreReadyInputBlocked);
+        let mut transcript_existed = true;
 
         // Codex 0.144.x runs terminal capability probes after raw mode and
         // intentionally discards unrelated input observed during that
@@ -12444,6 +12637,7 @@ impl OfficialTuiPackageHarness {
             &report.join("input.live"),
             PACKAGE_SUPERVISOR_INITIAL_INPUT,
             exercise_deadline(IO_TIMEOUT)?,
+            &mut transcript_existed,
         )?;
         record_package_exercise_phase(&report, PackageExercisePhase::InitialInputObserved);
 
@@ -12615,6 +12809,7 @@ impl OfficialTuiPackageHarness {
             &report.join("input.live"),
             &complete_input_transcript,
             exercise_deadline(IO_TIMEOUT)?,
+            &mut transcript_existed,
         )?;
         record_package_exercise_phase(&report, PackageExercisePhase::ExitInputObserved);
 
@@ -15477,6 +15672,7 @@ fn package_live_input_transcript_retries_only_a_concurrent_snapshot_change()
     wait_for_package_input_transcript_with_reader(
         expected,
         Instant::now() + Duration::from_secs(1),
+        &mut false,
         || {
             reads
                 .pop_front()
@@ -15490,6 +15686,7 @@ fn package_live_input_transcript_retries_only_a_concurrent_snapshot_change()
         wait_for_package_input_transcript_with_reader(
             expected,
             Instant::now() + Duration::from_secs(1),
+            &mut false,
             || {
                 unsafe_reads = unsafe_reads.saturating_add(1);
                 Err(std::io::Error::new(
@@ -15502,6 +15699,88 @@ fn package_live_input_transcript_retries_only_a_concurrent_snapshot_change()
     )?;
     assert_eq!(unsafe_reads, 1);
     assert_eq!(error.to_string(), "private identity changed");
+    Ok(())
+}
+
+#[test]
+fn package_live_input_transcript_retries_absent_file_until_the_exact_payload()
+-> Result<(), Box<dyn Error>> {
+    let expected = PACKAGE_SUPERVISOR_INITIAL_INPUT;
+    let mut reads = VecDeque::from([
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Ok(expected.to_vec()),
+    ]);
+    wait_for_package_input_transcript_with_reader(
+        expected,
+        Instant::now() + Duration::from_secs(1),
+        &mut false,
+        || {
+            reads
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("test read sequence was exhausted"))?
+        },
+    )?;
+    assert!(reads.is_empty());
+    Ok(())
+}
+
+#[test]
+fn package_live_input_transcript_rejects_not_found_after_the_file_existed()
+-> Result<(), Box<dyn Error>> {
+    let expected = PACKAGE_SUPERVISOR_INITIAL_INPUT;
+    let prefix = expected[..expected.len().saturating_sub(1)].to_vec();
+    let mut reads = VecDeque::from([
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Ok(prefix),
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Ok(expected.to_vec()),
+    ]);
+    let mut observed = 0_u8;
+    let mut transcript_existed = false;
+    let error = require_rejected_test_result(
+        wait_for_package_input_transcript_with_reader(
+            expected,
+            Instant::now() + Duration::from_secs(1),
+            &mut transcript_existed,
+            || {
+                observed = observed.saturating_add(1);
+                reads
+                    .pop_front()
+                    .ok_or_else(|| std::io::Error::other("test read sequence was exhausted"))?
+            },
+        ),
+        "a vanished live transcript was retried after it had already been observed",
+    )?;
+    assert_eq!(observed, 3);
+    let io_error = error
+        .downcast_ref::<std::io::Error>()
+        .ok_or("vanished transcript did not preserve NotFound")?;
+    assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(reads.len(), 1);
+    assert!(transcript_existed);
+
+    let mut later_reads = 0_u8;
+    let later = require_rejected_test_result(
+        wait_for_package_input_transcript_with_reader(
+            expected,
+            Instant::now() + Duration::from_secs(1),
+            &mut transcript_existed,
+            || {
+                later_reads = later_reads.saturating_add(1);
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+        ),
+        "a later wait retried NotFound after an earlier wait had seen the file",
+    )?;
+    assert_eq!(later_reads, 1);
+    assert_eq!(
+        later
+            .downcast_ref::<std::io::Error>()
+            .ok_or("later wait did not preserve NotFound")?
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
     Ok(())
 }
 
@@ -16478,32 +16757,46 @@ fn wait_for_package_input_transcript(
     path: &Path,
     expected: &[u8],
     deadline: Instant,
+    observed_existing_file: &mut bool,
 ) -> Result<(), Box<dyn Error>> {
-    wait_for_package_input_transcript_with_reader(expected, deadline, || {
-        read_private_bounded(path, 128 * 1024)
-    })
+    wait_for_package_input_transcript_with_reader(
+        expected,
+        deadline,
+        observed_existing_file,
+        || read_private_bounded(path, 128 * 1024),
+    )
 }
 
 fn wait_for_package_input_transcript_with_reader(
     expected: &[u8],
     deadline: Instant,
+    observed_existing_file: &mut bool,
     mut read: impl FnMut() -> std::io::Result<Vec<u8>>,
 ) -> Result<(), Box<dyn Error>> {
     loop {
         match read() {
-            Ok(bytes) => match classify_package_input_transcript(&bytes, expected) {
-                PackageInputTranscriptProgress::Exact => return Ok(()),
-                PackageInputTranscriptProgress::Diverged => {
-                    return Err("package terminal input diverged from the exact transcript".into());
+            Ok(bytes) => {
+                *observed_existing_file = true;
+                match classify_package_input_transcript(&bytes, expected) {
+                    PackageInputTranscriptProgress::Exact => return Ok(()),
+                    PackageInputTranscriptProgress::Diverged => {
+                        return Err(
+                            "package terminal input diverged from the exact transcript".into()
+                        );
+                    }
+                    PackageInputTranscriptProgress::Pending => {}
                 }
-                PackageInputTranscriptProgress::Pending => {}
-            },
+            }
             // `input.live` is append-only and observed concurrently with the
-            // guardian's post-forward commit. A stable descriptor whose
+            // guardian's post-forward commit. Absence is pending only before
+            // the first successful open. After that, NotFound means the
+            // create-once inode was replaced. A stable descriptor whose
             // length or mtime changed during one bounded read is expected
-            // progress, not an identity failure. Unsafe metadata and all
-            // other I/O errors remain immediately fatal.
+            // progress. Unsafe metadata and all other I/O errors remain
+            // immediately fatal.
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !*observed_existing_file => {}
             Err(error) => {
                 return Err(error.into());
             }
