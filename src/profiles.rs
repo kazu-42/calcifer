@@ -5847,7 +5847,53 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    #[test]
+    fn unverified_windows_directory_recovery_preserves_a_journal_temporary() {
+        let root = env::temp_dir().join(format!(
+            "calcifer-windows-removal-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("temporary root must be created");
+        let temporary = root.join(format!(".{REMOVAL_JOURNAL_FILE}.{}.tmp", Uuid::new_v4()));
+        let sentinel = b"windows-removal-artifact-must-survive";
+        fs::write(&temporary, sentinel).expect("temporary journal must be written");
+
+        let error = Registry::at(root.clone())
+            .recover_incomplete_removal()
+            .expect_err("a default NTFS directory must fail closed before removal recovery");
+
+        assert_eq!(error.code(), "unsafe_profile_state");
+        assert_eq!(
+            fs::read(&temporary).expect("temporary journal must remain readable"),
+            sentinel
+        );
+        fs::remove_dir_all(root).expect("temporary root must be removed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_new_private_file_applies_a_current_user_only_acl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::io::AsHandle;
+
+        let root = env::temp_dir().join(format!(
+            "calcifer-windows-private-file-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&root)?;
+        let path = root.join("private.bin");
+        let file = super::create_new_private_file(&path)?;
+        calcifer_windows_acl::verify_current_user_only(file.as_handle())?;
+        drop(file);
+        super::verify_private_regular_file(&path)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
     #[test]
     fn unsupported_platform_recovery_preserves_a_journal_temporary() {
         let root = env::temp_dir().join(format!(
