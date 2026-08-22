@@ -658,7 +658,7 @@ impl Registry {
     /// metadata lock. The registry rename that removes the immutable profile ID
     /// is the public visibility point. Credentials are recursively unlinked only
     /// after readback proves that visibility point completed.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn remove(
         &self,
         provider: Provider,
@@ -667,6 +667,7 @@ impl Registry {
     ) -> Result<Profile, ProfileError> {
         self.recover_incomplete_removal()?;
         self.recover_incomplete_reauth()?;
+        #[cfg(unix)]
         ensure_registration_supported()?;
         let selected = self.find_without_recovery(provider, alias)?;
         if confirmed_profile_id.is_some_and(|expected_id| expected_id != selected.id) {
@@ -751,7 +752,7 @@ impl Registry {
         Ok(selected)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     pub(crate) fn remove(
         &self,
         _provider: Provider,
@@ -787,7 +788,7 @@ impl Registry {
         #[cfg(windows)]
         {
             let _artifacts_absent = preflight?;
-            return self.recover_stale_windows_removal_temporaries();
+            return self.recover_incomplete_removal_journaled();
         }
 
         #[cfg(all(not(unix), not(windows)))]
@@ -797,35 +798,11 @@ impl Registry {
         }
 
         #[cfg(unix)]
-        self.recover_incomplete_removal_unix()
+        self.recover_incomplete_removal_journaled()
     }
 
-    #[cfg(windows)]
-    fn recover_stale_windows_removal_temporaries(&self) -> Result<(), ProfileError> {
-        if self.read_removal_barrier()?.is_some() || self.read_removal_journal()?.is_some() {
-            return Err(ProfileError::RemovalRecoveryRequired);
-        }
-        if !self.removal_tombstones()?.is_empty() {
-            return Err(ProfileError::RemovalRecoveryRequired);
-        }
-        private_directory_identity(&self.root)?;
-        let _removal_lock = self.lock_removal_exclusive()?;
-        let _registry_lock = self.lock_exclusive()?;
-        if self.read_removal_barrier()?.is_some() || self.read_removal_journal()?.is_some() {
-            return Err(ProfileError::RemovalRecoveryRequired);
-        }
-        if !self.removal_tombstones()?.is_empty() {
-            return Err(ProfileError::RemovalRecoveryRequired);
-        }
-        let temporaries = self.removal_temporaries()?;
-        if temporaries.is_empty() {
-            return Ok(());
-        }
-        self.remove_stale_removal_temporary(&temporaries)
-    }
-
-    #[cfg(unix)]
-    fn recover_incomplete_removal_unix(&self) -> Result<(), ProfileError> {
+    #[cfg(any(unix, windows))]
+    fn recover_incomplete_removal_journaled(&self) -> Result<(), ProfileError> {
         // Wait for a live remover to finish, then take one consistent artifact
         // snapshot while it cannot unlink the journal between verification and
         // open. Release this gate before taking a profile lease to preserve the
@@ -1815,7 +1792,7 @@ impl Registry {
         Ok(roots)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn lock_removal_tree(
         &self,
         path: &Path,
@@ -2007,7 +1984,7 @@ impl Registry {
         sync_directory(&self.root)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn finish_visible_removal(
         &self,
         _removal_lock: &RegistryLock,
@@ -6031,6 +6008,20 @@ fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, Prof
     Ok(file)
 }
 
+#[cfg(windows)]
+fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, ProfileError> {
+    verify_private_single_link_regular_file(path)?;
+    let file = open_windows_file_for_acl(path)?;
+    FileExt::try_lock_exclusive(&file).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            ProfileError::Busy(reference.to_owned())
+        } else {
+            ProfileError::Io(error)
+        }
+    })?;
+    Ok(file)
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::MetadataExt;
@@ -6714,6 +6705,60 @@ mod tests {
         assert_eq!(error.code(), "unsafe_profile_state");
         assert_eq!(fs::read(nested.join("sentinel"))?, b"must-survive");
 
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn windows_registered_profile(
+        test_name: &str,
+    ) -> Result<(PathBuf, Registry, Profile), Box<dyn std::error::Error>> {
+        let (root, _, _, profile_id, _) = windows_owned_profile_tree(test_name)?;
+        let registry = Registry::at(root.clone());
+        let profile = Profile {
+            id: profile_id,
+            alias: "work".to_owned(),
+            provider: Provider::Codex,
+            created_at: unix_timestamp()?,
+        };
+        registry.save(&RegistryDocument {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            profiles: vec![profile.clone()],
+        })?;
+        Ok((root, registry, profile))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_journaled_remove_unlinks_an_owned_profile() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (root, registry, profile) = windows_registered_profile("windows-journaled-remove")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        assert_eq!(registry.remove(Provider::Codex, "work", None)?, profile);
+        assert!(
+            !profile_directory.exists(),
+            "the removed profile directory must be gone"
+        );
+        assert!(
+            !root.join(REMOVAL_JOURNAL_FILE).exists(),
+            "the removal journal must be consumed"
+        );
+        assert!(registry.load()?.profiles.is_empty());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_registration_stays_unsupported_after_owned_tree_removal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root("windows-registration-closed");
+        secure_create_dir(&root)?;
+        let error = Registry::at(root.clone())
+            .begin_codex_registration("work")
+            .err()
+            .ok_or("Windows auth add must stay fail-closed")?;
+        assert_eq!(error.code(), "unsupported_platform");
         fs::remove_dir_all(root)?;
         Ok(())
     }
