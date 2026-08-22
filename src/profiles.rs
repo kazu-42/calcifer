@@ -1160,7 +1160,7 @@ impl Registry {
     ///
     /// Login and account-only App Server probes must not discover repository
     /// configuration through an ancestor of a user-selected `CALCIFER_HOME`.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn neutral_working_directory(&self) -> Result<PathBuf, ProfileError> {
         let runtime_root = managed_runtime_root()?;
         let neutral = runtime_root.join("neutral");
@@ -1169,7 +1169,7 @@ impl Registry {
         Ok(neutral)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     pub(crate) fn neutral_working_directory(&self) -> Result<PathBuf, ProfileError> {
         Err(ProfileError::UnsupportedPlatform)
     }
@@ -4964,7 +4964,7 @@ impl ProfileError {
                 let _ = error.kind();
                 "The profile registry became visible but its durability could not be confirmed. Run `calcifer auth list` before retrying; Calcifer preserved the profile credentials.".to_owned()
             }
-            Self::UnsupportedPlatform => "Managed profiles are not supported on this platform yet because private ACL creation has not been verified.".to_owned(),
+            Self::UnsupportedPlatform => "Managed profiles are not supported on this platform yet.".to_owned(),
             Self::UnsafeState(reason) => format!("Calcifer refused unsafe profile storage: {reason}."),
         }
     }
@@ -5166,13 +5166,23 @@ fn unix_timestamp() -> Result<i64, ProfileError> {
         .map_err(|_| ProfileError::UnsafeState("system clock is out of range".to_owned()))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ensure_registration_supported() -> Result<(), ProfileError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn ensure_registration_supported() -> Result<(), ProfileError> {
+    Err(ProfileError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+fn ensure_reauth_supported() -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_reauth_supported() -> Result<(), ProfileError> {
     Err(ProfileError::UnsupportedPlatform)
 }
 
@@ -5295,6 +5305,13 @@ pub(crate) fn managed_runtime_root() -> Result<PathBuf, ProfileError> {
             "managed runtime directory has an unexpected owner".to_owned(),
         ));
     }
+    Ok(runtime_root)
+}
+
+#[cfg(windows)]
+pub(crate) fn managed_runtime_root() -> Result<PathBuf, ProfileError> {
+    let runtime_root = canonicalize_managed_root(&env::temp_dir())?.join("calcifer");
+    ensure_private_subdirectory(&runtime_root)?;
     Ok(runtime_root)
 }
 
@@ -6783,15 +6800,36 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_registration_stays_unsupported_after_owned_tree_removal()
+    fn windows_codex_registration_commits_and_journaled_remove_cleans_up()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = windows_temporary_root("windows-registration-closed");
-        secure_create_dir(&root)?;
-        let error = Registry::at(root.clone())
-            .begin_codex_registration("work")
+        let root = windows_temporary_root("windows-codex-register");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        assert!(profile_directory.is_dir());
+        assert_eq!(registry.remove(Provider::Codex, "work", None)?, profile);
+        assert!(!profile_directory.exists());
+        assert!(!root.join(REMOVAL_JOURNAL_FILE).exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claude_registration_and_codex_reauth_stay_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root("windows-claude-reauth-closed");
+        let registry = Registry::at(root.clone());
+        let claude = registry
+            .begin_claude_registration("work")
             .err()
-            .ok_or("Windows auth add must stay fail-closed")?;
-        assert_eq!(error.code(), "unsupported_platform");
+            .ok_or("Claude Windows registration must stay fail-closed")?;
+        assert_eq!(claude.code(), "unsupported_platform");
+        let reauth = registry
+            .begin_codex_reauthentication("work", |_, _| Ok(test_identity_adapter()))
+            .err()
+            .ok_or("Windows Codex reauth must stay fail-closed")?;
+        assert_eq!(reauth.code(), "unsupported_platform");
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -6867,13 +6905,13 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn write_test_codex_auth(home: &Path) -> Result<(), ProfileError> {
         let account_scope = Uuid::new_v4().to_string();
         write_test_codex_auth_for_scope(home, &account_scope)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn write_test_codex_auth_for_scope(
         home: &Path,
         account_scope: &str,
@@ -7035,12 +7073,12 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const fn test_identity_adapter() -> CodexIdentityAdapter {
         CodexIdentityAdapter::for_test()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn register_test_profile(registry: &Registry, alias: &str) -> Result<Profile, ProfileError> {
         let pending = registry.begin_codex_registration(alias)?;
         write_test_codex_auth(&pending.home())?;

@@ -713,7 +713,7 @@ Credential storage is a separate compatibility lane:
 | Platform | Official storage contract | Calcifer decision |
 | --- | --- | --- |
 | Linux | `.credentials.json` below `CLAUDE_CONFIG_DIR`, mode `0600` | Implemented with a private root, descriptor-correlated exact-mode validation, a lifetime lease, and journaled rotation/recovery |
-| Windows | `.credentials.json` below `CLAUDE_CONFIG_DIR`, protected by the user-profile ACL | Blocked until Calcifer can create and revalidate an equivalent current-user-only ACL and recovery boundary |
+| Windows | `.credentials.json` below `CLAUDE_CONFIG_DIR`, protected by the user-profile ACL | Blocked until Claude Windows profiles use the current-user-only ACL and journaled recovery (issue #147) |
 | macOS | encrypted macOS Keychain; the official authentication page does not promise a `CLAUDE_CONFIG_DIR`-scoped Keychain namespace | Blocked for multiple managed identities; Calcifer will not infer or emulate internal Keychain service/account names |
 
 Current official surfaces support same-profile resume by explicit session ID.
