@@ -5749,7 +5749,7 @@ pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> 
 }
 
 #[cfg(windows)]
-fn seal_windows_private_directory(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn seal_windows_private_directory(path: &Path) -> Result<(), ProfileError> {
     use std::os::windows::io::AsHandle;
 
     let directory = open_windows_directory_for_acl(path)?;

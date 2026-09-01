@@ -330,6 +330,8 @@ impl PendingCodexReauth<'_> {
     }
 
     pub(crate) fn abort(mut self) -> Result<(), ProfileError> {
+        #[cfg(windows)]
+        seal_windows_private_directory(&self.staging)?;
         safe_remove_reauth_staging(&self.staging, &self.profile.id, &self.transaction_id)?;
         sync_directory(self.staging.parent().ok_or_else(|| {
             ProfileError::UnsafeState("reauth staging has no provider root".to_owned())
