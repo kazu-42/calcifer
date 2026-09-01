@@ -6361,7 +6361,7 @@ pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileErro
 }
 
 fn verify_codex_auth_file(path: &Path) -> Result<(), ProfileError> {
-    verify_private_regular_file(path).map_err(|error| match error {
+    verify_private_single_link_regular_file(path).map_err(|error| match error {
         ProfileError::Io(io_error) if io_error.kind() == io::ErrorKind::NotFound => {
             ProfileError::UnsafeState(
                 "managed Codex profile is missing a private auth.json".to_owned(),
@@ -6386,7 +6386,7 @@ fn verify_managed_codex_agents_absent(path: &Path) -> Result<(), ProfileError> {
 }
 
 fn verify_managed_codex_config(path: &Path) -> Result<(), ProfileError> {
-    verify_private_regular_file(path).map_err(|error| match error {
+    verify_private_single_link_regular_file(path).map_err(|error| match error {
         ProfileError::Io(io_error) if io_error.kind() == io::ErrorKind::NotFound => {
             ProfileError::UnsafeState("managed Codex profile is missing its config.toml".to_owned())
         }
@@ -6518,7 +6518,7 @@ pub(crate) fn sync_directory(_path: &Path) -> Result<(), ProfileError> {
 fn verify_owned_profile_directory(path: &Path, id: &str) -> Result<(), ProfileError> {
     verify_private_directory(path)?;
     let marker = path.join(OWNER_MARKER);
-    verify_private_regular_file(&marker)?;
+    verify_private_single_link_regular_file(&marker)?;
     let value = fs::read_to_string(marker)?;
     if value != id {
         return Err(ProfileError::UnsafeState(
@@ -7189,6 +7189,49 @@ mod tests {
             .ok_or("hard-linked managed files must fail closed")?;
         assert_eq!(link_error.code(), "unsafe_profile_state");
         assert_eq!(fs::symlink_metadata(&path)?.nlink(), 2);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remaining_profile_files_reject_hard_links_without_changing_registry_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_root("private-file-single-link");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let directory = registry
+            .profile_home(&profile)?
+            .parent()
+            .ok_or("profile dir")?
+            .to_owned();
+        let marker = directory.join(OWNER_MARKER);
+        fs::hard_link(&marker, directory.join("owner-link"))?;
+        let marker_error = registry
+            .profile_home(&profile)
+            .err()
+            .ok_or("hard-linked owner marker must fail closed")?;
+        assert_eq!(marker_error.code(), "unsafe_profile_state");
+        fs::remove_file(directory.join("owner-link"))?;
+
+        let home = registry.profile_home(&profile)?;
+        let auth = home.join("auth.json");
+        fs::hard_link(&auth, home.join("auth-link"))?;
+        let auth_error = registry
+            .profile_home(&profile)
+            .err()
+            .ok_or("hard-linked auth.json must fail closed")?;
+        assert_eq!(auth_error.code(), "unsafe_profile_state");
+        fs::remove_file(home.join("auth-link"))?;
+
+        let config = home.join("config.toml");
+        fs::hard_link(&config, home.join("config-link"))?;
+        let config_error = registry
+            .profile_home(&profile)
+            .err()
+            .ok_or("hard-linked config.toml must fail closed")?;
+        assert_eq!(config_error.code(), "unsafe_profile_state");
 
         fs::remove_dir_all(root)?;
         Ok(())
