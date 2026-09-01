@@ -58,7 +58,7 @@ pub(crate) fn run_codex(
 }
 
 pub(crate) fn run_claude(alias: &str, provider_args: &[OsString]) -> Result<ExitStatus, AppError> {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", windows)) {
         return Err(crate::profiles::ProfileError::UnsupportedPlatform.into());
     }
     let registry = Registry::discover()?;
