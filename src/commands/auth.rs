@@ -145,7 +145,7 @@ pub(crate) fn add_codex(alias: &str) -> Result<AuthReport, AppError> {
 }
 
 pub(crate) fn add_claude(alias: &str) -> Result<AuthReport, AppError> {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", windows)) {
         return Err(crate::profiles::ProfileError::UnsupportedPlatform.into());
     }
     let executable = resolve_claude()?;
@@ -168,6 +168,8 @@ pub(crate) fn add_claude(alias: &str) -> Result<AuthReport, AppError> {
         pending.abort()?;
         return Err(AppError::ProviderLoginFailed);
     }
+    #[cfg(windows)]
+    crate::profiles::seal_windows_private_directory(&home)?;
     verify_claude_profile(&executable, &home, &neutral_working_directory)
         .map_err(crate::profiles::ProfileError::from)?;
     let profile = pending.commit_claude()?;
@@ -205,7 +207,7 @@ pub(crate) fn verify_codex(alias: &str) -> Result<AuthReport, AppError> {
 }
 
 pub(crate) fn verify_claude(alias: &str) -> Result<AuthReport, AppError> {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", windows)) {
         return Err(crate::profiles::ProfileError::UnsupportedPlatform.into());
     }
     let executable = resolve_claude()?;
@@ -277,7 +279,7 @@ pub(crate) fn reauth_codex(alias: &str) -> Result<AuthReport, AppError> {
 }
 
 pub(crate) fn reauth_claude(alias: &str) -> Result<AuthReport, AppError> {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", windows)) {
         return Err(crate::profiles::ProfileError::UnsupportedPlatform.into());
     }
     let executable = resolve_claude()?;
@@ -300,6 +302,8 @@ pub(crate) fn reauth_claude(alias: &str) -> Result<AuthReport, AppError> {
         pending.abort()?;
         return Err(AppError::ProviderLoginFailed);
     }
+    #[cfg(windows)]
+    crate::profiles::seal_windows_private_directory(&staging_home)?;
     verify_claude_profile(&executable, &staging_home, &neutral_working_directory)
         .map_err(crate::profiles::ProfileError::from)?;
     let profile = pending.commit_claude()?;

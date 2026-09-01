@@ -267,7 +267,7 @@ impl Registry {
         &self,
         alias: &str,
     ) -> Result<PendingCodexReauth<'_>, ProfileError> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", windows)) {
             return Err(ProfileError::UnsupportedPlatform);
         }
         self.recover_incomplete_removal()?;
@@ -330,6 +330,8 @@ impl PendingCodexReauth<'_> {
     }
 
     pub(crate) fn abort(mut self) -> Result<(), ProfileError> {
+        #[cfg(windows)]
+        seal_windows_private_directory(&self.staging)?;
         safe_remove_reauth_staging(&self.staging, &self.profile.id, &self.transaction_id)?;
         sync_directory(self.staging.parent().ok_or_else(|| {
             ProfileError::UnsafeState("reauth staging has no provider root".to_owned())
@@ -343,6 +345,8 @@ impl PendingCodexReauth<'_> {
             return Err(ProfileError::ReauthRecoveryRequired);
         }
         let staging_home = self.home();
+        #[cfg(windows)]
+        seal_windows_private_directory(&staging_home)?;
         verify_managed_codex_home(&staging_home)?;
         let store = IdentityStore::new(&self.registry.root);
         let key = store.load_key()?;
@@ -361,6 +365,8 @@ impl PendingCodexReauth<'_> {
         if self.profile.provider != Provider::Claude || self.expected_identity.is_some() {
             return Err(ProfileError::ReauthRecoveryRequired);
         }
+        #[cfg(windows)]
+        seal_windows_private_directory(&self.home())?;
         crate::providers::claude::sync_linux_credentials(&self.home())?;
         self.commit_credential(credential_name(Provider::Claude))
     }

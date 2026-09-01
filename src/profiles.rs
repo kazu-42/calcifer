@@ -1080,12 +1080,12 @@ impl Registry {
         &self,
         alias: &str,
     ) -> Result<PendingProfile<'_>, ProfileError> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(not(target_os = "linux"), not(windows)))]
         {
             let _ = alias;
             Err(ProfileError::UnsupportedPlatform)
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         self.begin_registration(Provider::Claude, alias)
     }
 
@@ -3224,8 +3224,6 @@ fn remove_owned_tombstone_at_with_limits(
     max_entries: usize,
     max_depth: usize,
 ) -> Result<(), ProfileError> {
-    use std::os::windows::io::AsHandle;
-
     let tombstone_name = tombstone
         .file_name()
         .and_then(|name| name.to_str())
@@ -3235,6 +3233,30 @@ fn remove_owned_tombstone_at_with_limits(
             "profile removal path is outside its managed provider root".to_owned(),
         ));
     }
+    remove_owned_windows_child_directory(
+        provider_root,
+        tombstone_name,
+        expected_provider,
+        expected_tree,
+        expected_mount,
+        max_entries,
+        max_depth,
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn remove_owned_windows_child_directory(
+    provider_root: &Path,
+    tree_name: &str,
+    expected_provider: FileSystemIdentity,
+    expected_tree: FileSystemIdentity,
+    expected_mount: &RemovalMountIdentity,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<(), ProfileError> {
+    use std::os::windows::io::AsHandle;
+
     let provider = open_windows_directory_for_acl(provider_root)?;
     let provider_opened =
         verify_windows_removal_node(provider.as_handle(), true, expected_provider.device)?;
@@ -3245,12 +3267,9 @@ fn remove_owned_tombstone_at_with_limits(
         expected_mount,
         &windows_mount_identity(provider_opened.volume_serial),
     )?;
-    let tree = calcifer_windows_acl::open_nofollow_child(
-        provider.as_handle(),
-        tombstone_name.as_ref(),
-        true,
-    )
-    .map_err(windows_removal_open_error)?;
+    let tree =
+        calcifer_windows_acl::open_nofollow_child(provider.as_handle(), tree_name.as_ref(), true)
+            .map_err(windows_removal_open_error)?;
     let tree_opened =
         verify_windows_removal_node(tree.as_handle(), true, expected_provider.device)?;
     if windows_file_system_identity(tree_opened)? != expected_tree {
@@ -3266,12 +3285,9 @@ fn remove_owned_tombstone_at_with_limits(
         &mut budget,
         0,
     )?;
-    let final_tree = calcifer_windows_acl::open_nofollow_child(
-        provider.as_handle(),
-        tombstone_name.as_ref(),
-        true,
-    )
-    .map_err(windows_removal_open_error)?;
+    let final_tree =
+        calcifer_windows_acl::open_nofollow_child(provider.as_handle(), tree_name.as_ref(), true)
+            .map_err(windows_removal_open_error)?;
     let final_opened =
         verify_windows_removal_node(final_tree.as_handle(), true, expected_provider.device)?;
     if windows_file_system_identity(final_opened)? != expected_tree {
@@ -3439,7 +3455,37 @@ fn remove_owned_reauth_staging_at(
     )
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn remove_owned_reauth_staging_at(
+    provider_root: &Path,
+    staging: &Path,
+    expected_name: &str,
+    expected_tree: FileSystemIdentity,
+    max_entries: usize,
+) -> Result<(), ProfileError> {
+    if staging.parent() != Some(provider_root)
+        || staging.file_name().and_then(|name| name.to_str()) != Some(expected_name)
+        || !expected_name.starts_with(".reauth-")
+    {
+        return Err(ProfileError::ReauthRecoveryRequired);
+    }
+    let expected_provider = private_directory_identity(provider_root)
+        .map_err(|_| ProfileError::ReauthRecoveryRequired)?;
+    let expected_mount = removal_mount_identity_path(provider_root)
+        .map_err(|_| ProfileError::ReauthRecoveryRequired)?;
+    remove_owned_windows_child_directory(
+        provider_root,
+        expected_name,
+        expected_provider,
+        expected_tree,
+        &expected_mount,
+        max_entries,
+        MAX_REMOVAL_TREE_DEPTH,
+    )
+    .map_err(|_| ProfileError::ReauthRecoveryRequired)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn remove_owned_reauth_staging_at(
     _provider_root: &Path,
     _staging: &Path,
@@ -3785,6 +3831,8 @@ impl PendingProfile<'_> {
                 "Claude registration received a non-Claude profile".to_owned(),
             ));
         }
+        #[cfg(windows)]
+        seal_windows_private_directory(&self.home())?;
         crate::providers::claude::sync_linux_credentials(&self.home())?;
         self.publish()
     }
@@ -5178,12 +5226,12 @@ fn ensure_registration_supported() -> Result<(), ProfileError> {
     Err(ProfileError::UnsupportedPlatform)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ensure_reauth_supported() -> Result<(), ProfileError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn ensure_reauth_supported() -> Result<(), ProfileError> {
     Err(ProfileError::UnsupportedPlatform)
 }
@@ -5701,7 +5749,7 @@ pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ProfileError> 
 }
 
 #[cfg(windows)]
-fn seal_windows_private_directory(path: &Path) -> Result<(), ProfileError> {
+pub(crate) fn seal_windows_private_directory(path: &Path) -> Result<(), ProfileError> {
     use std::os::windows::io::AsHandle;
 
     let directory = open_windows_directory_for_acl(path)?;
@@ -6183,7 +6231,7 @@ pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileErro
 }
 
 #[cfg(windows)]
-fn open_windows_file_for_acl(path: &Path) -> Result<File, ProfileError> {
+pub(crate) fn open_windows_file_for_acl(path: &Path) -> Result<File, ProfileError> {
     use std::os::windows::fs::OpenOptionsExt;
 
     OpenOptions::new()
@@ -6899,23 +6947,67 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_claude_registration_and_codex_reauth_stay_unsupported()
+    fn windows_claude_registration_commits_and_journaled_remove_cleans_up()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = windows_temporary_root("windows-claude-reauth-closed");
+        let root = windows_temporary_root("windows-claude-register");
         let registry = Registry::at(root.clone());
-        let claude = registry
-            .begin_claude_registration("work")
-            .err()
-            .ok_or("Claude Windows registration must stay fail-closed")?;
-        assert_eq!(claude.code(), "unsupported_platform");
-        let reauth = registry
-            .begin_codex_reauthentication("work", |_, _| Ok(test_identity_adapter()))
-            .err()
-            .ok_or("Windows Codex reauth must stay fail-closed")?;
-        assert_eq!(reauth.code(), "unsupported_platform");
-        if root.exists() {
-            fs::remove_dir_all(root)?;
-        }
+        let pending = registry.begin_claude_registration("work")?;
+        write_private_file(
+            &pending.home().join(".credentials.json"),
+            b"synthetic-claude",
+        )?;
+        let profile = pending.commit_claude()?;
+        let profile_directory = registry.profile_directory(&profile)?;
+        assert_eq!(registry.remove(Provider::Claude, "work", None)?, profile);
+        assert!(!profile_directory.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_commit_seals_provider_created_claude_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::io::AsHandle;
+
+        let root = windows_temporary_root("windows-seal-claude");
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_claude_registration("work")?;
+        let credentials = pending.home().join(".credentials.json");
+        fs::write(&credentials, b"provider-created-claude")?;
+        let unsealed = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&credentials)?;
+        calcifer_windows_acl::verify_current_user_only(unsealed.as_handle())
+            .expect_err("a provider-created credential file must not already be current-user-only");
+        drop(unsealed);
+        let profile = pending.commit_claude()?;
+        super::verify_private_regular_file(
+            &registry.profile_home(&profile)?.join(".credentials.json"),
+        )?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claude_reauth_replaces_credentials_through_journaled_staging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root("windows-claude-reauth");
+        let registry = Registry::at(root.clone());
+        let pending = registry.begin_claude_registration("work")?;
+        write_private_file(&pending.home().join(".credentials.json"), b"old-claude")?;
+        let profile = pending.commit_claude()?;
+        let pending = registry.begin_claude_reauthentication("work")?;
+        write_private_file(&pending.home().join(".credentials.json"), b"new-claude")?;
+        let updated = pending.commit_claude()?;
+        assert_eq!(updated.id, profile.id);
+        assert_eq!(
+            fs::read(registry.profile_home(&profile)?.join(".credentials.json"))?,
+            b"new-claude"
+        );
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

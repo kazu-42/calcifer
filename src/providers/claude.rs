@@ -1,4 +1,4 @@
-//! Linux-only Claude Code profile compatibility boundary.
+//! Linux and Windows Claude Code profile compatibility boundary.
 
 #![allow(dead_code)] // Public profile lifecycle wiring follows this sealed adapter gate.
 
@@ -57,7 +57,7 @@ impl ClaudeProfileError {
                 "Claude Code returned an unsupported authentication status contract."
             }
             Self::Credentials => {
-                "The managed Claude credential file failed Calcifer's Linux ownership or permission checks."
+                "The managed Claude credential file failed Calcifer's ownership, permission, or ACL checks."
             }
             Self::Io => "Calcifer could not inspect the managed Claude profile.",
         }
@@ -250,15 +250,21 @@ fn bounded_stdout_until(
     Ok((status, output))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn validate_linux_credentials(config_dir: &Path) -> Result<(), ClaudeProfileError> {
     open_validated_linux_credentials(config_dir).map(|_| ())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn sync_linux_credentials(config_dir: &Path) -> Result<(), ClaudeProfileError> {
     let credentials = open_validated_linux_credentials(config_dir)?;
     credentials.sync_all().map_err(|_| ClaudeProfileError::Io)?;
+    #[cfg(windows)]
+    {
+        crate::profiles::sync_directory(config_dir).map_err(|_| ClaudeProfileError::Io)?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
     std::fs::File::open(config_dir)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| ClaudeProfileError::Io)
@@ -311,12 +317,38 @@ fn open_validated_linux_credentials(
     Ok(file)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn open_validated_linux_credentials(
+    config_dir: &Path,
+) -> Result<std::fs::File, ClaudeProfileError> {
+    use std::os::windows::io::AsHandle;
+
+    crate::profiles::verify_private_directory(config_dir)
+        .map_err(|_| ClaudeProfileError::Credentials)?;
+    let credentials = config_dir.join(".credentials.json");
+    crate::profiles::verify_private_regular_file(&credentials)
+        .map_err(|_| ClaudeProfileError::Credentials)?;
+    let file = crate::profiles::open_windows_file_for_acl(&credentials)
+        .map_err(|_| ClaudeProfileError::Credentials)?;
+    let identity = calcifer_windows_acl::inspect(file.as_handle())
+        .map_err(|_| ClaudeProfileError::Credentials)?;
+    if identity.is_reparse_point()
+        || identity.is_directory()
+        || identity.link_count != 1
+        || identity.file_size == 0
+        || identity.file_size > MAX_CREDENTIAL_BYTES
+    {
+        return Err(ClaudeProfileError::Credentials);
+    }
+    Ok(file)
+}
+
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 pub(crate) fn validate_linux_credentials(_config_dir: &Path) -> Result<(), ClaudeProfileError> {
     Err(ClaudeProfileError::Credentials)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 pub(crate) fn sync_linux_credentials(_config_dir: &Path) -> Result<(), ClaudeProfileError> {
     Err(ClaudeProfileError::Credentials)
 }
@@ -411,6 +443,29 @@ mod tests {
             Err(ClaudeProfileError::Credentials)
         );
         std::fs::remove_file(extra_link)?;
+        assert_eq!(sync_linux_credentials(&root), Ok(()));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_credentials_require_current_user_only_acl() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::windows::io::AsHandle;
+
+        let root = std::env::temp_dir().join(format!("calcifer-claude-{}", uuid::Uuid::new_v4()));
+        crate::profiles::secure_create_dir(&root)?;
+        let credentials = root.join(".credentials.json");
+        std::fs::write(&credentials, b"synthetic-not-a-token")?;
+        assert_eq!(
+            validate_linux_credentials(&root),
+            Err(ClaudeProfileError::Credentials)
+        );
+        let file = crate::profiles::open_windows_file_for_acl(&credentials)?;
+        calcifer_windows_acl::apply_current_user_only(file.as_handle())?;
+        drop(file);
+        assert_eq!(validate_linux_credentials(&root), Ok(()));
         assert_eq!(sync_linux_credentials(&root), Ok(()));
         std::fs::remove_dir_all(root)?;
         Ok(())

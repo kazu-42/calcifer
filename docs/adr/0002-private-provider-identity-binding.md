@@ -30,9 +30,9 @@ Calcifer binds each supported Codex profile to a provider-private equality
 token before publishing a new registration.
 
 1. Identity files use Unix owner-only modes or a verified Windows
-   current-user-only DACL. Windows Codex registration uses that ACL and
-   journaled removal recovery. Claude Windows profiles and Windows
-   reauthentication remain fail-closed.
+   current-user-only DACL. Windows Codex and Claude registration use that
+   ACL and journaled removal recovery. macOS Claude multi-profile
+   registration remains fail-closed.
 2. The provider module performs the existing App Server
    initialize/home/version gate and returns an unforgeable in-crate capability
    for the exact 0.144.4 identity adapter. Other production modules cannot
