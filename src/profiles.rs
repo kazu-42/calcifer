@@ -648,13 +648,18 @@ impl Registry {
         provider: Provider,
         alias: &str,
     ) -> Result<ProfileShow, ProfileError> {
-        let profile = self.find(provider, alias)?;
+        self.ensure_no_removal_artifacts_read_only()?;
+        self.ensure_no_reauth_artifacts_read_only()?;
+        let profile = self.find_without_recovery(provider, alias)?;
         let directory = self.profile_directory(&profile)?;
         let home = directory.join("home");
         let identity_binding = match profile.provider {
             Provider::Claude => "not_applicable",
             Provider::Codex => {
                 let store = IdentityStore::new(&self.root);
+                if !store.marker_exists(&directory)? {
+                    return Err(ProfileError::from(IdentityError::Unverified));
+                }
                 let key = store.load_key()?;
                 match store.read_marker(&directory, &key)? {
                     Some(_) => "bound",
@@ -7417,6 +7422,64 @@ mod tests {
                 .to_string()
                 .contains("planted-missing-key-secret-must-not-leak")
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_rejects_unverified_legacy_profile_without_identity_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-unverified-legacy");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-unverified-legacy");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        fs::remove_file(
+            registry
+                .profile_directory(&profile)?
+                .join(crate::provider_identity::IDENTITY_MARKER_FILE),
+        )?;
+        fs::remove_file(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
+        let error = registry
+            .show(Provider::Codex, "work")
+            .err()
+            .ok_or("legacy unbound profile must stay unverified")?;
+        assert_eq!(error.code(), "provider_identity_unverified");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_does_not_recover_unrelated_reauth_or_open_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-skip-reauth");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-skip-reauth");
+        let registry = Registry::at(root.clone());
+        let interrupted = register_test_profile(&registry, "busy")?;
+        let inspected = register_test_profile(&registry, "work")?;
+        let secret = b"planted-reauth-secret-must-not-leak";
+        fs::write(registry.profile_home(&inspected)?.join("auth.json"), secret)?;
+        let journal = registry
+            .profile_directory(&interrupted)?
+            .join(".calcifer-reauth.json");
+        fs::write(&journal, b"{\"schema_version\":2}")?;
+        let _lease = registry.lock_profile(&interrupted)?;
+        let error = registry
+            .show(Provider::Codex, "work")
+            .err()
+            .ok_or("auth show must not enter reauth recovery")?;
+        assert_eq!(error.code(), "reauth_recovery_required");
+        assert!(
+            !error
+                .to_string()
+                .contains("planted-reauth-secret-must-not-leak")
+        );
+        assert!(fs::symlink_metadata(&journal).is_ok());
         fs::remove_dir_all(root)?;
         Ok(())
     }

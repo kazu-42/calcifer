@@ -131,13 +131,50 @@ impl Registry {
     /// retained for inspection instead of being guessed or recursively
     /// deleted.
     pub(crate) fn recover_incomplete_reauth(&self) -> Result<(), ProfileError> {
+        let (document, affected_ids) = match self.incomplete_reauth_scan()? {
+            Some(scan) => scan,
+            None => return Ok(()),
+        };
+
+        for id in affected_ids {
+            let profile = document
+                .profiles
+                .iter()
+                .find(|profile| profile.id == id)
+                .ok_or(ProfileError::ReauthRecoveryRequired)?;
+            let lease = self.lock_profile(profile)?;
+            let current = self.find_by_id_without_recovery(profile.provider, &profile.id)?;
+            if current != *profile {
+                return Err(ProfileError::ReauthRecoveryRequired);
+            }
+            let profile_directory = self.profile_directory(&current)?;
+            recover_reauth_under_lease(self, &current, &profile_directory)?;
+            drop(lease);
+        }
+        Ok(())
+    }
+
+    /// Surfaces interrupted reauthentication without hashing or renaming
+    /// credential files.
+    pub(crate) fn ensure_no_reauth_artifacts_read_only(&self) -> Result<(), ProfileError> {
+        match self.incomplete_reauth_scan()? {
+            Some((_, affected_ids)) if !affected_ids.is_empty() => {
+                Err(ProfileError::ReauthRecoveryRequired)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn incomplete_reauth_scan(
+        &self,
+    ) -> Result<Option<(RegistryDocument, Vec<String>)>, ProfileError> {
         if !path_exists(&self.root)? {
-            return Ok(());
+            return Ok(None);
         }
         let document = self.load()?;
         let profiles_root = self.root.join("profiles");
         match fs::symlink_metadata(&profiles_root) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ProfileError::Io(error)),
             Ok(_) => verify_private_directory(&profiles_root)?,
         }
@@ -185,23 +222,7 @@ impl Registry {
         }
         affected_ids.sort();
         affected_ids.dedup();
-
-        for id in affected_ids {
-            let profile = document
-                .profiles
-                .iter()
-                .find(|profile| profile.id == id)
-                .ok_or(ProfileError::ReauthRecoveryRequired)?;
-            let lease = self.lock_profile(profile)?;
-            let current = self.find_by_id_without_recovery(profile.provider, &profile.id)?;
-            if current != *profile {
-                return Err(ProfileError::ReauthRecoveryRequired);
-            }
-            let profile_directory = self.profile_directory(&current)?;
-            recover_reauth_under_lease(self, &current, &profile_directory)?;
-            drop(lease);
-        }
-        Ok(())
+        Ok(Some((document, affected_ids)))
     }
 
     pub(crate) fn begin_codex_reauthentication(
