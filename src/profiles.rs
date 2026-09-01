@@ -655,10 +655,10 @@ impl Registry {
             Provider::Claude => "not_applicable",
             Provider::Codex => {
                 let store = IdentityStore::new(&self.root);
-                if store.marker_exists(&directory)? {
-                    "bound"
-                } else {
-                    return Err(ProfileError::from(IdentityError::Unverified));
+                let key = store.load_key()?;
+                match store.read_marker(&directory, &key)? {
+                    Some(_) => "bound",
+                    None => return Err(ProfileError::from(IdentityError::Unverified)),
                 }
             }
         };
@@ -7358,6 +7358,65 @@ mod tests {
             .err()
             .ok_or("missing profile must fail closed")?;
         assert_eq!(missing.code(), "profile_not_found");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_rejects_malformed_identity_marker_without_opening_auth_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-malformed-marker");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-malformed-marker");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let secret = b"planted-malformed-marker-secret-must-not-leak";
+        fs::write(registry.profile_home(&profile)?.join("auth.json"), secret)?;
+        fs::write(
+            registry
+                .profile_directory(&profile)?
+                .join(crate::provider_identity::IDENTITY_MARKER_FILE),
+            b"{not-valid-identity-marker",
+        )?;
+        let error = registry
+            .show(Provider::Codex, "work")
+            .err()
+            .ok_or("malformed identity marker must fail closed")?;
+        assert_eq!(error.code(), "provider_identity_invalid");
+        assert!(
+            !error
+                .to_string()
+                .contains("planted-malformed-marker-secret-must-not-leak")
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_rejects_missing_identity_key_without_opening_auth_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-missing-key");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-missing-key");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let secret = b"planted-missing-key-secret-must-not-leak";
+        fs::write(registry.profile_home(&profile)?.join("auth.json"), secret)?;
+        fs::remove_file(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
+        let error = registry
+            .show(Provider::Codex, "work")
+            .err()
+            .ok_or("missing identity key must fail closed")?;
+        assert_eq!(error.code(), "identity_key_unavailable");
+        assert!(
+            !error
+                .to_string()
+                .contains("planted-missing-key-secret-must-not-leak")
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
