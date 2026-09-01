@@ -286,6 +286,12 @@ pub(crate) enum AuthCommand {
 
     /// List registered profiles without reading credentials.
     List,
+
+    /// Show one registered profile without reading credentials.
+    Show {
+        /// Existing profile to show, for example codex@work.
+        profile: ProfileReference,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

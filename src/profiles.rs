@@ -195,6 +195,19 @@ impl Profile {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileShow {
+    pub(crate) reference: String,
+    pub(crate) id: String,
+    pub(crate) provider: Provider,
+    pub(crate) alias: String,
+    pub(crate) created_at: i64,
+    pub(crate) identity_binding: &'static str,
+    pub(crate) home_present: bool,
+    pub(crate) lease: &'static str,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryDocument {
@@ -627,6 +640,67 @@ impl Registry {
         self.recover_incomplete_removal()?;
         self.recover_incomplete_reauth()?;
         self.find_without_recovery(provider, alias)
+    }
+
+    /// Returns redacted public metadata for one profile without opening credentials.
+    pub(crate) fn show(
+        &self,
+        provider: Provider,
+        alias: &str,
+    ) -> Result<ProfileShow, ProfileError> {
+        if path_exists(&self.root)? {
+            verify_private_directory(&self.root)?;
+        }
+        self.ensure_no_removal_artifacts_read_only()?;
+        self.ensure_no_reauth_artifacts_read_only()?;
+        let profile = self.find_without_recovery(provider, alias)?;
+        let directory = self.profile_directory(&profile)?;
+        let home = directory.join("home");
+        let identity_binding = match profile.provider {
+            Provider::Claude => "not_applicable",
+            Provider::Codex => {
+                let store = IdentityStore::new(&self.root);
+                if !store.marker_exists(&directory)? {
+                    return Err(ProfileError::from(IdentityError::Unverified));
+                }
+                let key = store.load_key()?;
+                match store.read_marker(&directory, &key)? {
+                    Some(_) => "bound",
+                    None => return Err(ProfileError::from(IdentityError::Unverified)),
+                }
+            }
+        };
+        Ok(ProfileShow {
+            reference: profile.reference(),
+            id: profile.id.clone(),
+            provider: profile.provider,
+            alias: profile.alias.clone(),
+            created_at: profile.created_at,
+            identity_binding,
+            home_present: path_exists(&home)?,
+            lease: self.profile_lease_state(&profile, &directory)?,
+        })
+    }
+
+    fn profile_lease_state(
+        &self,
+        profile: &Profile,
+        directory: &Path,
+    ) -> Result<&'static str, ProfileError> {
+        for name in [COORDINATOR_LOCK_FILE, PROVIDER_LOCK_FILE] {
+            let path = directory.join(name);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(ProfileError::Io(error)),
+                Ok(_) => {}
+            }
+            match lock_existing_profile_file(&path, &profile.reference()) {
+                Ok(_) => {}
+                Err(ProfileError::Busy(_)) => return Ok("busy"),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok("idle")
     }
 
     fn find_without_recovery(
@@ -6172,6 +6246,11 @@ fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, Prof
     Ok(file)
 }
 
+#[cfg(all(not(unix), not(windows)))]
+fn lock_existing_profile_file(_path: &Path, _reference: &str) -> Result<File, ProfileError> {
+    Err(ProfileError::UnsupportedPlatform)
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::MetadataExt;
@@ -7260,6 +7339,185 @@ mod tests {
         let pending = registry.begin_codex_registration(alias)?;
         write_test_codex_auth(&pending.home())?;
         pending.commit(test_identity_adapter())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_reports_bound_idle_metadata_without_reading_auth_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-bound");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-bound");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let secret = b"planted-show-secret-must-not-leak";
+        fs::write(registry.profile_home(&profile)?.join("auth.json"), secret)?;
+        let shown = registry.show(Provider::Codex, "work")?;
+        assert_eq!(shown.reference, profile.reference());
+        assert_eq!(shown.id, profile.id);
+        assert_eq!(shown.identity_binding, "bound");
+        assert!(shown.home_present);
+        assert_eq!(shown.lease, "idle");
+        let encoded = serde_json::to_string(&shown)?;
+        assert!(!encoded.contains("planted-show-secret-must-not-leak"));
+        let missing = registry
+            .show(Provider::Codex, "missing")
+            .err()
+            .ok_or("missing profile must fail closed")?;
+        assert_eq!(missing.code(), "profile_not_found");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_rejects_malformed_identity_marker_without_opening_auth_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-malformed-marker");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-malformed-marker");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let secret = b"planted-malformed-marker-secret-must-not-leak";
+        fs::write(registry.profile_home(&profile)?.join("auth.json"), secret)?;
+        fs::write(
+            registry
+                .profile_directory(&profile)?
+                .join(crate::provider_identity::IDENTITY_MARKER_FILE),
+            b"{not-valid-identity-marker",
+        )?;
+        let error = registry
+            .show(Provider::Codex, "work")
+            .err()
+            .ok_or("malformed identity marker must fail closed")?;
+        assert_eq!(error.code(), "provider_identity_invalid");
+        assert!(
+            !error
+                .to_string()
+                .contains("planted-malformed-marker-secret-must-not-leak")
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_rejects_missing_identity_key_without_opening_auth_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-missing-key");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-missing-key");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let secret = b"planted-missing-key-secret-must-not-leak";
+        fs::write(registry.profile_home(&profile)?.join("auth.json"), secret)?;
+        fs::remove_file(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
+        let error = registry
+            .show(Provider::Codex, "work")
+            .err()
+            .ok_or("missing identity key must fail closed")?;
+        assert_eq!(error.code(), "identity_key_unavailable");
+        assert!(
+            !error
+                .to_string()
+                .contains("planted-missing-key-secret-must-not-leak")
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_rejects_unverified_legacy_profile_without_identity_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-unverified-legacy");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-unverified-legacy");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        fs::remove_file(
+            registry
+                .profile_directory(&profile)?
+                .join(crate::provider_identity::IDENTITY_MARKER_FILE),
+        )?;
+        fs::remove_file(root.join(crate::provider_identity::IDENTITY_KEY_FILE))?;
+        let error = registry
+            .show(Provider::Codex, "work")
+            .err()
+            .ok_or("legacy unbound profile must stay unverified")?;
+        assert_eq!(error.code(), "provider_identity_unverified");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_does_not_recover_unrelated_reauth_or_open_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-skip-reauth");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-skip-reauth");
+        let registry = Registry::at(root.clone());
+        let interrupted = register_test_profile(&registry, "busy")?;
+        let inspected = register_test_profile(&registry, "work")?;
+        let secret = b"planted-reauth-secret-must-not-leak";
+        fs::write(registry.profile_home(&inspected)?.join("auth.json"), secret)?;
+        let journal = registry
+            .profile_directory(&interrupted)?
+            .join(".calcifer-reauth.json");
+        fs::write(&journal, b"{\"schema_version\":2}")?;
+        let _lease = registry.lock_profile(&interrupted)?;
+        let error = registry
+            .show(Provider::Codex, "work")
+            .err()
+            .ok_or("auth show must not enter reauth recovery")?;
+        assert_eq!(error.code(), "reauth_recovery_required");
+        assert!(
+            !error
+                .to_string()
+                .contains("planted-reauth-secret-must-not-leak")
+        );
+        assert!(fs::symlink_metadata(&journal).is_ok());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_rejects_an_unsafe_managed_root_before_profile_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("auth-show-unsafe-root");
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
+        let error = Registry::at(root.clone())
+            .show(Provider::Codex, "missing")
+            .err()
+            .ok_or("unsafe managed root must fail closed")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn show_rejects_an_unsafe_managed_root_before_profile_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root("auth-show-unsafe-root");
+        fs::create_dir(&root)?;
+        let error = Registry::at(root.clone())
+            .show(Provider::Codex, "missing")
+            .err()
+            .ok_or("unsafe managed root must fail closed")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
