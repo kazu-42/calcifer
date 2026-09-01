@@ -648,6 +648,9 @@ impl Registry {
         provider: Provider,
         alias: &str,
     ) -> Result<ProfileShow, ProfileError> {
+        if path_exists(&self.root)? {
+            verify_private_directory(&self.root)?;
+        }
         self.ensure_no_removal_artifacts_read_only()?;
         self.ensure_no_reauth_artifacts_read_only()?;
         let profile = self.find_without_recovery(provider, alias)?;
@@ -7480,6 +7483,39 @@ mod tests {
                 .contains("planted-reauth-secret-must-not-leak")
         );
         assert!(fs::symlink_metadata(&journal).is_ok());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_rejects_an_unsafe_managed_root_before_profile_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("auth-show-unsafe-root");
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
+        let error = Registry::at(root.clone())
+            .show(Provider::Codex, "missing")
+            .err()
+            .ok_or("unsafe managed root must fail closed")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn show_rejects_an_unsafe_managed_root_before_profile_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = windows_temporary_root("auth-show-unsafe-root");
+        fs::create_dir(&root)?;
+        let error = Registry::at(root.clone())
+            .show(Provider::Codex, "missing")
+            .err()
+            .ok_or("unsafe managed root must fail closed")?;
+        assert_eq!(error.code(), "unsafe_profile_state");
         fs::remove_dir_all(root)?;
         Ok(())
     }
