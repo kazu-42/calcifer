@@ -5449,6 +5449,16 @@ fn private_directory_metadata_is_safe(metadata: &fs::Metadata, expected_uid: u32
         && metadata.mode() & 0o077 == 0
 }
 
+#[cfg(unix)]
+fn private_regular_file_metadata_is_safe(metadata: &fs::Metadata, expected_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == expected_uid
+        && metadata.mode() & 0o077 == 0
+}
+
 #[cfg(target_os = "macos")]
 struct MacosOpenedNode {
     metadata: fs::Metadata,
@@ -6253,17 +6263,10 @@ fn lock_existing_profile_file(_path: &Path, _reference: &str) -> Result<File, Pr
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
-    use std::os::unix::fs::MetadataExt;
-
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    if !private_regular_file_metadata_is_safe(&metadata, rustix::process::getuid().as_raw()) {
         return Err(ProfileError::UnsafeState(
-            "managed file is not a regular file".to_owned(),
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(ProfileError::UnsafeState(
-            "managed file is accessible by another OS user".to_owned(),
+            "managed file type, owner, link count, or mode is unsafe".to_owned(),
         ));
     }
     verify_safe_creation_parent(path)?;
@@ -6272,11 +6275,9 @@ pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileErro
 
 #[cfg(target_os = "macos")]
 fn verify_private_macos_regular_node(node: &MacosOpenedNode) -> Result<(), ProfileError> {
-    use std::os::unix::fs::MetadataExt;
-
-    if node.metadata.mode() & 0o077 != 0 {
+    if !private_regular_file_metadata_is_safe(&node.metadata, rustix::process::getuid().as_raw()) {
         return Err(ProfileError::UnsafeState(
-            "managed file is accessible by another OS user".to_owned(),
+            "managed file type, owner, link count, or mode is unsafe".to_owned(),
         ));
     }
     if !node.acl.is_empty() {
@@ -7126,6 +7127,71 @@ mod tests {
             std::process::id(),
             Uuid::new_v4()
         ))
+    }
+
+    /// Remaining Calcifer-owned regular-file kinds that still share
+    /// `verify_private_regular_file` (issue #142). This slice adds owner-UID
+    /// to that helper. Single-link proofs stay on the stricter helper so
+    /// removal recovery can keep mapping a hard-linked registry to
+    /// `removal_recovery_required`. Directory-relative open remains a
+    /// follow-up.
+    #[cfg(unix)]
+    const REMAINING_PRIVATE_REGULAR_FILE_KINDS: &[&str] = &[
+        "registry.json",
+        "identity.key",
+        ".calcifer-identity",
+        ".owner",
+        ".coordinator.lock",
+        ".provider.lock",
+        "auth.json",
+        ".credentials.json",
+        "config.toml",
+        ".calcifer-reauth.json",
+        "routing definitions",
+        "usage observations",
+    ];
+
+    #[cfg(unix)]
+    #[test]
+    fn remaining_private_regular_files_reject_owner_mode_and_hard_link_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        assert!(!REMAINING_PRIVATE_REGULAR_FILE_KINDS.is_empty());
+        let root = temporary_root("private-file-inventory");
+        secure_create_dir(&root)?;
+        let path = root.join("managed.bin");
+        write_private_file(&path, b"inventory")?;
+        super::verify_private_regular_file(&path)?;
+
+        let metadata = fs::symlink_metadata(&path)?;
+        assert!(super::private_regular_file_metadata_is_safe(
+            &metadata,
+            rustix::process::getuid().as_raw()
+        ));
+        assert!(!super::private_regular_file_metadata_is_safe(
+            &metadata,
+            rustix::process::getuid().as_raw().wrapping_add(1)
+        ));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        let mode_error = super::verify_private_regular_file(&path)
+            .err()
+            .ok_or("group-writable managed files must fail closed")?;
+        assert_eq!(mode_error.code(), "unsafe_profile_state");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+
+        let linked = root.join("linked.bin");
+        fs::hard_link(&path, &linked)?;
+        super::verify_private_regular_file(&path)?;
+        let link_error = super::verify_private_single_link_regular_file(&path)
+            .err()
+            .ok_or("hard-linked managed files must fail closed")?;
+        assert_eq!(link_error.code(), "unsafe_profile_state");
+        assert_eq!(fs::symlink_metadata(&path)?.nlink(), 2);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[cfg(unix)]
