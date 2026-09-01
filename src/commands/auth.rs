@@ -316,6 +316,49 @@ pub(crate) fn reauth_claude(alias: &str) -> Result<AuthReport, AppError> {
     })
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct ShowReport {
+    schema_version: u8,
+    command: &'static str,
+    ok: bool,
+    action: &'static str,
+    profile: crate::profiles::ProfileShow,
+}
+
+impl ShowReport {
+    pub(crate) fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+
+    pub(crate) fn to_human(&self) -> String {
+        let home = if self.profile.home_present {
+            "present"
+        } else {
+            "missing"
+        };
+        format!(
+            "{}\nid: {}\nidentity: {}\nhome: {}\nlease: {}",
+            self.profile.reference,
+            self.profile.id,
+            self.profile.identity_binding,
+            home,
+            self.profile.lease
+        )
+    }
+}
+
+pub(crate) fn show(provider: Provider, alias: &str) -> Result<ShowReport, AppError> {
+    let registry = Registry::discover()?;
+    let profile = registry.show(provider, alias)?;
+    Ok(ShowReport {
+        schema_version: 1,
+        command: "auth",
+        ok: true,
+        action: "show",
+        profile,
+    })
+}
+
 pub(crate) fn list() -> Result<AuthReport, AppError> {
     let registry = Registry::discover()?;
     Ok(AuthReport {

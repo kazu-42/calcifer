@@ -308,6 +308,12 @@ where
                 Ok(report) => render_auth_report(&report, cli.json),
                 Err(error) => render_app_error("auth", &error, cli.json),
             },
+            AuthCommand::Show { profile } => {
+                match commands::auth::show(provider_value(profile.provider), &profile.alias) {
+                    Ok(report) => render_show_report(&report, cli.json),
+                    Err(error) => render_app_error("auth", &error, cli.json),
+                }
+            }
         },
         Commands::Routing { command } => run_routing_command(command, cli.json),
         Commands::Run {
@@ -597,6 +603,25 @@ fn definition_value(reference: DefinitionReference) -> (Option<profiles::Provide
     (reference.provider.map(provider_value), reference.value)
 }
 
+fn render_show_report(report: &commands::auth::ShowReport, json: bool) -> ExitCode {
+    let rendered = if json {
+        report.to_json()
+    } else {
+        Ok(report.to_human())
+    };
+    match rendered {
+        Ok(rendered) if write_stdout(&rendered).is_ok() => ExitCode::SUCCESS,
+        _ => {
+            let _ = write_stderr(if json {
+                JSON_INTERNAL_ERROR
+            } else {
+                HUMAN_INTERNAL_ERROR
+            });
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn render_auth_report(report: &commands::auth::AuthReport, json: bool) -> ExitCode {
     let rendered = if json {
         report.to_json()
@@ -795,6 +820,12 @@ mod tests {
 
         assert!(before.is_ok());
         assert!(after.is_ok());
+    }
+
+    #[test]
+    fn auth_show_parses_a_profile_reference() {
+        assert!(Cli::try_parse_from(["calcifer", "auth", "show", "codex@work"]).is_ok());
+        assert!(Cli::try_parse_from(["calcifer", "--json", "auth", "show", "codex@work"]).is_ok());
     }
 
     #[test]

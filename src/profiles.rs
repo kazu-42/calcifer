@@ -195,6 +195,19 @@ impl Profile {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileShow {
+    pub(crate) reference: String,
+    pub(crate) id: String,
+    pub(crate) provider: Provider,
+    pub(crate) alias: String,
+    pub(crate) created_at: i64,
+    pub(crate) identity_binding: &'static str,
+    pub(crate) home_present: bool,
+    pub(crate) lease: &'static str,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryDocument {
@@ -627,6 +640,59 @@ impl Registry {
         self.recover_incomplete_removal()?;
         self.recover_incomplete_reauth()?;
         self.find_without_recovery(provider, alias)
+    }
+
+    /// Returns redacted public metadata for one profile without opening credentials.
+    pub(crate) fn show(
+        &self,
+        provider: Provider,
+        alias: &str,
+    ) -> Result<ProfileShow, ProfileError> {
+        let profile = self.find(provider, alias)?;
+        let directory = self.profile_directory(&profile)?;
+        let home = directory.join("home");
+        let identity_binding = match profile.provider {
+            Provider::Claude => "not_applicable",
+            Provider::Codex => {
+                let store = IdentityStore::new(&self.root);
+                if store.marker_exists(&directory)? {
+                    "bound"
+                } else {
+                    return Err(ProfileError::from(IdentityError::Unverified));
+                }
+            }
+        };
+        Ok(ProfileShow {
+            reference: profile.reference(),
+            id: profile.id.clone(),
+            provider: profile.provider,
+            alias: profile.alias.clone(),
+            created_at: profile.created_at,
+            identity_binding,
+            home_present: path_exists(&home)?,
+            lease: self.profile_lease_state(&profile, &directory)?,
+        })
+    }
+
+    fn profile_lease_state(
+        &self,
+        profile: &Profile,
+        directory: &Path,
+    ) -> Result<&'static str, ProfileError> {
+        for name in [COORDINATOR_LOCK_FILE, PROVIDER_LOCK_FILE] {
+            let path = directory.join(name);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(ProfileError::Io(error)),
+                Ok(_) => {}
+            }
+            match lock_existing_profile_file(&path, &profile.reference()) {
+                Ok(_) => {}
+                Err(ProfileError::Busy(_)) => return Ok("busy"),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok("idle")
     }
 
     fn find_without_recovery(
@@ -6172,6 +6238,11 @@ fn lock_existing_profile_file(path: &Path, reference: &str) -> Result<File, Prof
     Ok(file)
 }
 
+#[cfg(all(not(unix), not(windows)))]
+fn lock_existing_profile_file(_path: &Path, _reference: &str) -> Result<File, ProfileError> {
+    Err(ProfileError::UnsupportedPlatform)
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn verify_private_regular_file(path: &Path) -> Result<(), ProfileError> {
     use std::os::unix::fs::MetadataExt;
@@ -7260,6 +7331,35 @@ mod tests {
         let pending = registry.begin_codex_registration(alias)?;
         write_test_codex_auth(&pending.home())?;
         pending.commit(test_identity_adapter())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn show_reports_bound_idle_metadata_without_reading_auth_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let root = temporary_root("auth-show-bound");
+        #[cfg(windows)]
+        let root = windows_temporary_root("auth-show-bound");
+        let registry = Registry::at(root.clone());
+        let profile = register_test_profile(&registry, "work")?;
+        let secret = b"planted-show-secret-must-not-leak";
+        fs::write(registry.profile_home(&profile)?.join("auth.json"), secret)?;
+        let shown = registry.show(Provider::Codex, "work")?;
+        assert_eq!(shown.reference, profile.reference());
+        assert_eq!(shown.id, profile.id);
+        assert_eq!(shown.identity_binding, "bound");
+        assert!(shown.home_present);
+        assert_eq!(shown.lease, "idle");
+        let encoded = serde_json::to_string(&shown)?;
+        assert!(!encoded.contains("planted-show-secret-must-not-leak"));
+        let missing = registry
+            .show(Provider::Codex, "missing")
+            .err()
+            .ok_or("missing profile must fail closed")?;
+        assert_eq!(missing.code(), "profile_not_found");
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
